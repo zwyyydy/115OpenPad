@@ -1,0 +1,32 @@
+# 工具链与 SDK（体积巨大，不入库）
+tools/
+android-sdk/
+
+# 构建产物
+build/
+app/build/
+.gradle/
+local.properties
+*.apk.idsig
+
+# 含敏感令牌的临时文件（token 注入脚本/二进制）
+spb*.bin
+fix_pb.py
+.fresh_token
+
+# 截图等临时产物
+*.png
+*.jpg
+
+# IDE
+.idea/
+*.iml
+.DS_Store
+
+# 本地工作记录与内部笔记（不上库）
+.workbuddy/
+docs/
+
+# 临时令牌/文件
+.tmp_*
+*.pb
