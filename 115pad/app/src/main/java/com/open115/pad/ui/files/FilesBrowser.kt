@@ -60,6 +60,7 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -292,6 +293,46 @@ fun FilesBrowserPane(
             }
         }
 
+        // ---- 列表/网格的滚动状态（必须提升到下面的 when 之外）----
+        // ① 建在 when 分支里的话，一旦切到"加载中/空目录/错误"分支状态就被销毁，再回到列表
+        //    会从顶部开始（返回上级、刷新、切视图、退出播放/看图回来都可能踩到）；
+        // ② 提升后它始终在组合中，rememberSaveable 的存档才会被登记，配置变更/重创建后可恢复；
+        // ③ 另外按目录 cid 分别记住滚动位置：从子目录返回上级、或在目录间跳转时回到原处，
+        //    而不是继承上一个目录的偏移——子目录内容短时偏移会被夹到 0，返回上级就成了"回弹到顶部"。
+        val listState = rememberLazyListState()
+        val gridState = rememberLazyGridState()
+        val listScroll = remember { mutableStateMapOf<String, Pair<Int, Int>>() }
+        val gridScroll = remember { mutableStateMapOf<String, Pair<Int, Int>>() }
+        val curCid = ui.stack.last().cid
+        var lastCid by remember { mutableStateOf(curCid) }
+        var pendingRestore by remember { mutableStateOf<String?>(null) }
+
+        // 目录切换：先把上一个目录的位置存下来，并标记待恢复的目标目录
+        LaunchedEffect(curCid) {
+            if (curCid == lastCid) return@LaunchedEffect
+            listScroll[lastCid] = listState.firstVisibleItemIndex to listState.firstVisibleItemScrollOffset
+            gridScroll[lastCid] = gridState.firstVisibleItemIndex to gridState.firstVisibleItemScrollOffset
+            lastCid = curCid
+            pendingRestore = curCid
+        }
+
+        // 恢复必须等**新目录的数据到位之后**：LazyColumn 是按 item key 记忆位置的，
+        // 数据还是上一级目录时恢复会被随后的整表替换重置回顶部（实测踩过）。
+        LaunchedEffect(curCid, ui.loading, ui.items) {
+            if (ui.loading || pendingRestore != curCid) return@LaunchedEffect
+            pendingRestore = null
+            // 只恢复当前显示模式那一个（另一个没在组合里，别去碰它）；没有记录就从顶部开始
+            runCatching {
+                if (ui.gridMode) {
+                    val (i, o) = gridScroll[curCid] ?: (0 to 0)
+                    gridState.scrollToItem(i, o)
+                } else {
+                    val (i, o) = listScroll[curCid] ?: (0 to 0)
+                    listState.scrollToItem(i, o)
+                }
+            }
+        }
+
         // 宽屏防拉伸：列表/网格收进 960dp 居中容器，手机端自然占满
         Box(Modifier.weight(1f)) {
             com.open115.pad.ui.theme.AdaptiveBody(Modifier.fillMaxSize()) {
@@ -332,7 +373,6 @@ fun FilesBrowserPane(
                 }
 
                 ui.gridMode -> {
-                    val gridState = rememberLazyGridState()
                     LaunchedEffect(gridState, ui.display.size, ui.searchQuery) {
                         snapshotFlow { gridState.layoutInfo.visibleItemsInfo.lastOrNull()?.index }
                             .collect { last ->
@@ -360,7 +400,6 @@ fun FilesBrowserPane(
                 }
 
                 else -> {
-                    val listState = rememberLazyListState()
                     LaunchedEffect(listState, ui.display.size, ui.searchQuery) {
                         snapshotFlow { listState.layoutInfo.visibleItemsInfo.lastOrNull()?.index }
                             .collect { last ->

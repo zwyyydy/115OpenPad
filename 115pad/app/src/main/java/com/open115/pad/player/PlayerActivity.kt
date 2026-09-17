@@ -22,6 +22,7 @@ import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.animateScrollBy
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.gestures.detectTapGestures
@@ -63,6 +64,7 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material.icons.outlined.Close
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
@@ -82,6 +84,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
@@ -138,6 +141,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlin.math.abs
 import kotlin.math.roundToInt
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -343,6 +347,66 @@ fun PlayerScreen(
     var lockWakeAt by remember { mutableStateOf(0L) }
     // ---- 播放列表抽屉 ----
     var playlistOpen by remember { mutableStateOf(false) }
+
+    /**
+     * 抽屉列表的滚动状态：**必须提升到抽屉之外**。
+     *
+     * 抽屉收起时 AnimatedVisibility 会把内容移出组合，状态若建在抽屉内部，
+     * 每次展开都是新实例 → 一律回到顶部（长列表下当前集被甩出视野，正是那个
+     * "切集/删除后回弹到 Index 0"的 bug）。放这里再配 rememberSaveable，
+     * 收起/展开、列表数据轻微重组都保留滚动偏移。
+     */
+    val playlistListState = androidx.compose.runtime.saveable.rememberSaveable(
+        saver = LazyListState.Saver,
+    ) { LazyListState() }
+
+    /**
+     * 跟随当前播放项：切集（自动播完续播 / 上下集 / 随机 / 列表点播 / 删前移）或刚展开
+     * 抽屉时，把当前项平滑滚到视口正中。
+     *
+     * 三条防打架 / 防偏差规则：
+     * ① 用户正在手动滑动（含松手后的惯性）时先让位——等它停下再跟，最多等 3 秒；
+     *    等不到（用户还在翻）就放弃这一次，避免"人正往上翻、程序硬拉回去"。
+     * ② 全程用 animateScrollToItem / animateScrollBy 平滑滚动，没有瞬移；
+     *    滚动途中用户手指按下，Compose 的输入优先级会直接接管并取消动画。
+     * ③ 抽屉刚展开时首帧的视口尺寸还没算准（实测会让目标项偏出一行），所以滚完
+     *    按目标项的**实际位置**复核一次，偏差超过半行就用 animateScrollBy 校正；
+     *    两轮封顶，避免来回抖动。
+     */
+    LaunchedEffect(playlistOpen, currentIndex, playQueue.size) {
+        if (!playlistOpen || playQueue.isEmpty()) return@LaunchedEffect
+        if (playlistListState.isScrollInProgress) {
+            val stopped = withTimeoutOrNull(3000) {
+                snapshotFlow { playlistListState.isScrollInProgress }.first { !it }
+            }
+            if (stopped == null) return@LaunchedEffect
+        }
+        // 抽屉刚出现时列表还没布局：拿不到行高、滚动也会被丢弃，等一帧再算
+        if (playlistListState.layoutInfo.visibleItemsInfo.isEmpty()) {
+            withTimeoutOrNull(500) {
+                snapshotFlow { playlistListState.layoutInfo.visibleItemsInfo.isNotEmpty() }.first { it }
+            }
+        }
+        val target = currentIndex.coerceIn(0, playQueue.lastIndex)
+        repeat(2) { pass ->
+            val info = playlistListState.layoutInfo
+            // 行高取任一可见项（列表行同高）；一屏放得下就没有跟随可言，直接不做
+            val itemH = info.visibleItemsInfo.firstOrNull()?.size ?: return@LaunchedEffect
+            val viewportH = info.viewportSize.height
+            if (itemH <= 0 || info.totalItemsCount * itemH <= viewportH) return@LaunchedEffect
+            if (pass == 0) {
+                // 先按"行高/视口高"估一个居中偏移滚过去（负值 = 目标项落在视口顶部之下）
+                runCatching { playlistListState.animateScrollToItem(target, (itemH - viewportH) / 2) }
+            }
+            // 复核：目标项中心与视口中心的偏差，超过半行就补一次
+            val cur = playlistListState.layoutInfo
+            val t = cur.visibleItemsInfo.firstOrNull { it.index == target } ?: return@LaunchedEffect
+            val delta = (t.offset + t.size / 2) - cur.viewportSize.height / 2
+            if (abs(delta) <= t.size / 2) return@LaunchedEffect
+            runCatching { playlistListState.animateScrollBy(delta.toFloat()) }
+        }
+    }
+
     // ---- 播放列表删除的轻量提示（替代 snackbar，播放界面无 SnackbarHost）----
     var playerToast by remember { mutableStateOf<String?>(null) }
 
@@ -1767,7 +1831,7 @@ fun PlayerScreen(
                         }
                     }
                     HorizontalDivider(color = Color.White.copy(alpha = 0.15f))
-                    LazyColumn(Modifier.fillMaxSize()) {
+                    LazyColumn(Modifier.fillMaxSize(), state = playlistListState) {
                         itemsIndexed(playQueue) { i, entry ->
                             SwipeToDeleteRow(
                                 modifier = Modifier.fillMaxWidth(),
