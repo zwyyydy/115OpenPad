@@ -50,6 +50,10 @@ interface OpenApi {
         @Query("offset") offset: Int = 0,
         @Query("o") order: String? = null,
         @Query("asc") asc: Int? = null,
+        // 必须显式传 1，否则排序会被服务端忽略：custom_order 默认 0 = "使用记忆排序，
+        // 自定义排序失效"，此时 o/asc 完全不生效（官方文档枚举，已用真实接口复验）。
+        // 1 = 用自定义排序且保持文件夹置顶（2 会打乱置顶）。
+        @Query("custom_order") customOrder: Int = 1,
         @Query("type") type: Int? = null,
         @Query("suffix") suffix: String? = null,
         @Query("star") star: Int? = null,

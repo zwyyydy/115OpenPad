@@ -35,6 +35,7 @@ import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.requiredSize
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -81,7 +82,6 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
-import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
@@ -922,39 +922,42 @@ fun PlayerScreen(
         }
     }
 
-    // 规格胶囊：分辨率 / HDR 传输特性 / 编码，随播放器元数据变化更新
-    LaunchedEffect(player) {
-        snapshotFlow { player.videoSize to player.videoFormat }
-            .collect { (vs, vf) ->
-                if (vs.width <= 0 || vs.height <= 0) {
-                    specBadge = null
-                    return@collect
-                }
-                val longEdge = maxOf(vs.width, vs.height)
-                val res = when {
-                    longEdge >= 3800 -> "4K"
-                    longEdge >= 2500 -> "2K"
-                    longEdge >= 1900 -> "1080P"
-                    longEdge >= 1200 -> "720P"
-                    else -> vs.width.toString() + "x" + vs.height
-                }
-                // media3 1.4.1 的 Format 没有 colorTransfer 字段：HDR 在 colorInfo 里，
-                // 编码在 codecs 字符串里（如 hvc1.1.6 / avc1.640033）
-                val hdr = when (vf?.colorInfo?.colorTransfer) {
-                    C.COLOR_TRANSFER_ST2084 -> " HDR10"
-                    C.COLOR_TRANSFER_HLG -> " HLG"
-                    else -> ""
-                }
-                val codecs = (vf?.codecs ?: "").lowercase()
-                val codec = when {
-                    "dvh1" in codecs || "dva1" in codecs -> "DV"
-                    "hvc1" in codecs || "hev1" in codecs -> "HEVC"
-                    "avc1" in codecs || "avc3" in codecs -> "AVC"
-                    "av01" in codecs -> "AV1"
-                    else -> ""
-                }
-                specBadge = (res + hdr).let { if (codec.isNotBlank()) "$it · $codec" else it }
-            }
+    // 规格胶囊：分辨率 / HDR 传输特性 / 编码。
+    // 触发源必须是 vsVideoSize（监听器 onVideoSizeChanged 写入的 Compose 状态）：
+    // 早先用 snapshotFlow { player.videoSize } 是错的——Player 的属性不是快照状态，
+    // snapshotFlow 求值一次后不会再触发，而首次求值时首帧还没解码（0×0），
+    // 于是 specBadge 永远是 null，胶囊整条渲染不出来。
+    LaunchedEffect(vsVideoSize) {
+        val vs = vsVideoSize
+        if (vs.width <= 0 || vs.height <= 0) {
+            specBadge = null
+            return@LaunchedEffect
+        }
+        val vf = player.videoFormat
+        val longEdge = maxOf(vs.width, vs.height)
+        val res = when {
+            longEdge >= 3800 -> "4K"
+            longEdge >= 2500 -> "2K"
+            longEdge >= 1900 -> "1080P"
+            longEdge >= 1200 -> "720P"
+            else -> vs.width.toString() + "x" + vs.height
+        }
+        // media3 1.4.1 的 Format 没有 colorTransfer 字段：HDR 在 colorInfo 里，
+        // 编码在 codecs 字符串里（如 hvc1.1.6 / avc1.640033）
+        val hdr = when (vf?.colorInfo?.colorTransfer) {
+            C.COLOR_TRANSFER_ST2084 -> " HDR10"
+            C.COLOR_TRANSFER_HLG -> " HLG"
+            else -> ""
+        }
+        val codecs = (vf?.codecs ?: "").lowercase()
+        val codec = when {
+            "dvh1" in codecs || "dva1" in codecs -> "DV"
+            "hvc1" in codecs || "hev1" in codecs -> "HEVC"
+            "avc1" in codecs || "avc3" in codecs -> "AVC"
+            "av01" in codecs -> "AV1"
+            else -> ""
+        }
+        specBadge = (res + hdr).let { if (codec.isNotBlank()) "$it · $codec" else it }
     }
 
     /**
@@ -1102,7 +1105,11 @@ fun PlayerScreen(
             Box(
                 Modifier
                     .align(Alignment.Center)
-                    .size(with(vsDensity) { surfaceW.toDp() }, with(vsDensity) { surfaceH.toDp() })
+                    // 必须用 requiredSize 而非 size：旋转 90/270 时按帧比例算出的布局尺寸是
+                    // 转置的（1080×2370 的竖屏片在 2560×1600 屏上要 1167×2560），size() 会被
+                    // 父约束直接夹到 1600 高，布局比例随之从 0.46 变成 0.73，TextureView 把画面
+                    // 拉伸填满 → 旋转后画面形变。requiredSize 允许子节点超出父约束并居中。
+                    .requiredSize(with(vsDensity) { surfaceW.toDp() }, with(vsDensity) { surfaceH.toDp() })
                     .graphicsLayer { rotationZ = videoRotation.toFloat() },
             ) {
                 AndroidView(factory = { _ -> textureView }, modifier = Modifier.fillMaxSize())
