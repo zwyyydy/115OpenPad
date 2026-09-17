@@ -31,6 +31,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import com.open115.pad.appContainer
 import com.open115.pad.data.OpenApi
 import com.open115.pad.data.Uploader
 import com.open115.pad.util.Format
@@ -163,6 +164,7 @@ internal fun SubtitleSearchDialog(
     onDismiss: () -> Unit,
 ) {
     val scope = rememberCoroutineScope()
+    val context = androidx.compose.ui.platform.LocalContext.current
     var keyword by remember { mutableStateOf(initialKeyword) }
     var results by remember { mutableStateOf<List<XunleiSub>?>(null) }
     var searching by remember { mutableStateOf(false) }
@@ -315,9 +317,15 @@ internal fun SubtitleSearchDialog(
                                                         status = "正在上传到云盘…"
                                                         val fileName = "${uploadBaseName}.${langTagFor(sub.languages)}.${sub.ext}"
                                                         val res = withContext(Dispatchers.IO) {
-                                                            Uploader.uploadSmall(
-                                                                api, fileName, bytes,
-                                                                target = "U_1_$uploadTargetCid",
+                                                            Uploader.uploadSmallLogged(
+                                                                log = context.appContainer.transferLog,
+                                                                api = api,
+                                                                fileName = fileName,
+                                                                bytes = bytes,
+                                                                targetCid = uploadTargetCid,
+                                                                // 这条链路只有视频的 parentId、拿不到目录名，
+                                                                // 就用视频名交代"传到哪儿"（与视频同目录）
+                                                                targetName = "「$uploadBaseName」所在目录",
                                                             )
                                                         }
                                                         status = "已上传到云盘：${res.fileName}"

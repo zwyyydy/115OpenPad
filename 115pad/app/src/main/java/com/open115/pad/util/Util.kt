@@ -10,6 +10,13 @@ import java.security.MessageDigest
 import java.security.SecureRandom
 import java.util.Locale
 
+/**
+ * 全局 User-Agent。API 请求与"把下载直链交给系统下载器"必须用**同一个精确字符串**：
+ * 115 的下载直链与申请它时的 UA 绑定，换任何其它 UA（含 DownloadManager 自带的
+ * AndroidDownloadManager/… ）取文件都会被 CDN 判 403。改这里就够，别再各处硬编码。
+ */
+const val APP_USER_AGENT = "115OpenPad/0.1 (Android)"
+
 /** PKCE 工具：verifier 生成 + challenge 计算 */
 object Pkce {
     fun newVerifier(): String {

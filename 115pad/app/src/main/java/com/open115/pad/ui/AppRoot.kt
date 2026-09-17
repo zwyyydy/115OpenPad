@@ -9,6 +9,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.CloudDownload
+import androidx.compose.material.icons.outlined.Download
 import androidx.compose.material.icons.outlined.Folder
 import androidx.compose.material.icons.outlined.RestoreFromTrash
 import androidx.compose.material.icons.outlined.Settings
@@ -73,6 +74,7 @@ private val destinations = listOf(
     Dest("files", "文件", Icons.Outlined.Folder),
     Dest("filter", "过滤规则", Icons.Outlined.Tune),
     Dest("offline", "云下载", Icons.Outlined.CloudDownload),
+    Dest("transfer", "传输中心", Icons.Outlined.Download),
     Dest("recycle", "回收站", Icons.Outlined.RestoreFromTrash),
     Dest("settings", "设置", Icons.Outlined.Settings),
 )
@@ -261,6 +263,9 @@ private fun MainScaffold(container: AppContainer, widthClass: WindowWidthSizeCla
                 composable("recycle") {
                     val vm: RecycleViewModel = viewModel(initializer = { RecycleViewModel(container.openApi) })
                     RecycleScreen(vm, expanded, snackbarHostState)
+                }
+                composable("transfer") {
+                    com.open115.pad.ui.transfer.TransferScreen(snackbarHostState)
                 }
                 composable("settings") {
                     SettingsScreen(container)

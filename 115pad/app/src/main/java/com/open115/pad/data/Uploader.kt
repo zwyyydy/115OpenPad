@@ -38,6 +38,32 @@ object Uploader {
         val reused: Boolean, // 是否秒传
     )
 
+    /**
+     * 上传并在传输中心留一条记录（时间 / 大小 / 目标目录 / 成败 / 秒传）。
+     *
+     * 两条上传入口（文件页 SAF 上传、播放器"字幕传到视频目录"）都走这里，免得各自
+     * 记一遍导致漏记或字段不一致。记录先以"上传中"落库、结束再回填结果——上传是
+     * 一次性 PUT 拿不到进度，但至少让用户看得到"正在传、传给谁"。
+     */
+    suspend fun uploadSmallLogged(
+        log: TransferLog,
+        api: OpenApi,
+        fileName: String,
+        bytes: ByteArray,
+        targetCid: String,
+        targetName: String?,
+    ): UploadResult {
+        val id = log.beginUpload(fileName, bytes.size.toLong(), targetCid, targetName)
+        return try {
+            val r = uploadSmall(api, fileName, bytes, target = "U_1_$targetCid")
+            log.finishUpload(id, ok = true, reused = r.reused)
+            r
+        } catch (e: Exception) {
+            log.finishUpload(id, ok = false, error = e.message)
+            throw e
+        }
+    }
+
     suspend fun uploadSmall(
         api: OpenApi,
         fileName: String,

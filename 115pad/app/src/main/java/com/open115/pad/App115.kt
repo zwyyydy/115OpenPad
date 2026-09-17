@@ -39,6 +39,9 @@ class AppContainer(context: Context) {
     val filesPrefs = com.open115.pad.data.FilesPrefs(context)
     val downloadPrefs = com.open115.pad.data.DownloadPrefs(context)
 
+    /** 传输中心的历史记录（本机下载 + 上传） */
+    val transferLog = com.open115.pad.data.TransferLog(context)
+
     /** 剪贴板 / 外部唤起的下载链接汇聚点，由 MainActivity 投递、AppRoot 消费 */
     val downloadLinks = com.open115.pad.data.DownloadLinkBus(context, downloadPrefs)
 
@@ -46,7 +49,7 @@ class AppContainer(context: Context) {
         .addInterceptor { chain ->
             chain.proceed(
                 chain.request().newBuilder()
-                    .header("User-Agent", "115OpenPad/0.1 (Android)")
+                    .header("User-Agent", com.open115.pad.util.APP_USER_AGENT)
                     .build()
             )
         }

@@ -52,6 +52,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.open115.pad.appContainer
 import com.open115.pad.data.FileItem
 import com.open115.pad.data.FilesPrefs
 import com.open115.pad.data.JsonObject
@@ -481,7 +482,15 @@ fun FilesScreen(
                             c.close()
                         }
                     }
-                    Uploader.uploadSmall(vm.api, name, bytes, target = "U_1_${vm.currentTargetCid()}")
+                    Uploader.uploadSmallLogged(
+                        log = context.appContainer.transferLog,
+                        api = vm.api,
+                        fileName = name,
+                        bytes = bytes,
+                        targetCid = vm.currentTargetCid(),
+                        // 传输中心要能回答"传到哪个目录了"，这里给面包屑全路径最直观
+                        targetName = ui.stack.joinToString(" / ") { it.name },
+                    )
                 }
             }
             result.onSuccess {
