@@ -10,6 +10,8 @@ import android.view.View
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.infiniteRepeatable
@@ -284,6 +286,9 @@ fun PlayerScreen(
     var currentDef by remember { mutableStateOf(0) }
     var subtitles by remember { mutableStateOf<List<SubtitleCfg>>(emptyList()) }
     var loading by remember { mutableStateOf(true) }
+    /** 播放中缓冲（不含首次加载：起播全屏加载由 loading 接管）；短暂抖动不打扰，延迟 400ms 才显示 */
+    var rebuffering by remember { mutableStateOf(false) }
+    var showBuffering by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
     var qualityMenuOpen by remember { mutableStateOf(false) }
     var audioMenuOpen by remember { mutableStateOf(false) }
@@ -523,6 +528,8 @@ fun PlayerScreen(
                 // 播放结束信号：续播决策在 loadEpisodeAt 之后的 LaunchedEffect(endedTick) 里
                 // （局部函数必须先声明后使用，listener 这里拿不到 switchEpisode）
                 if (state == Player.STATE_ENDED) endedTick++
+                // 缓冲态驱动"缓冲中"动效（起播时的 BUFFERING 由 loading 全屏接管）
+                rebuffering = state == Player.STATE_BUFFERING
             }
 
             override fun onVideoSizeChanged(videoSize: VideoSize) {
@@ -1024,6 +1031,17 @@ fun PlayerScreen(
         specBadge = (res + hdr).let { if (codec.isNotBlank()) "$it · $codec" else it }
     }
 
+    // 缓冲动效的显隐：连续缓冲超过 400ms 才出现，避免每次细微卡顿都闪一下；
+    // 缓冲一结束立刻淡出（LaunchedEffect 换 key 会取消上一次的 delay）
+    LaunchedEffect(rebuffering) {
+        if (rebuffering) {
+            delay(400)
+            showBuffering = true
+        } else {
+            showBuffering = false
+        }
+    }
+
     /**
      * 字幕时间轴微调：基于原始字节平移时间轴后重建媒体。
      * 还没有原始字节时（仅挂了 115 官方字幕），先把官方字幕下载到本地作为基准，
@@ -1188,6 +1206,16 @@ fun PlayerScreen(
                         .height(64.dp)
                         .padding(bottom = 4.dp),
                 )
+            }
+            // 缓冲动效：叠在画面上但**不拦手势**（没有 clickable，事件照旧穿透到手势层），
+            // 锁屏时也保留——画面停住时用户最需要知道"是在缓冲还是卡死了"
+            androidx.compose.animation.AnimatedVisibility(
+                visible = showBuffering,
+                enter = fadeIn(tween(160)),
+                exit = fadeOut(tween(200)),
+                modifier = Modifier.fillMaxSize(),
+            ) {
+                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { BufferingPill() }
             }
             // 手势层：锁定时整体禁用（单击/双击/长按/垂直音量亮度/横向 seek 全部拦截）
             PlayerGestureOverlay(
@@ -1580,7 +1608,7 @@ fun PlayerScreen(
                                         )
                                     }
                                     DropdownMenu(expanded = speedMenuOpen, onDismissRequest = { speedMenuOpen = false }) {
-                                        listOf(0.5f, 0.75f, 1f, 1.25f, 1.5f, 2f, 3f).forEach { s ->
+                                        listOf(0.5f, 0.75f, 1f, 1.25f, 1.5f, 1.75f, 2f, 3f).forEach { s ->
                                             DropdownMenuItem(
                                                 text = { Text("x$s" + if (currentSpeed == s) " ✓" else "") },
                                                 onClick = {
@@ -2047,6 +2075,57 @@ internal fun PlayerStatusRow(
                     )
                 }
             }
+        }
+    }
+}
+
+/**
+ * 缓冲中动效：半透明胶囊 + 一段旋转的弧 + 文案。
+ *
+ * 手绘单段弧（而不是 CircularProgressIndicator）是为了轻：播放页每帧都在解码，
+ * 指示器只画一条 100° 的弧 + 呼吸透明度，视觉上也更贴合深色画面。
+ */
+@Composable
+private fun BufferingPill() {
+    val transition = rememberInfiniteTransition(label = "buffering")
+    val angle by transition.animateFloat(
+        initialValue = 0f,
+        targetValue = 360f,
+        animationSpec = infiniteRepeatable(tween(900, easing = LinearEasing)),
+        label = "bufferingAngle",
+    )
+    val alpha by transition.animateFloat(
+        initialValue = 0.35f,
+        targetValue = 1f,
+        animationSpec = infiniteRepeatable(tween(680, easing = FastOutSlowInEasing), RepeatMode.Reverse),
+        label = "bufferingAlpha",
+    )
+    Surface(
+        color = Color.Black.copy(alpha = 0.55f),
+        shape = RoundedCornerShape(14.dp),
+    ) {
+        Row(
+            Modifier.padding(horizontal = 16.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            androidx.compose.foundation.Canvas(Modifier.size(20.dp)) {
+                drawArc(
+                    color = Color.White.copy(alpha = alpha),
+                    startAngle = angle,
+                    sweepAngle = 100f,
+                    useCenter = false,
+                    style = androidx.compose.ui.graphics.drawscope.Stroke(
+                        width = 2.4.dp.toPx(),
+                        cap = androidx.compose.ui.graphics.StrokeCap.Round,
+                    ),
+                )
+            }
+            Spacer(Modifier.width(10.dp))
+            Text(
+                "缓冲中…",
+                color = Color.White,
+                style = MaterialTheme.typography.bodyMedium,
+            )
         }
     }
 }
