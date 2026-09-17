@@ -8,6 +8,7 @@ app/build/
 .gradle/
 local.properties
 *.apk.idsig
+*.apk
 
 # 含敏感令牌的临时文件（token 注入脚本/二进制）
 spb*.bin

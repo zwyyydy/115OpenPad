@@ -1387,8 +1387,8 @@ fun PlayerScreen(
                                         tint = Color.White,
                                     )
                                 }
-                                // 画质
-                                if ((data?.videoUrls?.size ?: 0) > 1) {
+                                // 画质：始终显示（单档片源也让用户知道当前画质，点开可确认档位）
+                                if (data != null) {
                                     Box {
                                         TextButton(onClick = { qualityMenuOpen = true }) {
                                             Text(
