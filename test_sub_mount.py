@@ -1,5 +1,9 @@
 # -*- coding: utf-8 -*-
-"""验证：字幕上传到视频同级目录后，/open/video/subtitle 是否自动关联（主动挂载依据）"""
+"""验证：字幕上传到视频同级目录后，/open/video/subtitle 是否自动关联（主动挂载依据）
+
+用法: python test_sub_mount.py <access_token> <视频 pick_code>
+"""
+
 import base64
 import hashlib
 import hmac
@@ -10,8 +14,8 @@ import urllib.parse
 import urllib.error
 import email.utils
 
-TOKEN = open("F:/ad/.fresh_token").read().strip()
-PICK = sys.argv[1]
+TOKEN = sys.argv[1]
+PICK = sys.argv[2]
 BASE = "https://proapi.115.com"
 
 def http(url, method="GET", form=None, headers=None):

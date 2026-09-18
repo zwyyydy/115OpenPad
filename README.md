@@ -41,12 +41,24 @@
 ## 构建
 
 ```bash
-git clone https://github.com/<你的用户名>/115OpenPad.git
+git clone https://github.com/zwyyydy/115OpenPad.git
 cd 115OpenPad/115pad
 ./gradlew assembleDebug
 ```
 
-需要 Android Studio 或命令行 Android SDK（platform 35 / build-tools 35.0.0）+ JDK 17。
+需要 Android Studio 或命令行 Android SDK（platform 35 / build-tools 35.0.0）+ JDK 17。若 `local.properties` 里的 `sdk.dir` 与本机不符，请修改或删除后改设 `ANDROID_HOME`。
+
+## 技术栈
+
+Kotlin + Jetpack Compose (Material 3) + material3-window-size-class（平板自适应）、Retrofit + OkHttp + kotlinx.serialization、Coil（图片）、Media3 ExoPlayer（HLS 播放）、DataStore（令牌与状态）、ZXing（二维码）、系统 DownloadManager（本机下载）。
+
+## 已知限制
+
+- **BT 任务**：`.torrent` 在本地解析出 info_hash 后以**磁力链**方式提交。官方的 `add_task_bt` 要求先把种子文件上传到 115，因此"按文件勾选下载"暂不可用；冷门资源若 DHT 拿不到元数据，会一直停在"分配中"
+- **文件上传**：仅支持 ≤32MB 的小文件，大文件上传未实现
+- **文件夹置顶**：只保存在本机，换设备不同步（115 开放平台无置顶接口）
+- 4K / 原画播放需要 115 会员
+- 开放平台接口有不公开的频控，请勿高频刷新（应用内已做列表缓存与节流，但别手动狂点）
 
 ## 凭据说明
 
