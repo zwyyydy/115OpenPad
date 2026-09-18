@@ -9,6 +9,10 @@ import com.open115.pad.data.QrApi
 import com.open115.pad.data.Session
 import com.open115.pad.data.TokenAuthenticator
 import kotlinx.serialization.json.Json
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import com.jakewharton.retrofit2.converter.kotlinx.serialization.asConverterFactory
@@ -41,6 +45,16 @@ class AppContainer(context: Context) {
 
     /** 文件夹置顶（本机生效，115 开放平台无对应接口） */
     val pinnedPrefs = com.open115.pad.data.PinnedPrefs(context)
+
+    /**
+     * 目录列表缓存（进程级、纯内存、LRU）。
+     * 放在 AppContainer 而不是 ViewModel 里：ViewModel 会随导航条目被清掉，
+     * 放里面收益只剩"目录间切换"，太薄。
+     */
+    val dirCache = com.open115.pad.data.DirCache()
+
+    /** 只用于极少数与 UI 无关的长期观察（目前只有"登出后清缓存"） */
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
     /** 传输中心的历史记录（本机下载 + 上传） */
     val transferLog = com.open115.pad.data.TransferLog(context)
@@ -97,6 +111,11 @@ class AppContainer(context: Context) {
                 .crossfade(true)
                 .build()
         )
+        // 登出（含因终态授权码被强制登出）后，本机缓存的目录列表必须作废：
+        // 不清的话，换个账号登录会直接看到上一个账号的目录内容
+        scope.launch {
+            session.loggedInFlow.collect { if (!it) dirCache.clear() }
+        }
     }
 }
 

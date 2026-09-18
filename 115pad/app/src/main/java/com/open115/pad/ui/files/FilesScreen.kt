@@ -53,6 +53,7 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.open115.pad.appContainer
+import com.open115.pad.data.DirCache
 import com.open115.pad.data.FileItem
 import com.open115.pad.data.FilesPrefs
 import com.open115.pad.data.JsonObject
@@ -105,6 +106,8 @@ class FilesViewModel(
     private val filterPrefs: FilterPrefs? = null,
     /** 文件夹置顶（未注入则无置顶能力，列表行为与从前完全一致） */
     private val pinnedPrefs: PinnedPrefs? = null,
+    /** 目录列表缓存（未注入则每次都真实请求，行为与从前一致） */
+    private val cache: DirCache? = null,
 ) : ViewModel() {
 
     data class DirEntry(val cid: String, val name: String)
@@ -181,7 +184,8 @@ class FilesViewModel(
                     )
                 }
             }
-            refresh()
+            // ViewModel 重建时（进程还活着）缓存可能还是热的，能省掉一次请求
+            loadCurrent()
         }
 
         // ---- 高级过滤 + 置顶：派生"可见列表" ----
@@ -250,18 +254,67 @@ class FilesViewModel(
         return pinned.sortedBy { rankOf(it) } + rest
     }
 
-    fun refresh() = load(0, more = false)
+    /**
+     * 强制刷新：**绕过缓存**重新拉第一页。
+     * 点刷新按钮、以及所有写操作之后都走它——写完缓存本来就是脏的，重取即顺带更新。
+     */
+    fun refresh() = load(0, more = false, force = true)
+
+    /**
+     * 按当前条件加载第一页，**允许命中缓存**。
+     * 切目录 / 返回上级 / 面包屑跳转 / 改排序 / 改筛选 / 进出搜索都走它。
+     */
+    private fun loadCurrent() = load(0, more = false, force = false)
 
     fun loadMore() {
         val s = _ui.value
         if (!s.loading && !s.loadingMore && s.items.size < s.count) load(s.items.size, more = true)
     }
 
-    private fun load(offset: Int, more: Boolean) {
+    /** 当前条件下的缓存 key；搜索模式与"未注入缓存"都返回 null（即永不读写缓存） */
+    private fun cacheKey(s: UiState): String? =
+        cache?.key(s.stack.last().cid, s.order, s.asc, s.typeFilter, s.starOnly)
+
+    private fun load(offset: Int, more: Boolean, force: Boolean = false) {
         viewModelScope.launch {
-            _ui.update { if (more) it.copy(loadingMore = true) else it.copy(loading = true, error = null) }
+            // 只读一次快照：缓存 key 与请求参数都取自它，保证两者永远指向同一个目录/同一组条件。
+            // （旧实现是在设置 loading 之后再读一次 _ui，中途切目录时两处会错位。）
+            val s = _ui.value
+            // 搜索模式的 key 随关键词变、结果按相关度排序、时效性也不同，一律不进缓存
+            val key = if (s.searching) null else cacheKey(s)
+
+            // 这次请求的"已有条目"基准：
+            // - 分页：入口快照 s.items（offset 就是由它算出来的）
+            // - 命中过期缓存：缓存里的那一份（**不是** s.items——s 是切目录之前的旧列表）
+            // - 全新加载：空
+            var servedFromCache = false
+            var base: List<FileItem> = if (more) s.items else emptyList()
+
+            // ---- ① 先吃缓存：命中就立刻出列表，用户不用等网络 ----
+            if (key != null && !more && !force) {
+                val hit = cache?.get(key)
+                if (hit != null) {
+                    base = hit.items
+                    _ui.update {
+                        it.copy(items = hit.items, count = hit.count, loading = false, error = null)
+                    }
+                    // 还在新鲜期内：连后台请求都省掉——"来回进出一个目录"因此在 TTL 内零请求
+                    if (cache?.isFresh(hit) == true) return@launch
+                    servedFromCache = true
+                }
+            }
+
+            // ---- ② 真实请求 ----
+            // 已有缓存兜底时不再显示全屏转圈：列表就在屏幕上，再转圈是倒退。
+            // 没有缓存才给 loading（首次进目录 / 改排序 / 搜索要让用户知道在加载）。
+            _ui.update {
+                when {
+                    more -> it.copy(loadingMore = true)
+                    servedFromCache -> it.copy(error = null)
+                    else -> it.copy(loading = true, error = null)
+                }
+            }
             try {
-                val s = _ui.value
                 if (s.searching) {
                     val page = parseSearchResponse(api.search(s.searchQuery, offset = offset, type = s.typeFilter))
                     val mapped = page.data.map { it.toItem() }
@@ -272,10 +325,9 @@ class FilesViewModel(
                         )
                     }
                 } else {
-                    val cid = s.stack.last().cid
                     val page = parseFilesResponse(
                         api.files(
-                            cid = cid,
+                            cid = s.stack.last().cid,
                             offset = offset,
                             order = s.order,
                             asc = s.asc,
@@ -283,11 +335,24 @@ class FilesViewModel(
                             star = if (s.starOnly) 1 else null,
                         )
                     )
-                    _ui.update {
-                        it.copy(
-                            items = if (more) it.items + page.items else page.items,
-                            count = page.count,
-                        )
+                    // 请求期间用户切走了：这份结果属于旧目录，直接丢掉。
+                    // 否则会拿它覆盖当前目录的列表、并写进旧目录的缓存键里（切目录/连点排序都会踩）。
+                    if (cacheKey(_ui.value) != key) return@launch
+
+                    val next = when {
+                        more -> base + page.items
+                        // 过期缓存的后台刷新：**只换第一页、保留已加载的后续页**。
+                        // 整表替换会把"已滚到第 400 条"的列表打回 200 条、滚动位置当场跳掉——
+                        // 那正是缓存要修的问题，不能自己再造一遍。
+                        servedFromCache && base.size > page.items.size ->
+                            page.items + base.drop(page.items.size)
+                        else -> page.items
+                    }
+                    _ui.update { it.copy(items = next, count = page.count) }
+                    // 写回缓存。分页必须把新页并到已有条目后面，否则下次进目录只剩第一页、
+                    // 滚动位置也跟着对不上；缓存与视图共用同一份 next，保证两边永远一致。
+                    if (key != null) {
+                        cache?.put(key, DirCache.Entry(next, page.count, System.currentTimeMillis()))
                     }
                 }
             } catch (e: Exception) {
@@ -298,16 +363,20 @@ class FilesViewModel(
         }
     }
 
+    // ---- 下面这一组统一走 loadCurrent()（允许命中缓存）而不是 refresh()（强制重取）：
+    // 切目录、改排序筛选都是"换一个视角看数据"，缓存 key 里带了参数，命不中自然会去请求。
+    // 只有点刷新按钮和写操作之后才需要强制绕过缓存。
+
     fun openDir(item: FileItem) {
         val fid = item.fid ?: return
         _ui.update { it.copy(stack = it.stack + DirEntry(fid, item.fn), selection = emptySet()) }
-        refresh()
+        loadCurrent()
     }
 
     fun popDir() {
         if (_ui.value.stack.size > 1) {
             _ui.update { it.copy(stack = it.stack.dropLast(1), selection = emptySet()) }
-            refresh()
+            loadCurrent()
         }
     }
 
@@ -315,25 +384,25 @@ class FilesViewModel(
         // 已在目标层级时直接返回，避免一次无谓的列表刷新
         if (index >= _ui.value.stack.lastIndex) return
         _ui.update { it.copy(stack = it.stack.subList(0, index + 1), selection = emptySet()) }
-        refresh()
+        loadCurrent()
     }
 
     fun setSort(order: String, asc: Int) {
         _ui.update { it.copy(order = order, asc = asc) }
         persistState()
-        refresh()
+        loadCurrent()
     }
 
     fun setType(type: Int?) {
         _ui.update { it.copy(typeFilter = type) }
         persistState()
-        refresh()
+        loadCurrent()
     }
 
     fun toggleStarOnly() {
         _ui.update { it.copy(starOnly = !it.starOnly) }
         persistState()
-        refresh()
+        loadCurrent()
     }
 
     fun setGrid(grid: Boolean) {
@@ -355,12 +424,15 @@ class FilesViewModel(
 
     fun search(query: String) {
         _ui.update { it.copy(searching = query.isNotBlank(), searchQuery = query.trim()) }
-        refresh()
+        // 搜索不进缓存（key 为 null），这里用 loadCurrent 只是"不强制重取"，
+        // 效果与刷新一致：真的会去请求
+        loadCurrent()
     }
 
     fun exitSearch() {
         _ui.update { it.copy(searching = false, searchQuery = "") }
-        refresh()
+        // 退出搜索回到目录浏览：大概率能命中缓存，回来即刻就有内容
+        loadCurrent()
     }
 
     fun toggleSelect(id: String?) {
@@ -406,8 +478,8 @@ class FilesViewModel(
      * 规则：所选文件夹**全部已置顶**时整体取消置顶，否则把还没置顶的补上——
      * 混合选择时"补全"比"反向翻转"更符合直觉，不会把已经置顶的反而取消掉。
      *
-     * 返回值是"要展示给用户的文案"，成功和失败都给出，调用方直接提示即可——
-     * 刻意不复用 [runOp] 那套"成功返回 null"的约定，否则成功提示会被静默丢掉。
+     * 返回值直接就是"要展示给用户的文案"：本方法全是本机操作（DataStore，不碰网络），
+     * 没有 [runOp] 里那条"网络错误"分支要走，成功与失败都直接给一句话反而更省事。
      */
     suspend fun togglePins(items: List<FileItem>): String {
         val prefs = pinnedPrefs ?: return "置顶功能未初始化"
@@ -457,28 +529,38 @@ class FilesViewModel(
     suspend fun moveSelected(toCid: String, toName: String): String? {
         val ids = _ui.value.selection.toList()
         if (ids.isEmpty()) return null
-        return runOp {
+        // 移动成功后条目从当前目录消失，"少了几项"很容易被忽略，所以明确告知去处
+        return runOp(onSuccess = "已移动到「$toName」") {
             val resp = api.moveFiles(ids.joinToString(","), toCid)
             val ok = resp.envOk()
             if (ok) {
                 clearSelection()
+                // 目标目录的缓存脏了（多出这几条），但它不在当前视图里，只能显式失效。
+                // 先失效再 refresh：万一 toCid 就是当前目录，后面那次重取会把新数据重新写回去。
+                cache?.invalidateDir(toCid)
+                // 当前目录强制重取，顺带把它的缓存刷成最新
                 refresh()
             }
-            ok to (if (ok) "已移动到「$toName」" else resp.envMsg() ?: "移动失败")
+            ok to (resp.envMsg() ?: "移动失败")
         }
     }
 
     suspend fun copySelected(toCid: String, toName: String): String? {
         val ids = _ui.value.selection.toList()
         if (ids.isEmpty()) return null
-        return runOp {
+        val fromCid = currentCid()
+        // 复制到别的目录后当前目录看不出任何变化，不给提示就等于"点了没反应"
+        return runOp(onSuccess = "已复制到「$toName」") {
             val resp = api.copyFiles(pid = toCid, fileIds = ids.joinToString(","))
             val ok = resp.envOk()
             if (ok) {
                 clearSelection()
-                refresh()
+                cache?.invalidateDir(toCid)
+                // 复制不动源目录，所以只有"目标就是当前目录"（当场多出副本）时才需要重取；
+                // 其余情况这一跳请求是白花的，缓存机制顺手把它省掉
+                if (toCid == fromCid) refresh()
             }
-            ok to (if (ok) "已复制到「$toName」" else resp.envMsg() ?: "复制失败")
+            ok to (resp.envMsg() ?: "复制失败")
         }
     }
 
@@ -490,10 +572,22 @@ class FilesViewModel(
 
     private fun currentCid(): String = _ui.value.stack.last().cid
 
-    private inline fun runOp(block: () -> Pair<Boolean, String>): String? {
+    /**
+     * 执行一次接口操作，把结果翻译成"要不要提示用户、提示什么"（返回 null = 不打扰）。
+     *
+     * [onSuccess] 是成功时要给的文案，默认 null = **成功静默**。默认静默是有意的：
+     * 重命名、星标、删除、新建这些操作完成后列表本身就有变化，再弹一句"操作成功"
+     * 纯属噪音。只有**界面上看不出结果**的动作才需要说一声——移动和复制就是：
+     * 东西从当前目录消失了，不明确告知的话，用户会以为按钮没点动。
+     *
+     * 旧实现无条件把成功结果丢成 null，于是 moveSelected / copySelected 里写好的
+     * "已移动到「x」"成了死代码、成功后毫无反馈。这个参数就是为修它加的；
+     * 其余调用点走默认值，行为与从前逐字一致。
+     */
+    private inline fun runOp(onSuccess: String? = null, block: () -> Pair<Boolean, String>): String? {
         return try {
             val (ok, msg) = block()
-            if (ok) null else msg
+            if (ok) onSuccess else msg
         } catch (e: Exception) {
             "网络错误：${e.message}"
         }

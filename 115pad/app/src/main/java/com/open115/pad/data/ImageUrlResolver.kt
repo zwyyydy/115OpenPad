@@ -37,6 +37,10 @@ class ImageUrlResolver(
     }
 
     private val lock = Mutex()
+
+    /** 串行化「取字节落盘」（见 fetchToCache 的注释：稳定 key 让同一张图的多个 URL 指向同一文件） */
+    private val fetchLock = Mutex()
+
     private val lru = object : LinkedHashMap<String, Entry>(16, 0.75f, true) {
         override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Entry>): Boolean =
             size > MAX_ENTRIES
@@ -135,30 +139,87 @@ class ImageUrlResolver(
 
     /**
      * 把某个 URL 的内容下载到缓存目录（超大图分块解码需要本地文件）。
-     * 走的是与 API 相同的 OkHttpClient，鉴权 / 401 重试链一致；同 URL 复用同一份文件。
+     * 走的是与 API 相同的 OkHttpClient，鉴权 / 401 重试链一致。
+     *
+     * [stableKey] 必须是**与 URL 签名无关**的稳定标识（用 pick_code / fid，别用 URL）：
+     * 115 的原图直链带签名、每次列表响应都会变，早先用 `url.hashCode()` 命名文件，
+     * 于是同一张图每重新解析一次就被当成新文件重下一遍——实测攒了 5 份字节数完全相同的
+     * 文件、白占 103MB。换成稳定 key 后同一张图永远命中同一份缓存。
      */
-    suspend fun fetchToCache(url: String, cacheDir: File): File = withContext(Dispatchers.IO) {
-        val dir = File(cacheDir, "huge_img").apply { mkdirs() }
-        val target = File(dir, "img_${url.hashCode()}.bin")
-        if (!target.exists() || target.length() == 0L) {
-            client.newCall(Request.Builder().url(url).build()).execute().use { resp ->
-                check(resp.isSuccessful) { "HTTP ${resp.code}" }
-                val body = resp.body ?: error("空响应")
-                body.byteStream().use { input ->
-                    target.outputStream().use { output -> input.copyTo(output) }
+    suspend fun fetchToCache(stableKey: String, url: String, cacheDir: File): File =
+        // 加了稳定 key 之后，同一张图的**不同 URL**会指向同一个文件（以前是不同文件、互不干扰），
+        // 所以这里必须串行化，否则两次并发下载会往同一个文件里交错写。
+        // 实际只有一个当前页在下载，串行化的开销可以忽略。
+        fetchLock.withLock {
+            withContext(Dispatchers.IO) {
+                val dir = hugeCacheDir(cacheDir).apply { mkdirs() }
+                val target = File(dir, "img_${stableKey.hashCode()}.bin")
+                if (target.exists() && target.length() > 0L) {
+                    // 复用时把 mtime 顶到现在：pruneHugeCache 的"最久未用"就是靠它判断的
+                    target.setLastModified(System.currentTimeMillis())
+                } else {
+                    val tmp = File(dir, "${target.name}.tmp")
+                    client.newCall(Request.Builder().url(url).build()).execute().use { resp ->
+                        check(resp.isSuccessful) { "HTTP ${resp.code}" }
+                        val body = resp.body ?: error("空响应")
+                        body.byteStream().use { input ->
+                            tmp.outputStream().use { output -> input.copyTo(output) }
+                        }
+                    }
+                    // 先写临时文件再改名：下载中途被杀不会留下"半个文件"被当成有效缓存。
+                    // 那种坏文件永远不会被重下（exists() && length>0 就复用），这张图会永久打不开。
+                    if (!tmp.renameTo(target)) {
+                        tmp.copyTo(target, overwrite = true)
+                        tmp.delete()
+                    }
                 }
+                pruneHugeCache(dir)
+                target
             }
         }
-        target
-    }
 
     private fun now(): Long = System.currentTimeMillis()
 
-    private companion object {
+    companion object {
         /** LRU 上限：一次浏览相册通常几十张，128 足够且内存开销可忽略（只是字符串） */
-        const val MAX_ENTRIES = 128
+        private const val MAX_ENTRIES = 128
 
         /** 直链签名有效期按 30 分钟算，留 10 分钟余量避免拿到临期链接 */
-        const val SIGN_TTL_MS = 20L * 60 * 1000
+        private const val SIGN_TTL_MS = 20L * 60 * 1000
+
+        /** 大图落盘目录名 */
+        private const val HUGE_DIR = "huge_img"
+
+        /**
+         * 大图落盘目录的体积上限，超了就按"最久未用"淘汰旧文件。
+         * 该目录只放 >10MB 的超大图，200MB 大约十来张——够回看，又不至于把用户空间吃光。
+         * （改造前没有任何清理，一周就攒到 103MB，而且其中大部分是同一张图的重复副本。）
+         */
+        const val HUGE_CACHE_MAX_BYTES = 200L * 1024 * 1024
+
+        /** 大图落盘目录：fetchToCache 与设置页的"清除大图缓存"共用同一份定义 */
+        fun hugeCacheDir(cacheDir: File): File = File(cacheDir, HUGE_DIR)
+
+        fun hugeCacheSizeBytes(cacheDir: File): Long =
+            hugeCacheDir(cacheDir).listFiles()?.sumOf { it.length() } ?: 0L
+
+        /** 清空大图落盘目录。删不掉的文件会留在原地，调用方重新读一次 size 即可发现 */
+        fun clearHugeCache(cacheDir: File) {
+            hugeCacheDir(cacheDir).listFiles()?.forEach { it.delete() }
+        }
+
+        /** 按"最久未用"把目录压回上限以内（mtime 兼作最近使用时间，由 fetchToCache 维护） */
+        private fun pruneHugeCache(dir: File) {
+            runCatching {
+                val files = dir.listFiles()?.filter { it.isFile } ?: return
+                var total = files.sumOf { it.length() }
+                if (total <= HUGE_CACHE_MAX_BYTES) return
+                for (f in files.sortedBy { it.lastModified() }) {
+                    if (total <= HUGE_CACHE_MAX_BYTES) break
+                    val len = f.length()
+                    if (f.delete()) total -= len
+                }
+            }
+        }
     }
 }

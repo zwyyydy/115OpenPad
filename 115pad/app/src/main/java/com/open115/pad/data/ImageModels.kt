@@ -24,16 +24,20 @@ data class ImageMediaItem(
 
     /**
      * 是否按"超大图"处理（单反原图 / 长图）。
-     * 判定依据是文件体积——像素尺寸要等解码后才知道，到时再按 [HUGE_MAX_PIXELS] 复核。
+     * 判定依据是文件体积——像素尺寸要等解码后才知道。
      * 超大图不允许 Coil 一次性整张解码，走 BitmapRegionDecoder 只渲染可视区域。
      */
     val isHugeBySize: Boolean get() = fileSize > HUGE_FILE_BYTES
 
     companion object {
-        /** 体积阈值：> 15MB 视为超大图 */
-        const val HUGE_FILE_BYTES: Long = 15L * 1024 * 1024
+        /** 体积阈值：> 10MB 视为超大图 */
+        const val HUGE_FILE_BYTES: Long = 10L * 1024 * 1024
 
-        /** 像素阈值：最长边 > 4096px 视为超大图 */
+        /**
+         * 像素阈值：最长边 > 4096px 视为超大图。
+         * 预留给"体积不大但边长极大"的图（高压缩比的长截图），**目前尚未接上判定**——
+         * 接它需要在路由前先解出原图头部的宽高，暂未做，见 2026-09-18 记录。
+         */
         const val HUGE_MAX_EDGE: Int = 4096
     }
 }

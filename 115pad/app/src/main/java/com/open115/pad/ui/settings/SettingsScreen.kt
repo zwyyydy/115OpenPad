@@ -47,6 +47,7 @@ import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.unit.dp
 import coil.compose.SubcomposeAsyncImage
 import com.open115.pad.AppContainer
+import com.open115.pad.data.ImageUrlResolver
 import com.open115.pad.data.OpenApi
 import com.open115.pad.data.UserInfo
 import com.open115.pad.player.PlayerCache
@@ -169,10 +170,13 @@ fun SettingsScreen(container: AppContainer) {
     val autoSubmitClipboard by container.downloadPrefs.autoSubmitClipboardDownload
         .collectAsState(initial = false)
     var cacheSizeMb by remember { mutableStateOf(-1L) }
+    /** 大图落盘缓存（cacheDir/huge_img）占用，-1 = 还在算 */
+    var hugeCacheMb by remember { mutableStateOf(-1L) }
 
     LaunchedEffect(Unit) {
         clientId = container.session.currentClientId()
         cacheSizeMb = PlayerCache.sizeBytes(context) / (1024 * 1024)
+        hugeCacheMb = ImageUrlResolver.hugeCacheSizeBytes(context.cacheDir) / (1024 * 1024)
     }
 
     // 宽屏防拉伸：设置内容收进 960dp 居中容器
@@ -289,6 +293,20 @@ fun SettingsScreen(container: AppContainer) {
             onClick = {
                 PlayerCache.clear(context)
                 cacheSizeMb = 0
+            },
+        )
+
+        SectionTitle("图片")
+        SettingRow(
+            title = "清除大图缓存",
+            subtitle = if (hugeCacheMb >= 0) {
+                "超大图的原图落盘（分块解码用），当前占用 ${hugeCacheMb} MB，点击清除；" +
+                    "超过 200MB 会自动淘汰最久未用的"
+            } else "计算中…",
+            onClick = {
+                ImageUrlResolver.clearHugeCache(context.cacheDir)
+                // 重新读一次而不是直接置 0：个别文件删不掉时能如实显示出来
+                hugeCacheMb = ImageUrlResolver.hugeCacheSizeBytes(context.cacheDir) / (1024 * 1024)
             },
         )
 

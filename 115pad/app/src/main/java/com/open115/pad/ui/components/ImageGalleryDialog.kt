@@ -9,6 +9,7 @@ import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -19,6 +20,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Close
 import androidx.compose.material3.CircularProgressIndicator
@@ -37,16 +39,21 @@ import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Rect as ComposeRect
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.FilterQuality
 import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
@@ -60,6 +67,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.sample
 import kotlinx.coroutines.withContext
+import java.io.File
 import kotlin.math.max
 import kotlin.math.roundToInt
 
@@ -71,6 +79,9 @@ import kotlin.math.roundToInt
  *   第二层：原图直链解析（uo → downurl → thumb 三级链）完成后淡入替换
  *
  * 预加载：浏览第 N 张时，后台解析并预热 N-1 / N+1 的直链与位图缓存。
+ *
+ * 鸟瞰位置图：放大后右下角浮出半透明小图 + 当前视口框（见 [MiniMap]）。
+ * 长图/巨图放大到 5x 时最容易"我在图的哪一块"迷失，这个框就是为它做的。
  */
 /**
  * 注意：不要用 Dialog 承载。平板（expanded）布局下 Dialog 窗口会被侧栏宽度内缩，
@@ -182,6 +193,8 @@ private fun GalleryPage(
     val zoomState = remember(item) { ZoomState() }
     var originUrl by remember(item) { mutableStateOf<String?>(null) }
     var originReady by remember(item) { mutableStateOf(false) }
+    /** 超大图落盘后的本地文件：鸟瞰图直接复用它，不再走一次网络 */
+    var cachedFile by remember(item) { mutableStateOf<File?>(null) }
 
     // 只有成为当前页才解析，避免 Pager 预组合相邻页时抢跑打满频控
     LaunchedEffect(item, active) {
@@ -216,13 +229,16 @@ private fun GalleryPage(
 
             val origin = originUrl
             if (origin != null) {
-                // 超大图：>15MB 或最长边 > 4096px → 分块解码，整张原图不进内存
+                // 超大图（>10MB）→ 分块解码，整张原图不进内存
                 if (item.isHugeBySize) {
                     HugeImage(
                         url = origin,
+                        // 落盘用稳定标识命名，避免签名 URL 一变就重下一份
+                        cacheKey = item.pickCode ?: item.fileId ?: origin,
                         resolver = resolver,
                         zoomState = zoomState,
                         onReady = { originReady = true },
+                        onCached = { cachedFile = it },
                         modifier = Modifier
                             .matchParentSize()
                             .graphicsLayer { alpha = if (originReady) 1f else 0f },
@@ -245,6 +261,25 @@ private fun GalleryPage(
             }
         }
 
+        // 鸟瞰位置图：只有放大后才出现（scale==1 时视口就是整张图，画出来是废话）。
+        // 刻意放在 ZoomableBox **之外**——它必须待在未被变换的图层里，
+        // 跟着图片一起缩放平移就没法当"位置参照"了。
+        AnimatedVisibility(
+            visible = zoomState.isZoomed && originUrl != null,
+            enter = fadeIn(),
+            exit = fadeOut(),
+            modifier = Modifier
+                .align(Alignment.BottomEnd)
+                .padding(16.dp)
+                // 下拉关闭时整屏都在渐隐，鸟瞰图也得跟着淡出，否则会孤零零悬在暗下去的图上
+                .graphicsLayer { alpha = 1f - zoomState.dismissProgress },
+        ) {
+            MiniMap(
+                zoomState = zoomState,
+                model = if (item.isHugeBySize) cachedFile else originUrl,
+            )
+        }
+
         // 原图解析中（缩略图已经显示，所以只给一个轻量指示）
         if (active && originUrl == null) {
             CircularProgressIndicator(
@@ -256,6 +291,98 @@ private fun GalleryPage(
             )
         }
     }
+}
+
+/** 鸟瞰图的最大尺寸：长图 / 全景图都按比例收进这个框，不会顶到屏幕上沿或压成一条线 */
+private val MINIMAP_MAX_W = 88.dp
+private val MINIMAP_MAX_H = 118.dp
+
+/**
+ * 鸟瞰位置图：整张图的半透明缩略 + 当前视口框。
+ *
+ * [model] 就是当前这张图本身，且**容器长宽比 == 图片长宽比**，
+ * 配合 ContentScale.Fit 等于原样画整张图（不裁切、不留黑边），位置框才能和画面对得上：
+ * - 超大图 → 本地缓存文件（resolver 已落盘，零额外请求）
+ * - 普通图 → 原图 URL（命中 Coil 缓存；只在放大后才会组合出来，不是每张图都加载）
+ *
+ * 注意：这里**不能**用列表自带的 thumb——它是方形裁剪的，比例与原图不一致，
+ * 拿它当鸟瞰底图会系统性地框错位置（跟 fitRatio 那个坑同源）。
+ */
+@Composable
+private fun MiniMap(zoomState: ZoomState, model: Any?, modifier: Modifier = Modifier) {
+    val iw = zoomState.intrinsic.width
+    val ih = zoomState.intrinsic.height
+    if (iw <= 0f || ih <= 0f) return
+
+    val density = LocalDensity.current
+    val maxW = with(density) { MINIMAP_MAX_W.toPx() }
+    val maxH = with(density) { MINIMAP_MAX_H.toPx() }
+    val aspectFit = minOf(maxW / iw, maxH / ih)
+    val w = with(density) { (iw * aspectFit).toDp() }
+    val h = with(density) { (ih * aspectFit).toDp() }
+    val shape = RoundedCornerShape(6.dp)
+
+    Box(
+        modifier
+            .size(w, h)
+            .clip(shape)
+            .background(Color.Black.copy(alpha = 0.35f))
+            .border(1.dp, Color.White.copy(alpha = 0.35f), shape),
+    ) {
+        if (model != null) {
+            AsyncImage(
+                model = model,
+                contentDescription = null,
+                contentScale = ContentScale.Fit,
+                modifier = Modifier
+                    .fillMaxSize()
+                    .graphicsLayer { alpha = 0.8f },
+            )
+        }
+        Canvas(Modifier.fillMaxSize()) {
+            val f = visibleFraction(zoomState) ?: return@Canvas
+            drawRect(
+                color = Color.White.copy(alpha = 0.92f),
+                topLeft = Offset(f.left * size.width, f.top * size.height),
+                size = Size(f.width * size.width, f.height * size.height),
+                style = Stroke(width = 1.5.dp.toPx()),
+            )
+        }
+    }
+}
+
+/**
+ * 当前视口在"整张图"上的归一化位置（0..1），给鸟瞰图的位置框用。
+ *
+ * 与 [decodeVisible] 是同一套坐标换算，改一处务必同步改另一处：
+ * 内容按 ContentScale.Fit 居中放进视口（左上角 left/top），
+ * 再绕视口中心缩放到 scale、最后平移 offset（graphicsLayer 默认变换原点就是中心）。
+ *
+ * 视口坐标 v 反算回内容坐标：
+ *   content = (v - 视口中心 - offset) / scale + 视口中心 - 内容左上角
+ *
+ * 返回 null 表示尺寸还没就位（算不出来），调用方直接不画框。
+ */
+private fun visibleFraction(zs: ZoomState): ComposeRect? {
+    val vw = zs.viewport.width
+    val vh = zs.viewport.height
+    val cw = zs.content.width
+    val ch = zs.content.height
+    if (vw <= 0f || vh <= 0f || cw <= 0f || ch <= 0f || zs.scale <= 0f) return null
+
+    val cx = vw / 2f
+    val cy = vh / 2f
+    val left = (vw - cw) / 2f
+    val top = (vh - ch) / 2f
+    fun fx(v: Float) = ((v - cx - zs.offset.x) / zs.scale + cx - left).coerceIn(0f, cw)
+    fun fy(v: Float) = ((v - cy - zs.offset.y) / zs.scale + cy - top).coerceIn(0f, ch)
+
+    val x1 = fx(0f)
+    val y1 = fy(0f)
+    val x2 = fx(vw)
+    val y2 = fy(vh)
+    if (x2 - x1 <= 0.5f || y2 - y1 <= 0.5f) return null
+    return ComposeRect(x1 / cw, y1 / ch, x2 / cw, y2 / ch)
 }
 
 /**
@@ -273,9 +400,16 @@ private fun GalleryPage(
 @Composable
 private fun HugeImage(
     url: String,
+    /**
+     * 落盘缓存的稳定 key（pick_code / fid）。**不能用 url**：
+     * 115 的原图直链带签名、每次列表响应都会变，用 url 命名会让同一张图反复重下。
+     */
+    cacheKey: String,
     resolver: ImageUrlResolver,
     zoomState: ZoomState,
     onReady: () -> Unit,
+    /** 原图落盘后把本地文件回抛给宿主：鸟瞰图要用同一份文件，避免再下一遍原图 */
+    onCached: (File) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val context = LocalContext.current
@@ -286,7 +420,8 @@ private fun HugeImage(
 
     // ① 拉取原图字节到缓存文件（BitmapRegionDecoder 需要文件路径 / 文件描述符）
     LaunchedEffect(url) {
-        val file = resolver.fetchToCache(url, context.cacheDir)
+        val file = resolver.fetchToCache(cacheKey, url, context.cacheDir)
+        onCached(file)
         val d = withContext(Dispatchers.IO) {
             BitmapRegionDecoder.newInstance(file.absolutePath, false)
         }
