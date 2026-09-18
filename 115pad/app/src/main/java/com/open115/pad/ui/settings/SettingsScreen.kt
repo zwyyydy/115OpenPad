@@ -164,6 +164,8 @@ fun SettingsScreen(container: AppContainer) {
     val showNetSpeed by container.playerPrefs.showNetSpeed.collectAsState(initial = true)
     val showSpecBadge by container.playerPrefs.showSpecBadge.collectAsState(initial = true)
     val subtitleTextSize by container.playerPrefs.subtitleTextSize.collectAsState(initial = 18f)
+    val subtitleBottomPercent by container.playerPrefs.subtitleBottomPercent.collectAsState(initial = 0)
+    val softwareDecode by container.playerPrefs.softwareDecode.collectAsState(initial = false)
     val autoSubmitClipboard by container.downloadPrefs.autoSubmitClipboardDownload
         .collectAsState(initial = false)
     var cacheSizeMb by remember { mutableStateOf(-1L) }
@@ -253,11 +255,27 @@ fun SettingsScreen(container: AppContainer) {
             title = "外挂字幕字号",
             valueText = "%d sp".format(subtitleTextSize.roundToInt()),
             value = subtitleTextSize,
-            range = 12f..30f,
-            steps = 8,
+            range = 12f..50f,
+            steps = 19,
         ) { v ->
             scope.launch { container.playerPrefs.setSubtitleTextSize((v / 2).roundToInt() * 2f) }
         }
+        SliderRow(
+            title = "外挂字幕位置",
+            valueText = if (subtitleBottomPercent <= 0) "贴底（默认）" else "上移 ${subtitleBottomPercent}%",
+            value = subtitleBottomPercent.toFloat(),
+            range = 0f..50f,
+            steps = 9,
+        ) { v ->
+            scope.launch { container.playerPrefs.setSubtitleBottomPercent((v / 5).roundToInt() * 5) }
+        }
+        SettingSwitch(
+            title = "软件解码",
+            subtitle = "默认用硬件解码（省电、发热低）。出现花屏、黑屏、画面撕裂或直接起播失败时打开，" +
+                "改用 CPU 软解；个别编码没有软解时会自动回退硬解。改完重进播放器生效",
+            checked = softwareDecode,
+            onChange = { v -> scope.launch { container.playerPrefs.setSoftwareDecode(v) } },
+        )
         SettingSwitch(
             title = "常驻迷你进度条",
             subtitle = "控制栏隐藏时，播放器最底部保留一条 3dp 细进度条（无滑块）；" +

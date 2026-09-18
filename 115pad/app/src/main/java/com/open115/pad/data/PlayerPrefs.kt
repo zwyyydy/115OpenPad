@@ -23,6 +23,18 @@ class PlayerPrefs(private val context: Context) {
     /** 外挂字幕字号（sp）：设置页可调，播放器实时生效 */
     val subtitleTextSize: Flow<Float> = context.playerDataStore.data.map { it[KEY_SUB_TEXT_SIZE] ?: 18f }
 
+    /** 字幕垂直位置：距画面底部占画面高度的百分比（0 = 贴底），越大越靠上 */
+    val subtitleBottomPercent: Flow<Int> =
+        context.playerDataStore.data.map { it[KEY_SUB_BOTTOM_PERCENT] ?: 0 }
+
+    /**
+     * 解码方式：true = 软件（CPU）解码优先。
+     * 硬件解码在个别片源/设备上会花屏、黑屏或直接起播失败，这时切软解绕过；
+     * 默认 false = 硬解优先（省电、发热低）。
+     */
+    val softwareDecode: Flow<Boolean> =
+        context.playerDataStore.data.map { it[KEY_SOFTWARE_DECODE] ?: false }
+
     // ---- 播放器右上角状态栏（四项独立开关，默认全开）----
     val showClock: Flow<Boolean> = context.playerDataStore.data.map { it[KEY_SHOW_CLOCK] ?: true }
     val showBattery: Flow<Boolean> = context.playerDataStore.data.map { it[KEY_SHOW_BATTERY] ?: true }
@@ -45,6 +57,12 @@ class PlayerPrefs(private val context: Context) {
 
     suspend fun setSubtitleTextSize(v: Float) = context.playerDataStore.edit { it[KEY_SUB_TEXT_SIZE] = v }
 
+    suspend fun setSubtitleBottomPercent(v: Int) =
+        context.playerDataStore.edit { it[KEY_SUB_BOTTOM_PERCENT] = v }
+
+    suspend fun setSoftwareDecode(v: Boolean) =
+        context.playerDataStore.edit { it[KEY_SOFTWARE_DECODE] = v }
+
     suspend fun setCacheEnabled(v: Boolean) = context.playerDataStore.edit { it[KEY_CACHE_ENABLED] = v }
     suspend fun setCacheMaxMb(v: Int) = context.playerDataStore.edit { it[KEY_CACHE_MB] = v }
     suspend fun setSpeedBoost(v: Float) = context.playerDataStore.edit { it[KEY_SPEED_BOOST] = v }
@@ -57,6 +75,8 @@ class PlayerPrefs(private val context: Context) {
         val KEY_SEEK_SECONDS = intPreferencesKey("seek_seconds")
         val KEY_SUBS_ENABLED = booleanPreferencesKey("subs_enabled")
         val KEY_SUB_TEXT_SIZE = floatPreferencesKey("subtitle_text_size")
+        val KEY_SUB_BOTTOM_PERCENT = intPreferencesKey("subtitle_bottom_percent")
+        val KEY_SOFTWARE_DECODE = booleanPreferencesKey("software_decode")
         val KEY_MINI_PROGRESS = booleanPreferencesKey("always_show_mini_progress")
         val KEY_SHOW_CLOCK = booleanPreferencesKey("show_clock")
         val KEY_SHOW_BATTERY = booleanPreferencesKey("show_battery")

@@ -113,6 +113,8 @@ import androidx.media3.common.Player
 import androidx.media3.datasource.DefaultDataSource
 import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.datasource.cache.CacheDataSource
+import androidx.media3.exoplayer.DefaultRenderersFactory
+import androidx.media3.exoplayer.mediacodec.MediaCodecSelector
 import androidx.media3.exoplayer.upstream.DefaultBandwidthMeter
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
@@ -239,12 +241,34 @@ class PlayerActivity : ComponentActivity() {
     }
 }
 
+/**
+ * 软解优先的解码器选择器（设置页「软件解码」开启时使用）。
+ *
+ * 只做**排序**、不做过滤：过滤成"仅软解"在个别编码上会得到空列表（例如某些设备的 AV1
+ * 只有硬解），那样是直接起播失败，比花屏更难排查。软解排前面 + 解码器回退兜底，
+ * 软解不存在或失败时仍能落回硬解。
+ */
+private val SOFTWARE_FIRST_DECODER = MediaCodecSelector { mime, secure, tunneling ->
+    val infos = MediaCodecSelector.DEFAULT.getDecoderInfos(mime, secure, tunneling)
+    val sorted = infos.sortedBy { it.hardwareAccelerated }
+    // 候选与最终顺序是排障的关键线索（花屏/黑屏时要能确认到底走的哪个解码器）。
+    // 只在解码器初始化时打一行：adb logcat -s PlayerDecode
+    android.util.Log.d(
+        "PlayerDecode",
+        "软解优先 $mime 候选=[${infos.joinToString { "${it.name}(hw=${it.hardwareAccelerated})" }}]" +
+            " 顺序=[${sorted.joinToString { it.name }}]",
+    )
+    sorted
+}
+
 private data class PlayerPrefValues(
     val cacheEnabled: Boolean,
     val cacheMaxMb: Int,
     val speedBoost: Float,
     val seekSeconds: Int,
     val miniProgress: Boolean,
+    /** 软解优先（设置页可改，重进播放器生效） */
+    val softwareDecode: Boolean,
     // 右上角状态栏四项（设置页「界面显示」分组）
     val showClock: Boolean,
     val showBattery: Boolean,
@@ -437,6 +461,7 @@ fun PlayerScreen(
             speedBoost = container.playerPrefs.speedBoost.first(),
             seekSeconds = container.playerPrefs.seekSeconds.first(),
             miniProgress = container.playerPrefs.alwaysShowMiniProgress.first(),
+            softwareDecode = container.playerPrefs.softwareDecode.first(),
             showClock = container.playerPrefs.showClock.first(),
             showBattery = container.playerPrefs.showBattery.first(),
             showNetSpeed = container.playerPrefs.showNetSpeed.first(),
@@ -476,7 +501,16 @@ fun PlayerScreen(
             DefaultMediaSourceFactory(upstream)
         }
         bandwidthMeterRef = bandwidthMeter // 状态栏网速读它的估算值
+        // 解码器：默认走系统默认顺序（硬解优先）；开了「软件解码」把设备自带的软解排到前面。
+        // 两种模式都打开解码器回退：首选解码器报错时自动换下一个（硬解不兼容的片源，
+        // 默认模式下也能落到软解，不至于直接播不了）。
+        // 用 SdrOutputRenderersFactory 而不是 DefaultRenderersFactory：本播放器走 TextureView
+        // 自合成画面，HDR 片源必须让解码器先转 SDR，否则会泛白成灰雾（见该文件注释）。
+        val renderersFactory = SdrOutputRenderersFactory(context)
+            .setEnableDecoderFallback(true)
+            .apply { if (prefs.softwareDecode) setMediaCodecSelector(SOFTWARE_FIRST_DECODER) }
         ExoPlayer.Builder(context)
+            .setRenderersFactory(renderersFactory)
             .setMediaSourceFactory(mediaFactory)
             .setBandwidthMeter(bandwidthMeter)
             .build()
@@ -1156,10 +1190,12 @@ fun PlayerScreen(
                 onDispose { player.clearVideoTextureView(textureView) }
             }
             // ---- 视频与外挂字幕同组：同尺寸、同 graphicsLayer 旋转——
-            //      字幕锚定在画面底部，随画面一起旋转；字号固定 18sp 不随视图尺寸缩放 ----
-            // 字幕字号：设置页可调，实时生效
+            //      字幕锚定在画面底部，随画面一起旋转；字号不随视图尺寸缩放 ----
+            // 字幕字号 / 垂直位置：设置页可调，实时生效
             val subtitleTextSize by container.playerPrefs.subtitleTextSize
                 .collectAsState(initial = 18f)
+            val subtitleBottomPercent by container.playerPrefs.subtitleBottomPercent
+                .collectAsState(initial = 0)
             val subtitleView = remember {
                 androidx.media3.ui.SubtitleView(context).apply {
                     setStyle(
@@ -1202,8 +1238,12 @@ fun PlayerScreen(
                     },
                     modifier = Modifier
                         .align(Alignment.BottomCenter)
-                        .fillMaxWidth()
-                        .height(64.dp)
+                        .fillMaxSize()
+                        // 垂直位置：整幅字幕层随画面高度按百分比上移。不用 SubtitleView 的
+                        // bottomPaddingFraction——该参数只在 cue 未自带行位置（Cue.line 为
+                        // DIMEN_UNSET）时生效，115 官方字幕带行位置时会被完全忽略（实测拉滑块
+                        // 字幕纹丝不动）；整层位移与字幕格式、行位置无关。
+                        .graphicsLayer { translationY = -surfaceH * subtitleBottomPercent / 100f }
                         .padding(bottom = 4.dp),
                 )
             }
@@ -1395,6 +1435,26 @@ fun PlayerScreen(
                 modifier = Modifier.align(Alignment.BottomCenter).fillMaxWidth(),
             ) {
                 Column(Modifier.fillMaxWidth()) {
+                    // 状态行（时长 / 当前画质 / 缓存 / 解码方式）：挂在控制排上方。
+                    // 原先这行挂在根 Box 的默认 TopStart 位置，横屏下被顶栏和画面盖住、
+                    // 实际从来看不到，挪到最容易看见的进度条上方。
+                    if ((data?.playLong ?: 0) > 0) {
+                        Text(
+                            // 各段单独拼接：`"a" + if (x) "b" else "c" + if (y) ...` 会被解析成
+                            // else 分支吞掉后半段，多一个条件就会静默丢内容
+                            buildString {
+                                append("时长 ${Format.duration(data!!.playLong)}")
+                                append(" · 当前 ${labelOf(currentDef)}")
+                                append(if (prefs.cacheEnabled) " · 缓存开" else " · 缓存关")
+                                append(if (prefs.softwareDecode) " · 软解" else " · 硬解")
+                            },
+                            style = MaterialTheme.typography.bodySmall,
+                            color = Color.White.copy(alpha = 0.7f),
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.padding(start = 16.dp, top = 6.dp, end = 16.dp),
+                        )
+                    }
                     InteractiveSeekBar(
                         positionMs = positionMs,
                         durationMs = durationMs,
@@ -1779,29 +1839,6 @@ fun PlayerScreen(
                             )
                         }
                     }
-                }
-            }
-            androidx.compose.animation.AnimatedVisibility(
-                visible = controlRowVisible && !screenLocked,
-                enter = fadeIn(tween(160)),
-                exit = fadeOut(tween(200)),
-            ) {
-                Column(Modifier.fillMaxWidth().padding(16.dp)) {
-                Text(
-                    data?.fileName ?: currentName,
-                    style = MaterialTheme.typography.titleMedium,
-                    color = Color.White,
-                    maxLines = 2,
-                    overflow = TextOverflow.Ellipsis,
-                )
-                if ((data?.playLong ?: 0) > 0) {
-                    Text(
-                        "时长 ${Format.duration(data!!.playLong)} · 当前 ${labelOf(currentDef)}" +
-                            if (prefs.cacheEnabled) " · 缓存开" else " · 缓存关",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = Color.White.copy(alpha = 0.6f),
-                    )
-                }
                 }
             }
         }
