@@ -23,6 +23,7 @@ import androidx.compose.foundation.lazy.items as listItems
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.PushPin
 import androidx.compose.material.icons.outlined.Check
 import androidx.compose.material.icons.outlined.ChevronRight
 import androidx.compose.material.icons.outlined.CloudDownload
@@ -34,6 +35,7 @@ import androidx.compose.material.icons.outlined.Edit
 import androidx.compose.material.icons.outlined.FilterAlt
 import androidx.compose.material.icons.outlined.FilterList
 import androidx.compose.material.icons.outlined.GridView
+import androidx.compose.material.icons.outlined.PushPin
 import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material.icons.outlined.Search
 import androidx.compose.material.icons.outlined.Star
@@ -98,12 +100,17 @@ fun FilesBrowserPane(
     onDelete: () -> Unit,
     onRename: (FileItem) -> Unit,
     onStar: (FileItem) -> Unit,
+    /** 置顶 / 取消置顶：传入当前选择集里可置顶的文件夹（可能为空） */
+    onPin: (List<FileItem>) -> Unit,
     onDownload: () -> Unit,
     onUpload: () -> Unit,
     onCreateFolder: () -> Unit,
     onOpenFilterRules: () -> Unit,
 ) {
     var sortMenuOpen by remember { mutableStateOf(false) }
+
+    // 置顶条目的 fid 集合。搜索模式下不标（那时不重排，标了反而误导）
+    val pinnedIds: Set<String> = if (ui.searching) emptySet() else ui.pinnedIds.toSet()
 
     Column(modifier) {
         if (searchMode) {
@@ -390,6 +397,7 @@ fun FilesBrowserPane(
                         items(ui.display, key = { (it.fid ?: "") + "#" + it.fn }) { item ->
                             FileGridCard(
                                 item = item,
+                                pinned = item.fid in pinnedIds,
                                 selectMode = ui.selectMode,
                                 selected = item.fid in ui.selection,
                                 onClick = { onActivate(item) },
@@ -410,6 +418,7 @@ fun FilesBrowserPane(
                         listItems(ui.display, key = { (it.fid ?: "") + "#" + it.fn }) { item ->
                             FileListRow(
                                 item = item,
+                                pinned = item.fid in pinnedIds,
                                 selectMode = ui.selectMode,
                                 selected = item.fid in ui.selection,
                                 onClick = { onActivate(item) },
@@ -457,6 +466,18 @@ fun FilesBrowserPane(
                 }
                 IconButton(onClick = { single?.let(onStar) }, enabled = single != null) {
                     Icon(Icons.Outlined.StarBorder, contentDescription = "星标")
+                }
+                // 置顶：只对文件夹有意义，所以选择集里至少有一个文件夹时按钮才可用
+                //（夹在里面的文件会被忽略）。这些文件夹若已全部置顶，按钮转为实心态。
+                val pinTargets = ui.items.filter { it.isDir && it.fid in ui.selection }
+                val allPinned = pinTargets.isNotEmpty() && pinTargets.all { it.fid in ui.pinnedIds }
+                IconButton(onClick = { onPin(pinTargets) }, enabled = pinTargets.isNotEmpty()) {
+                    Icon(
+                        if (allPinned) Icons.Filled.PushPin else Icons.Outlined.PushPin,
+                        contentDescription = if (allPinned) "取消置顶" else "置顶",
+                        tint = if (allPinned) com.open115.pad.ui.theme.AppColors.AccentDeep
+                        else androidx.compose.material3.LocalContentColor.current,
+                    )
                 }
                 IconButton(onClick = onDelete) {
                     Icon(Icons.Outlined.Delete, contentDescription = "删除")

@@ -246,6 +246,7 @@ private fun MainScaffold(container: AppContainer, widthClass: WindowWidthSizeCla
                             container.filesPrefs,
                             container.imageUrlResolver,
                             container.filterPrefs,
+                            container.pinnedPrefs,
                         )
                     })
                     FilesScreen(

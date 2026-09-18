@@ -39,6 +39,9 @@ class AppContainer(context: Context) {
     val filesPrefs = com.open115.pad.data.FilesPrefs(context)
     val downloadPrefs = com.open115.pad.data.DownloadPrefs(context)
 
+    /** 文件夹置顶（本机生效，115 开放平台无对应接口） */
+    val pinnedPrefs = com.open115.pad.data.PinnedPrefs(context)
+
     /** 传输中心的历史记录（本机下载 + 上传） */
     val transferLog = com.open115.pad.data.TransferLog(context)
 

@@ -62,6 +62,8 @@ import com.open115.pad.data.FilterPrefs
 import com.open115.pad.data.FilterRules
 import com.open115.pad.data.ImageUrlResolver
 import com.open115.pad.data.OpenApi
+import com.open115.pad.data.PinnedFolder
+import com.open115.pad.data.PinnedPrefs
 import com.open115.pad.data.PlaylistEntry
 import com.open115.pad.data.Uploader
 import com.open115.pad.data.parseFilesResponse
@@ -101,6 +103,8 @@ class FilesViewModel(
     val urlResolver: ImageUrlResolver? = null,
     /** 高级过滤：方案存储 + 右上角总开关（未注入则不过滤） */
     private val filterPrefs: FilterPrefs? = null,
+    /** 文件夹置顶（未注入则无置顶能力，列表行为与从前完全一致） */
+    private val pinnedPrefs: PinnedPrefs? = null,
 ) : ViewModel() {
 
     data class DirEntry(val cid: String, val name: String)
@@ -112,6 +116,8 @@ class FilesViewModel(
         val display: List<FileItem> = emptyList(),
         /** 当前生效的过滤方案（含就近继承解析结果）；null = 该目录不执行过滤 */
         val activeFilter: FilterRules.FilterScheme? = null,
+        /** 已置顶文件夹的 fid（有序）；display 里的置顶条目按这个顺序排在最前 */
+        val pinnedIds: List<String> = emptyList(),
         val count: Long = 0,
         val loading: Boolean = false,
         val loadingMore: Boolean = false,
@@ -127,6 +133,19 @@ class FilesViewModel(
     ) {
         val selectMode: Boolean get() = selection.isNotEmpty()
     }
+
+    /**
+     * "可见列表"重算的输入指纹：其中任一项变化都必须重排。
+     * 刻意不含 display 自身——重算结果写回 UiState 后指纹不变，
+     * distinctUntilChanged 会吃掉这次回声，不会形成重算死循环。
+     */
+    private data class RenderKey(
+        val items: List<FileItem>,
+        val searching: Boolean,
+        val filterOn: Boolean,
+        val scheme: FilterRules.FilterScheme?,
+        val pins: List<String>,
+    )
 
     private val _ui = MutableStateFlow(UiState())
     val ui = _ui.asStateFlow()
@@ -165,36 +184,70 @@ class FilesViewModel(
             refresh()
         }
 
-        // ---- 高级过滤：派生"可见列表" ----
-        // items / 目录链 / 方案 / 总开关 任一变化都重算；display 与 activeFilter 写回 UiState 后
-        // 若值未变，StateFlow 会去重，不会形成回环。过滤计算放 Default 线程，千级列表无感。
-        // 未注入 FilterPrefs 或关掉开关时 display == items，UI 行为与从前完全一致。
+        // ---- 高级过滤 + 置顶：派生"可见列表" ----
+        // items / 目录链 / 方案 / 总开关 / 置顶关系 任一变化都重算；display 与 activeFilter
+        // 写回 UiState 后若值未变，StateFlow 会去重，不会形成回环。
+        // 过滤计算放 Default 线程，千级列表无感。
+        // 未注入 FilterPrefs / PinnedPrefs 时 display == items，UI 行为与从前完全一致。
         viewModelScope.launch { filterPrefs?.schemes?.collect { _schemes.value = it } }
+
+        // 置顶关系（有序 fid）同步进 UiState：既给下面重排用，也给 UI 判断"选中项是否已置顶"
+        viewModelScope.launch {
+            pinnedPrefs?.pins?.collect { list ->
+                _ui.update { it.copy(pinnedIds = list.map { p -> p.fid }) }
+            }
+        }
+
         viewModelScope.launch {
             combine(_ui, filterOn, _schemes) { ui, on, schemes ->
-                Triple(
-                    ui.items,
-                    on,
-                    FilterRules.resolveScheme(
+                RenderKey(
+                    items = ui.items,
+                    searching = ui.searching,
+                    filterOn = on,
+                    pins = ui.pinnedIds,
+                    scheme = FilterRules.resolveScheme(
                         schemes,
                         ui.stack.map { FilterRules.DirRef(it.cid, it.name) },
                     ),
                 )
             }
                 .distinctUntilChanged()
-                .collect { (items, on, scheme) ->
-                    val shown = if (!on || scheme == null) items
+                .collect { k ->
+                    val filtered = if (!k.filterOn || k.scheme == null) k.items
                     else withContext(Dispatchers.Default) {
-                        items.filter { FilterRules.evaluate(it, scheme.group) }
+                        k.items.filter { FilterRules.evaluate(it, k.scheme.group) }
                     }
                     _ui.update {
                         it.copy(
-                            display = shown,
-                            activeFilter = if (on) scheme else null,
+                            display = applyPins(filtered, k.pins, k.searching),
+                            activeFilter = if (k.filterOn) k.scheme else null,
                         )
                     }
                 }
         }
+    }
+
+    /**
+     * 把已置顶的文件夹浮到列表最前，其余条目保持服务端返回的顺序。
+     *
+     * - 匹配用 fid 而不是名称：改名、移动都不会让置顶失效；
+     *   反过来，置顶的文件夹被删掉后自然就从列表里消失，不需要额外清理。
+     * - 只认文件夹（[FileItem.isDir]），呼应"指定文件夹置顶"的语义。
+     * - 搜索结果不重排：那里是按相关度排的，把置顶项插到最前反而让人看不懂。
+     * - 目录里没有置顶项时原样返回同一个 List 实例，避免列表做无谓的重组与重绘。
+     */
+    private fun applyPins(list: List<FileItem>, pins: List<String>, searching: Boolean): List<FileItem> {
+        if (searching || pins.isEmpty() || list.isEmpty()) return list
+        val rank = pins.withIndex().associate { (i, fid) -> fid to i }
+        // 取置顶优先级；非文件夹、未置顶、无 fid 一律返回 MAX_VALUE（= 不参与置顶）
+        fun rankOf(item: FileItem): Int {
+            val fid = item.fid ?: return Int.MAX_VALUE
+            if (!item.isDir) return Int.MAX_VALUE
+            return rank[fid] ?: Int.MAX_VALUE
+        }
+        val (pinned, rest) = list.partition { rankOf(it) != Int.MAX_VALUE }
+        if (pinned.isEmpty()) return list
+        return pinned.sortedBy { rankOf(it) } + rest
     }
 
     fun refresh() = load(0, more = false)
@@ -347,6 +400,44 @@ class FilesViewModel(
         ok to (resp.envMsg() ?: "操作失败")
     }
 
+    /**
+     * 置顶 / 取消置顶（只对文件夹有效，选中的非文件夹会被忽略）。
+     *
+     * 规则：所选文件夹**全部已置顶**时整体取消置顶，否则把还没置顶的补上——
+     * 混合选择时"补全"比"反向翻转"更符合直觉，不会把已经置顶的反而取消掉。
+     *
+     * 返回值是"要展示给用户的文案"，成功和失败都给出，调用方直接提示即可——
+     * 刻意不复用 [runOp] 那套"成功返回 null"的约定，否则成功提示会被静默丢掉。
+     */
+    suspend fun togglePins(items: List<FileItem>): String {
+        val prefs = pinnedPrefs ?: return "置顶功能未初始化"
+        val folders = items.filter { it.isDir && it.fid != null }
+        if (folders.isEmpty()) return "只有文件夹可以置顶"
+        val pinnedNow = _ui.value.pinnedIds.toSet()
+        val already = folders.count { it.fid in pinnedNow }
+        return try {
+            if (already == folders.size) {
+                prefs.unpinAll(folders.mapNotNull { it.fid })
+                if (folders.size == 1) "已取消置顶「${folders[0].fn}」"
+                else "已取消 ${folders.size} 个文件夹的置顶"
+            } else {
+                val pid = currentCid()
+                val now = System.currentTimeMillis()
+                var added = 0
+                folders.forEach { f ->
+                    val fid = f.fid ?: return@forEach
+                    if (fid in pinnedNow) return@forEach
+                    prefs.pin(PinnedFolder(fid, f.fn, pid, now))
+                    added++
+                }
+                if (folders.size == 1) "已置顶「${folders[0].fn}」，将在本目录内置顶显示"
+                else "已置顶 $added 个文件夹"
+            }
+        } catch (e: Exception) {
+            "操作失败：${e.message}"
+        }
+    }
+
     suspend fun deleteSelected(): String? {
         val ids = _ui.value.selection.toList()
         if (ids.isEmpty()) return null
@@ -354,6 +445,8 @@ class FilesViewModel(
             val resp = api.deleteFiles(ids.joinToString(","), parentId = currentCid())
             val ok = resp.envOk()
             if (ok) {
+                // 置顶的文件夹被删掉后，置顶记录已无意义——顺手清理，避免记录无限累积
+                pinnedPrefs?.unpinAll(ids)
                 clearSelection()
                 refresh()
             }
@@ -561,6 +654,7 @@ fun FilesScreen(
                 onDelete = { showDeleteConfirm = true },
                 onRename = { renameTarget = it },
                 onStar = { starTarget = it },
+                onPin = { scope.launch { notify(vm.togglePins(it)) } },
                 onDownload = {
                     val files = ui.items.filter { it.fid in ui.selection && !it.isDir }
                     scope.launch {
@@ -596,6 +690,7 @@ fun FilesScreen(
                 onDelete = { showDeleteConfirm = true },
                 onRename = { renameTarget = it },
                 onStar = { starTarget = it },
+                onPin = { scope.launch { notify(vm.togglePins(it)) } },
                 onDownload = {
                     val files = ui.items.filter { it.fid in ui.selection && !it.isDir }
                     scope.launch {

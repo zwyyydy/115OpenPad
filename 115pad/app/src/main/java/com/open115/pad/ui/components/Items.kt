@@ -1,6 +1,7 @@
 package com.open115.pad.ui.components
 
 import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.background
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -11,8 +12,10 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.PushPin
 import androidx.compose.material.icons.outlined.Android
 import androidx.compose.material.icons.outlined.Description
 import androidx.compose.material.icons.outlined.Folder
@@ -96,10 +99,13 @@ fun FileListRow(
     selected: Boolean,
     onClick: () -> Unit,
     onLongClick: () -> Unit,
+    /** 已置顶的文件夹：整行铺一层淡蓝底 + 图钉标记，让置顶区一眼可分 */
+    pinned: Boolean = false,
 ) {
     Row(
         Modifier
             .fillMaxWidth()
+            .then(if (pinned) Modifier.background(AppColors.AccentSoft) else Modifier)
             .combinedClickable(onClick = onClick, onLongClick = onLongClick)
             .padding(horizontal = 16.dp, vertical = 8.dp),
         verticalAlignment = Alignment.CenterVertically,
@@ -142,6 +148,14 @@ fun FileListRow(
                 overflow = TextOverflow.Ellipsis,
             )
         }
+        if (pinned) {
+            Icon(
+                Icons.Filled.PushPin,
+                contentDescription = "已置顶",
+                tint = AppColors.AccentDeep,
+                modifier = Modifier.size(16.dp),
+            )
+        }
         if (item.ism == 1 && !selectMode) {
             Icon(
                 Icons.Outlined.Star,
@@ -162,10 +176,18 @@ fun FileGridCard(
     selected: Boolean,
     onClick: () -> Unit,
     onLongClick: () -> Unit,
+    /** 已置顶的文件夹：卡片淡蓝底 + 左上角图钉角标 */
+    pinned: Boolean = false,
 ) {
     Surface(
         shape = RoundedCornerShape(14.dp),
-        color = if (selected) AppColors.AccentSoft else AppColors.Card,
+        // 置顶比选中态用得再深一档（卡片浮在灰底上，略强的色块才读得出"成组"）；
+        // 选中优先，避免"又选中又置顶"时两种状态互相盖住
+        color = when {
+            selected -> AppColors.AccentSoft
+            pinned -> AppColors.BlueBg
+            else -> AppColors.Card
+        },
         border = if (selected) null else androidx.compose.foundation.BorderStroke(
             1.dp,
             AppColors.CardBorder,
@@ -188,6 +210,25 @@ fun FileGridCard(
                 contentAlignment = Alignment.Center,
             ) {
                 Thumb(item, Modifier.fillMaxSize(), iconSize = 40)
+                if (pinned) {
+                    // 图钉角标放左上角，与右上角的勾选框分区，互不打架
+                    Box(
+                        Modifier
+                            .align(Alignment.TopStart)
+                            .padding(2.dp)
+                            .size(20.dp)
+                            .clip(CircleShape)
+                            .background(AppColors.Card),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Icon(
+                            Icons.Filled.PushPin,
+                            contentDescription = "已置顶",
+                            tint = AppColors.AccentDeep,
+                            modifier = Modifier.size(12.dp),
+                        )
+                    }
+                }
                 if (selectMode) {
                     Row(
                         Modifier
