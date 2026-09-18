@@ -203,7 +203,6 @@ fun DownloadDialog(
     name: String,
     sizeText: String,
     onDownload: () -> Unit,
-    onCopyLink: () -> Unit,
     onDismiss: () -> Unit,
 ) {
     AlertDialog(
@@ -211,12 +210,7 @@ fun DownloadDialog(
         title = { Text(name, maxLines = 2) },
         text = { Text(sizeText) },
         confirmButton = { Button(onClick = onDownload) { Text("下载") } },
-        dismissButton = {
-            Row {
-                TextButton(onClick = onCopyLink) { Text("复制直链") }
-                TextButton(onClick = onDismiss) { Text("取消") }
-            }
-        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } },
     )
 }
 

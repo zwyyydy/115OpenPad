@@ -401,9 +401,11 @@ fun OfflineScreen(
             api = vm.api,
             initial = saveLocation,
             onDismiss = { showAdd = false },
+            // 选择目录即落盘：这里就写回持久化，不必等任务真的提交过
+            onPickLocation = { cid, name -> vm.rememberSaveLocation(cid, name) },
             onConfirm = { urls, cid, name ->
                 showAdd = false
-                // 保存位置写回持久化：下次添加任务（含剪贴板/外部唤起）默认还是这里
+                // 兜底再写一次：用户没动过"选择"时保存的仍是同一个值，重复写无副作用
                 vm.rememberSaveLocation(cid, name)
                 scope.launch { notify(vm.addUrls(urls, cid)) }
             },
@@ -544,6 +546,7 @@ private fun AddTaskDialog(
     api: OpenApi,
     initial: DownloadPrefs.SaveLocation,
     onDismiss: () -> Unit,
+    onPickLocation: (cid: String, name: String) -> Unit,
     onConfirm: (urls: String, wpPathId: String, wpName: String) -> Unit,
 ) {
     val context = LocalContext.current
@@ -634,6 +637,11 @@ private fun AddTaskDialog(
                     )
                     TextButton(onClick = { picking = true }) { Text("选择") }
                 }
+                Text(
+                    "选定即记住，之后手动添加、剪贴板识别、外部 App 唤起的云下载都默认存到这里",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
             }
         },
         confirmButton = {
@@ -655,6 +663,8 @@ private fun AddTaskDialog(
             onPick = { cid, name ->
                 targetCid = cid
                 targetName = name
+                // 立即持久化：用户只"指定目录"、不立刻提交任务时也要记住
+                onPickLocation(cid, name)
                 picking = false
             },
         )

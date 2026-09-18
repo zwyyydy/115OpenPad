@@ -70,6 +70,7 @@ import com.open115.pad.data.envData
 import com.open115.pad.data.envMsg
 import com.open115.pad.data.envOk
 import com.open115.pad.data.toImageMediaItem
+import com.open115.pad.data.isTextFile
 import com.open115.pad.ui.components.ConfirmDialog
 import com.open115.pad.ui.components.DownloadDialog
 import com.open115.pad.ui.components.FolderPickerDialog
@@ -80,7 +81,6 @@ import com.open115.pad.ui.components.isImageItem
 import com.open115.pad.ui.settings.UserInfoCard
 import com.open115.pad.util.Downloader
 import com.open115.pad.util.Format
-import com.open115.pad.util.copyToClipboard
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
@@ -97,7 +97,7 @@ import kotlinx.coroutines.withContext
 class FilesViewModel(
     val api: OpenApi,
     private val prefs: FilesPrefs? = null,
-    /** 图片直链解析（三级降级链 + 防频控缓存），图片查看器与本处"复制直链/下载"共用 */
+    /** 图片直链解析（三级降级链 + 防频控缓存），图片查看器与本处"下载到本机"共用 */
     val urlResolver: ImageUrlResolver? = null,
     /** 高级过滤：方案存储 + 右上角总开关（未注入则不过滤） */
     private val filterPrefs: FilterPrefs? = null,
@@ -425,6 +425,7 @@ fun FilesScreen(
     snackbarHostState: SnackbarHostState,
     onPlayVideo: (item: FileItem, playlist: List<PlaylistEntry>, index: Int) -> Unit,
     onOpenGallery: (items: List<ImageMediaItem>, index: Int) -> Unit,
+    onPreviewText: (item: FileItem) -> Unit,
     onOpenFilterRules: () -> Unit,
 ) {
     val ui by vm.ui.collectAsState()
@@ -520,6 +521,9 @@ fun FilesScreen(
             val media = item.toImageMediaItem()
             val idx = galleryItems.indexOfFirst { it.pickCode == media.pickCode }
             onOpenGallery(galleryItems, if (idx >= 0) idx else 0)
+        } else if (isTextFile(item.fn)) {
+            // 文本类（txt/py/md/js…）：直接进预览，内容与分页在应用根层级渲染
+            onPreviewText(item)
         } else {
             downloadTarget = item
         }
@@ -678,15 +682,6 @@ fun FilesScreen(
                             }
                             .onFailure { notify(it.message) }
                     }
-                }
-            },
-            onCopyLink = {
-                downloadTarget = null
-                scope.launch {
-                    val pc = item.pc
-                    if (pc.isNullOrBlank()) notify("该文件缺少提取码")
-                    else vm.getDownloadUrl(pc).onSuccess { copyToClipboard(context, it); notify("直链已复制") }
-                        .onFailure { notify(it.message) }
                 }
             },
         )

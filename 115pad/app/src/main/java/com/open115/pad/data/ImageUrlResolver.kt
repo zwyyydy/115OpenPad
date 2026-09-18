@@ -58,7 +58,7 @@ class ImageUrlResolver(
 
     /**
      * 严格版解析（失败抛异常，带服务端 message）。
-     * 给"下载到本机 / 复制直链"这类需要明确报错的场景用。
+     * 给"下载到本机"这类需要明确报错的场景用。
      */
     suspend fun downloadUrl(pickCode: String): String {
         val url = parseDownUrl(pickCode)

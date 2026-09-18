@@ -54,6 +54,12 @@ class DownloadLinkBus(
             ?.takeIf { it.isNotBlank() }
             ?: return
 
+        // 外部唤起优先：应用被唤起时窗口刚获焦，剪贴板检查（延迟 250ms 后跑）可能晚于
+        // offerExternal 落地，若此时写入剪贴板请求就会把外部请求顶掉——表现就是"应用已
+        // 在运行时被联动，既没提交也没弹返回询问"。这里直接让位，剪贴板内容留到下次焦点
+        // 变化再处理（落盘指纹也一并推迟，避免这次内容被永久跳过）。
+        if (_pending.value?.source == LinkSource.EXTERNAL) return
+
         val key = LinkParser.contentKey(text)
         if (key == prefs.currentLastClipboardKey()) return
         // 先落盘再解析：即使这段文本里没有链接（或提交失败），也不会反复读同一段剪贴板

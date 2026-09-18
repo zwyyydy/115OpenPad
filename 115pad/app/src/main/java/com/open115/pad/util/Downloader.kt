@@ -1,7 +1,5 @@
 package com.open115.pad.util
 
-import android.content.ClipData
-import android.content.ClipboardManager
 import android.content.Context
 import android.app.DownloadManager
 import android.net.Uri
@@ -45,9 +43,4 @@ object Downloader {
         }
         return id
     }
-}
-
-fun copyToClipboard(context: Context, text: String, label: String = "115OpenPad") {
-    val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-    cm.setPrimaryClip(ClipData.newPlainText(label, text))
 }

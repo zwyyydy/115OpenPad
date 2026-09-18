@@ -58,6 +58,9 @@ import com.open115.pad.data.Session
 import com.open115.pad.player.PlayerActivity
 import com.open115.pad.ui.components.DownloadLinkSheet
 import com.open115.pad.ui.components.ImageGalleryDialog
+import com.open115.pad.ui.components.TextPreviewHost
+import com.open115.pad.util.Downloader
+import com.open115.pad.util.Format
 import com.open115.pad.ui.files.FilesScreen
 import com.open115.pad.ui.files.FilesViewModel
 import com.open115.pad.ui.login.LoginScreen
@@ -138,6 +141,8 @@ private fun MainScaffold(container: AppContainer, widthClass: WindowWidthSizeCla
 
     // ---------------- 大图画廊（应用根层级渲染，才能盖住侧栏） ----------------
     var imageGallery by remember { mutableStateOf<Pair<List<ImageMediaItem>, Int>?>(null) }
+    /** 文本预览：与画廊一样在根层级全屏渲染，才能盖住侧栏 */
+    var textPreview by remember { mutableStateOf<FileItem?>(null) }
 
     // ---------------- 剪贴板识别 / 外部 App 唤起的下载链接 ----------------
 
@@ -147,8 +152,8 @@ private fun MainScaffold(container: AppContainer, widthClass: WindowWidthSizeCla
     // 需要二次确认的请求（仅剪贴板来源 + 未开静默模式），留在本地状态里等用户点按
     var sheetRequest by remember { mutableStateOf<DownloadRequest?>(null) }
     var submittingDownload by remember { mutableStateOf(false) }
-    // 外部程序唤起提交成功后：弹窗询问是否返回原程序
-    var askReturnToCaller by remember { mutableStateOf(false) }
+    // 外部程序联动云离线：处理结束后询问是否返回原程序（成功、失败都问）
+    var returnAsk by remember { mutableStateOf<ReturnAsk?>(null) }
 
     /**
      * 提交下载并给出反馈。
@@ -169,11 +174,14 @@ private fun MainScaffold(container: AppContainer, widthClass: WindowWidthSizeCla
                 snackbarHostState.showSnackbar(if (auto) "已自动提交云下载任务" else "任务已加入云端离线队列")
             }
             if (gotoOffline) destinations.firstOrNull { it.route == "offline" }?.let { navigate(it) }
-            // 外部 App 唤起的：提交成功后询问是否返回原程序（剪贴板来源不问）
-            if (req.source == LinkSource.EXTERNAL) askReturnToCaller = true
         } else {
             snackbarHostState.showSnackbar("提交失败：$err")
         }
+        // 外部 App 唤起的：**不论提交成败**都问一次要不要回去。
+        // 用户是从别的应用跳过来的，留在这里多半不是本意；失败时更需要一个出口。
+        // 早先只在成功时问，于是磁力/直链因"任务已存在"等被服务端拒绝时毫无反馈，
+        // 看起来就像"应用已在运行时被联动却什么都不弹"。
+        if (req.source == LinkSource.EXTERNAL) returnAsk = ReturnAsk(err)
     }
 
     LaunchedEffect(pendingDownload) {
@@ -246,6 +254,7 @@ private fun MainScaffold(container: AppContainer, widthClass: WindowWidthSizeCla
                         snackbarHostState,
                         onPlayVideo,
                         onOpenGallery = { items, idx -> imageGallery = items to idx },
+                        onPreviewText = { item -> textPreview = item },
                         onOpenFilterRules = {
                             destinations.firstOrNull { it.route == "filter" }?.let { navigate(it) }
                         },
@@ -284,6 +293,30 @@ private fun MainScaffold(container: AppContainer, widthClass: WindowWidthSizeCla
         )
     }
 
+    // 文本预览：同一套根层级全屏遮罩；缺提取码的文件直接提示并关闭
+    textPreview?.let { item ->
+        val pc = item.pc
+        if (pc.isNullOrBlank()) {
+            LaunchedEffect(item.fid) {
+                snackbarHostState.showSnackbar("该文件缺少提取码，无法预览")
+                textPreview = null
+            }
+        } else {
+            TextPreviewHost(
+                name = item.fn,
+                pickCode = pc,
+                sizeText = Format.size(item.fs),
+                resolver = container.imageUrlResolver,
+                client = container.okHttpClient,
+                onDownload = { url, name ->
+                    runCatching { Downloader.enqueue(context, url, name) }
+                    scope.launch { snackbarHostState.showSnackbar("已加入系统下载队列") }
+                },
+                onDismiss = { textPreview = null },
+            )
+        }
+    }
+
     // 剪贴板链接的二次确认抽屉（外部唤起与静默模式都不经过这里）
     sheetRequest?.let { req ->
         DownloadLinkSheet(
@@ -303,26 +336,35 @@ private fun MainScaffold(container: AppContainer, widthClass: WindowWidthSizeCla
         )
     }
 
-    // 外部程序联动云离线：提交成功后询问是否返回原程序。
-    // "返回" = 把本应用任务整体退到后台，系统自然回到唤起方；
-    // 任务栈保留，用户再切回来时仍停在云下载页。
-    if (askReturnToCaller) {
+    // 外部程序联动云离线：处理结束后询问是否返回原程序。
+    // "返回" = 把本应用任务整体退到后台，系统自然回到唤起方。
+    // 刻意不用 finish()：主界面若被销毁，任务栈就空了，用户再切回来等于冷启动
+    // （正在播放的视频、浏览到的目录全丢），这正是要避免的"返回后把应用杀掉"。
+    returnAsk?.let { ask ->
         AlertDialog(
-            onDismissRequest = { askReturnToCaller = false },
-            title = { Text("已提交云下载") },
-            text = { Text("任务已加入离线队列。是否返回原来的应用？") },
+            onDismissRequest = { returnAsk = null },
+            title = { Text(if (ask.error == null) "已提交云下载" else "云下载未提交") },
+            text = {
+                Text(
+                    if (ask.error == null) "任务已加入离线队列。是否返回原来的应用？"
+                    else "${ask.error}。是否返回原来的应用？",
+                )
+            },
             confirmButton = {
                 Button(onClick = {
-                    askReturnToCaller = false
+                    returnAsk = null
                     context.findHostActivity()?.moveTaskToBack(true)
                 }) { Text("返回原程序") }
             },
             dismissButton = {
-                TextButton(onClick = { askReturnToCaller = false }) { Text("留在本应用") }
+                TextButton(onClick = { returnAsk = null }) { Text("留在本应用") }
             },
         )
     }
 }
+
+/** 外部联动处理结果：error 为 null 表示已成功提交 */
+private data class ReturnAsk(val error: String?)
 
 /** 从 Compose 的 context 一路解到宿主 Activity（moveTaskToBack 需要） */
 private fun Context.findHostActivity(): Activity? {
