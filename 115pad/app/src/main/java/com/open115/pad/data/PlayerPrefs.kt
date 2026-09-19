@@ -5,6 +5,7 @@ import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.floatPreferencesKey
 import androidx.datastore.preferences.core.intPreferencesKey
+import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
@@ -68,6 +69,33 @@ class PlayerPrefs(private val context: Context) {
     suspend fun setSpeedBoost(v: Float) = context.playerDataStore.edit { it[KEY_SPEED_BOOST] = v }
     suspend fun setSeekSeconds(v: Int) = context.playerDataStore.edit { it[KEY_SEEK_SECONDS] = v }
 
+    // ---- VR 视角（180/360 立体素材实时反投影成平面观看）----
+
+    /**
+     * 手动指定的 VR 模式名（`VrMode.name`）。空串 = 没手动指定过，
+     * 由分辨率自动猜；也用来记住"用户明确关掉过"，避免每次开片都弹出来。
+     */
+    val vrMode: Flow<String> = context.playerDataStore.data.map { it[KEY_VR_MODE] ?: "" }
+
+    /** 取右眼（默认左眼。极少数素材左右眼装反，或者主眼是右眼） */
+    val vrRightEye: Flow<Boolean> = context.playerDataStore.data.map { it[KEY_VR_RIGHT_EYE] ?: false }
+
+    /** 是否启用陀螺仪跟随（默认关：不是所有场景都想举着手机看） */
+    val vrGyro: Flow<Boolean> = context.playerDataStore.data.map { it[KEY_VR_GYRO] ?: false }
+
+    /** 上次的视场角，下次进 VR 沿用 */
+    val vrFov: Flow<Float> = context.playerDataStore.data.map { it[KEY_VR_FOV] ?: 90f }
+
+    /** 边缘畸变抑制强度（Pannini d）。0 = 直线透视，1 = 标准 Pannini */
+    val vrPanniniD: Flow<Float> =
+        context.playerDataStore.data.map { it[KEY_VR_PANNINI] ?: 1.0f }
+
+    suspend fun setVrMode(v: String) = context.playerDataStore.edit { it[KEY_VR_MODE] = v }
+    suspend fun setVrRightEye(v: Boolean) = context.playerDataStore.edit { it[KEY_VR_RIGHT_EYE] = v }
+    suspend fun setVrGyro(v: Boolean) = context.playerDataStore.edit { it[KEY_VR_GYRO] = v }
+    suspend fun setVrFov(v: Float) = context.playerDataStore.edit { it[KEY_VR_FOV] = v }
+    suspend fun setVrPanniniD(v: Float) = context.playerDataStore.edit { it[KEY_VR_PANNINI] = v }
+
     private companion object {
         val KEY_CACHE_ENABLED = booleanPreferencesKey("cache_enabled")
         val KEY_CACHE_MB = intPreferencesKey("cache_max_mb")
@@ -82,5 +110,10 @@ class PlayerPrefs(private val context: Context) {
         val KEY_SHOW_BATTERY = booleanPreferencesKey("show_battery")
         val KEY_SHOW_NET_SPEED = booleanPreferencesKey("show_net_speed")
         val KEY_SHOW_SPEC = booleanPreferencesKey("show_spec_badge")
+        val KEY_VR_MODE = stringPreferencesKey("vr_mode")
+        val KEY_VR_RIGHT_EYE = booleanPreferencesKey("vr_right_eye")
+        val KEY_VR_GYRO = booleanPreferencesKey("vr_gyro")
+        val KEY_VR_FOV = floatPreferencesKey("vr_fov")
+        val KEY_VR_PANNINI = floatPreferencesKey("vr_pannini_d")
     }
 }

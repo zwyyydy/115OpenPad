@@ -55,6 +55,8 @@ import androidx.compose.material.icons.outlined.Audiotrack
 import androidx.compose.material.icons.outlined.LightMode
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.outlined.LockOpen
+import androidx.compose.material.icons.outlined.MyLocation
+import androidx.compose.material.icons.outlined.PanoramaPhotosphere
 import androidx.compose.material.icons.outlined.Pause
 import androidx.compose.material.icons.outlined.PlayArrow
 import androidx.compose.material.icons.outlined.SkipNext
@@ -74,6 +76,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Slider
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -376,6 +379,124 @@ fun PlayerScreen(
     var lockWakeAt by remember { mutableStateOf(0L) }
     // ---- 播放列表抽屉 ----
     var playlistOpen by remember { mutableStateOf(false) }
+
+    // ---- VR 视角（180/360 立体素材实时反投影成平面观看）----
+    /**
+     * 当前 VR 模式；`null` = 关闭。
+     * 关闭时渲染路径完全走原来的 TextureView，一行逻辑都不受影响。
+     */
+    var vrMode by remember { mutableStateOf<VrMode?>(null) }
+    val vrState = remember { VrViewState() }
+    /**
+     * GL 视图实例。用 AtomicReference 是因为陀螺仪回调来自传感器线程，
+     * 而视图的创建/销毁发生在组合里。
+     */
+    val vrViewRef = remember { java.util.concurrent.atomic.AtomicReference<VrViewportView?>(null) }
+    val vrGyro = remember { VrGyroController(context) }
+    var vrGyroOn by remember { mutableStateOf(false) }
+    var vrHudText by remember { mutableStateOf<String?>(null) }
+    var vrMenuOpen by remember { mutableStateOf(false) }
+    /**
+     * 滑杆显示值。必须单独放一份 Compose 状态：`VrViewState` 里的字段是普通变量
+     * （故意不走快照系统，免得每帧都触发重组），Slider 是受控组件，
+     * 读普通变量的话拖动时滑块根本不会动。
+     */
+    var vrPanniniUi by remember { androidx.compose.runtime.mutableFloatStateOf(VrViewState.DEFAULT_PANNINI) }
+    /** 被用户手动改过设置的条目 pick_code：改过就不再让自动识别覆盖 */
+    var vrTouchedFor by remember { mutableStateOf<String?>(null) }
+    /** 持久化值："" = 自动识别，"off" = 明确关闭，否则是 VrMode.name */
+    val vrStoredMode by container.playerPrefs.vrMode.collectAsState(initial = null)
+    val vrStoredEye by container.playerPrefs.vrRightEye.collectAsState(initial = false)
+    val vrStoredGyro by container.playerPrefs.vrGyro.collectAsState(initial = null)
+    /** 边缘畸变抑制强度（Pannini d） */
+    val vrStoredPannini by container.playerPrefs.vrPanniniD.collectAsState(initial = null)
+    /** 分辨率能不能猜出 VR 布局（决定 VR 按钮是否出现） */
+    val vrGuess = remember(vsVideoSize) {
+        VrDetector.guess(vsVideoSize.width, vsVideoSize.height)
+    }
+
+    /** 把当前视角推给 GL 线程：只换 uniform，不重建任何东西 */
+    fun pushVrParams() {
+        vrViewRef.get()?.updateParams(vrState.snapshot())
+    }
+
+    // 自动识别 + 手动兜底。
+    //
+    // ⚠️ 持久化的模式是「**当素材确实是 VR 时**用哪种布局」，不是「所有视频都开 VR」。
+    //    早期版本漏了 `guess == null` 这一档，导致用户手动选过一次模式之后，
+    //    那个模式被无条件套用到**后面每一条视频**（包括普通 16:9 视频）——
+    //    表现就是"播完 VR 片再播普通片，VR 键还在、原手势全失效"。
+    //    判定必须前置：分辨率猜不出 VR 布局 ⇒ 一律关闭。
+    LaunchedEffect(vsVideoSize, vrStoredMode, currentPickCode) {
+        val stored = vrStoredMode ?: return@LaunchedEffect
+        if (vrTouchedFor == currentPickCode) return@LaunchedEffect
+        val guess = VrDetector.guess(vsVideoSize.width, vsVideoSize.height)
+        val next = when {
+            stored == VR_MODE_OFF -> null
+            guess == null -> null
+            stored.isEmpty() -> guess
+            else -> VrMode.entries.firstOrNull { it.name == stored } ?: guess
+        }
+        if (next != vrMode) {
+            vrMode = next
+            next?.let { m ->
+                vrState.mode = m
+                vrState.resetForNewMode()
+                pushVrParams()
+            }
+        }
+    }
+
+    // 取眼 / 畸变抑制偏好随模式生效
+    LaunchedEffect(vrMode, vrStoredEye, vrStoredPannini) {
+        vrState.rightEye = vrStoredEye
+        // 用户在当前这条片子里拖过滑杆就不再回写，否则拖动过程中会被覆盖打断
+        if (vrTouchedFor != currentPickCode) {
+            vrStoredPannini?.let {
+                vrState.setPannini(it)
+                vrPanniniUi = vrState.panniniD
+            }
+        }
+        pushVrParams()
+    }
+
+    // 陀螺仪开关与持久化首值同步（只在未手动改过的条目上套用）
+    LaunchedEffect(vrStoredGyro, currentPickCode) {
+        val v = vrStoredGyro ?: return@LaunchedEffect
+        if (vrTouchedFor != currentPickCode) vrGyroOn = v
+    }
+
+    // 陀螺仪生命周期：只在 VR 模式 + 开关打开 + 设备确实有传感器时才注册。
+    // key 用 gyroActive 而不是 (vrGyroOn, vrMode)：后者在「VR180 → 360」这类
+    // 仍在 VR 内的模式切换时会重启传感器，而 start() 会把基准清零 ⇒ 视角被强制复位，
+    // 用户会觉得"只是换了个投影，怎么朝向也跳了"。
+    val gyroActive = vrGyroOn && vrMode != null && vrGyro.available
+    DisposableEffect(gyroActive) {
+        if (gyroActive) {
+            vrGyro.displayRotation =
+                (context as? android.app.Activity)?.windowManager?.defaultDisplay?.rotation
+                    ?: android.view.Surface.ROTATION_0
+            vrGyro.onRotate = { m ->
+                vrState.applyGyro(m)
+                // GLSurfaceView.requestRender 是线程安全的，可以直接从传感器线程调，
+                // 不用绕主线程队列（陀螺仪 200Hz，绕一圈会明显滞后）
+                pushVrParams()
+            }
+            vrGyro.start()
+        }
+        onDispose {
+            vrGyro.onRotate = null
+            vrGyro.stop()
+        }
+    }
+
+    // 退出播放器时确保传感器不再持有监听
+    DisposableEffect(Unit) {
+        onDispose {
+            vrGyro.stop()
+            vrViewRef.set(null)
+        }
+    }
 
     /**
      * 抽屉列表的滚动状态：**必须提升到抽屉之外**。
@@ -1185,9 +1306,47 @@ fun PlayerScreen(
             val textureView = remember {
                 android.view.TextureView(context).apply { isOpaque = true }
             }
-            DisposableEffect(textureView) {
-                player.setVideoTextureView(textureView)
-                onDispose { player.clearVideoTextureView(textureView) }
+            if (vrMode != null) {
+                // ---- VR 模式：画面交给 GL 实时反投影 ----
+                // ⚠️ GLSurfaceView 是 SurfaceView 子类，内容由 SurfaceFlinger 合成、
+                //    不参与 View 变换，所以这条路上既不能靠 graphicsLayer 旋转，
+                //    也不需要等比适配——视窗本来就是满屏的。90/270 的旋转改由
+                //    着色器承担（VrParams.camRot 里带 roll），反正本来就在重投影。
+                AndroidView(
+                    factory = { ctx ->
+                        VrViewportView(ctx).also { v ->
+                            vrViewRef.set(v)
+                            v.onSurfaceReady = { s -> player.setVideoSurface(s) }
+                        }
+                    },
+                    update = { v -> v.updateParams(vrState.snapshot()) },
+                    modifier = Modifier.fillMaxSize(),
+                )
+            } else {
+                DisposableEffect(textureView) {
+                    player.setVideoTextureView(textureView)
+                    onDispose { player.clearVideoTextureView(textureView) }
+                }
+            }
+            // 退出 VR：必须把输出面切回 TextureView。GL 视图销毁时它持有的 Surface
+            // 一并失效，不切回去画面直接变黑（解码照跑，只是没有输出面了）。
+            //
+            // ⚠️ key 必须用 `inVr`（布尔），**不能直接用 `vrMode`**：
+            //    DisposableEffect 换 key 时会拿**旧值**跑 onDispose。用 vrMode 当 key 的话，
+            //    从「VR180 左右」切到「360 左右」这种**仍在 VR 内**的变更也会触发 onDispose，
+            //    而旧值非空 ⇒ 它会误判成"要退出 VR"，把输出面切回 TextureView 并清空 vrViewRef。
+            //    此时 GL 视图的实例身份没变、AndroidView 的 factory 不会重跑，
+            //    `onSurfaceReady` 再也不会触发 ⇒ 视频流断掉、画面冻在最后一帧（表现为"卡死"）。
+            //    用布尔当 key，只有真正进出 VR 才会触发。
+            val inVr = vrMode != null
+            DisposableEffect(inVr) {
+                onDispose {
+                    if (inVr) {
+                        vrViewRef.set(null)
+                        player.clearVideoSurface()
+                        player.setVideoTextureView(textureView)
+                    }
+                }
             }
             // ---- 视频与外挂字幕同组：同尺寸、同 graphicsLayer 旋转——
             //      字幕锚定在画面底部，随画面一起旋转；字号不随视图尺寸缩放 ----
@@ -1220,7 +1379,7 @@ fun PlayerScreen(
                 player.addListener(cueListener)
                 onDispose { player.removeListener(cueListener) }
             }
-            Box(
+            if (vrMode == null) Box(
                 Modifier
                     .align(Alignment.Center)
                     // 必须用 requiredSize 而非 size：旋转 90/270 时按帧比例算出的布局尺寸是
@@ -1246,6 +1405,19 @@ fun PlayerScreen(
                         .graphicsLayer { translationY = -surfaceH * subtitleBottomPercent / 100f }
                         .padding(bottom = 4.dp),
                 )
+            } else {
+                // VR：视窗满屏，字幕直接贴底叠一层，不参与旋转也不做等比适配
+                AndroidView(
+                    factory = { _ -> subtitleView },
+                    update = { sv ->
+                        sv.setFixedTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, subtitleTextSize)
+                    },
+                    modifier = Modifier
+                        .align(Alignment.BottomCenter)
+                        .fillMaxSize()
+                        .graphicsLayer { translationY = -vsH * subtitleBottomPercent / 100f }
+                        .padding(bottom = 4.dp),
+                )
             }
             // 缓冲动效：叠在画面上但**不拦手势**（没有 clickable，事件照旧穿透到手势层），
             // 锁屏时也保留——画面停住时用户最需要知道"是在缓冲还是卡死了"
@@ -1257,10 +1429,31 @@ fun PlayerScreen(
             ) {
                 Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { BufferingPill() }
             }
-            // 手势层：锁定时整体禁用（单击/双击/长按/垂直音量亮度/横向 seek 全部拦截）
+            // VR 手势层：只在 VR 模式生效，与下面那套普通手势**互斥**（见两边的 enabled 条件）
+            if (vrMode != null) {
+                VrGestureLayer(
+                    modifier = Modifier.fillMaxSize(),
+                    state = vrState,
+                    onViewChanged = { pushVrParams() },
+                    onToggleController = {
+                        if (controlRowVisible) {
+                            controlRowVisible = false
+                            controlRowUntil = 0L
+                        } else {
+                            pulseControlRow()
+                        }
+                    },
+                    onDoubleTap = { if (player.isPlaying) player.pause() else player.play() },
+                    onHud = { vrHudText = it },
+                )
+            }
+            // 手势层：锁定时整体禁用（单击/双击/长按/垂直音量亮度/横向 seek 全部拦截）。
+            // **VR 模式下同样整体禁用**：此时画面是实时反投影的视窗，横拖要转视角、
+            // 竖拖要抬低头，会和"横滑快进 / 左半屏调亮度 / 右半屏调音量"直接打架——
+            // 两套同时生效的结果是拖动时亮度乱跳、进度条跟着乱 seek。
             PlayerGestureOverlay(
                 modifier = Modifier.fillMaxSize(),
-                enabled = !screenLocked,
+                enabled = !screenLocked && vrMode == null,
                 player = player,
                 config = DoubleTapConfig(
                     leftSeconds = prefs.seekSeconds,
@@ -1353,38 +1546,144 @@ fun PlayerScreen(
                 }
             }
             }
-            // 画面旋转键：右侧垂直居中，与左侧锁屏键水平对称；
-            // 随控制排自动淡出/单击唤出，锁定状态强制隐藏禁用
+            // 右侧竖排：VR 开关（识别到 VR 素材才出现）+ 旋转/复位。
+            // VR 模式下这个位置变成「复位视角」：视窗本来就满屏，画面旋转对 VR 没意义，
+            // 而陀螺仪无磁力计必然缓慢漂移，恰恰最需要一个快速回正的入口。
             androidx.compose.animation.AnimatedVisibility(
                 visible = controlRowVisible && !screenLocked,
                 enter = fadeIn(tween(160)),
                 exit = fadeOut(tween(200)),
                 modifier = Modifier.align(Alignment.CenterEnd),
             ) {
-                Surface(
-                    color = Color.Black.copy(alpha = 0.55f),
-                    shape = CircleShape,
-                    modifier = Modifier.padding(end = 18.dp),
-                ) {
-                    Box(
-                        modifier = Modifier
-                            .size(44.dp)
-                            .clickable(
-                                interactionSource = remember { MutableInteractionSource() },
-                                indication = null,
-                            ) {
-                                videoRotation = (videoRotation + 90) % 360
-                                setIndicator("画面旋转 ${videoRotation}°", null)
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    if (vrMenuOpen) {
+                        VrModeMenu(
+                            current = vrMode,
+                            autoMode = vrStoredMode.isNullOrEmpty(),
+                            rightEye = vrStoredEye,
+                            gyroOn = vrGyroOn,
+                            gyroAvailable = vrGyro.available,
+                            panniniD = vrPanniniUi,
+                            onAuto = {
+                                // 清掉"用户手动改过"的标记，并把偏好置空 ⇒ 交回自动识别
+                                vrTouchedFor = null
+                                vrMode = null
+                                scope.launch { container.playerPrefs.setVrMode("") }
                                 pulseControlRow()
                             },
-                        contentAlignment = Alignment.Center,
-                    ) {
-                        Icon(
-                            Icons.Outlined.ScreenRotation,
-                            contentDescription = "画面旋转 90°",
-                            tint = Color.White,
-                            modifier = Modifier.size(20.dp),
+                            onPannini = { d ->
+                                vrTouchedFor = currentPickCode
+                                vrPanniniUi = d
+                                vrState.setPannini(d)
+                                pushVrParams()
+                                // 滑杆拖一下控制排就续命一次，否则拖到一半整排淡出
+                                pulseControlRow()
+                            },
+                            onPanniniCommit = { d ->
+                                scope.launch { container.playerPrefs.setVrPanniniD(d) }
+                            },
+                            onPick = { m ->
+                                vrTouchedFor = currentPickCode
+                                vrMode = m
+                                m?.let { vrState.mode = it }
+                                vrState.resetForNewMode()
+                                scope.launch { container.playerPrefs.setVrMode(m?.name ?: VR_MODE_OFF) }
+                                pushVrParams()
+                                pulseControlRow()
+                            },
+                            onToggleEye = {
+                                vrTouchedFor = currentPickCode
+                                val v = !vrStoredEye
+                                vrState.rightEye = v
+                                scope.launch { container.playerPrefs.setVrRightEye(v) }
+                                pushVrParams()
+                                pulseControlRow()
+                            },
+                            onToggleGyro = {
+                                vrTouchedFor = currentPickCode
+                                val v = !vrGyroOn
+                                vrGyroOn = v
+                                vrState.gyroEnabled = v
+                                if (v) vrGyro.recenter()
+                                scope.launch { container.playerPrefs.setVrGyro(v) }
+                                pushVrParams()
+                                pulseControlRow()
+                            },
+                            onRecenter = {
+                                vrState.resetView()
+                                vrGyro.recenter()
+                                pushVrParams()
+                                pulseControlRow()
+                            },
                         )
+                    }
+                    Column(
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        modifier = Modifier.padding(end = 18.dp),
+                    ) {
+                        // VR 键**常驻**（不再只在识别到 VR 素材时出现）。
+                        // 自动识别必然有猜不到的情况——宽高比 2 既可能是 VR180 左右、
+                        // 也可能是 360 单目，还有带黑边/非标裁剪的素材。
+                        // 按钮一旦隐藏，手动兜底这条路就断了，用户只能干看着。
+                        Surface(
+                            color = if (vrMode != null) VrActiveColor
+                            else Color.Black.copy(alpha = 0.55f),
+                            shape = CircleShape,
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .size(44.dp)
+                                    .clickable(
+                                        interactionSource = remember { MutableInteractionSource() },
+                                        indication = null,
+                                    ) {
+                                        vrMenuOpen = !vrMenuOpen
+                                        pulseControlRow()
+                                    },
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                Icon(
+                                    Icons.Outlined.PanoramaPhotosphere,
+                                    contentDescription = "VR 视角",
+                                    tint = Color.White,
+                                    modifier = Modifier.size(20.dp),
+                                )
+                            }
+                            Spacer(Modifier.height(10.dp))
+                        }
+                        Surface(
+                            color = Color.Black.copy(alpha = 0.55f),
+                            shape = CircleShape,
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .size(44.dp)
+                                    .clickable(
+                                        interactionSource = remember { MutableInteractionSource() },
+                                        indication = null,
+                                    ) {
+                                        if (vrMode != null) {
+                                            vrState.resetView()
+                                            vrGyro.recenter()
+                                            pushVrParams()
+                                            setIndicator("视角已复位", null)
+                                        } else {
+                                            videoRotation = (videoRotation + 90) % 360
+                                            setIndicator("画面旋转 ${videoRotation}°", null)
+                                        }
+                                        pulseControlRow()
+                                    },
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                Icon(
+                                    if (vrMode != null) Icons.Outlined.MyLocation
+                                    else Icons.Outlined.ScreenRotation,
+                                    contentDescription = if (vrMode != null) "复位视角" else "画面旋转 90°",
+                                    tint = Color.White,
+                                    modifier = Modifier.size(20.dp),
+                                )
+                            }
+                        }
                     }
                 }
             }
@@ -1415,6 +1714,15 @@ fun PlayerScreen(
                     Modifier
                         .align(Alignment.TopCenter)
                         .padding(top = 60.dp),
+                )
+            }
+            // VR 手势提示（顶部居中，比倍速胶囊低一点避免重叠）
+            if (vrMode != null) {
+                VrHud(
+                    vrHudText,
+                    Modifier
+                        .align(Alignment.TopCenter)
+                        .padding(top = 108.dp),
                 )
             }
             // 进度预览（居中，抬手才真正 seek）
@@ -2190,5 +2498,129 @@ private fun PlayingBarsIndicator(
                     .background(color),
             )
         }
+    }
+}
+
+/** VR 生效时开关按钮的高亮色（暗金，黑底画面上醒目但不刺眼） */
+private val VrActiveColor = Color(0xFF8A6A16)
+
+/**
+ * VR 模式选择条（横排胶囊）。
+ *
+ * 为什么不用下拉菜单 / Dialog：播放器是横屏，控制排 4 秒无操作就整体淡出，
+ * 弹层挂着的时候控制排一淡出，弹层就会孤零零留在画面上（或者被一起隐藏后
+ * 用户以为点空了）。做成同一排里的内联胶囊，跟控制排同生共死，行为最可预期。
+ *
+ * 「关闭」与四个模式是互斥单选；取眼 / 陀螺仪是两个独立开关；复位是动作。
+ */
+@Composable
+internal fun VrModeMenu(
+    current: VrMode?,
+    autoMode: Boolean,
+    rightEye: Boolean,
+    gyroOn: Boolean,
+    gyroAvailable: Boolean,
+    panniniD: Float,
+    onPick: (VrMode?) -> Unit,
+    onAuto: () -> Unit,
+    onToggleEye: () -> Unit,
+    onToggleGyro: () -> Unit,
+    onRecenter: () -> Unit,
+    onPannini: (Float) -> Unit,
+    onPanniniCommit: (Float) -> Unit,
+) {
+    Surface(
+        color = Color.Black.copy(alpha = 0.8f),
+        shape = RoundedCornerShape(14.dp),
+        modifier = Modifier.padding(end = 10.dp),
+    ) {
+        Column(modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                // 「自动」必须单独给一个入口：否则用户一旦选过「关闭」，
+                // 自动识别就被永久关掉、没有任何回头的路。
+                VrChip("自动", autoMode) { onAuto() }
+                VrChip("关闭", !autoMode && current == null) { onPick(null) }
+                // 顺序即日常使用频率：VR180 远多于 360
+                VrMode.entries.forEach { m ->
+                    VrChip(m.label, current == m) { onPick(m) }
+                }
+                VrChip(if (rightEye) "右眼" else "左眼", false) { onToggleEye() }
+                VrChip(
+                    label = when {
+                        !gyroAvailable -> "无陀螺仪"
+                        gyroOn -> "陀螺仪开"
+                        else -> "陀螺仪关"
+                    },
+                    selected = gyroOn && gyroAvailable,
+                    enabled = gyroAvailable,
+                    onClick = onToggleGyro,
+                )
+                VrChip("复位", false) { onRecenter() }
+            }
+            Spacer(Modifier.height(4.dp))
+            // 边缘畸变抑制：0 = 直线透视，1 = 标准 Pannini，越大越接近柱面。
+            // 纵向不随它变，所以拖的时候画面中心大小不动，只改边缘 —— 好判断。
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    "边缘畸变抑制",
+                    color = Color.White.copy(alpha = 0.75f),
+                    style = MaterialTheme.typography.labelMedium,
+                    maxLines = 1,
+                )
+                Spacer(Modifier.width(6.dp))
+                Slider(
+                    value = panniniD,
+                    onValueChange = onPannini,
+                    onValueChangeFinished = { onPanniniCommit(panniniD) },
+                    valueRange = 0f..VrViewState.MAX_PANNINI,
+                    modifier = Modifier.width(160.dp),
+                )
+                Spacer(Modifier.width(6.dp))
+                Text(
+                    if (panniniD < 0.05f) "关"
+                    else String.format(java.util.Locale.US, "%.1f", panniniD),
+                    color = Color.White,
+                    style = MaterialTheme.typography.labelMedium,
+                    maxLines = 1,
+                    modifier = Modifier.width(26.dp),
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun VrChip(
+    label: String,
+    selected: Boolean,
+    enabled: Boolean = true,
+    onClick: () -> Unit,
+) {
+    Surface(
+        color = when {
+            !enabled -> Color.White.copy(alpha = 0.10f)
+            selected -> Color.White
+            else -> Color.White.copy(alpha = 0.15f)
+        },
+        shape = RoundedCornerShape(50),
+        modifier = Modifier
+            .padding(horizontal = 3.dp)
+            .clickable(
+                interactionSource = remember { MutableInteractionSource() },
+                indication = null,
+                enabled = enabled,
+            ) { onClick() },
+    ) {
+        Text(
+            label,
+            color = when {
+                !enabled -> Color.White.copy(alpha = 0.35f)
+                selected -> Color(0xFF1B1B1B)
+                else -> Color.White
+            },
+            style = MaterialTheme.typography.labelMedium,
+            maxLines = 1,
+            modifier = Modifier.padding(horizontal = 11.dp, vertical = 7.dp),
+        )
     }
 }
