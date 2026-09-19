@@ -54,6 +54,17 @@ class PlayerPrefs(private val context: Context) {
     suspend fun setAlwaysShowMiniProgress(v: Boolean) =
         context.playerDataStore.edit { it[KEY_MINI_PROGRESS] = v }
 
+    /**
+     * 是否优先用「原盘」档位：直接拿下载直链播原始文件，不经 115 转码。
+     * 画质上限最高（逐字节原文件、保留全部音轨/字幕轨），但没有自适应码率、
+     * 带宽占用高，所以默认关，只有用户在画质菜单里主动选过才记住。
+     */
+    val preferOriginal: Flow<Boolean> =
+        context.playerDataStore.data.map { it[KEY_PREFER_ORIGINAL] ?: false }
+
+    suspend fun setPreferOriginal(v: Boolean) =
+        context.playerDataStore.edit { it[KEY_PREFER_ORIGINAL] = v }
+
     suspend fun setSubtitlesEnabled(v: Boolean) = context.playerDataStore.edit { it[KEY_SUBS_ENABLED] = v }
 
     suspend fun setSubtitleTextSize(v: Float) = context.playerDataStore.edit { it[KEY_SUB_TEXT_SIZE] = v }
@@ -110,6 +121,7 @@ class PlayerPrefs(private val context: Context) {
         val KEY_SHOW_BATTERY = booleanPreferencesKey("show_battery")
         val KEY_SHOW_NET_SPEED = booleanPreferencesKey("show_net_speed")
         val KEY_SHOW_SPEC = booleanPreferencesKey("show_spec_badge")
+        val KEY_PREFER_ORIGINAL = booleanPreferencesKey("prefer_original")
         val KEY_VR_MODE = stringPreferencesKey("vr_mode")
         val KEY_VR_RIGHT_EYE = booleanPreferencesKey("vr_right_eye")
         val KEY_VR_GYRO = booleanPreferencesKey("vr_gyro")

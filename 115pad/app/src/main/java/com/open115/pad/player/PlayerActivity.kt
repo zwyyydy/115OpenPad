@@ -137,7 +137,9 @@ import com.open115.pad.data.parseVideoHistoryTime
 import com.open115.pad.data.envMsg
 import com.open115.pad.data.envOk
 import com.open115.pad.data.parseVideoPlayResponse
+import com.open115.pad.data.parseFileDownloadUrl
 import com.open115.pad.ui.theme.Open115Theme
+import com.open115.pad.util.APP_USER_AGENT
 import com.open115.pad.util.Format
 import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.json.Json
@@ -169,8 +171,27 @@ enum class PlayMode(val label: String) {
     SHUFFLE("随机播放"),
 }
 
+/**
+ * 「原盘」档位的伪清晰度值。
+ * 它不在 `video_url` 列表里，而是单独走 `open/ufile/downurl` 拿下载直链来播
+ * （= 115master 的 Ultra 画质）。取值避开 115 真实档位（1~5）与原画（100）。
+ */
+private const val DEF_ORIGINAL_FILE = 999
+
+/** 续播位置距片尾不足这么多毫秒就认为"已经播完"，从头开始（见 resumePos） */
+private const val RESUME_END_MARGIN_MS = 1000L
+
 private fun defLabel(def: Int): String = when (def) {
-    1 -> "标清"; 2 -> "高清"; 3 -> "超清"; 4 -> "1080P"; 5 -> "4K"; 100 -> "原画"; else -> "清晰度 $def"
+    1 -> "标清"; 2 -> "高清"; 3 -> "超清"; 4 -> "1080P"; 5 -> "4K"
+    100 -> "原画"; DEF_ORIGINAL_FILE -> "原盘"; else -> "清晰度 $def"
+}
+
+/** 按文件名后缀给直链一个 mime；认不出来的返回 null，交给 ExoPlayer 嗅探容器 */
+private fun mimeOfFileName(name: String?): String? = when (name?.substringAfterLast('.', "")?.lowercase()) {
+    "mp4", "m4v", "mov" -> "video/mp4"
+    "mkv" -> "video/x-matroska"
+    "webm" -> "video/webm"
+    else -> null
 }
 
 // ---- 播放地址自愈参数（403 类错误的"换地址续播"重试预算）----
@@ -601,7 +622,9 @@ fun PlayerScreen(
         // 独立带宽计：状态栏实时网速的数据源（Builder.setBandwidthMeter 注入后全程累计估算）
         val bandwidthMeter = DefaultBandwidthMeter.Builder(context).build()
         val httpFactory = DefaultHttpDataSource.Factory()
-            .setUserAgent("Mozilla/5.0 (Linux; Android 13) 115OpenPad/0.1")
+            // ⚠️ 必须用 APP_USER_AGENT：115 的下载直链与「申请它时的 UA」绑定（见 Util.kt），
+            // 原盘档位拿的是下载直链，这里 UA 不一致会被 CDN 判 403。转码流没这个校验。
+            .setUserAgent(APP_USER_AGENT)
             .setAllowCrossProtocolRedirects(true)
             .setConnectTimeoutMs(15000)
             .setReadTimeoutMs(30000)
@@ -651,14 +674,32 @@ fun PlayerScreen(
         }
     }
 
-    suspend fun buildItem(def: Int): Pair<Int, MediaItem>? {
-        val d = data ?: return null
-        val entry = d.videoUrls.firstOrNull { it.definition == def } ?: return null
-        val url = entry.url ?: return null
-        var trackUrl = url
-        if (currentAudio >= 0) {
-            trackUrl += (if (url.contains('?')) "&" else "?") + "audio_track=$currentAudio"
-        }
+    /**
+     * 续播位置贴着片尾时直接从头播。
+     *
+     * 115 的观看历史经常把进度记成"刚好播完"（例如 96.9s 的片子记为 97s），带这种位置
+     * 起播/切档会 READY 之后立刻 ENDED → 黑屏，用户感知就是"走原盘会报错"，
+     * 其实换任何清晰度都一样。距片尾不足 1 秒就归零。
+     *
+     * @param durationMs 总时长；未知（0 或负数）时原样返回，避免误伤。
+     */
+    fun resumePos(pos: Long, durationMs: Long = player.duration): Long =
+        if (durationMs > 0 && pos >= durationMs - RESUME_END_MARGIN_MS) 0L else pos.coerceAtLeast(0L)
+
+    /**
+     * 取原始文件的下载直链（原盘档位的播放源）。
+     * 失败返回 null，调用方负责提示/回退——不抛异常是因为它只影响一个可选档位，
+     * 不该把整条起播链路打断。
+     */
+    suspend fun fetchOriginalUrl(pickCode: String): String? = runCatching {
+        parseFileDownloadUrl(container.openApi.downUrl(pickCode))
+    }.getOrNull()
+
+    /**
+     * @param mime 传 null 表示不声明类型，由 ExoPlayer 嗅探容器。
+     *             原盘直链不能套 m3u8——那会让 ExoPlayer 按 HLS 去解析 mp4/mkv，直接失败。
+     */
+    fun buildMediaItem(url: String, mime: String?): MediaItem {
         val cfgs = if (useSubs && subsEnabled) (subtitles + onlineSubs).map { s ->
             MediaItem.SubtitleConfiguration.Builder(android.net.Uri.parse(s.url))
                 .setMimeType(s.mime)
@@ -667,14 +708,28 @@ fun PlayerScreen(
                 .setSelectionFlags(C.SELECTION_FLAG_DEFAULT)
                 .build()
         } else emptyList()
-        val item = MediaItem.Builder()
-            .setUri(trackUrl)
-            // 115 的播放地址没有 .m3u8 后缀，必须显式声明 HLS 类型，
-            // 否则 ExoPlayer 会按普通容器解析导致 PARSING_CONTAINER_UNSUPPORTED
-            .setMimeType(MimeTypes.APPLICATION_M3U8)
+        return MediaItem.Builder()
+            .setUri(url)
+            .apply { if (mime != null) setMimeType(mime) }
             .setSubtitleConfigurations(cfgs)
             .build()
-        return entry.definition to item
+    }
+
+    suspend fun buildItem(def: Int): Pair<Int, MediaItem>? {
+        val d = data ?: return null
+        // 原盘：绕开 115 的转码/切片，直接播原始文件
+        if (def == DEF_ORIGINAL_FILE) {
+            val raw = fetchOriginalUrl(currentPickCode) ?: return null
+            return DEF_ORIGINAL_FILE to buildMediaItem(raw, mimeOfFileName(d.fileName))
+        }
+        val entry = d.videoUrls.firstOrNull { it.definition == def } ?: return null
+        var trackUrl = entry.url
+        if (currentAudio >= 0) {
+            trackUrl += (if (trackUrl.contains('?')) "&" else "?") + "audio_track=$currentAudio"
+        }
+        // 115 的转码地址没有 .m3u8 后缀，必须显式声明 HLS 类型，
+        // 否则 ExoPlayer 会按普通容器解析导致 PARSING_CONTAINER_UNSUPPORTED
+        return entry.definition to buildMediaItem(trackUrl, MimeTypes.APPLICATION_M3U8)
     }
 
     DisposableEffect(Unit) {
@@ -707,15 +762,21 @@ fun PlayerScreen(
                         try {
                             // 首次立刻重试；之后递退等待，避免打爆 115 频控
                             if (attempt > 1) delay(attempt * REFRESH_BACKOFF_STEP_MS)
-                            val fresh = parseVideoPlayResponse(container.openApi.videoPlay(currentPickCode))
-                            data = fresh
-                            val pos = player.currentPosition
+                            // 原盘档位的地址不是 videoPlay 给的：直接重取直链（buildItem 内部会再 downUrl 一次），
+                            // 拿到带新签名的地址续播。其余档位要刷 videoPlay 才能拿到新的分片地址。
+                            if (currentDef != DEF_ORIGINAL_FILE) {
+                                val fresh = parseVideoPlayResponse(container.openApi.videoPlay(currentPickCode))
+                                data = fresh
+                            } else {
+                                setIndicator("原盘地址已刷新", null)
+                            }
+                            val pos = resumePos(player.currentPosition)
                             val built = buildItem(currentDef)
                             if (built == null) {
                                 error = "播放失败（${err.errorCodeName}）：地址刷新后仍不可用"
                                 return@launch
                             }
-                            player.setMediaItem(built.second, if (pos > 0) pos else 0L)
+                            player.setMediaItem(built.second, pos)
                             player.prepare()
                             player.playWhenReady = true
                         } catch (e: Exception) {
@@ -727,14 +788,45 @@ fun PlayerScreen(
                     }
                     return
                 }
+                // 原盘档解码失败（典型：原文件是 HEVC Main10 / 4K 之类的高规格编码，
+                // 设备的解码器声明能力不覆盖 —— ExoPlayer 给 DECODING_FAILED 且
+                // format_supported=NO_EXCEEDS_CAPABILITIES）→ 回退到转码最高档。
+                // 这类失败换直链地址没有意义：编码参数本身就播不了；而 115 的转码档恒为
+                // 8bit AVC，设备基本都放得动。只自动回退一次，且把偏好改回非原盘，
+                // 否则连播的每一集都会重复踩同一个坑。
+                val decodeFail = err.errorCode == PlaybackException.ERROR_CODE_DECODING_FAILED ||
+                    err.errorCode == PlaybackException.ERROR_CODE_DECODING_FORMAT_UNSUPPORTED
+                if (decodeFail && currentDef == DEF_ORIGINAL_FILE) {
+                    val fallbackDef = data?.videoUrls
+                        ?.map { it.definition }
+                        ?.filter { it != DEF_ORIGINAL_FILE }
+                        ?.maxOrNull()
+                    if (fallbackDef != null) {
+                        scope.launch {
+                            runCatching { container.playerPrefs.setPreferOriginal(false) }
+                            val pos = resumePos(player.currentPosition)
+                            val built = buildItem(fallbackDef)
+                            if (built == null) {
+                                error = "播放失败（${err.errorCodeName}）：原盘与转码均不可用"
+                                return@launch
+                            }
+                            currentDef = fallbackDef
+                            player.setMediaItem(built.second, pos)
+                            player.prepare()
+                            player.playWhenReady = true
+                            setIndicator("设备不支持原盘编码，已切回${defLabel(fallbackDef)}", null)
+                        }
+                        return
+                    }
+                }
                 // 预算用完（或非 403 错误）→ 走原有的字幕降级 → 终态报错链路
                 if (useSubs && subtitles.isNotEmpty()) {
                     useSubs = false
                     scope.launch {
-                        val pos = player.currentPosition
+                        val pos = resumePos(player.currentPosition)
                         val built = buildItem(currentDef)
                         if (built != null) {
-                            player.setMediaItem(built.second, if (pos > 0) pos else 0L)
+                            player.setMediaItem(built.second, pos)
                             player.prepare()
                             player.playWhenReady = true
                         } else {
@@ -766,7 +858,7 @@ fun PlayerScreen(
         scope.launch { container.playerPrefs.setSubtitlesEnabled(v) }
         // 重建媒体应用字幕显隐（记住进度）
         scope.launch {
-            val pos = player.currentPosition
+            val pos = resumePos(player.currentPosition)
             val built = buildItem(currentDef)
             if (built != null) {
                 player.setMediaItem(built.second, pos)
@@ -883,17 +975,31 @@ fun PlayerScreen(
             }
             // 起播位置：切集时由 pendingStartMs 强制为 0（需求：进度归零）；
             // 否则沿用观看记录续播。无观看记录时接口返回 data:[]，由解析器归一为 0
-            val startPos = pendingStartMs ?: runCatching {
+            val forcedStart = pendingStartMs
+            val rawStart = forcedStart ?: runCatching {
                 parseVideoHistoryTime(container.openApi.videoHistoryGet(currentPickCode)) * 1000
             }.getOrNull() ?: 0L
             pendingStartMs = null
+            // 续播位置贴着片尾时从头播（时长用接口给的 playLong，单位秒）。
+            // 切集时的 0 是业务强制值，不走这个逻辑。
+            val startPos = if (forcedStart != null) forcedStart
+            else resumePos(rawStart, parsed.playLong * 1000)
 
             val d = parsed
-            val targetDef = d.userDef
-                ?.takeIf { def -> d.videoUrls.any { it.definition == def } }
-                ?: d.videoUrls.filter { it.definition != 100 }.maxOfOrNull { it.definition }
-                ?: d.videoUrls.maxOfOrNull { it.definition }
-                ?: 4
+            // 用户在画质菜单里主动选过「原盘」→ 后续每集都沿用直链。
+            // 这里用 flow.first() 直读而不是 collectAsState：后者首帧是默认值 false，
+            // 会让"记住的原盘偏好"在第一集失效。
+            val targetDef = if (container.playerPrefs.preferOriginal.first() &&
+                fetchOriginalUrl(currentPickCode) != null
+            ) {
+                DEF_ORIGINAL_FILE
+            } else {
+                d.userDef
+                    ?.takeIf { def -> d.videoUrls.any { it.definition == def } }
+                    ?: d.videoUrls.filter { it.definition != 100 }.maxOfOrNull { it.definition }
+                    ?: d.videoUrls.maxOfOrNull { it.definition }
+                    ?: 4
+            }
             val built = buildItem(targetDef)
             if (built == null) {
                 error = "没有可用的播放地址（部分清晰度需要会员）"
@@ -943,10 +1049,21 @@ fun PlayerScreen(
 
     fun switchQuality(def: Int) {
         scope.launch {
-            val pos = player.currentPosition
-            val built = buildItem(def) ?: return@launch
+            val pos = resumePos(player.currentPosition)
+            val built = buildItem(def)
+            if (built == null) {
+                // 原盘直链取不到（无下载权限/接口频控/签名异常）时保持当前档位继续播，
+                // 只给个瞬时提示——切画质失败不该把正在看的画面打断。
+                setIndicator(
+                    if (def == DEF_ORIGINAL_FILE) "原盘直链获取失败" else "该清晰度不可用",
+                    null,
+                )
+                return@launch
+            }
             val (d, item) = built
             currentDef = d
+            // 记住档位偏好：选了原盘就一直用原盘，选回转码档位则清除
+            runCatching { container.playerPrefs.setPreferOriginal(d == DEF_ORIGINAL_FILE) }
             player.setMediaItem(item, pos)
             player.prepare()
             player.playWhenReady = true
@@ -956,7 +1073,7 @@ fun PlayerScreen(
     fun switchAudio(index: Int) {
         scope.launch {
             currentAudio = index
-            val pos = player.currentPosition
+            val pos = resumePos(player.currentPosition)
             val built = buildItem(currentDef) ?: return@launch
             val (_, item) = built
             player.setMediaItem(item, pos)
@@ -990,7 +1107,7 @@ fun PlayerScreen(
                 scope.launch { container.playerPrefs.setSubtitlesEnabled(true) }
                 onlineSubs = listOf(cfg.copy(url = android.net.Uri.fromFile(file).toString()))
                 useSubs = true
-                val pos = player.currentPosition
+                val pos = resumePos(player.currentPosition)
                 val built = buildItem(currentDef) ?: return@launch
                 player.setMediaItem(built.second, pos)
                 player.prepare()
@@ -1234,7 +1351,7 @@ fun PlayerScreen(
                     (onlineSubCfg ?: SubtitleCfg("", mimeForSubtitleExt(onlineSubExt), null, null))
                         .copy(url = android.net.Uri.fromFile(file).toString()),
                 )
-                val pos = player.currentPosition
+                val pos = resumePos(player.currentPosition)
                 val built = buildItem(currentDef) ?: return@launch
                 player.setMediaItem(built.second, pos)
                 player.prepare()
@@ -1883,6 +2000,20 @@ fun PlayerScreen(
                                                     },
                                                 )
                                             }
+                                            // 原盘：不走 115 转码，直接用下载直链播原始文件。
+                                            // 画质上限最高（保留全部音轨/字幕轨），但没有自适应码率、带宽占用高。
+                                            DropdownMenuItem(
+                                                text = {
+                                                    Text(
+                                                        "原盘" +
+                                                            if (currentDef == DEF_ORIGINAL_FILE) " ✓" else "",
+                                                    )
+                                                },
+                                                onClick = {
+                                                    qualityMenuOpen = false
+                                                    switchQuality(DEF_ORIGINAL_FILE)
+                                                },
+                                            )
                                         }
                                     }
                                 }

@@ -169,6 +169,24 @@ fun parseVideoPlayResponse(root: JsonObject): VideoPlayData {
     )
 }
 
+/**
+ * 从 `open/ufile/downurl` 的回包里取下载地址。
+ * 结构是 `{ data: { <pick_code>: { url: {...} } } }`，`url` 有时是对象（含 `url` 字段、
+ * 可能还带 `auth_cookie`）、有时直接是字符串，两种都兼容。
+ *
+ * 这个地址指向 **原始文件字节**（不经过 115 转码），拿它当播放源就是"原盘"画质
+ * （等价 115master 的 Ultra）。注意带签名、有有效期，过期会 403。
+ */
+fun parseFileDownloadUrl(root: JsonObject): String? {
+    val data = root.envData() ?: return null
+    val entry = data.values.firstOrNull() as? JsonObject ?: return null
+    return when (val el = entry["url"]) {
+        is JsonObject -> el.optStr("url")?.takeIf { it.isNotBlank() }
+        is JsonPrimitive -> el.content.takeIf { it.isNotBlank() }
+        else -> null
+    }
+}
+
 /** 播放进度：无记录时 data 是 []，有记录时是对象 */
 fun parseVideoHistoryTime(root: JsonObject): Long {
     if (!root.stateOk()) return 0L
