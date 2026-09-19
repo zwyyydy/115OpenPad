@@ -1,5 +1,6 @@
 package com.open115.pad.ui.components
 
+import android.app.Activity
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.BitmapRegionDecoder
@@ -15,6 +16,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
@@ -27,7 +29,6 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -45,6 +46,7 @@ import androidx.compose.ui.geometry.Rect as ComposeRect
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.FilterQuality
+import androidx.compose.ui.graphics.Shadow
 import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.Stroke
@@ -58,6 +60,9 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import coil.compose.AsyncImage
 import coil.imageLoader
 import coil.request.ImageRequest
@@ -103,6 +108,25 @@ fun ImageGalleryDialog(
     var chromeVisible by remember { mutableStateOf(true) }
     var dismissProgress by remember { mutableStateOf(0f) }
 
+    // 进浏览即隐藏状态栏 + 导航栏，退出时恢复。
+    // 用 BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE 而不是"永久隐藏"：
+    // 用户仍可从边缘划出系统栏看时间/电量，划出后会自动收起，不会把画面顶掉。
+    // ⚠️ onDispose 必须无条件 show —— 若在这里判断条件，退出时会漏掉恢复，
+    //    整个 App 的状态栏就再也不回来了（和 VR 那个 DisposableEffect 的坑同源）。
+    DisposableEffect(Unit) {
+        val window = (context as? Activity)?.window
+        val controller = window?.let { WindowCompat.getInsetsController(it, it.decorView) }
+        controller?.systemBarsBehavior =
+            WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        controller?.hide(WindowInsetsCompat.Type.systemBars())
+        onDispose {
+            (context as? Activity)?.window?.let {
+                WindowCompat.getInsetsController(it, it.decorView)
+                    .show(WindowInsetsCompat.Type.systemBars())
+            }
+        }
+    }
+
     Box(
         Modifier
             .fillMaxSize()
@@ -123,40 +147,51 @@ fun ImageGalleryDialog(
             )
         }
 
-        // 顶部栏：关闭 + 文件名 + 页码（单击屏幕显隐）
+        // 顶部栏：关闭 + 文件名 + 页码（单击屏幕显隐）。
+        // 不再铺整条半透明黑带——那条带子会压在画面上，观感很脏。
+        // 可读性改由文字/图标的描边阴影保证：文字用 TextStyle.shadow（跟字形走），
+        // 图标画两层（底层黑、上层白）模拟描边。
         AnimatedVisibility(
             visible = chromeVisible,
             enter = fadeIn(),
             exit = fadeOut(),
             modifier = Modifier.align(Alignment.TopCenter),
         ) {
-            Surface(
-                color = Color.Black.copy(alpha = 0.45f),
-                modifier = Modifier.fillMaxWidth(),
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .statusBarsPadding()
+                    .padding(horizontal = 4.dp, vertical = 8.dp),
+                verticalAlignment = Alignment.CenterVertically,
             ) {
-                Row(
-                    Modifier
-                        .statusBarsPadding()
-                        .padding(horizontal = 4.dp, vertical = 2.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    IconButton(onClick = onDismiss) {
+                IconButton(onClick = onDismiss) {
+                    Box {
+                        Icon(
+                            Icons.Outlined.Close,
+                            contentDescription = null,
+                            tint = Color.Black.copy(alpha = 0.55f),
+                            modifier = Modifier.offset(0.5.dp, 0.5.dp),
+                        )
                         Icon(Icons.Outlined.Close, "关闭", tint = Color.White)
                     }
-                    Column(Modifier.weight(1f)) {
-                        Text(
-                            items.getOrNull(pagerState.currentPage)?.fileName ?: "",
-                            color = Color.White,
-                            style = MaterialTheme.typography.bodyMedium,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                        )
-                        Text(
-                            "${pagerState.currentPage + 1} / ${items.size}",
-                            color = Color.White.copy(alpha = 0.7f),
-                            style = MaterialTheme.typography.labelSmall,
-                        )
-                    }
+                }
+                Column(Modifier.weight(1f)) {
+                    Text(
+                        items.getOrNull(pagerState.currentPage)?.fileName ?: "",
+                        color = Color.White,
+                        style = MaterialTheme.typography.bodyMedium.copy(
+                            shadow = CHROME_TEXT_SHADOW,
+                        ),
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    Text(
+                        "${pagerState.currentPage + 1} / ${items.size}",
+                        color = Color.White.copy(alpha = 0.85f),
+                        style = MaterialTheme.typography.labelSmall.copy(
+                            shadow = CHROME_TEXT_SHADOW,
+                        ),
+                    )
                 }
             }
         }
@@ -296,6 +331,16 @@ private fun GalleryPage(
 /** 鸟瞰图的最大尺寸：长图 / 全景图都按比例收进这个框，不会顶到屏幕上沿或压成一条线 */
 private val MINIMAP_MAX_W = 88.dp
 private val MINIMAP_MAX_H = 118.dp
+
+/**
+ * 顶部信息（文件名 / 页码）的字形阴影：去掉半透明黑带之后，
+ * 在亮色图片上的可读性全靠它。跟字形走的阴影比铺一层背景带干净得多。
+ */
+private val CHROME_TEXT_SHADOW = Shadow(
+    color = Color.Black.copy(alpha = 0.75f),
+    offset = Offset(1f, 1f),
+    blurRadius = 3f,
+)
 
 /**
  * 鸟瞰位置图：整张图的半透明缩略 + 当前视口框。
