@@ -160,6 +160,16 @@ interface OpenApi {
         @Field("sign_val") signVal: String? = null,
     ): JsonObject
 
+    /** 断点续传调度：按 pick_code 换回新的 bucket/object/callback（原调度可能已过期） */
+    @FormUrlEncoded
+    @POST("open/upload/resume")
+    suspend fun uploadResume(
+        @Field("file_size") fileSize: Long,
+        @Field("target") target: String,
+        @Field("fileid") fileId: String,
+        @Field("pick_code") pickCode: String,
+    ): JsonObject
+
     // ---------------- 回收站 ----------------
 
     @GET("open/rb/list")

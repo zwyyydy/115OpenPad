@@ -354,6 +354,10 @@ object Uploader {
     /**
      * 大文件分片上传 + 传输中心留痕。进度按整数百分比变化回写
      * （DataStore 每次 edit 都是一次事务，不按片节流会高频小步写盘）。
+     *
+     * 断点续传：init/resume 拿到会话（sha1/pick_code/oss_upload_id）后立刻落库；
+     * 本进程内失败自动 ListParts 探测续传重试一次，进程被杀的残留记录由
+     * [resumeLargeLogged] 恢复。
      */
     suspend fun uploadLargeLogged(
         log: TransferLog,
@@ -363,21 +367,90 @@ object Uploader {
         size: Long,
         targetCid: String,
         targetName: String?,
+        uri: String? = null,
     ): UploadResult {
-        val id = log.beginUpload(fileName, size, targetCid, targetName)
+        val id = log.beginUpload(fileName, size, targetCid, targetName, uri)
         var lastPct = -1L
-        return try {
-            val r = uploadLarge(api, fileName, pfd, size, target = "U_1_$targetCid") { uploaded ->
-                val pct = uploaded * 100 / size
-                if (pct != lastPct) {
-                    lastPct = pct
-                    log.updateUploadProgress(id, uploaded)
-                }
+        suspend fun prog(uploaded: Long) {
+            val pct = uploaded * 100 / size
+            if (pct != lastPct) {
+                lastPct = pct
+                log.updateUploadProgress(id, uploaded)
             }
+        }
+        suspend fun runOnce(
+            resumeSha1: String?, resumePickCode: String?, resumeUploadId: String?,
+        ): UploadResult = uploadLarge(
+            api, fileName, pfd, size, target = "U_1_$targetCid",
+            resumeSha1 = resumeSha1, resumePickCode = resumePickCode, resumeUploadId = resumeUploadId,
+            onProgress = { prog(it) },
+            onSession = { s, p, o -> log.updateUploadSession(id, s, p, o) },
+        )
+        return try {
+            val r = runOnce(null, null, null)
             log.finishUpload(id, ok = true, reused = r.reused)
             r
         } catch (e: Exception) {
-            log.finishUpload(id, ok = false, error = e.message)
+            if (e is kotlinx.coroutines.CancellationException) {
+                log.finishUpload(id, ok = false, error = "已取消")
+                throw e
+            }
+            // 已拿到会话才值得续传重试（否则连 init 都没过，重试就是从头再来）
+            val rec = log.uploadRecord(id)
+            if (rec?.pickCode == null) {
+                log.finishUpload(id, ok = false, error = e.message)
+                throw e
+            }
+            Log.w(TAG, "分片上传失败，ListParts 断点续传重试：${e.message}")
+            try {
+                val r = runOnce(rec.fileSha1, rec.pickCode, rec.ossUploadId)
+                log.finishUpload(id, ok = true, reused = r.reused)
+                r
+            } catch (e2: Exception) {
+                if (e2 !is kotlinx.coroutines.CancellationException) {
+                    Log.w(TAG, "续传重试仍失败：${e2.message}")
+                }
+                log.finishUpload(id, ok = false, error = e2.message)
+                throw e2
+            }
+        }
+    }
+
+    /**
+     * 进程重启后恢复中断的大文件上传（传输中心扫描"上传中"残留记录时调用）。
+     * pfd 由调用方按记录里落库的 SAF uri 重新打开；恢复时 uploadLarge 会重算
+     * SHA1 与记录比对，文件变了就自动走全新上传。
+     */
+    suspend fun resumeLargeLogged(
+        log: TransferLog,
+        api: OpenApi,
+        rec: UploadRecord,
+        pfd: ParcelFileDescriptor,
+    ): UploadResult {
+        if (rec.size != pfd.statSize) {
+            error("文件大小与中断记录不一致（${pfd.statSize} ≠ ${rec.size}），放弃续传")
+        }
+        Log.i(TAG, "恢复中断上传 id=${rec.id} ${rec.name} size=${rec.size} 已传≈${rec.uploaded}")
+        var lastPct = -1L
+        return try {
+            val r = uploadLarge(
+                api, rec.name, pfd, rec.size, target = "U_1_${rec.targetCid}",
+                resumeSha1 = rec.fileSha1, resumePickCode = rec.pickCode, resumeUploadId = rec.ossUploadId,
+                onProgress = { up ->
+                    val pct = up * 100 / rec.size
+                    if (pct != lastPct) {
+                        lastPct = pct
+                        log.updateUploadProgress(rec.id, up)
+                    }
+                },
+                onSession = { s, p, o -> log.updateUploadSession(rec.id, s, p, o) },
+            )
+            log.finishUpload(rec.id, ok = true, reused = r.reused)
+            r
+        } catch (e: Exception) {
+            if (e !is kotlinx.coroutines.CancellationException) {
+                log.finishUpload(rec.id, ok = false, error = e.message)
+            }
             throw e
         }
     }
@@ -386,16 +459,17 @@ object Uploader {
      * 大文件分片上传（流式，不占内存，无大小上限）：
      * 1. 全量 SHA1 + 前 128K preid（流式哈希，两次哈希一遍读完成）
      * 2. init 协商（秒传判定 / sign_check 二次认证，协议与 uploadSmall 完全一致，
-     *    区间读取走 FileChannel 而非内存切片）
-     * 3. OSS 分片：POST ?uploads 建会话 → 逐片 PUT ?partNumber&uploadId →
+     *    区间读取走 FileChannel 而非内存切片）；带 resumePickCode 时优先走
+     *    /open/upload/resume 换回调度，失败回退全新 init
+     * 3. OSS 分片：POST ?sequential&uploads 建会话 → 逐片 PUT ?partNumber&uploadId →
      *    POST ?uploadId complete（携带 callback/callback_var，115 回调入库）
+     *    带 resumeUploadId 时先 ListParts 探测旧会话，已完成分片直接跳过；
+     *    NoSuchUpload（会话过期）或分片尺寸不符则重建会话从头传
      *
      * 取消：每个分片边界 ensureActive()（协程取消即停，OSS 会话交给服务端过期回收）
-     * 进度：每片完成回调一次已上传字节
+     * 进度：每片完成回调一次已上传字节（恢复时起始回调一次已完成量）
      * STS：提前 5 分钟判定过期，每片开传前检查，过期自动换新凭证——OSS uploadId
      *      与 STS 凭证无关，换证不破坏会话
-     * 未做（后续迭代）：断点续传（oss_upload_id 落库 + resume/ListParts）、
-     *      单片失败的会话级重试，当前失败即整任务重传
      */
     suspend fun uploadLarge(
         api: OpenApi,
@@ -403,7 +477,11 @@ object Uploader {
         pfd: ParcelFileDescriptor,
         size: Long,
         target: String = "U_1_0",
+        resumeSha1: String? = null,
+        resumePickCode: String? = null,
+        resumeUploadId: String? = null,
         onProgress: suspend (Long) -> Unit = {},
+        onSession: suspend (sha1: String, pickCode: String, ossUploadId: String?) -> Unit = { _, _, _ -> },
     ): UploadResult = withContext(Dispatchers.IO) {
         // dup 一个私有 fd 再开通道：FileChannel 的关闭语义作用于底层描述符，
         // 直接用调用方的 pfd 开 channel，channel.close() 会把别人的 fd 关掉
@@ -433,39 +511,24 @@ object Uploader {
                     preSha1 = preMd.digest().joinToString("") { "%02x".format(it) }
                 }
 
-                // ---- 2. init 协商（秒传 / 二次认证 / 拿 bucket+object+callback）----
-                Log.i(TAG, "init sha1=$sha1 preSha1=$preSha1 size=$size fileName=$fileName")
-                var initRoot = api.uploadInit(fileName, size, target, sha1, preSha1, null, null, null)
-                Log.i(TAG, "init resp=${initRoot.toString().take(1500)}")
+                // ---- 2. 调度协商（秒传 / 二次认证 / 拿 bucket+object+callback）----
+                // 断点续传优先：resumeSha1 与重算结果一致（文件没变）才尝试 resume，
+                // pick_code 换回新调度；失败（过期/无响应）回退全新 init。
                 var bucket = ""
                 var obj = ""
                 var callback = ""
                 var callbackVar = ""
-                loop@ for (round in 0 until 3) {
-                    currentCoroutineContext().ensureActive()
-                    if (!initRoot.envOk()) error(initRoot.envMsg() ?: "上传初始化失败")
-                    val d = initRoot.envData() ?: error("上传初始化响应异常")
-                    fun f(k: String) = (d[k] as? JsonPrimitive)?.takeIf { it !is JsonNull }?.content ?: ""
-                    when {
-                        f("status").toIntOrNull() == 2 -> { // 秒传
-                            return@withContext UploadResult(f("file_id"), f("pick_code"), fileName, true)
-                        }
-                        d["sign_check"] !is JsonNull && f("sign_check").isNotBlank() -> {
-                            // 二次认证：读 sign_check 区间（含两端）字节算 SHA1——sign_val 官方要求大写
-                            val range = f("sign_check").split("-")
-                            val a = range.getOrNull(0)?.toLongOrNull() ?: error("二次认证参数异常")
-                            val b = range.getOrNull(1)?.toLongOrNull() ?: error("二次认证参数异常")
-                            if (b < a || b >= size) error("二次认证区间越界：$a-$b")
-                            val seg = ByteArray((b - a + 1).toInt())
-                            fillFromChannel(ch, seg, a)
-                            val signVal = MessageDigest.getInstance("SHA-1").digest(seg)
-                                .joinToString("") { "%02X".format(it) }
-                            initRoot = api.uploadInit(
-                                fileName, size, target, sha1, preSha1,
-                                f("pick_code"), f("sign_key"), signVal,
-                            )
-                        }
-                        else -> {
+                var pickCode = ""
+                val resumeId = resumeUploadId?.takeIf { it.isNotBlank() }
+                val canResume = !resumePickCode.isNullOrBlank() &&
+                    (resumeSha1 == null || resumeSha1 == sha1)
+                if (canResume) {
+                    runCatching { api.uploadResume(size, target, sha1, resumePickCode!!) }
+                        .getOrNull()
+                        ?.takeIf { it.envOk() }
+                        ?.envData()
+                        ?.let { d ->
+                            fun f(k: String) = (d[k] as? JsonPrimitive)?.takeIf { it !is JsonNull }?.content ?: ""
                             bucket = f("bucket")
                             obj = f("object")
                             val cbObj = (d["callback"] as? JsonObject)
@@ -475,17 +538,62 @@ object Uploader {
                                 callback = c("callback")
                                 callbackVar = c("callback_var")
                             }
-                            break@loop
+                            pickCode = f("pick_code").ifBlank { resumePickCode!! }
+                        }
+                }
+                if (bucket.isNotBlank() && callback.isNotBlank()) {
+                    Log.i(TAG, "resume 调度成功 pick=$pickCode（续传）")
+                } else {
+                    if (canResume) Log.w(TAG, "resume 调度不可用，回退全新 init")
+                    Log.i(TAG, "init sha1=$sha1 preSha1=$preSha1 size=$size fileName=$fileName")
+                    var initRoot = api.uploadInit(fileName, size, target, sha1, preSha1, null, null, null)
+                    loop@ for (round in 0 until 3) {
+                        currentCoroutineContext().ensureActive()
+                        if (!initRoot.envOk()) error(initRoot.envMsg() ?: "上传初始化失败")
+                        val d = initRoot.envData() ?: error("上传初始化响应异常")
+                        fun f(k: String) = (d[k] as? JsonPrimitive)?.takeIf { it !is JsonNull }?.content ?: ""
+                        when {
+                            f("status").toIntOrNull() == 2 -> { // 秒传
+                                return@withContext UploadResult(f("file_id"), f("pick_code"), fileName, true)
+                            }
+                            d["sign_check"] !is JsonNull && f("sign_check").isNotBlank() -> {
+                                // 二次认证：读 sign_check 区间（含两端）字节算 SHA1——sign_val 官方要求大写
+                                val range = f("sign_check").split("-")
+                                val a = range.getOrNull(0)?.toLongOrNull() ?: error("二次认证参数异常")
+                                val b = range.getOrNull(1)?.toLongOrNull() ?: error("二次认证参数异常")
+                                if (b < a || b >= size) error("二次认证区间越界：$a-$b")
+                                val seg = ByteArray((b - a + 1).toInt())
+                                fillFromChannel(ch, seg, a)
+                                val signVal = MessageDigest.getInstance("SHA-1").digest(seg)
+                                    .joinToString("") { "%02X".format(it) }
+                                initRoot = api.uploadInit(
+                                    fileName, size, target, sha1, preSha1,
+                                    f("pick_code"), f("sign_key"), signVal,
+                                )
+                            }
+                            else -> {
+                                pickCode = f("pick_code")
+                                bucket = f("bucket")
+                                obj = f("object")
+                                val cbObj = (d["callback"] as? JsonObject)
+                                    ?: ((d["callback"] as? JsonArray)?.firstOrNull() as? JsonObject)
+                                if (cbObj != null) {
+                                    fun c(k: String) = (cbObj[k] as? JsonPrimitive)?.takeIf { it !is JsonNull }?.content ?: ""
+                                    callback = c("callback")
+                                    callbackVar = c("callback_var")
+                                }
+                                break@loop
+                            }
                         }
                     }
                 }
                 if (bucket.isBlank() || obj.isBlank()) {
-                    Log.w(TAG, "init 响应未含存储位置 resp=${initRoot.toString().take(600)}")
+                    Log.w(TAG, "调度未返回存储位置 pick=$pickCode resume=$canResume callbackBlank=${callback.isBlank()}")
                     error("上传调度未返回存储位置")
                 }
                 if (callback.isBlank()) error("上传调度未返回回调参数")
 
-                // ---- 3. OSS 分片 ----
+                // ---- 3. OSS 分片（ListParts 断点探测 → 跳过已完成片）----
                 val partSize = if (size > OSS_PART_SIZE * OSS_MAX_PARTS) {
                     val mb = 1024L * 1024L
                     ((size + OSS_MAX_PARTS - 1) / OSS_MAX_PARTS / mb + 1) * mb
@@ -495,61 +603,122 @@ object Uploader {
                 val totalParts = ((size + partSize - 1) / partSize).toInt()
 
                 var cred = fetchCred(api)
-                // 建分片会话：POST /{obj}?sequential&uploads（sequential 是 115 特有参数，
-                // 在 OSS V1 签名白名单内，必须参与 CanonicalizedResource；多子资源按
-                // 字典序拼接且空值不带等号——与 aliyun-oss-go-sdk getSubResource 一致）
-                val initResp = ossRequest(
-                    cred, "POST", bucket, "$obj?sequential&uploads",
-                    contentType = "", body = ByteArray(0),
-                    extraHeaders = listOf("x-oss-security-token" to cred.token),
-                    canonResource = "/$bucket/$obj?sequential&uploads",
-                )
-                if (initResp.code !in 200..299) {
-                    error("创建分片会话失败 HTTP ${initResp.code}：${initResp.body.take(600)}")
+                var uploadId: String? = resumeId
+                var completedParts = LinkedHashMap<Int, String>()
+                if (uploadId != null) {
+                    // 旧会话探测：200 + 分片尺寸与当前划分一致 → 沿用并跳片；
+                    // 404（会话过期）/ 网络失败 / 尺寸不符 → 丢弃旧会话，下面新建。
+                    // 旧会话服务端会自行回收（生命周期），不主动 abort 也无害。
+                    var keepOld = false
+                    try {
+                        val (code, parts) = listPartsAll(cred, bucket, obj, uploadId)
+                        if (code !in 200..299) {
+                            Log.i(TAG, "ListParts HTTP $code，旧分片会话不可用，重建")
+                        } else {
+                            val consistent = parts.all { p ->
+                                p.size == minOf(partSize, size - (p.n - 1L) * partSize)
+                            }
+                            if (!consistent) {
+                                Log.w(TAG, "ListParts 分片尺寸与当前划分不一致（${parts.size} 片），重建会话从头传")
+                            } else {
+                                parts.forEach { completedParts[it.n] = it.etag }
+                                keepOld = true
+                                if (parts.isNotEmpty()) {
+                                    Log.i(TAG, "断点恢复：ListParts 命中 ${parts.size}/$totalParts 片")
+                                } else {
+                                    Log.i(TAG, "ListParts 成功：旧会话尚无已完成分片，沿用会话")
+                                }
+                            }
+                        }
+                    } catch (e: Exception) {
+                        if (e is kotlinx.coroutines.CancellationException) throw e
+                        Log.w(TAG, "ListParts 探测失败，重建分片会话：${e.message}")
+                    }
+                    if (!keepOld) {
+                        uploadId = null
+                        completedParts = LinkedHashMap()
+                    }
                 }
-                val uploadId = Regex("<UploadId>(.*?)</UploadId>")
-                    .find(initResp.body)?.groupValues?.get(1)?.trim()
-                    .takeUnless { it.isNullOrBlank() }
-                    ?: error("分片会话响应缺少 UploadId：${initResp.body.take(600)}")
+                if (uploadId == null) uploadId = createSequentialSession(cred, bucket, obj)
+                onSession(sha1, pickCode, uploadId)
 
                 val eTags = ArrayList<Pair<Int, String>>(totalParts)
                 val partBuf = ByteArray(partSize.toInt())
-                var uploaded = 0L
-                for (n in 1..totalParts) {
-                    currentCoroutineContext().ensureActive()
-                    if (cred.expired()) cred = fetchCred(api)
-                    val offset = (n - 1L) * partSize
-                    val len = minOf(partSize, size - offset).toInt()
-                    fillFromChannel(ch, partBuf, offset, len)
-                    // 逐片 PUT：partNumber/uploadId 都是签名子资源（字典序在前）。
-                    // 重试只针对传输异常（IOException 类）；非 2xx 是会话级错误，
-                    // 重试无意义，直接失败。
-                    var etag: String? = null
-                    var lastErr: Exception? = null
-                    for (attempt in 1..3) {
-                        try {
-                            val resp = ossRequest(
-                                cred, "PUT", bucket, "$obj?partNumber=$n&uploadId=$uploadId",
-                                contentType = "", body = partBuf, bodyLen = len,
-                                extraHeaders = listOf("x-oss-security-token" to cred.token),
-                                canonResource = "/$bucket/$obj?partNumber=$n&uploadId=$uploadId",
-                            )
-                            if (resp.code in 200..299) {
-                                etag = resp.etag?.trim()
-                                break
-                            }
-                            lastErr = IllegalStateException("分片 $n 上传失败 HTTP ${resp.code}：${resp.body.take(600)}")
-                            break
-                        } catch (e: Exception) {
-                            if (e is kotlinx.coroutines.CancellationException) throw e
-                            lastErr = e
-                        }
-                    }
-                    if (etag.isNullOrBlank()) error("分片 $n 上传失败：${lastErr?.message ?: "无 ETag"}")
-                    eTags.add(n to etag)
-                    uploaded += len
-                    onProgress(uploaded)
+                var completedBytes = completedParts.keys.sumOf { n ->
+                    minOf(partSize, size - (n - 1L) * partSize)
                 }
+                if (completedBytes > 0) onProgress(completedBytes)
+                var restartFromScratch = true
+                while (restartFromScratch) {
+                    restartFromScratch = false
+                    eTags.clear()
+                    var acc = 0L
+                    for (n in 1..totalParts) {
+                        currentCoroutineContext().ensureActive()
+                        if (cred.expired()) cred = fetchCred(api)
+                        val offset = (n - 1L) * partSize
+                        val len = minOf(partSize, size - offset).toInt()
+                        val doneEtag = completedParts[n]
+                        if (doneEtag != null) {
+                            eTags.add(n to doneEtag)
+                            continue
+                        }
+                        // 逐片 PUT：partNumber/uploadId 都是签名子资源（字典序在前）。
+                        // 重试只针对传输异常（IOException 类）；非 2xx 是会话级错误，
+                        // 重试无意义，直接失败——唯一例外 PartAlreadyExist（顺序分片
+                        // 冲突），废弃会话重建从头传（参考 115-plus-desktop oss.rs）。
+                        val uid = uploadId ?: error("分片会话 ID 缺失")
+                        var etag: String? = null
+                        var lastErr: Exception? = null
+                        var rebuild = false
+                        for (attempt in 1..3) {
+                            try {
+                                val resp = ossRequest(
+                                    cred, "PUT", bucket, "$obj?partNumber=$n&uploadId=$uid",
+                                    contentType = "", body = partBuf, bodyLen = len,
+                                    extraHeaders = listOf("x-oss-security-token" to cred.token),
+                                    canonResource = "/$bucket/$obj?partNumber=$n&uploadId=$uid",
+                                )
+                                if (resp.code in 200..299) {
+                                    etag = resp.etag?.trim()
+                                    break
+                                }
+                                if (resp.code == 409 && resp.body.contains("PartAlreadyExist")) {
+                                    rebuild = true
+                                    break
+                                }
+                                lastErr = IllegalStateException("分片 $n 上传失败 HTTP ${resp.code}：${resp.body.take(600)}")
+                                break
+                            } catch (e: Exception) {
+                                if (e is kotlinx.coroutines.CancellationException) throw e
+                                lastErr = e
+                            }
+                        }
+                        if (rebuild) {
+                            Log.w(TAG, "分片 $n 顺序冲突，废弃会话重建从头传")
+                            runCatching {
+                                ossRequest(
+                                    cred, "DELETE", bucket, "$obj?uploadId=$uid",
+                                    contentType = "", body = null,
+                                    extraHeaders = listOf("x-oss-security-token" to cred.token),
+                                    canonResource = "/$bucket/$obj?uploadId=$uid",
+                                )
+                            }
+                            uploadId = createSequentialSession(cred, bucket, obj)
+                            onSession(sha1, pickCode, uploadId)
+                            completedParts = LinkedHashMap()
+                            completedBytes = 0
+                            restartFromScratch = true
+                            break
+                        }
+                        if (etag.isNullOrBlank()) error("分片 $n 上传失败：${lastErr?.message ?: "无 ETag"}")
+                        eTags.add(n to etag)
+                        acc += len
+                        onProgress(completedBytes + acc)
+                    }
+                }
+                eTags.sortBy { it.first }
+                onProgress(size)
 
                 // ---- 4. complete（携带 callback，115 收到回调才入库）----
                 currentCoroutineContext().ensureActive()
@@ -566,7 +735,7 @@ object Uploader {
                 )
                 val cbvB64 = Base64.encodeToString(callbackVar.toByteArray(), Base64.NO_WRAP)
                 val completeResp = ossRequest(
-                    cred, "POST", bucket, "$obj?uploadId=$uploadId",
+                    cred, "POST", bucket, "$obj?uploadId=${uploadId ?: error("分片会话 ID 缺失")}",
                     contentType = "application/xml", body = xml,
                     extraHeaders = listOf(
                         "x-oss-callback" to cbB64,
@@ -589,5 +758,71 @@ object Uploader {
                 UploadResult(g("file_id"), g("pick_code"), fileName, false)
             }
         }
+    }
+
+    // ==================== 断点续传辅助（ListParts / 建会话） ====================
+
+    /** ListParts 返回的单个已完成分片（etag 保留 OSS 原样，与 PUT 响应头一致可直接进 complete XML） */
+    private data class ListedPart(val n: Int, val etag: String, val size: Long)
+
+    /** 分页拉取分片会话的全部已完成分片；返回 HTTP code（404 = NoSuchUpload 会话过期） */
+    private fun listPartsAll(
+        cred: OssCred,
+        bucket: String,
+        obj: String,
+        uploadId: String,
+    ): Pair<Int, List<ListedPart>> {
+        val out = ArrayList<ListedPart>()
+        var marker = 0L
+        // OSS 分片上限 10000，1000/页最多 10 页；12 页留余量
+        for (page in 0 until 12) {
+            // URL query 带全部三个参数；但 V1 签名子资源白名单只含 uploadId——
+            // max-parts / part-number-marker 是列举参数不参与签名（aliyun-oss-go-sdk
+            // signKeyList 确认），混入签名串 → SignatureDoesNotMatch 403（实测踩过）
+            val query = buildString {
+                append("?max-parts=1000")
+                if (marker > 0) append("&part-number-marker=$marker")
+                append("&uploadId=$uploadId")
+            }
+            val resp = ossRequest(
+                cred, "GET", bucket, "$obj$query",
+                contentType = "", body = null,
+                extraHeaders = listOf("x-oss-security-token" to cred.token),
+                canonResource = "/$bucket/$obj?uploadId=$uploadId",
+            )
+            if (resp.code !in 200..299) return resp.code to emptyList()
+            for (m in Regex("<Part>(.*?)</Part>", RegexOption.DOT_MATCHES_ALL).findAll(resp.body)) {
+                val seg = m.groupValues[1]
+                val n = Regex("<PartNumber>(\\d+)</PartNumber>").find(seg)?.groupValues?.get(1)?.toIntOrNull() ?: continue
+                val et = Regex("<ETag>(.*?)</ETag>").find(seg)?.groupValues?.get(1)?.trim() ?: continue
+                val sz = Regex("<Size>(\\d+)</Size>").find(seg)?.groupValues?.get(1)?.toLongOrNull() ?: continue
+                out += ListedPart(n, et, sz)
+            }
+            if (!resp.body.contains("<IsTruncated>true</IsTruncated>")) break
+            marker = Regex("<NextPartNumberMarker>(\\d+)</NextPartNumberMarker>")
+                .find(resp.body)?.groupValues?.get(1)?.toLongOrNull() ?: break
+        }
+        return 200 to out
+    }
+
+    /**
+     * 建顺序分片会话：POST /{obj}?sequential&uploads（sequential 是 115 特有参数，
+     * 在 OSS V1 签名白名单内，必须参与 CanonicalizedResource；多子资源按字典序
+     * 拼接且空值不带等号——与 aliyun-oss-go-sdk getSubResource 一致）
+     */
+    private fun createSequentialSession(cred: OssCred, bucket: String, obj: String): String {
+        val initResp = ossRequest(
+            cred, "POST", bucket, "$obj?sequential&uploads",
+            contentType = "", body = ByteArray(0),
+            extraHeaders = listOf("x-oss-security-token" to cred.token),
+            canonResource = "/$bucket/$obj?sequential&uploads",
+        )
+        if (initResp.code !in 200..299) {
+            error("创建分片会话失败 HTTP ${initResp.code}：${initResp.body.take(600)}")
+        }
+        return Regex("<UploadId>(.*?)</UploadId>")
+            .find(initResp.body)?.groupValues?.get(1)?.trim()
+            .takeUnless { it.isNullOrBlank() }
+            ?: error("分片会话响应缺少 UploadId：${initResp.body.take(600)}")
     }
 }

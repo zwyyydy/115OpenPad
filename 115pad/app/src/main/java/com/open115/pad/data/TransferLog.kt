@@ -44,6 +44,15 @@ data class UploadRecord(
     val ok: Boolean? = null,
     val reused: Boolean = false,
     val error: String? = null,
+    // ---- 断点续传会话（init/resume 拿到后立刻落库，进程被杀也能恢复）----
+    /** SAF 文件 uri（takePersistableUriPermission 后跨进程仍可读） */
+    val uri: String? = null,
+    /** 115 上传任务 ID（init/resume 返回） */
+    val pickCode: String? = null,
+    /** OSS 分片会话 ID（POST ?uploads 返回；会话服务端默认保留，ListParts 探测续传） */
+    val ossUploadId: String? = null,
+    /** 全量 SHA1（小写）；恢复时重算比对，文件变了就不续传 */
+    val fileSha1: String? = null,
 )
 
 /**
@@ -79,6 +88,7 @@ class TransferLog(private val context: Context) {
         size: Long,
         targetCid: String,
         targetName: String?,
+        uri: String? = null,
     ): Long {
         var id = 0L
         context.transferDataStore.edit { p ->
@@ -91,14 +101,29 @@ class TransferLog(private val context: Context) {
                 targetCid = targetCid,
                 targetName = targetName,
                 startedAt = System.currentTimeMillis(),
+                uri = uri,
             )
             p[KEY_UPLOADS] = Json.encodeToString((cur + rec).takeLast(MAX_RECORDS))
         }
+        activeUploads.add(id)
         return id
     }
 
+    /** init/resume 拿到上传会话后立刻落库——之后进程被杀也能按会话恢复 */
+    suspend fun updateUploadSession(id: Long, sha1: String, pickCode: String, ossUploadId: String?) =
+        context.transferDataStore.edit { p ->
+            val cur = decode<UploadRecord>(p[KEY_UPLOADS])
+            p[KEY_UPLOADS] = Json.encodeToString(
+                cur.map {
+                    if (it.id != id) it
+                    else it.copy(fileSha1 = sha1, pickCode = pickCode, ossUploadId = ossUploadId)
+                },
+            )
+        }
+
     /** 回填上传结果；ok=false 时带上错误信息 */
-    suspend fun finishUpload(id: Long, ok: Boolean, reused: Boolean = false, error: String? = null) =
+    suspend fun finishUpload(id: Long, ok: Boolean, reused: Boolean = false, error: String? = null) {
+        activeUploads.remove(id)
         context.transferDataStore.edit { p ->
             val cur = decode<UploadRecord>(p[KEY_UPLOADS])
             val next = cur.map { r ->
@@ -112,6 +137,25 @@ class TransferLog(private val context: Context) {
             }
             p[KEY_UPLOADS] = Json.encodeToString(next)
         }
+    }
+
+    /**
+     * 取走"中断待续传"的上传记录（进程被杀时 finishUpload 没跑，记录停留在上传中）。
+     * 只认领带会话信息（pickCode/ossUploadId）且当前不在进行中的记录；认领结果在
+     * 进程内记账，重复调用（反复进出文件页）不会二次接管同一条。
+     */
+    suspend fun claimPendingUploads(): List<UploadRecord> {
+        val p = context.transferDataStore.data.first()
+        val fresh = decode<UploadRecord>(p[KEY_UPLOADS])
+            .filter {
+                it.finishedAt == null &&
+                    (it.ossUploadId != null || it.pickCode != null) &&
+                    it.uri != null &&
+                    it.id !in activeUploads &&
+                    resuming.add(it.id)
+            }
+        return fresh
+    }
 
     /**
      * 分片上传的进度回写。调用方（uploadLargeLogged）已按整数百分比变化节流，
@@ -124,6 +168,11 @@ class TransferLog(private val context: Context) {
                 cur.map { if (it.id == id) it.copy(uploaded = uploaded) else it },
             )
         }
+
+    /** 单条上传记录（自动续传重试前查会话信息用） */
+    suspend fun uploadRecord(id: Long): UploadRecord? =
+        context.transferDataStore.data.first()
+            .let { decode<UploadRecord>(it[KEY_UPLOADS]).find { r -> r.id == id } }
 
     suspend fun removeUpload(id: Long) = context.transferDataStore.edit { p ->
         val cur = decode<UploadRecord>(p[KEY_UPLOADS])
@@ -147,4 +196,8 @@ class TransferLog(private val context: Context) {
         val KEY_DOWNLOADS = stringPreferencesKey("download_records")
         val KEY_UPLOADS = stringPreferencesKey("upload_records")
     }
+
+    /** 进程内正在上传/已认领续传的记录 id（内存态，防恢复扫描与进行中的上传双开） */
+    private val activeUploads = mutableSetOf<Long>()
+    private val resuming = mutableSetOf<Long>()
 }

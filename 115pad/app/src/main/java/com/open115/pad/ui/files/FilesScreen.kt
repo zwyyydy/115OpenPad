@@ -694,11 +694,45 @@ fun FilesScreen(
         if (msg != null) scope.launch { snackbarHostState.showSnackbar(msg) }
     }
 
+    // ---- 断点续传：进程重启后恢复中断的大文件上传（每次进程只认领一次）----
+    // 记录里落库了 SAF uri + pick_code + oss_upload_id，重启后按 ListParts 跳过
+    // 已传分片继续；原文件不可访问（权限失效/被删）则把记录标记为失败。
+    LaunchedEffect(Unit) {
+        val log = context.appContainer.transferLog
+        val pending = log.claimPendingUploads()
+        if (pending.isEmpty()) return@LaunchedEffect
+        notify("发现 ${pending.size} 个未完成上传，恢复中…")
+        for (rec in pending) scope.launch {
+            val pfd = runCatching {
+                context.contentResolver.openFileDescriptor(android.net.Uri.parse(rec.uri!!), "r")
+            }.getOrNull()
+            if (pfd == null) {
+                log.finishUpload(rec.id, ok = false, error = "续传失败：无法访问原文件（权限可能已失效）")
+                notify("续传失败：" + rec.name)
+                return@launch
+            }
+            pfd.use {
+                runCatching { Uploader.resumeLargeLogged(log, vm.api, rec, it) }
+                    .onSuccess { r ->
+                        notify("续传完成：" + rec.name + if (r.reused) "（秒传）" else "")
+                        vm.refresh()
+                    }
+                    .onFailure { notify("续传失败：" + rec.name + "（${it.message}）") }
+            }
+        }
+    }
+
     val uploadPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri != null) scope.launch {
             notify("开始上传…")
             val result = runCatching {
                 withContext(Dispatchers.IO) {
+                    // 持久化读权限：分片上传中断后重启进程仍能按 uri 打开原文件续传
+                    runCatching {
+                        context.contentResolver.takePersistableUriPermission(
+                            uri, android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION,
+                        )
+                    }
                     // SAF 不同来源的 uri 形态不同（数字 id / path），文件名以 DISPLAY_NAME 查询为准
                     var name = uri.lastPathSegment?.substringAfterLast(':')?.substringAfterLast('/') ?: "upload.bin"
                     runCatching {
@@ -735,7 +769,8 @@ fun FilesScreen(
                                 targetName = targetPath,
                             )
                         } else {
-                            // 大文件：流式分片上传（SHA1 流式算，不占内存，无大小上限）
+                            // 大文件：流式分片上传（SHA1 流式算，不占内存，无大小上限）；
+                            // uri 落库供进程重启后续传
                             Uploader.uploadLargeLogged(
                                 log = context.appContainer.transferLog,
                                 api = vm.api,
@@ -744,6 +779,7 @@ fun FilesScreen(
                                 size = size,
                                 targetCid = targetCid,
                                 targetName = targetPath,
+                                uri = uri.toString(),
                             )
                         }
                     }
