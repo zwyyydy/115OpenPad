@@ -231,4 +231,4 @@ fun SearchField(value: String, onValueChange: (String) -> Unit, onSearch: () -> 
 }
 
 /** 宽度参考常量，供侧栏使用 */
-val SidePaneWidth = 280.dp
+val SidePaneWidth = 320.dp

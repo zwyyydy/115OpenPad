@@ -24,11 +24,18 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.outlined.DriveFileMove
 import androidx.compose.material.icons.outlined.ChevronLeft
 import androidx.compose.material.icons.outlined.ChevronRight
-import androidx.compose.material.icons.outlined.Folder
-import androidx.compose.material.icons.outlined.Star
-import androidx.compose.material.icons.outlined.StarBorder
+import androidx.compose.material.icons.outlined.CloudDownload
+import androidx.compose.material.icons.outlined.Delete
+import androidx.compose.material.icons.outlined.Description
+import androidx.compose.material.icons.outlined.Download
+import androidx.compose.material.icons.outlined.FileCopy
+import androidx.compose.material.icons.outlined.History
+import androidx.compose.material.icons.outlined.Image
+import androidx.compose.material.icons.outlined.PlayCircle
+import androidx.compose.material.icons.outlined.Upload
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
@@ -47,6 +54,7 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -63,6 +71,8 @@ import com.open115.pad.data.FilterPrefs
 import com.open115.pad.data.FilterRules
 import com.open115.pad.data.ImageUrlResolver
 import com.open115.pad.data.OpenApi
+import com.open115.pad.data.OpLog
+import com.open115.pad.data.OpType
 import com.open115.pad.data.PinnedFolder
 import com.open115.pad.data.PinnedPrefs
 import com.open115.pad.data.PlaylistEntry
@@ -96,6 +106,10 @@ import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.text.SimpleDateFormat
+import java.util.Calendar
+import java.util.Date
+import java.util.Locale
 
 class FilesViewModel(
     val api: OpenApi,
@@ -108,6 +122,8 @@ class FilesViewModel(
     private val pinnedPrefs: PinnedPrefs? = null,
     /** 目录列表缓存（未注入则每次都真实请求，行为与从前一致） */
     private val cache: DirCache? = null,
+    /** 操作记录（未注入则不记录，行为与从前一致） */
+    private val opLog: OpLog? = null,
 ) : ViewModel() {
 
     data class DirEntry(val cid: String, val name: String)
@@ -387,6 +403,23 @@ class FilesViewModel(
         loadCurrent()
     }
 
+    /**
+     * 从操作记录跳转到任意目录：stack 重置为「全部文件 > 该目录」。
+     * 拿不到完整中间路径（cid 无法反查），两级面包屑是最诚实的表达。
+     */
+    fun openByCid(cid: String, name: String) {
+        if (cid == currentCid()) return
+        _ui.update {
+            it.copy(
+                stack = listOf(DirEntry("0", "全部文件"), DirEntry(cid, name)),
+                selection = emptySet(),
+                searching = false,
+                searchQuery = "",
+            )
+        }
+        loadCurrent()
+    }
+
     fun setSort(order: String, asc: Int) {
         _ui.update { it.copy(order = order, asc = asc) }
         persistState()
@@ -510,15 +543,25 @@ class FilesViewModel(
         }
     }
 
+    /** 选中项的展示名："a.jpg" 或 "a.jpg 等 N 项"；列表里找不到就退化为"N 项" */
+    private fun selectionNames(ids: Collection<String>): String {
+        val names = _ui.value.items.filter { it.fid in ids }.map { it.fn }
+        if (names.isEmpty()) return "${ids.size} 项"
+        return if (names.size == 1) names[0] else "${names[0]} 等 ${names.size} 项"
+    }
+
     suspend fun deleteSelected(): String? {
         val ids = _ui.value.selection.toList()
         if (ids.isEmpty()) return null
+        val fromCid = currentCid()
+        val fromName = _ui.value.stack.last().name
         return runOp {
-            val resp = api.deleteFiles(ids.joinToString(","), parentId = currentCid())
+            val resp = api.deleteFiles(ids.joinToString(","), parentId = fromCid)
             val ok = resp.envOk()
             if (ok) {
                 // 置顶的文件夹被删掉后，置顶记录已无意义——顺手清理，避免记录无限累积
                 pinnedPrefs?.unpinAll(ids)
+                opLog?.log(OpType.DELETE, selectionNames(ids), "移入回收站", fromCid, fromName)
                 clearSelection()
                 refresh()
             }
@@ -534,6 +577,8 @@ class FilesViewModel(
             val resp = api.moveFiles(ids.joinToString(","), toCid)
             val ok = resp.envOk()
             if (ok) {
+                // 跳转去目标目录：文件现在在那
+                opLog?.log(OpType.MOVE, selectionNames(ids), "移动到「$toName」", toCid, toName)
                 clearSelection()
                 // 目标目录的缓存脏了（多出这几条），但它不在当前视图里，只能显式失效。
                 // 先失效再 refresh：万一 toCid 就是当前目录，后面那次重取会把新数据重新写回去。
@@ -554,6 +599,8 @@ class FilesViewModel(
             val resp = api.copyFiles(pid = toCid, fileIds = ids.joinToString(","))
             val ok = resp.envOk()
             if (ok) {
+                // 跳转去目标目录：副本在那
+                opLog?.log(OpType.COPY, selectionNames(ids), "复制到「$toName」", toCid, toName)
                 clearSelection()
                 cache?.invalidateDir(toCid)
                 // 复制不动源目录，所以只有"目标就是当前目录"（当场多出副本）时才需要重取；
@@ -683,6 +730,13 @@ fun FilesScreen(
             }
             result.onSuccess {
                 notify("上传成功：" + it.fileName + if (it.reused) "（秒传）" else "")
+                context.appContainer.opLog.log(
+                    OpType.UPLOAD,
+                    it.fileName,
+                    "上传到「" + ui.stack.joinToString(" / ") { s -> s.name } + "」" + if (it.reused) "（秒传）" else "",
+                    vm.currentTargetCid(),
+                    ui.stack.last().name,
+                )
                 vm.refresh()
             }.onFailure { notify("上传失败：${it.message}") }
         }
@@ -701,15 +755,42 @@ fun FilesScreen(
                 .filter { !it.isDir && it.isv == 1 }
                 .mapNotNull { f -> f.pc?.let { pc -> PlaylistEntry(pc, f.fn, f.fid) } }
             val index = entries.indexOfFirst { it.pc == item.pc }.coerceAtLeast(0)
+            // 记录点在文件页而非 AppRoot：只有这里拿得到"当时所在的目录"，点击记录才能跳回来
+            scope.launch {
+                context.appContainer.opLog.log(
+                    OpType.VIDEO_PLAY,
+                    item.fn,
+                    if (entries.size > 1) "连播 ${entries.size} 项" else null,
+                    vm.currentTargetCid(),
+                    ui.stack.last().name,
+                )
+            }
             onPlayVideo(item, entries, index)
         } else if (isImageItem(item)) {
             // 传"图片序列 + 索引"给大图画廊，才能左右翻页；同时带上归一化后的元数据
             // 把"图片序列 + 索引"上抛，画廊在应用根层级渲染（才能盖住侧栏）
             val media = item.toImageMediaItem()
             val idx = galleryItems.indexOfFirst { it.pickCode == media.pickCode }
+            scope.launch {
+                context.appContainer.opLog.log(
+                    OpType.IMAGE_VIEW,
+                    item.fn,
+                    if (galleryItems.size > 1) "共 ${galleryItems.size} 张" else null,
+                    vm.currentTargetCid(),
+                    ui.stack.last().name,
+                )
+            }
             onOpenGallery(galleryItems, if (idx >= 0) idx else 0)
         } else if (isTextFile(item.fn)) {
             // 文本类（txt/py/md/js…）：直接进预览，内容与分页在应用根层级渲染
+            scope.launch {
+                context.appContainer.opLog.log(
+                    OpType.TEXT_PREVIEW,
+                    item.fn,
+                    cid = vm.currentTargetCid(),
+                    path = ui.stack.last().name,
+                )
+            }
             onPreviewText(item)
         } else {
             downloadTarget = item
@@ -867,6 +948,7 @@ fun FilesScreen(
                         vm.getDownloadUrl(pc)
                             .onSuccess { url ->
                                 runCatching { Downloader.enqueue(context, url, item.fn) }
+                                context.appContainer.opLog.log(OpType.DOWNLOAD, item.fn, "下载到本机")
                                 notify("已加入系统下载队列")
                             }
                             .onFailure { notify(it.message) }
@@ -897,72 +979,114 @@ private fun SidePaneHandle(collapsed: Boolean, onToggle: () -> Unit) {
     }
 }
 
-/** 平板宽屏下的左侧栏：目录层级 + 分类筛选 */
+/** 侧栏操作记录最多展示条数（存储层保留 100 条，这里只渲染最近的） */
+private const val SIDE_PANE_OP_COUNT = 30
+
+/** 平板宽屏下的左侧栏：用户操作记录 */
 @Composable
 private fun FilesSidePane(vm: FilesViewModel, ui: FilesViewModel.UiState, modifier: Modifier = Modifier) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val ops by context.appContainer.opLog.entries.collectAsState(initial = emptyList())
     Column(modifier.verticalScroll(rememberScrollState()).padding(12.dp)) {
-        Text("当前位置", style = MaterialTheme.typography.labelLarge)
-        Spacer(Modifier.height(8.dp))
-        ui.stack.forEachIndexed { i, entry ->
-            Row(
-                Modifier
-                    .fillMaxWidth()
-                    .clickable { vm.jumpTo(i) }
-                    .padding(vertical = 8.dp, horizontal = 4.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Icon(
-                    Icons.Outlined.Folder,
-                    contentDescription = null,
-                    tint = if (i == ui.stack.lastIndex) MaterialTheme.colorScheme.primary
-                    else MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.size(18.dp),
-                )
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            Text("操作记录", style = MaterialTheme.typography.labelLarge, modifier = Modifier.weight(1f))
+            if (ops.isNotEmpty()) {
                 Text(
-                    entry.name,
-                    modifier = Modifier.padding(start = 8.dp),
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = if (i == ui.stack.lastIndex) MaterialTheme.colorScheme.onSurface
-                    else MaterialTheme.colorScheme.onSurfaceVariant,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
+                    "清空",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier
+                        .clickable { scope.launch { context.appContainer.opLog.clear() } }
+                        .padding(horizontal = 4.dp, vertical = 2.dp),
                 )
             }
         }
-        Spacer(Modifier.height(12.dp))
-        HorizontalDivider()
-        Spacer(Modifier.height(12.dp))
-        Text("分类", style = MaterialTheme.typography.labelLarge)
         Spacer(Modifier.height(8.dp))
-        filterTypes.forEach { (label, type) ->
-            com.open115.pad.ui.theme.AppChip(
-                label = label,
-                selected = ui.typeFilter == type,
-                onClick = { vm.setType(type) },
-                modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp),
+        val recent = ops.asReversed().take(SIDE_PANE_OP_COUNT)
+        if (recent.isEmpty()) {
+            Text(
+                "暂无记录\n复制、移动、删除、上传下载、播放等操作会显示在这里",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
+        } else {
+            recent.forEach { op ->
+                val (icon, verb) = opTypeMeta(op.type)
+                // 有目录信息的记录可点击跳转（下载到本机 / 云离线 / 旧数据没有，点击无响应）
+                val target = op.cid?.let { c -> c to (op.path ?: op.name) }
+                Row(
+                    Modifier
+                        .fillMaxWidth()
+                        .clickable(enabled = target != null) {
+                            target?.let { vm.openByCid(it.first, it.second) }
+                        }
+                        .padding(vertical = 6.dp, horizontal = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Icon(
+                        icon,
+                        contentDescription = verb,
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.size(18.dp),
+                    )
+                    Column(Modifier.padding(start = 8.dp)) {
+                        Text(
+                            op.name,
+                            style = MaterialTheme.typography.bodyMedium,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                        Text(
+                            listOfNotNull(verb, op.detail, opRelTime(op.at)).joinToString(" · "),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+                }
+            }
         }
-        com.open115.pad.ui.theme.AppChip(
-            label = "仅星标",
-            selected = ui.starOnly,
-            onClick = { vm.toggleStarOnly() },
-            modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp),
-            leading = {
-                Icon(
-                    if (ui.starOnly) Icons.Outlined.Star else Icons.Outlined.StarBorder,
-                    contentDescription = null,
-                    tint = if (ui.starOnly) com.open115.pad.ui.theme.AppColors.AccentDeep
-                    else com.open115.pad.ui.theme.AppColors.TextSecondary,
-                    modifier = Modifier.size(16.dp),
-                )
-            },
-        )
         if (ui.searching) {
             Spacer(Modifier.height(8.dp))
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Icon(Icons.Outlined.ChevronRight, contentDescription = null, modifier = Modifier.size(16.dp))
                 Text("搜索「${ui.searchQuery}」结果", style = MaterialTheme.typography.bodyMedium)
             }
+        }
+    }
+}
+
+/** 操作类型 → (图标, 中文动词) */
+private fun opTypeMeta(type: String): Pair<ImageVector, String> = when (type) {
+    OpType.COPY.name -> Icons.Outlined.FileCopy to "复制"
+    OpType.MOVE.name -> Icons.AutoMirrored.Outlined.DriveFileMove to "移动"
+    OpType.DELETE.name -> Icons.Outlined.Delete to "删除"
+    OpType.UPLOAD.name -> Icons.Outlined.Upload to "上传"
+    OpType.DOWNLOAD.name -> Icons.Outlined.Download to "下载"
+    OpType.OFFLINE.name -> Icons.Outlined.CloudDownload to "云离线"
+    OpType.TEXT_PREVIEW.name -> Icons.Outlined.Description to "文本预览"
+    OpType.IMAGE_VIEW.name -> Icons.Outlined.Image to "图片浏览"
+    OpType.VIDEO_PLAY.name -> Icons.Outlined.PlayCircle to "视频播放"
+    else -> Icons.Outlined.History to "操作"
+}
+
+/** 相对时间：刚刚 / N 分钟前 / N 小时前 / 昨天 / M-d */
+private fun opRelTime(at: Long): String {
+    val diff = System.currentTimeMillis() - at
+    val minute = 60_000L
+    return when {
+        diff < minute -> "刚刚"
+        diff < 60 * minute -> "${diff / minute} 分钟前"
+        diff < 24 * 60 * minute -> "${diff / (60 * minute)} 小时前"
+        else -> {
+            val cal = Calendar.getInstance().apply { timeInMillis = at }
+            val yesterday = Calendar.getInstance().apply { add(Calendar.DAY_OF_YEAR, -1) }
+            if (cal.get(Calendar.YEAR) == yesterday.get(Calendar.YEAR) &&
+                cal.get(Calendar.DAY_OF_YEAR) == yesterday.get(Calendar.DAY_OF_YEAR)
+            ) "昨天"
+            else SimpleDateFormat("M-d", Locale.getDefault()).format(Date(at))
         }
     }
 }

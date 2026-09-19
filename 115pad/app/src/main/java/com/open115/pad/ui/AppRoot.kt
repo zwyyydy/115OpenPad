@@ -53,6 +53,7 @@ import com.open115.pad.data.DownloadSubmitter
 import com.open115.pad.data.FileItem
 import com.open115.pad.data.ImageMediaItem
 import com.open115.pad.data.LinkSource
+import com.open115.pad.data.OpType
 import com.open115.pad.data.PlaylistEntry
 import com.open115.pad.data.Session
 import com.open115.pad.player.PlayerActivity
@@ -135,6 +136,7 @@ private fun MainScaffold(container: AppContainer, widthClass: WindowWidthSizeCla
         if (pc.isNullOrBlank()) {
             scope.launch { snackbarHostState.showSnackbar("该文件缺少提取码，无法播放") }
         } else {
+            // 记录点在 FilesScreen（只有那里拿得到"当时所在的目录"），这里只负责启动播放
             context.startActivity(PlayerActivity.intent(context, pc, item.fn, playlist, index))
         }
     }
@@ -168,6 +170,14 @@ private fun MainScaffold(container: AppContainer, widthClass: WindowWidthSizeCla
         val err = container.downloadSubmitter.submit(container.openApi, req.url)
         submittingDownload = false
         if (err == null) {
+            // 记录云离线操作（URL 只留前 40 字符做摘要，磁力/直链都够辨认）
+            scope.launch {
+                container.opLog.log(
+                    OpType.OFFLINE,
+                    if (req.url.length > 40) req.url.take(40) + "…" else req.url,
+                    if (req.source == LinkSource.EXTERNAL) "来自外部应用" else "来自剪贴板",
+                )
+            }
             // snackbar 是挂起调用（挂住约 4 秒），单独起协程展示，
             // 不拖累后面的页面跳转与"返回原程序"弹窗
             scope.launch {
@@ -248,6 +258,7 @@ private fun MainScaffold(container: AppContainer, widthClass: WindowWidthSizeCla
                             container.filterPrefs,
                             container.pinnedPrefs,
                             container.dirCache,
+                            container.opLog,
                         )
                     })
                     FilesScreen(

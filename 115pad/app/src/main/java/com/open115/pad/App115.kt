@@ -59,6 +59,9 @@ class AppContainer(context: Context) {
     /** 传输中心的历史记录（本机下载 + 上传） */
     val transferLog = com.open115.pad.data.TransferLog(context)
 
+    /** 用户操作记录（复制/移动/删除/上传/下载/云离线/预览/播放），侧栏展示 */
+    val opLog = com.open115.pad.data.OpLog(context)
+
     /** 剪贴板 / 外部唤起的下载链接汇聚点，由 MainActivity 投递、AppRoot 消费 */
     val downloadLinks = com.open115.pad.data.DownloadLinkBus(context, downloadPrefs)
 
