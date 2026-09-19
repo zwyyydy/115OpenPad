@@ -22,8 +22,10 @@ data class DownloadRecord(
 )
 
 /**
- * 一次上传的记录。上传是"一次性 PUT"，没有进度可查，但开始/结束时间、目标目录、
- * 成败与是否秒传都值得留痕——云盘里文件名相同、时间久了根本想不起来传哪去了。
+ * 一次上传的记录。小文件是"一次性 PUT"没有进度；大文件走分片上传，
+ * 每传完一片回写一次 uploaded（整数百分比变化才落库），传输中心能显示进度。
+ * 开始/结束时间、目标目录、成败与是否秒传都值得留痕——云盘里文件名相同、
+ * 时间久了根本想不起来传哪去了。
  */
 @Serializable
 data class UploadRecord(
@@ -35,6 +37,8 @@ data class UploadRecord(
     /** 目标目录展示名；调用方拿不到（如"与视频同目录"）时为 null */
     val targetName: String? = null,
     val startedAt: Long,
+    /** 已上传字节（分片上传才有意义；小文件保持 0 = 不显示进度） */
+    val uploaded: Long = 0,
     /** null = 上传中 */
     val finishedAt: Long? = null,
     val ok: Boolean? = null,
@@ -107,6 +111,18 @@ class TransferLog(private val context: Context) {
                 )
             }
             p[KEY_UPLOADS] = Json.encodeToString(next)
+        }
+
+    /**
+     * 分片上传的进度回写。调用方（uploadLargeLogged）已按整数百分比变化节流，
+     * 这里不重复节流——DataStore 每次edit都是一次事务，避免大文件高频小步写。
+     */
+    suspend fun updateUploadProgress(id: Long, uploaded: Long) =
+        context.transferDataStore.edit { p ->
+            val cur = decode<UploadRecord>(p[KEY_UPLOADS])
+            p[KEY_UPLOADS] = Json.encodeToString(
+                cur.map { if (it.id == id) it.copy(uploaded = uploaded) else it },
+            )
         }
 
     suspend fun removeUpload(id: Long) = context.transferDataStore.edit { p ->

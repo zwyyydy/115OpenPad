@@ -699,9 +699,6 @@ fun FilesScreen(
             notify("开始上传…")
             val result = runCatching {
                 withContext(Dispatchers.IO) {
-                    val bytes = context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
-                        ?: error("无法读取所选文件")
-                    if (bytes.size > 32 * 1024 * 1024) error("当前版本仅支持 32MB 内的小文件")
                     // SAF 不同来源的 uri 形态不同（数字 id / path），文件名以 DISPLAY_NAME 查询为准
                     var name = uri.lastPathSegment?.substringAfterLast(':')?.substringAfterLast('/') ?: "upload.bin"
                     runCatching {
@@ -717,15 +714,39 @@ fun FilesScreen(
                             c.close()
                         }
                     }
-                    Uploader.uploadSmallLogged(
-                        log = context.appContainer.transferLog,
-                        api = vm.api,
-                        fileName = name,
-                        bytes = bytes,
-                        targetCid = vm.currentTargetCid(),
-                        // 传输中心要能回答"传到哪个目录了"，这里给面包屑全路径最直观
-                        targetName = ui.stack.joinToString(" / ") { it.name },
-                    )
+                    val targetCid = vm.currentTargetCid()
+                    // 传输中心要能回答"传到哪个目录了"，这里给面包屑全路径最直观
+                    val targetPath = ui.stack.joinToString(" / ") { it.name }
+                    val smallLimit = 32L * 1024 * 1024 // 超过 32MB 走分片上传（流式不占内存）
+                    val pfd = context.contentResolver.openFileDescriptor(uri, "r")
+                        ?: error("无法读取所选文件")
+                    pfd.use {
+                        val size = it.statSize
+                        if (size <= smallLimit) {
+                            // 小文件：整文件读内存直传（原链路不动）
+                            val bytes = context.contentResolver.openInputStream(uri)?.use { s -> s.readBytes() }
+                                ?: error("无法读取所选文件")
+                            Uploader.uploadSmallLogged(
+                                log = context.appContainer.transferLog,
+                                api = vm.api,
+                                fileName = name,
+                                bytes = bytes,
+                                targetCid = targetCid,
+                                targetName = targetPath,
+                            )
+                        } else {
+                            // 大文件：流式分片上传（SHA1 流式算，不占内存，无大小上限）
+                            Uploader.uploadLargeLogged(
+                                log = context.appContainer.transferLog,
+                                api = vm.api,
+                                fileName = name,
+                                pfd = it,
+                                size = size,
+                                targetCid = targetCid,
+                                targetName = targetPath,
+                            )
+                        }
+                    }
                 }
             }
             result.onSuccess {

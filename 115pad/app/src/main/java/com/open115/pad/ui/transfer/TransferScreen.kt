@@ -68,7 +68,7 @@ import kotlinx.coroutines.launch
  * 传输中心：本机下载（系统 DownloadManager 任务）+ 上传（文件页 / 播放器字幕上传）两份记录。
  *
  * 下载：不另建任务表，状态直接查系统；只额外记"什么时候开始下的"（DownloadManager 不提供）。
- * 上传：一次性 PUT 没有进度可查，只记开始/结束时间、大小、目标目录与成败。
+ * 上传：小文件直传没有进度过程；大文件分片上传按百分比回写 uploaded，行内显示已传字节与进度条。
  */
 private data class DlTask(
     val id: Long,
@@ -446,53 +446,68 @@ private fun EmptyHint(
 @Composable
 private fun UploadRow(record: UploadRecord, onDelete: () -> Unit) {
     AppCard(Modifier.fillMaxWidth()) {
-        Row(
-            Modifier.padding(horizontal = 14.dp, vertical = 12.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            KindBadge(record.name, isDir = false)
-            Spacer(Modifier.width(12.dp))
-            Column(Modifier.weight(1f)) {
-                Text(
-                    record.name,
-                    fontWeight = FontWeight.Medium,
-                    color = AppColors.TextPrimary,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
-                Spacer(Modifier.height(4.dp))
-                Text(
-                    // 目标目录是这条记录的重点：云盘里同名文件多，事后靠它认路
-                    "→ ${record.targetName ?: "云盘目录（${record.targetCid}）"} · ${Format.size(record.size)}",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = AppColors.TextSecondary,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
-                Spacer(Modifier.height(2.dp))
-                val timing = when {
-                    record.ok == null -> "开始 ${timeText(record.startedAt)}"
-                    record.ok == true -> "上传于 ${timeText(record.finishedAt ?: record.startedAt)}"
-                    else -> "上传于 ${timeText(record.finishedAt ?: record.startedAt)}"
+        Column(Modifier.padding(horizontal = 14.dp, vertical = 12.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                KindBadge(record.name, isDir = false)
+                Spacer(Modifier.width(12.dp))
+                Column(Modifier.weight(1f)) {
+                    Text(
+                        record.name,
+                        fontWeight = FontWeight.Medium,
+                        color = AppColors.TextPrimary,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        // 目标目录是这条记录的重点：云盘里同名文件多，事后靠它认路
+                        "→ ${record.targetName ?: "云盘目录（${record.targetCid}）"} · ${Format.size(record.size)}",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = AppColors.TextSecondary,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    Spacer(Modifier.height(2.dp))
+                    val timing = when {
+                        // 分片上传进行中：显示已传字节（小文件直传没有过程，uploaded 一直是 0）
+                        record.ok == null && record.uploaded > 0 ->
+                            "已传 ${Format.size(record.uploaded)} / ${Format.size(record.size)} · 开始 ${timeText(record.startedAt)}"
+                        record.ok == null -> "开始 ${timeText(record.startedAt)}"
+                        record.ok == true -> "上传于 ${timeText(record.finishedAt ?: record.startedAt)}"
+                        else -> "上传于 ${timeText(record.finishedAt ?: record.startedAt)}"
+                    }
+                    Text(
+                        if (record.ok == false && !record.error.isNullOrBlank()) "$timing · ${record.error}" else timing,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = if (record.ok == false) AppColors.RedFg else AppColors.TextTertiary,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
                 }
-                Text(
-                    if (record.ok == false && !record.error.isNullOrBlank()) "$timing · ${record.error}" else timing,
-                    style = MaterialTheme.typography.bodySmall,
-                    color = if (record.ok == false) AppColors.RedFg else AppColors.TextTertiary,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
+                Spacer(Modifier.width(8.dp))
+                val (label, bg, fg) = when {
+                    record.ok == null ->
+                        if (record.size > 0 && record.uploaded > 0) {
+                            Triple("上传中 ${record.uploaded * 100 / record.size}%", AppColors.BlueBg, AppColors.BlueFg)
+                        } else {
+                            Triple("上传中", AppColors.BlueBg, AppColors.BlueFg)
+                        }
+                    record.ok == false -> Triple("失败", AppColors.RedBg, AppColors.RedFg)
+                    record.reused -> Triple("秒传", AppColors.AmberBg, AppColors.AmberFg)
+                    else -> Triple("已上传", AppColors.GreenBg, AppColors.GreenFg)
+                }
+                StatusBadge(label, bg = bg, fg = fg)
+                IconButton(onClick = onDelete) {
+                    Icon(Icons.Outlined.DeleteOutline, contentDescription = "移除记录", tint = AppColors.RedFg)
+                }
+            }
+            // 分片上传进行中显示进度条（小文件直传/秒传没有过程，不显示）
+            if (record.ok == null && record.size > 0) {
+                Spacer(Modifier.height(8.dp))
+                LinearProgressIndicator(
+                    progress = { (record.uploaded.toFloat() / record.size).coerceIn(0f, 1f) },
+                    modifier = Modifier.fillMaxWidth().height(4.dp),
                 )
-            }
-            Spacer(Modifier.width(8.dp))
-            val (label, bg, fg) = when {
-                record.ok == null -> Triple("上传中", AppColors.BlueBg, AppColors.BlueFg)
-                record.ok == false -> Triple("失败", AppColors.RedBg, AppColors.RedFg)
-                record.reused -> Triple("秒传", AppColors.AmberBg, AppColors.AmberFg)
-                else -> Triple("已上传", AppColors.GreenBg, AppColors.GreenFg)
-            }
-            StatusBadge(label, bg = bg, fg = fg)
-            IconButton(onClick = onDelete) {
-                Icon(Icons.Outlined.DeleteOutline, contentDescription = "移除记录", tint = AppColors.RedFg)
             }
         }
     }
