@@ -1556,67 +1556,6 @@ fun PlayerScreen(
                 modifier = Modifier.align(Alignment.CenterEnd),
             ) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    if (vrMenuOpen) {
-                        VrModeMenu(
-                            current = vrMode,
-                            autoMode = vrStoredMode.isNullOrEmpty(),
-                            rightEye = vrStoredEye,
-                            gyroOn = vrGyroOn,
-                            gyroAvailable = vrGyro.available,
-                            panniniD = vrPanniniUi,
-                            onAuto = {
-                                // 清掉"用户手动改过"的标记，并把偏好置空 ⇒ 交回自动识别
-                                vrTouchedFor = null
-                                vrMode = null
-                                scope.launch { container.playerPrefs.setVrMode("") }
-                                pulseControlRow()
-                            },
-                            onPannini = { d ->
-                                vrTouchedFor = currentPickCode
-                                vrPanniniUi = d
-                                vrState.setPannini(d)
-                                pushVrParams()
-                                // 滑杆拖一下控制排就续命一次，否则拖到一半整排淡出
-                                pulseControlRow()
-                            },
-                            onPanniniCommit = { d ->
-                                scope.launch { container.playerPrefs.setVrPanniniD(d) }
-                            },
-                            onPick = { m ->
-                                vrTouchedFor = currentPickCode
-                                vrMode = m
-                                m?.let { vrState.mode = it }
-                                vrState.resetForNewMode()
-                                scope.launch { container.playerPrefs.setVrMode(m?.name ?: VR_MODE_OFF) }
-                                pushVrParams()
-                                pulseControlRow()
-                            },
-                            onToggleEye = {
-                                vrTouchedFor = currentPickCode
-                                val v = !vrStoredEye
-                                vrState.rightEye = v
-                                scope.launch { container.playerPrefs.setVrRightEye(v) }
-                                pushVrParams()
-                                pulseControlRow()
-                            },
-                            onToggleGyro = {
-                                vrTouchedFor = currentPickCode
-                                val v = !vrGyroOn
-                                vrGyroOn = v
-                                vrState.gyroEnabled = v
-                                if (v) vrGyro.recenter()
-                                scope.launch { container.playerPrefs.setVrGyro(v) }
-                                pushVrParams()
-                                pulseControlRow()
-                            },
-                            onRecenter = {
-                                vrState.resetView()
-                                vrGyro.recenter()
-                                pushVrParams()
-                                pulseControlRow()
-                            },
-                        )
-                    }
                     Column(
                         horizontalAlignment = Alignment.CenterHorizontally,
                         modifier = Modifier.padding(end = 18.dp),
@@ -1743,6 +1682,71 @@ fun PlayerScreen(
                 modifier = Modifier.align(Alignment.BottomCenter).fillMaxWidth(),
             ) {
                 Column(Modifier.fillMaxWidth()) {
+                    // VR 模式菜单：挂在控制排顶部（贴底居中）。此前它挂在右侧圆钮旁、
+                    // 整排横在画面正中，非常突兀；贴底之后与进度条/按钮排同生共死，
+                    // 4 秒淡出行为完全一致，也不遮画面中心。
+                    if (vrMenuOpen) {
+                        VrModeMenu(
+                            current = vrMode,
+                            autoMode = vrStoredMode.isNullOrEmpty(),
+                            rightEye = vrStoredEye,
+                            gyroOn = vrGyroOn,
+                            gyroAvailable = vrGyro.available,
+                            panniniD = vrPanniniUi,
+                            onAuto = {
+                                // 清掉"用户手动改过"的标记，并把偏好置空 ⇒ 交回自动识别
+                                vrTouchedFor = null
+                                vrMode = null
+                                scope.launch { container.playerPrefs.setVrMode("") }
+                                pulseControlRow()
+                            },
+                            onPannini = { d ->
+                                vrTouchedFor = currentPickCode
+                                vrPanniniUi = d
+                                vrState.setPannini(d)
+                                pushVrParams()
+                                // 滑杆拖一下控制排就续命一次，否则拖到一半整排淡出
+                                pulseControlRow()
+                            },
+                            onPanniniCommit = { d ->
+                                scope.launch { container.playerPrefs.setVrPanniniD(d) }
+                            },
+                            onPick = { m ->
+                                vrTouchedFor = currentPickCode
+                                vrMode = m
+                                m?.let { vrState.mode = it }
+                                vrState.resetForNewMode()
+                                scope.launch { container.playerPrefs.setVrMode(m?.name ?: VR_MODE_OFF) }
+                                pushVrParams()
+                                pulseControlRow()
+                            },
+                            onToggleEye = {
+                                vrTouchedFor = currentPickCode
+                                val v = !vrStoredEye
+                                vrState.rightEye = v
+                                scope.launch { container.playerPrefs.setVrRightEye(v) }
+                                pushVrParams()
+                                pulseControlRow()
+                            },
+                            onToggleGyro = {
+                                vrTouchedFor = currentPickCode
+                                val v = !vrGyroOn
+                                vrGyroOn = v
+                                vrState.gyroEnabled = v
+                                if (v) vrGyro.recenter()
+                                scope.launch { container.playerPrefs.setVrGyro(v) }
+                                pushVrParams()
+                                pulseControlRow()
+                            },
+                            onRecenter = {
+                                vrState.resetView()
+                                vrGyro.recenter()
+                                pushVrParams()
+                                pulseControlRow()
+                            },
+                            modifier = Modifier.align(Alignment.CenterHorizontally),
+                        )
+                    }
                     // 状态行（时长 / 当前画质 / 缓存 / 解码方式）：挂在控制排上方。
                     // 原先这行挂在根 Box 的默认 TopStart 位置，横屏下被顶栏和画面盖住、
                     // 实际从来看不到，挪到最容易看见的进度条上方。
@@ -2528,14 +2532,19 @@ internal fun VrModeMenu(
     onRecenter: () -> Unit,
     onPannini: (Float) -> Unit,
     onPanniniCommit: (Float) -> Unit,
+    modifier: Modifier = Modifier,
 ) {
     Surface(
         color = Color.Black.copy(alpha = 0.8f),
         shape = RoundedCornerShape(14.dp),
-        modifier = Modifier.padding(end = 10.dp),
+        modifier = modifier.padding(start = 12.dp, end = 12.dp, bottom = 6.dp),
     ) {
         Column(modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
+            // 低分辨率横屏下 8 个胶囊可能超宽，允许横向滚动兜底
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.horizontalScroll(rememberScrollState()),
+            ) {
                 // 「自动」必须单独给一个入口：否则用户一旦选过「关闭」，
                 // 自动识别就被永久关掉、没有任何回头的路。
                 VrChip("自动", autoMode) { onAuto() }
@@ -2560,7 +2569,12 @@ internal fun VrModeMenu(
             Spacer(Modifier.height(4.dp))
             // 边缘畸变抑制：0 = 直线透视，1 = 标准 Pannini，越大越接近柱面。
             // 纵向不随它变，所以拖的时候画面中心大小不动，只改边缘 —— 好判断。
-            Row(verticalAlignment = Alignment.CenterVertically) {
+            // 整行在菜单里居中：此前贴左 + 滑杆只有 160dp，右侧大片空白，
+            // 整个菜单的视觉重心被推向一侧，看起来就像整体没居中。
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.align(Alignment.CenterHorizontally),
+            ) {
                 Text(
                     "边缘畸变抑制",
                     color = Color.White.copy(alpha = 0.75f),
@@ -2573,7 +2587,7 @@ internal fun VrModeMenu(
                     onValueChange = onPannini,
                     onValueChangeFinished = { onPanniniCommit(panniniD) },
                     valueRange = 0f..VrViewState.MAX_PANNINI,
-                    modifier = Modifier.width(160.dp),
+                    modifier = Modifier.width(300.dp),
                 )
                 Spacer(Modifier.width(6.dp))
                 Text(
