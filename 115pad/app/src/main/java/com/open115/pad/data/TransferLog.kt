@@ -4,6 +4,7 @@ import android.content.Context
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
@@ -44,6 +45,8 @@ data class UploadRecord(
     val ok: Boolean? = null,
     val reused: Boolean = false,
     val error: String? = null,
+    /** 用户主动暂停（会话保留，传输中心点「继续」可从断点续传）；重启后保持暂停不被自动恢复 */
+    val paused: Boolean = false,
     // ---- 断点续传会话（init/resume 拿到后立刻落库，进程被杀也能恢复）----
     /** SAF 文件 uri（takePersistableUriPermission 后跨进程仍可读） */
     val uri: String? = null,
@@ -124,6 +127,10 @@ class TransferLog(private val context: Context) {
     /** 回填上传结果；ok=false 时带上错误信息 */
     suspend fun finishUpload(id: Long, ok: Boolean, reused: Boolean = false, error: String? = null) {
         activeUploads.remove(id)
+        resuming.remove(id)
+        uploadJobs.remove(id)
+        pauseRequests.remove(id)
+        cancelRequests.remove(id)
         context.transferDataStore.edit { p ->
             val cur = decode<UploadRecord>(p[KEY_UPLOADS])
             val next = cur.map { r ->
@@ -133,6 +140,7 @@ class TransferLog(private val context: Context) {
                     ok = ok,
                     reused = reused,
                     error = error,
+                    paused = false,
                 )
             }
             p[KEY_UPLOADS] = Json.encodeToString(next)
@@ -149,6 +157,7 @@ class TransferLog(private val context: Context) {
         val fresh = decode<UploadRecord>(p[KEY_UPLOADS])
             .filter {
                 it.finishedAt == null &&
+                    !it.paused && // 用户主动暂停的记录重启后保持暂停，不自动恢复
                     (it.ossUploadId != null || it.pickCode != null) &&
                     it.uri != null &&
                     it.id !in activeUploads &&
@@ -173,6 +182,45 @@ class TransferLog(private val context: Context) {
     suspend fun uploadRecord(id: Long): UploadRecord? =
         context.transferDataStore.data.first()
             .let { decode<UploadRecord>(it[KEY_UPLOADS]).find { r -> r.id == id } }
+
+    // ==================== 暂停 / 继续 / 取消 ====================
+
+    /** 暂停：标记 paused=true（会话信息已在库上），下次「继续」走断点续传 */
+    suspend fun pauseUpload(id: Long) {
+        activeUploads.remove(id)
+        resuming.remove(id)
+        uploadJobs.remove(id)
+        pauseRequests.remove(id)
+        context.transferDataStore.edit { p ->
+            val cur = decode<UploadRecord>(p[KEY_UPLOADS])
+            p[KEY_UPLOADS] = Json.encodeToString(
+                cur.map { if (it.id == id) it.copy(paused = true) else it },
+            )
+        }
+    }
+
+    /** 继续/重试前置：登记为进行中并把 paused 清掉；重复点按（已在传）返回 false */
+    suspend fun beginResume(id: Long): Boolean {
+        if (id in activeUploads || id in resuming) return false
+        activeUploads.add(id)
+        context.transferDataStore.edit { p ->
+            val cur = decode<UploadRecord>(p[KEY_UPLOADS])
+            p[KEY_UPLOADS] = Json.encodeToString(
+                cur.map { if (it.id == id) it.copy(paused = false, finishedAt = null) else it },
+            )
+        }
+        return true
+    }
+
+    /** 上传协程的 Job 登记表：传输中心暂停/取消靠它 cancel 对应协程（各上传入口自动注册） */
+    fun registerJob(id: Long, job: Job) { uploadJobs[id] = job }
+    fun job(id: Long): Job? = uploadJobs[id]
+
+    /** 协程取消前先登记意图，取消落地的 catch 分支按意图分类（暂停保留会话/取消清记录） */
+    fun requestPause(id: Long) { pauseRequests.add(id) }
+    fun requestCancel(id: Long) { cancelRequests.add(id) }
+    fun consumePauseRequest(id: Long): Boolean = pauseRequests.remove(id)
+    fun consumeCancelRequest(id: Long): Boolean = cancelRequests.remove(id)
 
     suspend fun removeUpload(id: Long) = context.transferDataStore.edit { p ->
         val cur = decode<UploadRecord>(p[KEY_UPLOADS])
@@ -200,4 +248,11 @@ class TransferLog(private val context: Context) {
     /** 进程内正在上传/已认领续传的记录 id（内存态，防恢复扫描与进行中的上传双开） */
     private val activeUploads = mutableSetOf<Long>()
     private val resuming = mutableSetOf<Long>()
+
+    /** 上传协程 Job（recordId → Job），TransferScreen 暂停/取消用 */
+    private val uploadJobs = mutableMapOf<Long, Job>()
+
+    /** 暂停/取消意图登记：请求方先登记再 cancel 协程，catch 分支消费意图分类落地 */
+    private val pauseRequests = mutableSetOf<Long>()
+    private val cancelRequests = mutableSetOf<Long>()
 }

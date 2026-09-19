@@ -77,6 +77,7 @@ import com.open115.pad.data.PinnedFolder
 import com.open115.pad.data.PinnedPrefs
 import com.open115.pad.data.PlaylistEntry
 import com.open115.pad.data.Uploader
+import com.open115.pad.data.resumeUploadRecord
 import com.open115.pad.data.parseFilesResponse
 import com.open115.pad.data.parseSearchResponse
 import com.open115.pad.data.envData
@@ -697,33 +698,29 @@ fun FilesScreen(
     // ---- 断点续传：进程重启后恢复中断的大文件上传（每次进程只认领一次）----
     // 记录里落库了 SAF uri + pick_code + oss_upload_id，重启后按 ListParts 跳过
     // 已传分片继续；原文件不可访问（权限失效/被删）则把记录标记为失败。
+    // 用户主动暂停的记录（paused=true）不会被 claim，保持暂停等手动继续。
     LaunchedEffect(Unit) {
         val log = context.appContainer.transferLog
         val pending = log.claimPendingUploads()
         if (pending.isEmpty()) return@LaunchedEffect
         notify("发现 ${pending.size} 个未完成上传，恢复中…")
-        for (rec in pending) scope.launch {
-            val pfd = runCatching {
-                context.contentResolver.openFileDescriptor(android.net.Uri.parse(rec.uri!!), "r")
-            }.getOrNull()
-            if (pfd == null) {
-                log.finishUpload(rec.id, ok = false, error = "续传失败：无法访问原文件（权限可能已失效）")
-                notify("续传失败：" + rec.name)
-                return@launch
-            }
-            pfd.use {
-                runCatching { Uploader.resumeLargeLogged(log, vm.api, rec, it) }
-                    .onSuccess { r ->
-                        notify("续传完成：" + rec.name + if (r.reused) "（秒传）" else "")
-                        vm.refresh()
+        for (rec in pending) context.appContainer.transferScope.launch {
+            runCatching { resumeUploadRecord(context, log, vm.api, rec) }
+                .onSuccess { r ->
+                    notify("续传完成：" + rec.name + if (r.reused) "（秒传）" else "")
+                    vm.refresh()
+                }
+                .onFailure { e ->
+                    if (e !is kotlinx.coroutines.CancellationException) {
+                        notify("续传失败：" + rec.name + "（${e.message}）")
                     }
-                    .onFailure { notify("续传失败：" + rec.name + "（${it.message}）") }
-            }
+                }
         }
     }
 
     val uploadPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
-        if (uri != null) scope.launch {
+        // 挂应用级 transferScope：切页/换目录不中断上传；暂停与取消由传输中心显式操作
+        if (uri != null) context.appContainer.transferScope.launch {
             notify("开始上传…")
             val result = runCatching {
                 withContext(Dispatchers.IO) {
@@ -795,7 +792,10 @@ fun FilesScreen(
                     ui.stack.last().name,
                 )
                 vm.refresh()
-            }.onFailure { notify("上传失败：${it.message}") }
+            }.onFailure {
+                // 暂停/取消走 CancellationException，不算失败
+                if (it !is kotlinx.coroutines.CancellationException) notify("上传失败：${it.message}")
+            }
         }
     }
 

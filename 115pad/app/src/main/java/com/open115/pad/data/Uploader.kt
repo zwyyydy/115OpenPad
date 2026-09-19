@@ -4,6 +4,7 @@ import android.os.ParcelFileDescriptor
 import android.util.Base64
 import android.util.Log
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
@@ -63,12 +64,17 @@ object Uploader {
         targetName: String?,
     ): UploadResult {
         val id = log.beginUpload(fileName, bytes.size.toLong(), targetCid, targetName)
+        currentCoroutineContext()[Job]?.let { log.registerJob(id, it) }
         return try {
             val r = uploadSmall(api, fileName, bytes, target = "U_1_$targetCid")
             log.finishUpload(id, ok = true, reused = r.reused)
             r
         } catch (e: Exception) {
-            log.finishUpload(id, ok = false, error = e.message)
+            // 小文件没有可续传的会话，取消（用户/外部）直接清记录，不留「已取消」尸体；
+            // 协程已取消，落库必须包 NonCancellable，否则 DataStore edit 被取消打断
+            if (e is kotlinx.coroutines.CancellationException) {
+                withContext(kotlinx.coroutines.NonCancellable) { log.removeUpload(id) }
+            } else log.finishUpload(id, ok = false, error = e.message)
             throw e
         }
     }
@@ -370,6 +376,7 @@ object Uploader {
         uri: String? = null,
     ): UploadResult {
         val id = log.beginUpload(fileName, size, targetCid, targetName, uri)
+        currentCoroutineContext()[Job]?.let { log.registerJob(id, it) }
         var lastPct = -1L
         suspend fun prog(uploaded: Long) {
             val pct = uploaded * 100 / size
@@ -392,7 +399,14 @@ object Uploader {
             r
         } catch (e: Exception) {
             if (e is kotlinx.coroutines.CancellationException) {
-                log.finishUpload(id, ok = false, error = "已取消")
+                // 取消请求：清记录（会话缺 bucket/object/STS 无法 abort，交给服务端
+                // 生命周期回收，与 ListParts 降级路径同一策略）；暂停或意外取消：
+                // 保留会话标记暂停，传输中心可「继续」或启动扫描按暂停状态保持不动。
+                // 协程已取消，落库必须包 NonCancellable，否则 edit 被取消打断静默失败
+                withContext(kotlinx.coroutines.NonCancellable) {
+                    if (log.consumeCancelRequest(id)) log.removeUpload(id)
+                    else log.pauseUpload(id)
+                }
                 throw e
             }
             // 已拿到会话才值得续传重试（否则连 init 都没过，重试就是从头再来）
@@ -430,6 +444,7 @@ object Uploader {
         if (rec.size != pfd.statSize) {
             error("文件大小与中断记录不一致（${pfd.statSize} ≠ ${rec.size}），放弃续传")
         }
+        currentCoroutineContext()[Job]?.let { log.registerJob(rec.id, it) }
         Log.i(TAG, "恢复中断上传 id=${rec.id} ${rec.name} size=${rec.size} 已传≈${rec.uploaded}")
         var lastPct = -1L
         return try {
@@ -448,7 +463,13 @@ object Uploader {
             log.finishUpload(rec.id, ok = true, reused = r.reused)
             r
         } catch (e: Exception) {
-            if (e !is kotlinx.coroutines.CancellationException) {
+            if (e is kotlinx.coroutines.CancellationException) {
+                // 与 uploadLargeLogged 同规则：取消清记录；暂停/意外取消保留会话标记暂停
+                withContext(kotlinx.coroutines.NonCancellable) {
+                    if (log.consumeCancelRequest(rec.id)) log.removeUpload(rec.id)
+                    else log.pauseUpload(rec.id)
+                }
+            } else {
                 log.finishUpload(rec.id, ok = false, error = e.message)
             }
             throw e

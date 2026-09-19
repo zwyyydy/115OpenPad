@@ -56,6 +56,12 @@ class AppContainer(context: Context) {
     /** 只用于极少数与 UI 无关的长期观察（目前只有"登出后清缓存"） */
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
+    /**
+     * 上传/恢复协程的作用域：不随页面销毁（切页/换目录不会中断上传），
+     * SupervisorJob 防止单个上传失败连坐。暂停/取消由传输中心显式发起。
+     */
+    val transferScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
     /** 传输中心的历史记录（本机下载 + 上传） */
     val transferLog = com.open115.pad.data.TransferLog(context)
 

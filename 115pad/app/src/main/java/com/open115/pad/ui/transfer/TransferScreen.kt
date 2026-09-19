@@ -20,10 +20,13 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.outlined.Close
 import androidx.compose.material.icons.outlined.CloudUpload
 import androidx.compose.material.icons.outlined.DeleteOutline
 import androidx.compose.material.icons.outlined.Download
 import androidx.compose.material.icons.outlined.OpenInNew
+import androidx.compose.material.icons.outlined.Pause
+import androidx.compose.material.icons.outlined.PlayArrow
 import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
@@ -54,6 +57,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.open115.pad.appContainer
 import com.open115.pad.data.UploadRecord
+import com.open115.pad.data.resumeUploadRecord
 import com.open115.pad.ui.theme.AppCard
 import com.open115.pad.ui.theme.AppChip
 import com.open115.pad.ui.theme.AppColors
@@ -246,9 +250,51 @@ fun TransferScreen(snackbarHostState: SnackbarHostState) {
     // ---- 上传侧状态 ----
     val uploads by log.uploads.collectAsState(initial = emptyList())
     var pendingUploadDelete by remember { mutableStateOf<UploadRecord?>(null) }
+    var pendingUploadCancel by remember { mutableStateOf<UploadRecord?>(null) }
 
     fun notify(msg: String?) {
         if (msg != null) scope.launch { snackbarHostState.showSnackbar(msg) }
+    }
+
+    // ---- 上传暂停/继续/取消/重试 ----
+    // 暂停 = 登记意图后 cancel 上传协程，catch 分支保留会话标记 paused；
+    // 取消 = 同样 cancel，catch 分支清记录（OSS 会话交给服务端回收）。
+    // 继续/重试 = beginResume 后在应用级 transferScope 走 resumeUploadRecord（断点续传）。
+    fun pauseUpload(r: UploadRecord) {
+        val job = log.job(r.id)
+        if (job == null) scope.launch { log.pauseUpload(r.id) }
+        else {
+            log.requestPause(r.id)
+            job.cancel()
+        }
+    }
+
+    fun doCancelUpload(r: UploadRecord) {
+        val job = log.job(r.id)
+        if (job == null) scope.launch { log.removeUpload(r.id) }
+        else {
+            log.requestCancel(r.id)
+            job.cancel()
+        }
+    }
+
+    fun resumeUpload(r: UploadRecord) {
+        scope.launch {
+            if (!log.beginResume(r.id)) return@launch
+            val fresh = log.uploadRecord(r.id) ?: return@launch
+            notify((if (r.ok == false) "重试" else "继续") + "上传：" + fresh.name)
+            context.appContainer.transferScope.launch {
+                runCatching {
+                    resumeUploadRecord(context, log, context.appContainer.openApi, fresh)
+                }.onSuccess { res ->
+                    notify("上传完成：" + fresh.name + if (res.reused) "（秒传）" else "")
+                }.onFailure { e ->
+                    if (e !is kotlinx.coroutines.CancellationException) {
+                        notify("续传失败：" + fresh.name + "（${e.message}）")
+                    }
+                }
+            }
+        }
     }
 
     // 有进行中的任务时 1 秒一刷（速度/剩余时间要秒级刷新），全部停下后放慢到 2.5 秒
@@ -319,7 +365,16 @@ fun TransferScreen(snackbarHostState: SnackbarHostState) {
 
                     else -> UploadList(
                         uploads = uploads,
-                        onDelete = { r -> pendingUploadDelete = r },
+                        onPause = { pauseUpload(it) },
+                        onResume = { resumeUpload(it) },
+                        onCancel = { r -> pendingUploadCancel = r },
+                        onRetry = { resumeUpload(it) },
+                        // 进行中的上传点删除 = 取消上传（否则只删记录、协程还在传，用户会困惑）；
+                        // 其余状态（已暂停/失败/已完成）才是纯移除记录
+                        onDelete = { r ->
+                            if (r.ok == null && !r.paused && log.job(r.id) != null) pendingUploadCancel = r
+                            else pendingUploadDelete = r
+                        },
                     )
                 }
             }
@@ -357,6 +412,30 @@ fun TransferScreen(snackbarHostState: SnackbarHostState) {
                 }) { Text("移除") }
             },
             dismissButton = { TextButton(onClick = { pendingUploadDelete = null }) { Text("取消") } },
+        )
+    }
+
+    pendingUploadCancel?.let { r ->
+        AlertDialog(
+            onDismissRequest = { pendingUploadCancel = null },
+            title = { Text("取消上传") },
+            text = {
+                Text(
+                    "将取消「${r.name}」的上传并移除记录，已上传的分片不会保留" +
+                        "（如需保留断点，请改用暂停）。",
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        pendingUploadCancel = null
+                        doCancelUpload(r)
+                        notify("已取消上传：" + r.name)
+                    },
+                    colors = androidx.compose.material3.ButtonDefaults.textButtonColors(contentColor = AppColors.RedFg),
+                ) { Text("取消上传") }
+            },
+            dismissButton = { TextButton(onClick = { pendingUploadCancel = null }) { Text("返回") } },
         )
     }
 }
@@ -400,7 +479,14 @@ private fun DownloadList(
 }
 
 @Composable
-private fun UploadList(uploads: List<UploadRecord>, onDelete: (UploadRecord) -> Unit) {
+private fun UploadList(
+    uploads: List<UploadRecord>,
+    onPause: (UploadRecord) -> Unit,
+    onResume: (UploadRecord) -> Unit,
+    onCancel: (UploadRecord) -> Unit,
+    onRetry: (UploadRecord) -> Unit,
+    onDelete: (UploadRecord) -> Unit,
+) {
     if (uploads.isEmpty()) {
         EmptyHint(
             icon = { Icon(Icons.Outlined.CloudUpload, null, tint = AppColors.TextTertiary, modifier = Modifier.size(44.dp)) },
@@ -416,7 +502,14 @@ private fun UploadList(uploads: List<UploadRecord>, onDelete: (UploadRecord) -> 
     ) {
         // 新的在前：id 是本地自增序号
         items(uploads.sortedByDescending { it.id }, key = { it.id }) { r ->
-            UploadRow(record = r, onDelete = { onDelete(r) })
+            UploadRow(
+                record = r,
+                onPause = { onPause(r) },
+                onResume = { onResume(r) },
+                onCancel = { onCancel(r) },
+                onRetry = { onRetry(r) },
+                onDelete = { onDelete(r) },
+            )
         }
     }
 }
@@ -444,7 +537,14 @@ private fun EmptyHint(
 }
 
 @Composable
-private fun UploadRow(record: UploadRecord, onDelete: () -> Unit) {
+private fun UploadRow(
+    record: UploadRecord,
+    onPause: () -> Unit,
+    onResume: () -> Unit,
+    onCancel: () -> Unit,
+    onRetry: () -> Unit,
+    onDelete: () -> Unit,
+) {
     AppCard(Modifier.fillMaxWidth()) {
         Column(Modifier.padding(horizontal = 14.dp, vertical = 12.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
@@ -470,6 +570,8 @@ private fun UploadRow(record: UploadRecord, onDelete: () -> Unit) {
                     Spacer(Modifier.height(2.dp))
                     val timing = when {
                         // 分片上传进行中：显示已传字节（小文件直传没有过程，uploaded 一直是 0）
+                        record.ok == null && record.paused ->
+                            "已传 ${Format.size(record.uploaded)} / ${Format.size(record.size)} · 已暂停，可继续"
                         record.ok == null && record.uploaded > 0 ->
                             "已传 ${Format.size(record.uploaded)} / ${Format.size(record.size)} · 开始 ${timeText(record.startedAt)}"
                         record.ok == null -> "开始 ${timeText(record.startedAt)}"
@@ -486,6 +588,7 @@ private fun UploadRow(record: UploadRecord, onDelete: () -> Unit) {
                 }
                 Spacer(Modifier.width(8.dp))
                 val (label, bg, fg) = when {
+                    record.ok == null && record.paused -> Triple("已暂停", AppColors.AmberBg, AppColors.AmberFg)
                     record.ok == null ->
                         if (record.size > 0 && record.uploaded > 0) {
                             Triple("上传中 ${record.uploaded * 100 / record.size}%", AppColors.BlueBg, AppColors.BlueFg)
@@ -497,6 +600,31 @@ private fun UploadRow(record: UploadRecord, onDelete: () -> Unit) {
                     else -> Triple("已上传", AppColors.GreenBg, AppColors.GreenFg)
                 }
                 StatusBadge(label, bg = bg, fg = fg)
+                // 操作按钮：上传中→暂停；已暂停→继续+取消；失败且有文件来源→重试
+                when {
+                    record.ok == null && !record.paused -> {
+                        IconButton(onClick = onPause) {
+                            Icon(
+                                Icons.Outlined.Pause,
+                                contentDescription = "暂停",
+                                tint = AppColors.AmberFg,
+                            )
+                        }
+                    }
+                    record.ok == null && record.paused -> {
+                        IconButton(onClick = onResume) {
+                            Icon(Icons.Outlined.PlayArrow, contentDescription = "继续", tint = AppColors.BlueFg)
+                        }
+                        IconButton(onClick = onCancel) {
+                            Icon(Icons.Outlined.Close, contentDescription = "取消", tint = AppColors.RedFg)
+                        }
+                    }
+                    record.ok == false && record.uri != null -> {
+                        IconButton(onClick = onRetry) {
+                            Icon(Icons.Outlined.Refresh, contentDescription = "重试", tint = AppColors.BlueFg)
+                        }
+                    }
+                }
                 IconButton(onClick = onDelete) {
                     Icon(Icons.Outlined.DeleteOutline, contentDescription = "移除记录", tint = AppColors.RedFg)
                 }
