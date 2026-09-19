@@ -34,7 +34,6 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
@@ -46,7 +45,9 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
@@ -69,6 +70,7 @@ import androidx.compose.material.icons.outlined.Close
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListState
+import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
@@ -93,6 +95,7 @@ import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalConfiguration
@@ -1373,13 +1376,11 @@ fun PlayerScreen(
         val window = (context as? Activity)?.window
         if (window != null) {
             val controller = WindowCompat.getInsetsController(window, window.decorView)
-            if (landscape) {
-                controller.systemBarsBehavior =
-                    WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
-                controller.hide(WindowInsetsCompat.Type.systemBars())
-            } else {
-                controller.show(WindowInsetsCompat.Type.systemBars())
-            }
+            controller.systemBarsBehavior =
+                WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+            // 横竖屏一致：播放页全沉浸，状态栏+导航栏都藏；
+            // 从屏幕边缘上/下滑可临时唤出（半透明覆盖，不挤占布局）
+            controller.hide(WindowInsetsCompat.Type.systemBars())
         }
         onDispose {
             val window = (context as? Activity)?.window
@@ -2242,47 +2243,136 @@ fun PlayerScreen(
             }
         }
     } else {
-        Column(
+        // ---- 竖屏布局 ----
+        // ① 横屏片：满宽、高度按比例，**整体垂直居中**（不再钉在屏幕顶部）；
+        // ② 竖屏片：直接占满状态栏以下的可用高度、宽度按比例收窄——等效全屏
+        //    且不裁切内容（左右仅留极窄黑边）；③ VR 仍满屏；④ 标题/时长/集数
+        //  chips 改为贴屏幕底部的悬浮层（渐变遮罩），控制排弹出或锁屏时隐藏，
+        //    避免与压在视频底沿的进度条/按钮排互相遮挡。
+        // 系统栏已全沉浸（上方 DisposableEffect），无需再让出状态栏/导航栏空间
+        BoxWithConstraints(
             Modifier
                 .fillMaxSize()
                 .background(Color.Black),
         ) {
-            Box {
-                VideoSurface(
-                    Modifier.fillMaxWidth().aspectRatio(16f / 9f),
-                    onSubSearch = { showSubSearch = true },
-                )
-                androidx.compose.animation.AnimatedVisibility(
-                    visible = controlRowVisible && !screenLocked,
-                    enter = fadeIn(tween(160)),
-                    exit = fadeOut(tween(200)),
-                    modifier = Modifier.align(Alignment.TopEnd),
-                ) {
-                    Row(
-                        Modifier
-                            .statusBarsPadding()
-                            .padding(horizontal = 8.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        PlayerStatusRow(
-                            netSpeedText = netSpeedText,
-                            clockText = clockText,
-                            batteryPct = batteryPct,
-                            specText = specBadge,
-                            showNetSpeed = prefs.showNetSpeed,
-                            showClock = prefs.showClock,
-                            showBattery = prefs.showBattery,
-                            showSpec = prefs.showSpecBadge,
+            val density = LocalDensity.current
+            val maxW = constraints.maxWidth
+            val maxH = constraints.maxHeight
+            val vw = vsVideoSize.width.takeIf { it > 0 } ?: 16
+            val vh = vsVideoSize.height.takeIf { it > 0 } ?: 9
+            val boxW: Int
+            val boxH: Int
+            if (vrMode != null) {
+                // VR：反投影视窗按满屏渲染（与横屏行为一致），不做等比适配
+                boxW = maxW
+                boxH = maxH
+            } else {
+                val hAtFullW = (maxW.toFloat() * vh / vw).roundToInt()
+                if (hAtFullW <= maxH) {
+                    // 横屏片 / 方片：满宽，高度按比例，垂直居中
+                    boxW = maxW
+                    boxH = hAtFullW
+                } else {
+                    // 竖屏片：占满可用高度，宽度按比例收窄（不裁切，等效全屏）
+                    boxH = maxH
+                    boxW = (maxH.toFloat() * vw / vh).roundToInt().coerceIn(1, maxW)
+                }
+            }
+            VideoSurface(
+                Modifier
+                    .align(Alignment.Center)
+                    .size(with(density) { boxW.toDp() }, with(density) { boxH.toDp() }),
+                onSubSearch = { showSubSearch = true },
+            )
+            // 底部悬浮信息层：标题 + 时长画质 + 集数 chips（有队列才显示）。
+            // 控制排的进度条和按钮排压在画面底沿，与这块是同一区域，二者互斥显隐。
+            AnimatedVisibility(
+                visible = !controlRowVisible && !screenLocked,
+                enter = fadeIn(tween(200)),
+                exit = fadeOut(tween(160)),
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .fillMaxWidth(),
+            ) {
+                Column(
+                    Modifier
+                        .fillMaxWidth()
+                        .background(
+                            Brush.verticalGradient(
+                                0f to Color.Transparent,
+                                1f to Color.Black.copy(alpha = 0.72f),
+                            ),
                         )
-                        IconButton(onClick = { playlistOpen = true }) {
-                            Icon(
-                                Icons.AutoMirrored.Filled.QueueMusic,
-                                contentDescription = "播放列表",
-                                tint = Color.White,
-                            )
+                        .navigationBarsPadding()
+                        .padding(horizontal = 16.dp, vertical = 12.dp),
+                ) {
+                    Text(
+                        data?.fileName ?: currentName,
+                        color = Color.White,
+                        style = MaterialTheme.typography.titleMedium,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    Spacer(Modifier.height(6.dp))
+                    Text(
+                        buildString {
+                            val playLong = data?.playLong ?: 0L
+                            if (playLong > 0) append("时长 ${Format.duration(playLong)} · ")
+                            append(labelOf(currentDef))
+                        },
+                        color = Color.White.copy(alpha = 0.6f),
+                        style = MaterialTheme.typography.bodySmall,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    if (playQueue.size > 1) {
+                        Spacer(Modifier.height(14.dp))
+                        Text(
+                            "播放列表 (${playQueue.size})",
+                            color = Color.White.copy(alpha = 0.55f),
+                            style = MaterialTheme.typography.labelSmall,
+                        )
+                        Spacer(Modifier.height(8.dp))
+                        LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            itemsIndexed(playQueue) { i, entry ->
+                                val isCurrent = i == currentIndex
+                                Surface(
+                                    color = if (isCurrent) MaterialTheme.colorScheme.primary.copy(alpha = 0.22f)
+                                    else Color.White.copy(alpha = 0.08f),
+                                    shape = RoundedCornerShape(10.dp),
+                                ) {
+                                    Text(
+                                        entry.fn.substringBeforeLast('.'),
+                                        color = if (isCurrent) MaterialTheme.colorScheme.primary
+                                        else Color.White.copy(alpha = 0.85f),
+                                        fontWeight = if (isCurrent) FontWeight.Medium else null,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                        modifier = Modifier
+                                            .widthIn(max = 180.dp)
+                                            .clickable {
+                                                if (i != currentIndex) {
+                                                    loadEpisodeAt(i)
+                                                    toast("已切换：" + entry.fn)
+                                                }
+                                            }
+                                            .padding(horizontal = 12.dp, vertical = 8.dp),
+                                    )
+                                }
+                            }
                         }
                     }
                 }
+            }
+            // 顶栏：竖屏此前完全没有返回键，与横屏同源、同样随控制排显隐
+            AnimatedVisibility(
+                visible = controlRowVisible && !screenLocked,
+                enter = fadeIn(tween(160)),
+                exit = fadeOut(tween(200)),
+                modifier = Modifier.align(Alignment.TopStart).fillMaxWidth(),
+            ) {
+                topBar(Modifier.fillMaxWidth())
             }
         }
     }
