@@ -426,6 +426,12 @@ fun PlayerScreen(
      * 读普通变量的话拖动时滑块根本不会动。
      */
     var vrPanniniUi by remember { androidx.compose.runtime.mutableFloatStateOf(VrViewState.DEFAULT_PANNINI) }
+    /**
+     * 竖屏 VR 视窗档位（**只在竖屏生效**，横屏恒满屏）。
+     * 横屏不给档位：Pannini 已经压在长轴（水平）上，实测 4:3~21:9 最差边缘拉伸
+     * 都锁在 1.65~1.70×，长宽比不是瓶颈，收窄只会白丢画面宽度。详见 [VrWindow]。
+     */
+    var vrWindow by remember { mutableStateOf(VrWindow.FULL) }
     /** 被用户手动改过设置的条目 pick_code：改过就不再让自动识别覆盖 */
     var vrTouchedFor by remember { mutableStateOf<String?>(null) }
     /** 持久化值："" = 自动识别，"off" = 明确关闭，否则是 VrMode.name */
@@ -434,6 +440,8 @@ fun PlayerScreen(
     val vrStoredGyro by container.playerPrefs.vrGyro.collectAsState(initial = null)
     /** 边缘畸变抑制强度（Pannini d） */
     val vrStoredPannini by container.playerPrefs.vrPanniniD.collectAsState(initial = null)
+    /** 竖屏 VR 视窗档位名（`VrWindow.name`） */
+    val vrStoredWindow by container.playerPrefs.vrWindow.collectAsState(initial = null)
     /** 分辨率能不能猜出 VR 布局（决定 VR 按钮是否出现） */
     val vrGuess = remember(vsVideoSize) {
         VrDetector.guess(vsVideoSize.width, vsVideoSize.height)
@@ -488,6 +496,12 @@ fun PlayerScreen(
     LaunchedEffect(vrStoredGyro, currentPickCode) {
         val v = vrStoredGyro ?: return@LaunchedEffect
         if (vrTouchedFor != currentPickCode) vrGyroOn = v
+    }
+
+    // 视窗档位是全局偏好：不随条目走，也不存在"拖到一半被回写打断"的问题，
+    // 所以直接单向同步即可，不需要 vrTouchedFor 那套保护
+    LaunchedEffect(vrStoredWindow) {
+        VrWindow.entries.firstOrNull { it.name == vrStoredWindow }?.let { vrWindow = it }
     }
 
     // 陀螺仪生命周期：只在 VR 模式 + 开关打开 + 设备确实有传感器时才注册。
@@ -1811,6 +1825,8 @@ fun PlayerScreen(
                             gyroOn = vrGyroOn,
                             gyroAvailable = vrGyro.available,
                             panniniD = vrPanniniUi,
+                            windowMode = vrWindow,
+                            showWindowOptions = !landscape,
                             onAuto = {
                                 // 清掉"用户手动改过"的标记，并把偏好置空 ⇒ 交回自动识别
                                 vrTouchedFor = null
@@ -1828,6 +1844,14 @@ fun PlayerScreen(
                             },
                             onPanniniCommit = { d ->
                                 scope.launch { container.playerPrefs.setVrPanniniD(d) }
+                            },
+                            onWindow = { w ->
+                                vrWindow = w
+                                scope.launch { container.playerPrefs.setVrWindow(w.name) }
+                                // 视窗尺寸变化会让 GL 面 resize（走 onSurfaceChanged
+                                // → requestRender），投影参数不用重推；这里续命只是
+                                // 为了让用户点完档位控制排别立刻淡出
+                                pulseControlRow()
                             },
                             onPick = { m ->
                                 vrTouchedFor = currentPickCode
@@ -2263,9 +2287,29 @@ fun PlayerScreen(
             val boxW: Int
             val boxH: Int
             if (vrMode != null) {
-                // VR：反投影视窗按满屏渲染（与横屏行为一致），不做等比适配
-                boxW = maxW
-                boxH = maxH
+                // VR：反投影视窗。横屏满屏；竖屏按档位收窄**长边**（垂直方向）。
+                // 视窗越方、黑边越多，能看到的水平范围越宽 —— 满屏 67°×121° /
+                // 3:4 的 74°×106° / 1:1 的 90°×79°（fovDeg=90、D=1），三档最差边缘
+                // 拉伸都在 1.66~1.75×，所以这里选的是**取景范围**而不是画质。
+                // 竖屏长边之所以不再畸变，是因为 Pannini 的轴向自动跟随了它
+                // （见 VrViewportView 的 vertAxis）。
+                val wa = vrWindow.portraitAspect
+                when {
+                    wa == null -> {
+                        boxW = maxW
+                        boxH = maxH
+                    }
+                    // 视窗形状比屏幕更"宽"（常见：9:16 屏选 3:4 / 1:1）⇒ 占满宽度、收窄高度
+                    maxW.toFloat() / maxH <= wa -> {
+                        boxW = maxW
+                        boxH = (maxW / wa).roundToInt().coerceIn(1, maxH)
+                    }
+                    // 屏幕本身比档位还方（折叠屏内屏之类）⇒ 占满高度、收窄宽度
+                    else -> {
+                        boxH = maxH
+                        boxW = (maxH * wa).roundToInt().coerceIn(1, maxW)
+                    }
+                }
             } else {
                 val hAtFullW = (maxW.toFloat() * vh / vw).roundToInt()
                 if (hAtFullW <= maxH) {
@@ -2746,6 +2790,9 @@ internal fun VrModeMenu(
     gyroOn: Boolean,
     gyroAvailable: Boolean,
     panniniD: Float,
+    windowMode: VrWindow,
+    /** 视窗档位只在竖屏有意义（横屏长宽比不是瓶颈，见 [VrWindow]），横屏不显示这一行 */
+    showWindowOptions: Boolean,
     onPick: (VrMode?) -> Unit,
     onAuto: () -> Unit,
     onToggleEye: () -> Unit,
@@ -2753,6 +2800,7 @@ internal fun VrModeMenu(
     onRecenter: () -> Unit,
     onPannini: (Float) -> Unit,
     onPanniniCommit: (Float) -> Unit,
+    onWindow: (VrWindow) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     Surface(
@@ -2819,6 +2867,29 @@ internal fun VrModeMenu(
                     maxLines = 1,
                     modifier = Modifier.width(26.dp),
                 )
+            }
+            // 视窗档位（仅竖屏）：收窄长边把 Pannini 压不到的垂直畸变压下来。
+            // 横屏不显示 —— 横屏的长宽比不是瓶颈（实测 4:3~21:9 最差拉伸都锁在
+            // 1.65~1.70×），收窄只会白丢画面宽度，放一个在当前方向下不起作用的
+            // 开关比不放更糟。放在单独一行而不是并进上面那排：竖屏屏窄，
+            // 11 个胶囊必然横向溢出，得滚动才够得着。
+            if (showWindowOptions) {
+                Spacer(Modifier.height(4.dp))
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.align(Alignment.CenterHorizontally),
+                ) {
+                    Text(
+                        "视窗",
+                        color = Color.White.copy(alpha = 0.75f),
+                        style = MaterialTheme.typography.labelMedium,
+                        maxLines = 1,
+                    )
+                    Spacer(Modifier.width(6.dp))
+                    VrWindow.entries.forEach { w ->
+                        VrChip(w.label, windowMode == w) { onWindow(w) }
+                    }
+                }
             }
         }
     }

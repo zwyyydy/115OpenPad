@@ -180,7 +180,17 @@ internal fun VrGestureLayer(
                         val dist = (a - b).getDistance()
                         if (pinchPrev > 0f && dist > 0f) {
                             state.zoomBy(dist / pinchPrev)
-                            onHud("视场角 ${state.currentFov().toInt()}°")
+                            // 显示**实际**视场角，而不是 fov 字段本身：Pannini 只保证
+                            // 它作用的那个轴角度不变，另一个轴会被压小 —— 横屏 16:9 下
+                            // fov=90 实际是 121°×67°，直接显示 90 会虚报 20° 以上。
+                            // 比例必须用**视窗**尺寸：竖屏选了 3:4 / 1:1 档位时视窗比屏幕窄，
+                            // 拿屏幕比例算出来的读数会和画面不符。
+                            val (hFov, vFov) = VrProjection.actualFov(
+                                state.currentFov(),
+                                size.width.toFloat() / size.height.coerceAtLeast(1),
+                                state.panniniD,
+                            )
+                            onHud("视场角 ${hFov.toInt()}°×${vFov.toInt()}°")
                             onViewChanged()
                         }
                         pinchPrev = dist

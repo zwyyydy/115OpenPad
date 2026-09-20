@@ -101,11 +101,20 @@ class PlayerPrefs(private val context: Context) {
     val vrPanniniD: Flow<Float> =
         context.playerDataStore.data.map { it[KEY_VR_PANNINI] ?: 1.0f }
 
+    /**
+     * 竖屏 VR 反投影视窗档位名（`VrWindow.name`）。**只在竖屏生效**，横屏恒满屏。
+     * 空串 = 没设过（按满屏走），认不出来的名字也一律当满屏 —— 所以这里不需要
+     * 给默认值兜底成某个具体档位，加档位/改名都不会让旧数据落到奇怪的档上。
+     */
+    val vrWindow: Flow<String> =
+        context.playerDataStore.data.map { it[KEY_VR_WINDOW] ?: "" }
+
     suspend fun setVrMode(v: String) = context.playerDataStore.edit { it[KEY_VR_MODE] = v }
     suspend fun setVrRightEye(v: Boolean) = context.playerDataStore.edit { it[KEY_VR_RIGHT_EYE] = v }
     suspend fun setVrGyro(v: Boolean) = context.playerDataStore.edit { it[KEY_VR_GYRO] = v }
     suspend fun setVrFov(v: Float) = context.playerDataStore.edit { it[KEY_VR_FOV] = v }
     suspend fun setVrPanniniD(v: Float) = context.playerDataStore.edit { it[KEY_VR_PANNINI] = v }
+    suspend fun setVrWindow(v: String) = context.playerDataStore.edit { it[KEY_VR_WINDOW] = v }
 
     private companion object {
         val KEY_CACHE_ENABLED = booleanPreferencesKey("cache_enabled")
@@ -127,5 +136,6 @@ class PlayerPrefs(private val context: Context) {
         val KEY_VR_GYRO = booleanPreferencesKey("vr_gyro")
         val KEY_VR_FOV = floatPreferencesKey("vr_fov")
         val KEY_VR_PANNINI = floatPreferencesKey("vr_pannini_d")
+        val KEY_VR_WINDOW = stringPreferencesKey("vr_window")
     }
 }

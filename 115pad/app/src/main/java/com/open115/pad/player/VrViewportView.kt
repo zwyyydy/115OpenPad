@@ -288,23 +288,40 @@ class VrViewportView(context: Context) : GLSurfaceView(context) {
                 float tanH0 = (aspect >= 1.0) ? tanShort * aspect : tanShort;
                 float tanV0 = (aspect >= 1.0) ? tanShort : tanShort / aspect;
 
+                // ---- Pannini 作用在**视窗长轴**上 ----
+                // 长轴离轴角最大、拉伸最狠，压住它才有效。横屏长轴是水平（A 轴 = 水平），
+                // 竖屏长轴是垂直 —— 竖屏下若仍只压水平（那是短轴），那根 111° 的垂直长轴
+                // 就整个留在直线透视里，D 拖到 3 也压不动它（中线 yaw=0 处压缩因子恒为 1）。
+                //
+                // 实现上不重写公式，而是**转置坐标系**：竖屏时把两轴互换、跑同一套 Pannini，
+                // 最后再把射线分量换回来。D=0 时仍然逐像素退化成直线透视。
+                bool vertAxis = aspect < 1.0;
+                float tanA = tanH0;
+                float tanB = tanV0;
+                vec2 pp = p;
+                if (vertAxis) {
+                    tanA = tanV0;
+                    tanB = tanH0;
+                    pp = vec2(p.y, p.x);
+                }
+
                 // ---- 屏幕平面 → 相机射线 ----
-                // 默认是直线透视：边缘按 sec²θ 横向摊开（水平 FOV 110° 时边缘达 3.04×），
-                // 这就是"边缘畸变明显"的来源。uPanniniD 把水平映射换成 Pannini 那族
+                // 默认是直线透视：边缘按 sec²θ 径向摊开（水平 FOV 110° 时边缘达 3.04×），
+                // 这就是"边缘畸变明显"的来源。uPanniniD 把 A 轴映射换成 Pannini 那族
                 // "压角"映射，把边缘拉伸压下来：
                 //   d=0 → 退化成直线透视（与改动前逐像素一致）
-                //   d=1 → 标准 Pannini，边缘拉伸大幅下降，水平线只轻微弯
-                //   d 更大 → 趋近柱面，边缘几乎不拉伸但水平线明显弯成弧
+                //   d=1 → 标准 Pannini，边缘拉伸大幅下降，直线只轻微弯
+                //   d 更大 → 趋近柱面，边缘几乎不拉伸但直线明显弯成弧
                 //
-                // ⚠️ 平面半宽要**按 d 重算**，让"取景范围"保持不变 —— 否则同样的平面
-                //    宽度在 d 变大后对应更大的角度，画面左右边缘会直接越过半球边界出黑边
-                //    （d=2 时边缘 yaw 能到 98°）。代价是中心会有轻微放大（压角本来就
-                //    等价于把中心放大、边缘压回来），这是换投影的固有取舍，不是 bug。
+                // ⚠️ 平面半宽要**按 d 重算**，让 A 轴的取景角度保持不变 —— 否则同样的平面
+                //    宽度在 d 变大后对应更大的角度，边缘会直接越过半球边界出黑边
+                //    （d=2 时边缘 yaw 能到 98°）。代价是 B 轴被压小（A 轴角度不变 + 像素
+                //    仍为正方形 ⇒ B 轴必须缩），这是换投影的固有取舍，不是 bug。
                 float D = uPanniniD;
-                float halfH = atan(tanH0);
-                float planeH = (D + 1.0) * sin(halfH) / (D + cos(halfH));
-                float planeV = planeH * tanV0 / tanH0;
-                vec2 q = vec2(p.x * planeH, p.y * planeV);
+                float halfA = atan(tanA);
+                float planeA = (D + 1.0) * sin(halfA) / (D + cos(halfA));
+                float planeB = planeA * tanB / tanA;
+                vec2 q = vec2(pp.x * planeA, pp.y * planeB);
 
                 // 反解 x = (D+1)·sinλ/(D+cosλ)：令 u = tan(λ/2)，得一元二次
                 //   x(D-1)·u² - 2(D+1)·u + x(D+1) = 0
@@ -319,7 +336,11 @@ class VrViewportView(context: Context) : GLSurfaceView(context) {
                 float tp = q.y * ((D + 1.0) + (D - 1.0) * u * u)
                     / ((D + 1.0) * (1.0 + u * u));
                 float cp = inversesqrt(1.0 + tp * tp);
+                // 转置回去：竖屏时 A 轴是垂直，射线要还原成 (水平, 垂直, 视线)
                 vec3 d = vec3(sin(lam) * cp, tp * cp, cos(lam) * cp);
+                if (vertAxis) {
+                    d = vec3(tp * cp, sin(lam) * cp, cos(lam) * cp);
+                }
                 vec3 di = uCamRot * d;
 
                 float yaw = atan(di.x, di.z);

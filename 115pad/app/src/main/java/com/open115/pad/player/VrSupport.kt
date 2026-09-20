@@ -1,9 +1,11 @@
 package com.open115.pad.player
 
 import kotlin.math.abs
+import kotlin.math.atan
 import kotlin.math.atan2
 import kotlin.math.cos
 import kotlin.math.sin
+import kotlin.math.tan
 
 /** 立体排布方式 */
 enum class VrLayout { SBS, TB }
@@ -38,6 +40,41 @@ enum class VrMode(
 
     val eyeSpanU: Float get() = if (layout == VrLayout.SBS) 0.5f else 1f
     val eyeSpanV: Float get() = if (layout == VrLayout.TB) 0.5f else 1f
+}
+
+/**
+ * VR 反投影视窗档位（**只在竖屏生效**）。
+ *
+ * 为什么横屏不给档位：Pannini 作用在视窗长轴上，横屏的长轴就是水平方向，
+ * 已经被压住了，残差由短轴决定。实测（fovDeg=90、D=1）4:3 / 16:9 / 2:1 / 21:9
+ * 四档最差边缘拉伸全锁在 1.65~1.70×，横屏的长宽比**已经不是瓶颈** ——
+ * 收窄到 4:3 反而略差（1.70 vs 1.66），还要白丢 25% 画面宽度。
+ *
+ * 竖屏正相反：长轴是垂直方向，而 Pannini 只压水平，那根 111° 的长轴整个暴露在
+ * 直线透视下（D 拖到 3 也压不动它，因为中线处 yaw=0、压缩因子恒等于 1）。
+ * 收窄视窗是唯一能把长轴真正缩短的手段。
+ *
+ * 实测（fovDeg=90、D=1，轴向按视窗长轴自动推导）：
+ *
+ * | 档位 | 水平×垂直 | 最差拉伸 | >2× 面积占比 | 占屏幕高度 |
+ * |---|---|---|---|---|
+ * | 满屏 | 67°×121° | 1.66× | 0% | 100% |
+ * | 3:4  | 74°×106° | 1.70× | 0% | 75% |
+ * | 1:1  | 90°×79°  | 1.75× | 0% | 56% |
+ *
+ * ⚠️ 三档的畸变几乎持平（1.66~1.75），**换来的是水平视野** —— 视窗越方、黑边越多，
+ * 能看到的水平范围越宽。畸变问题本身是"轴向自动跟随长轴"解决的，档位是给
+ * "愿意拿黑边换水平视野"的人用的。作为对照，改造前竖屏满屏是 90°×112°、
+ * 最差 3.16×、16.2% 的面积超 2×（因为那时 Pannini 压的是水平的短轴）。
+ */
+enum class VrWindow(
+    val label: String,
+    /** 竖屏视窗的宽高比（< 1）；`null` = 满屏 */
+    val portraitAspect: Float?,
+) {
+    FULL("满屏", null),
+    THREE_FOUR("3:4", 3f / 4f),
+    SQUARE("1:1", 1f),
 }
 
 /**
@@ -184,4 +221,41 @@ object VrMath {
         if (abs(cy - yaw) < 0.01f && abs(cp - pitch) < 0.01f) return camRot
         return mul(mul(rotY(cy - yaw), rotX(cp - pitch)), camRot)
     }
+}
+
+/**
+ * 反投影后的**实际**视场角。给 HUD 显示用。
+ *
+ * ⚠️ 不能直接把 `VrViewState.currentFov()` 显示出来：Pannini 只保证**它作用的
+ * 那个轴**角度不变，另一个轴会被压小。所以 fovDeg=90 在横屏 16:9 下实际是
+ * 121°×67°、在竖屏 1:1 下是 90°×79° —— 直接显示 90 会虚报 20° 以上，
+ * 而加了视窗档位之后用户会横向比较各档，读数不准就更碍事。
+ *
+ * 与 `VrViewportView` 里的着色器是同一套公式（那边从 `uViewSize` 现算 aspect
+ * 和轴向）。**改任何一边都要同步改另一边**，否则 HUD 和画面会对不上。
+ */
+object VrProjection {
+
+    /**
+     * @param aspect 视窗宽高比。注意是**视窗**（VR 反投影面）不是屏幕 ——
+     *   竖屏选了 3:4 / 1:1 档位时两者不同，拿屏幕比例算会得到错的读数。
+     * @return 水平 FOV to 垂直 FOV，单位度
+     */
+    fun actualFov(fovShortDeg: Float, aspect: Float, panniniD: Float): Pair<Float, Float> {
+        val t = tan(Math.toRadians(fovShortDeg / 2.0))
+        val tanH = if (aspect >= 1f) t * aspect else t
+        val tanV = if (aspect >= 1f) t else t / aspect
+        // Pannini 作用在长轴：横屏是水平，竖屏是垂直（理由见 VrWindow 注释）
+        return if (aspect >= 1f) {
+            val halfH = atan(tanH)
+            val planeH = (panniniD + 1) * sin(halfH) / (panniniD + cos(halfH))
+            deg(2.0 * atan(tanH)) to deg(2.0 * atan(planeH * tanV / tanH))
+        } else {
+            val halfV = atan(tanV)
+            val planeV = (panniniD + 1) * sin(halfV) / (panniniD + cos(halfV))
+            deg(2.0 * atan(planeV * tanH / tanV)) to deg(2.0 * atan(tanV))
+        }
+    }
+
+    private fun deg(rad: Double): Float = Math.toDegrees(rad).toFloat()
 }
