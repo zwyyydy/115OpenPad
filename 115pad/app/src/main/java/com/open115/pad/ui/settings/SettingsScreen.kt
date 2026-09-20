@@ -344,7 +344,7 @@ fun SettingsScreen(container: AppContainer) {
 
         SectionTitle("关于")
         SettingRow(
-            title = "115 OpenPad v0.2.0",
+            title = "115 OpenPad v${com.open115.pad.BuildConfig.VERSION_NAME}",
             subtitle = "基于 115 开放平台 API 的第三方客户端，为大屏/平板优化",
             onClick = null,
         )
@@ -355,7 +355,7 @@ fun SettingsScreen(container: AppContainer) {
         )
         Text(
             "说明：本应用仅供个人学习交流使用，请遵守《115生活开放平台开发者协议》。\n" +
-                "大文件上传、BT 原生任务暂未实现；部分清晰度（4K/原画）需要 115 会员；\n" +
+                "BT 原生任务暂未实现；部分清晰度（4K/原画）需要 115 会员；\n" +
                 "接口存在频控，操作过快可能被暂时限制。",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,

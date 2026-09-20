@@ -28,6 +28,20 @@ fix_pb.py
 .workbuddy/
 docs/
 
+# AI 助手的工作目录（计划草稿等）
+.zcode/
+
+# 参考实现：别人的项目源码，只作本地对照
+ref/
+
+# adb / uiautomator 抓的界面 dump（都落在仓库根目录）
+/*.xml
+
+# 上传与播放测试用的素材（体积大，本地复现问题用）
+test_upload_*.bin
+test_video_*.mp4
+test_*.bin
+
 # 临时令牌/文件
 .tmp_*
 *.pb

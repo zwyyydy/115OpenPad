@@ -13,8 +13,8 @@ android {
         applicationId = "com.open115.pad"
         minSdk = 26
         targetSdk = 35
-        versionCode = 2
-        versionName = "0.2.0"
+        versionCode = 3
+        versionName = "0.3.0"
     }
 
     signingConfigs {
@@ -35,6 +35,8 @@ android {
     }
     buildFeatures {
         compose = true
+        // 设置页的版本号读 BuildConfig.VERSION_NAME，免得每次发版都漏改一处硬编码
+        buildConfig = true
     }
     packaging {
         resources.excludes += "/META-INF/{AL2.0,LGPL2.1}"
