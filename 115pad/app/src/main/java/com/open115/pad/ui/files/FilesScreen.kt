@@ -78,6 +78,7 @@ import com.open115.pad.data.PinnedPrefs
 import com.open115.pad.data.PlaylistEntry
 import com.open115.pad.data.Uploader
 import com.open115.pad.data.resumeUploadRecord
+import com.open115.pad.data.uploadFolder
 import com.open115.pad.data.parseFilesResponse
 import com.open115.pad.data.parseSearchResponse
 import com.open115.pad.data.envData
@@ -799,6 +800,52 @@ fun FilesScreen(
         }
     }
 
+    // ---- 文件夹上传（SAF 目录树）：递归建远端目录 + 逐文件走现有上传链路 ----
+    // 每个文件是一条独立传输记录（并发排队/断点续传/暂停取消全部复用）；
+    // 整个文件夹任务挂在应用级 transferScope，切页不中断。
+    val folderPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
+        if (uri != null) context.appContainer.transferScope.launch {
+            notify("文件夹上传已开始，可在传输中心查看进度")
+            val result = runCatching {
+                withContext(Dispatchers.IO) {
+                    // 持久化目录树读权限：子文档 uri 重启后仍可打开（断点续传依赖）
+                    runCatching {
+                        context.contentResolver.takePersistableUriPermission(
+                            uri, android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION,
+                        )
+                    }
+                    uploadFolder(
+                        context = context,
+                        log = context.appContainer.transferLog,
+                        api = vm.api,
+                        treeUri = uri,
+                        targetCid = vm.currentTargetCid(),
+                        targetPath = ui.stack.joinToString(" / ") { s -> s.name },
+                    )
+                }
+            }
+            result.onSuccess { s ->
+                if (s.failed == 0 && s.dirsFailed == 0) {
+                    notify("文件夹上传完成：${s.succeeded} 个文件" + if (s.reused > 0) "（含秒传 ${s.reused}）" else "")
+                } else {
+                    notify("文件夹上传完成：成功 ${s.succeeded}，失败 ${s.failed}" +
+                        (if (s.dirsFailed > 0) "（含 ${s.dirsFailed} 个目录建失败）" else ""))
+                }
+                context.appContainer.opLog.log(
+                    OpType.UPLOAD,
+                    "文件夹（${s.succeeded}/${s.files} 个文件）",
+                    "上传到「" + ui.stack.joinToString(" / ") { st -> st.name } + "」",
+                    vm.currentTargetCid(),
+                    ui.stack.last().name,
+                )
+                vm.refresh()
+            }.onFailure {
+                // 用户取消/应用退出走 CancellationException，不算失败
+                if (it !is kotlinx.coroutines.CancellationException) notify("文件夹上传失败：${it.message}")
+            }
+        }
+    }
+
     fun onItemActivate(item: FileItem) {
         if (ui.selectMode) {
             vm.toggleSelect(item.fid)
@@ -903,6 +950,7 @@ fun FilesScreen(
                     }
                 },
                 onUpload = { uploadPicker.launch(arrayOf("*/*")) },
+                onUploadFolder = { folderPicker.launch(null) },
                 onOpenFilterRules = onOpenFilterRules,
                 onCreateFolder = { showCreate = true },
             )
@@ -939,6 +987,7 @@ fun FilesScreen(
                     }
                 },
                 onUpload = { uploadPicker.launch(arrayOf("*/*")) },
+                onUploadFolder = { folderPicker.launch(null) },
                 onOpenFilterRules = onOpenFilterRules,
                 onCreateFolder = { showCreate = true },
             )

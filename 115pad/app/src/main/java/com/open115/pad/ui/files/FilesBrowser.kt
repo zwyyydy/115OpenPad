@@ -104,6 +104,7 @@ fun FilesBrowserPane(
     onPin: (List<FileItem>) -> Unit,
     onDownload: () -> Unit,
     onUpload: () -> Unit,
+    onUploadFolder: () -> Unit,
     onCreateFolder: () -> Unit,
     onOpenFilterRules: () -> Unit,
 ) {
@@ -205,8 +206,30 @@ fun FilesBrowserPane(
                     IconButton(onClick = onCreateFolder) {
                         Icon(Icons.Outlined.CreateNewFolder, contentDescription = "新建文件夹")
                     }
-                    IconButton(onClick = onUpload) {
-                        Icon(Icons.Outlined.Upload, contentDescription = "上传文件")
+                    // 上传：文件 / 文件夹（SAF 目录树）二选一
+                    var uploadMenuOpen by remember { mutableStateOf(false) }
+                    Box {
+                        IconButton(onClick = { uploadMenuOpen = true }) {
+                            Icon(Icons.Outlined.Upload, contentDescription = "上传")
+                        }
+                        DropdownMenu(expanded = uploadMenuOpen, onDismissRequest = { uploadMenuOpen = false }) {
+                            DropdownMenuItem(
+                                text = { Text("上传文件") },
+                                leadingIcon = { Icon(Icons.Outlined.Upload, contentDescription = null) },
+                                onClick = {
+                                    uploadMenuOpen = false
+                                    onUpload()
+                                },
+                            )
+                            DropdownMenuItem(
+                                text = { Text("上传文件夹") },
+                                leadingIcon = { Icon(Icons.Outlined.DriveFileMove, contentDescription = null) },
+                                onClick = {
+                                    uploadMenuOpen = false
+                                    onUploadFolder()
+                                },
+                            )
+                        }
                     }
                     IconButton(onClick = { vm.refresh() }) {
                         Icon(Icons.Outlined.Refresh, contentDescription = "刷新")
