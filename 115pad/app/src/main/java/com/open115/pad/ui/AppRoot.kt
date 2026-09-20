@@ -10,6 +10,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.CloudDownload
 import androidx.compose.material.icons.outlined.Download
+import androidx.compose.material.icons.outlined.DriveFileRenameOutline
 import androidx.compose.material.icons.outlined.Folder
 import androidx.compose.material.icons.outlined.RestoreFromTrash
 import androidx.compose.material.icons.outlined.Settings
@@ -57,11 +58,13 @@ import com.open115.pad.data.OpType
 import com.open115.pad.data.PlaylistEntry
 import com.open115.pad.data.Session
 import com.open115.pad.player.PlayerActivity
+import com.open115.pad.ui.components.BatchRenamePanel
 import com.open115.pad.ui.components.DownloadLinkSheet
 import com.open115.pad.ui.components.ImageGalleryDialog
 import com.open115.pad.ui.components.TextPreviewHost
 import com.open115.pad.util.Downloader
 import com.open115.pad.util.Format
+import com.open115.pad.ui.files.BatchRenameRequest
 import com.open115.pad.ui.files.FilesScreen
 import com.open115.pad.ui.files.FilesViewModel
 import com.open115.pad.ui.login.LoginScreen
@@ -79,6 +82,8 @@ private val destinations = listOf(
     Dest("filter", "过滤规则", Icons.Outlined.Tune),
     Dest("offline", "云下载", Icons.Outlined.CloudDownload),
     Dest("transfer", "传输中心", Icons.Outlined.Download),
+    // 改名是 N 次带限频的网络调用，几十秒起步，所以单独一页看进度、也在这里建任务
+    Dest("rename", "重命名", Icons.Outlined.DriveFileRenameOutline),
     Dest("recycle", "回收站", Icons.Outlined.RestoreFromTrash),
     Dest("settings", "设置", Icons.Outlined.Settings),
 )
@@ -145,6 +150,8 @@ private fun MainScaffold(container: AppContainer, widthClass: WindowWidthSizeCla
     var imageGallery by remember { mutableStateOf<Pair<List<ImageMediaItem>, Int>?>(null) }
     /** 文本预览：与画廊一样在根层级全屏渲染，才能盖住侧栏 */
     var textPreview by remember { mutableStateOf<FileItem?>(null) }
+    /** 批量重命名：面板渲染在内容区之内（左侧导航栏保持可见），状态由文件页触发 */
+    var batchRename by remember { mutableStateOf<BatchRenameRequest?>(null) }
 
     // ---------------- 剪贴板识别 / 外部 App 唤起的下载链接 ----------------
 
@@ -244,53 +251,81 @@ private fun MainScaffold(container: AppContainer, widthClass: WindowWidthSizeCla
                     }
                 }
             }
-            NavHost(
-                navController = navController,
-                startDestination = "files",
-                modifier = Modifier.fillMaxSize(),
-            ) {
-                composable("files") {
-                    val vm: FilesViewModel = viewModel(initializer = {
-                        FilesViewModel(
-                            container.openApi,
-                            container.filesPrefs,
-                            container.imageUrlResolver,
-                            container.filterPrefs,
-                            container.pinnedPrefs,
-                            container.dirCache,
-                            container.opLog,
+            // NavHost 与批量重命名面板同层，面板只盖内容区、不盖导航栏
+            Box(Modifier.weight(1f)) {
+                NavHost(
+                    navController = navController,
+                    startDestination = "files",
+                    modifier = Modifier.fillMaxSize(),
+                ) {
+                    composable("files") {
+                        val vm: FilesViewModel = viewModel(initializer = {
+                            FilesViewModel(
+                                container.openApi,
+                                container.filesPrefs,
+                                container.imageUrlResolver,
+                                container.filterPrefs,
+                                container.pinnedPrefs,
+                                container.dirCache,
+                                container.opLog,
+                            )
+                        })
+                        FilesScreen(
+                            vm,
+                            expanded,
+                            snackbarHostState,
+                            onPlayVideo,
+                            onOpenGallery = { items, idx -> imageGallery = items to idx },
+                            onPreviewText = { item -> textPreview = item },
+                            onBatchRename = { batchRename = it },
+                            onOpenFilterRules = {
+                                destinations.firstOrNull { it.route == "filter" }?.let { navigate(it) }
+                            },
                         )
-                    })
-                    FilesScreen(
-                        vm,
-                        expanded,
-                        snackbarHostState,
-                        onPlayVideo,
-                        onOpenGallery = { items, idx -> imageGallery = items to idx },
-                        onPreviewText = { item -> textPreview = item },
-                        onOpenFilterRules = {
-                            destinations.firstOrNull { it.route == "filter" }?.let { navigate(it) }
-                        },
+                    }
+                    composable("filter") {
+                        com.open115.pad.ui.filter.FilterRulesScreen(container)
+                    }
+                    composable("offline") {
+                        val vm: OfflineViewModel = viewModel(initializer = {
+                            OfflineViewModel(container.openApi, container.downloadPrefs)
+                        })
+                        OfflineScreen(vm, expanded, snackbarHostState)
+                    }
+                    composable("recycle") {
+                        val vm: RecycleViewModel = viewModel(initializer = { RecycleViewModel(container.openApi) })
+                        RecycleScreen(vm, expanded, snackbarHostState)
+                    }
+                    composable("transfer") {
+                        com.open115.pad.ui.transfer.TransferScreen(snackbarHostState)
+                    }
+                composable("rename") {
+                    com.open115.pad.ui.rename.RenameTasksScreen(
+                        container = container,
+                        snackbarHostState = snackbarHostState,
+                        // 选好目录后把配置面板交给根层级渲染（面板要浮在内容区之上）
+                        onNewTask = { batchRename = it },
                     )
-                }
-                composable("filter") {
-                    com.open115.pad.ui.filter.FilterRulesScreen(container)
-                }
-                composable("offline") {
-                    val vm: OfflineViewModel = viewModel(initializer = {
-                        OfflineViewModel(container.openApi, container.downloadPrefs)
-                    })
-                    OfflineScreen(vm, expanded, snackbarHostState)
-                }
-                composable("recycle") {
-                    val vm: RecycleViewModel = viewModel(initializer = { RecycleViewModel(container.openApi) })
-                    RecycleScreen(vm, expanded, snackbarHostState)
-                }
-                composable("transfer") {
-                    com.open115.pad.ui.transfer.TransferScreen(snackbarHostState)
                 }
                 composable("settings") {
                     SettingsScreen(container)
+                }
+                }
+
+                // 批量重命名面板：与 NavHost 同层，浮在内容区之上但**不盖住左侧导航栏** ——
+                // 批量改名时经常要换目录挑文件，把导航藏掉反而挡路。
+                // （图片画廊 / 文本预览仍是根层级全屏，那是沉浸式查看，语义不同）
+                batchRename?.let { req ->
+                    BatchRenamePanel(
+                        request = req,
+                        queue = container.renameQueue,
+                        scope = scope,
+                        onGotoTasks = {
+                            batchRename = null
+                            destinations.firstOrNull { it.route == "rename" }?.let { navigate(it) }
+                        },
+                        onDismiss = { batchRename = null },
+                    )
                 }
             }
         }

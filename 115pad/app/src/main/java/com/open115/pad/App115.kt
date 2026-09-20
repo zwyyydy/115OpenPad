@@ -99,6 +99,15 @@ class AppContainer(context: Context) {
     /** 图片直链三级解析链（uo → downurl → thumb）+ downurl 防频控缓存 */
     val imageUrlResolver = com.open115.pad.data.ImageUrlResolver(openApi, okHttpClient)
 
+    /** 批量重命名的持久化任务队列：任务逐条落库，进程被杀后重启能精确续跑 */
+    val renameQueue = com.open115.pad.data.RenameQueue(context)
+
+    /**
+     * 队列执行器：一条常驻协程把队列里的任务**顺序**跑完。挂在容器上（而不是面板或
+     * ViewModel 里）—— 关面板、切页、切任务页都不该中断它，跟上传一样由 [transferScope] 承载。
+     */
+    val renameWorker = com.open115.pad.data.RenameQueueWorker(openApi, renameQueue, opLog)
+
     /** 高级文件过滤：方案存储 + 文件页右上角总开关 */
     val filterPrefs = com.open115.pad.data.FilterPrefs(context)
 
@@ -124,6 +133,15 @@ class AppContainer(context: Context) {
         // 不清的话，换个账号登录会直接看到上一个账号的目录内容
         scope.launch {
             session.loggedInFlow.collect { if (!it) dirCache.clear() }
+        }
+
+        // 改名队列按登录态启停。**启动即恢复**：worker 一跑起来就会捡起队列里所有
+        // 未完成的任务，不需要额外的扫描步骤（也就不依赖用户先打开哪个页面）。
+        // 登出必须停 —— 没有 token 还继续跑，只会把剩下的文件全跑成失败。
+        scope.launch {
+            session.loggedInFlow.collect { loggedIn ->
+                if (loggedIn) renameWorker.start(transferScope) else renameWorker.stop()
+            }
         }
     }
 }

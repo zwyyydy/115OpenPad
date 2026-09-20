@@ -30,6 +30,7 @@ import androidx.compose.material.icons.outlined.CloudDownload
 import androidx.compose.material.icons.outlined.ContentCopy
 import androidx.compose.material.icons.outlined.CreateNewFolder
 import androidx.compose.material.icons.outlined.Delete
+import androidx.compose.material.icons.outlined.Deselect
 import androidx.compose.material.icons.outlined.DriveFileMove
 import androidx.compose.material.icons.outlined.Edit
 import androidx.compose.material.icons.outlined.FilterAlt
@@ -38,6 +39,7 @@ import androidx.compose.material.icons.outlined.GridView
 import androidx.compose.material.icons.outlined.PushPin
 import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material.icons.outlined.Search
+import androidx.compose.material.icons.outlined.SelectAll
 import androidx.compose.material.icons.outlined.Star
 import androidx.compose.material.icons.outlined.StarBorder
 import androidx.compose.material.icons.outlined.Upload
@@ -99,6 +101,10 @@ fun FilesBrowserPane(
     onCopy: () -> Unit,
     onDelete: () -> Unit,
     onRename: (FileItem) -> Unit,
+    /** 选中 ≥2 项时的批量重命名入口 */
+    onBatchRename: () -> Unit,
+    /** 全选 / 取消全选当前显示的条目 */
+    onSelectAll: () -> Unit,
     onStar: (FileItem) -> Unit,
     /** 置顶 / 取消置顶：传入当前选择集里可置顶的文件夹（可能为空） */
     onPin: (List<FileItem>) -> Unit,
@@ -474,6 +480,16 @@ fun FilesBrowserPane(
                     style = MaterialTheme.typography.labelLarge,
                     modifier = Modifier.padding(end = 4.dp),
                 )
+                // 全选/取消全选：批量改名、移动、删除这些常见操作往往要整个目录一起处理，
+                // 一个个点太费事。只作用于**当前显示**的条目（与筛选/搜索/置顶保持一致）。
+                val displayedIds = ui.display.mapNotNull { it.fid }
+                val allSelected = displayedIds.isNotEmpty() && displayedIds.all { it in ui.selection }
+                IconButton(onClick = onSelectAll) {
+                    Icon(
+                        if (allSelected) Icons.Outlined.Deselect else Icons.Outlined.SelectAll,
+                        contentDescription = if (allSelected) "取消全选" else "全选",
+                    )
+                }
                 Box(Modifier.weight(1f))
                 IconButton(onClick = onDownload, enabled = filesSelected > 0) {
                     Icon(Icons.Outlined.CloudDownload, contentDescription = "下载")
@@ -484,7 +500,11 @@ fun FilesBrowserPane(
                 IconButton(onClick = onCopy, enabled = !ui.searching) {
                     Icon(Icons.Outlined.ContentCopy, contentDescription = "复制")
                 }
-                IconButton(onClick = { single?.let(onRename) }, enabled = single != null) {
+                // 重命名：单选走原来的对话框（快、老习惯不变），多选才进批量面板
+                IconButton(
+                    onClick = { if (single != null) onRename(single) else onBatchRename() },
+                    enabled = ui.selection.isNotEmpty(),
+                ) {
                     Icon(Icons.Outlined.Edit, contentDescription = "重命名")
                 }
                 IconButton(onClick = { single?.let(onStar) }, enabled = single != null) {

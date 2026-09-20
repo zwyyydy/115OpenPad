@@ -13,7 +13,7 @@ import kotlinx.serialization.json.Json
 private val Context.opLogDataStore by preferencesDataStore(name = "op_log")
 
 /** 操作记录的类型（存枚举名，加新类型不破坏旧 JSON） */
-enum class OpType { COPY, MOVE, DELETE, UPLOAD, DOWNLOAD, OFFLINE, TEXT_PREVIEW, IMAGE_VIEW, VIDEO_PLAY }
+enum class OpType { COPY, MOVE, DELETE, RENAME, UPLOAD, DOWNLOAD, OFFLINE, TEXT_PREVIEW, IMAGE_VIEW, VIDEO_PLAY }
 
 /**
  * 一条用户操作记录。

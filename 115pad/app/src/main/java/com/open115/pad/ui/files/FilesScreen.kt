@@ -29,6 +29,7 @@ import androidx.compose.material.icons.outlined.ChevronLeft
 import androidx.compose.material.icons.outlined.ChevronRight
 import androidx.compose.material.icons.outlined.CloudDownload
 import androidx.compose.material.icons.outlined.Delete
+import androidx.compose.material.icons.outlined.DriveFileRenameOutline
 import androidx.compose.material.icons.outlined.Description
 import androidx.compose.material.icons.outlined.Download
 import androidx.compose.material.icons.outlined.FileCopy
@@ -619,7 +620,34 @@ class FilesViewModel(
         resolver.downloadUrl(pickCode)
     }
 
-    private fun currentCid(): String = _ui.value.stack.last().cid
+    fun currentCid(): String = _ui.value.stack.last().cid
+
+    /**
+     * 批量重命名的目标：已选中项，**按列表显示顺序**返回。
+     *
+     * 顺序必须取自 [UiState.display] 而不是 selection —— 后者是无序的 `Set<String>`，
+     * 拿它当顺序来源的话编号会和预览列表对不上（display 已经过筛选与置顶重排，
+     * 正是用户看到的那个顺序）。fid 为空的项无法定位到云端文件，直接排除。
+     */
+    fun selectedInDisplayOrder(): List<FileItem> {
+        val s = _ui.value
+        return s.display.filter { it.fid != null && it.fid in s.selection }
+    }
+
+    /**
+     * 全选 / 取消全选。
+     *
+     * 只作用于**当前显示**的条目（display 已过筛选与置顶重排，正是用户看到的那些）；
+     * 搜索态下 display 就是结果集，所以搜索时全选的是搜索结果。
+     * 已经全选时再点一次 = 取消全选，与回收站页的 toggleSelectAll 行为一致。
+     */
+    fun toggleSelectAll() {
+        _ui.update { s ->
+            val ids = s.display.mapNotNull { it.fid }.toSet()
+            val allSelected = ids.isNotEmpty() && s.selection.containsAll(ids)
+            s.copy(selection = if (allSelected) emptySet() else ids)
+        }
+    }
 
     /**
      * 执行一次接口操作，把结果翻译成"要不要提示用户、提示什么"（返回 null = 不打扰）。
@@ -662,6 +690,8 @@ fun FilesScreen(
     onPlayVideo: (item: FileItem, playlist: List<PlaylistEntry>, index: Int) -> Unit,
     onOpenGallery: (items: List<ImageMediaItem>, index: Int) -> Unit,
     onPreviewText: (item: FileItem) -> Unit,
+    /** 多选时进批量重命名面板；入参里带上了整个目录的列表，面板可一键扩到全目录 */
+    onBatchRename: (BatchRenameRequest) -> Unit,
     onOpenFilterRules: () -> Unit,
 ) {
     val ui by vm.ui.collectAsState()
@@ -680,6 +710,20 @@ fun FilesScreen(
     }
     var searchMode by remember { mutableStateOf(false) }
     var sideCollapsed by rememberSaveable { mutableStateOf(false) }
+
+    // 重命名任务结束后刷新列表。
+    // 刷新**不能**放在面板里：任务归持久化队列管，关面板、切页、杀进程都不停，
+    // 用户很可能早就走开了。这里靠"最新的结束时间戳"变化触发，并且只在该任务
+    // 正好属于当前目录时才刷 —— 别的目录改了不必白刷一遍。
+    val renameTasks by context.appContainer.renameQueue.tasks.collectAsState()
+    val lastRenameFinish = renameTasks.maxOfOrNull { it.finishedAt ?: 0L } ?: 0L
+    LaunchedEffect(lastRenameFinish) {
+        if (lastRenameFinish > 0L &&
+            renameTasks.any { it.finishedAt == lastRenameFinish && it.cid == vm.currentCid() }
+        ) {
+            vm.refresh()
+        }
+    }
 
     // ---- 返回键分级处理（后注册的优先级更高）----
     // ① 浏览子目录时：返回上一级；根目录"返无可返"时不拦截，交给系统退出应用
@@ -932,6 +976,21 @@ fun FilesScreen(
                 onCopy = { moveMode = "copy" },
                 onDelete = { showDeleteConfirm = true },
                 onRename = { renameTarget = it },
+                onBatchRename = {
+                    val targets = vm.selectedInDisplayOrder()
+                    if (targets.size >= 2) {
+                        onBatchRename(
+                            BatchRenameRequest(
+                                items = targets,
+                                // 整个目录的显示列表：面板里「全选本目录」要用
+                                allFiles = ui.display,
+                                cid = vm.currentCid(),
+                                dirName = ui.stack.last().name,
+                            ),
+                        )
+                    }
+                },
+                onSelectAll = { vm.toggleSelectAll() },
                 onStar = { starTarget = it },
                 onPin = { scope.launch { notify(vm.togglePins(it)) } },
                 onDownload = {
@@ -969,6 +1028,21 @@ fun FilesScreen(
                 onCopy = { moveMode = "copy" },
                 onDelete = { showDeleteConfirm = true },
                 onRename = { renameTarget = it },
+                onBatchRename = {
+                    val targets = vm.selectedInDisplayOrder()
+                    if (targets.size >= 2) {
+                        onBatchRename(
+                            BatchRenameRequest(
+                                items = targets,
+                                // 整个目录的显示列表：面板里「全选本目录」要用
+                                allFiles = ui.display,
+                                cid = vm.currentCid(),
+                                dirName = ui.stack.last().name,
+                            ),
+                        )
+                    }
+                },
+                onSelectAll = { vm.toggleSelectAll() },
                 onStar = { starTarget = it },
                 onPin = { scope.launch { notify(vm.togglePins(it)) } },
                 onDownload = {
@@ -1169,6 +1243,7 @@ private fun opTypeMeta(type: String): Pair<ImageVector, String> = when (type) {
     OpType.COPY.name -> Icons.Outlined.FileCopy to "复制"
     OpType.MOVE.name -> Icons.AutoMirrored.Outlined.DriveFileMove to "移动"
     OpType.DELETE.name -> Icons.Outlined.Delete to "删除"
+    OpType.RENAME.name -> Icons.Outlined.DriveFileRenameOutline to "重命名"
     OpType.UPLOAD.name -> Icons.Outlined.Upload to "上传"
     OpType.DOWNLOAD.name -> Icons.Outlined.Download to "下载"
     OpType.OFFLINE.name -> Icons.Outlined.CloudDownload to "云离线"

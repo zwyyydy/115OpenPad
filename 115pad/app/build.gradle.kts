@@ -49,6 +49,9 @@ dependencies {
     implementation(composeBom)
     androidTestImplementation(composeBom)
 
+    // 纯逻辑单测（批量重命名的算名规则：中文数字、Excel 式字母、扩展名边界）
+    testImplementation("junit:junit:4.13.2")
+
     implementation("androidx.core:core-ktx:1.13.1")
     implementation("androidx.activity:activity-compose:1.9.3")
     // SAF 目录树遍历（文件夹上传）：DocumentsContract 的轻量封装
