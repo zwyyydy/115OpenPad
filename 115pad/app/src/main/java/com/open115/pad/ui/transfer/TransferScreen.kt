@@ -249,6 +249,8 @@ fun TransferScreen(snackbarHostState: SnackbarHostState) {
 
     // ---- 上传侧状态 ----
     val uploads by log.uploads.collectAsState(initial = emptyList())
+    // 排队中的上传 id（按入队序，内存态）：并发闸限流，超出的显示「排队中 · 第 N 位」
+    val queuedIds by log.queuedUploads.collectAsState(initial = emptyList())
     var pendingUploadDelete by remember { mutableStateOf<UploadRecord?>(null) }
     var pendingUploadCancel by remember { mutableStateOf<UploadRecord?>(null) }
 
@@ -365,6 +367,7 @@ fun TransferScreen(snackbarHostState: SnackbarHostState) {
 
                     else -> UploadList(
                         uploads = uploads,
+                        queuedIds = queuedIds,
                         onPause = { pauseUpload(it) },
                         onResume = { resumeUpload(it) },
                         onCancel = { r -> pendingUploadCancel = r },
@@ -421,8 +424,12 @@ fun TransferScreen(snackbarHostState: SnackbarHostState) {
             title = { Text("取消上传") },
             text = {
                 Text(
-                    "将取消「${r.name}」的上传并移除记录，已上传的分片不会保留" +
-                        "（如需保留断点，请改用暂停）。",
+                    if (r.id in queuedIds) {
+                        "「${r.name}」还在排队、尚未开始上传，取消将直接移除这个任务。"
+                    } else {
+                        "将取消「${r.name}」的上传并移除记录，已上传的分片不会保留" +
+                            "（如需保留断点，请改用暂停）。"
+                    },
                 )
             },
             confirmButton = {
@@ -481,6 +488,7 @@ private fun DownloadList(
 @Composable
 private fun UploadList(
     uploads: List<UploadRecord>,
+    queuedIds: List<Long>,
     onPause: (UploadRecord) -> Unit,
     onResume: (UploadRecord) -> Unit,
     onCancel: (UploadRecord) -> Unit,
@@ -504,6 +512,8 @@ private fun UploadList(
         items(uploads.sortedByDescending { it.id }, key = { it.id }) { r ->
             UploadRow(
                 record = r,
+                // 排队列里的位次（1 起）；null = 不在排队（已在传/已结束）
+                queuedPos = queuedIds.indexOf(r.id).takeIf { it >= 0 }?.plus(1),
                 onPause = { onPause(r) },
                 onResume = { onResume(r) },
                 onCancel = { onCancel(r) },
@@ -539,6 +549,7 @@ private fun EmptyHint(
 @Composable
 private fun UploadRow(
     record: UploadRecord,
+    queuedPos: Int?,
     onPause: () -> Unit,
     onResume: () -> Unit,
     onCancel: () -> Unit,
@@ -572,6 +583,8 @@ private fun UploadRow(
                         // 分片上传进行中：显示已传字节（小文件直传没有过程，uploaded 一直是 0）
                         record.ok == null && record.paused ->
                             "已传 ${Format.size(record.uploaded)} / ${Format.size(record.size)} · 已暂停，可继续"
+                        record.ok == null && queuedPos != null ->
+                            "排在第 $queuedPos 位 · 开始 ${timeText(record.startedAt)}"
                         record.ok == null && record.uploaded > 0 ->
                             "已传 ${Format.size(record.uploaded)} / ${Format.size(record.size)} · 开始 ${timeText(record.startedAt)}"
                         record.ok == null -> "开始 ${timeText(record.startedAt)}"
@@ -589,6 +602,7 @@ private fun UploadRow(
                 Spacer(Modifier.width(8.dp))
                 val (label, bg, fg) = when {
                     record.ok == null && record.paused -> Triple("已暂停", AppColors.AmberBg, AppColors.AmberFg)
+                    record.ok == null && queuedPos != null -> Triple("排队中", AppColors.AmberBg, AppColors.AmberFg)
                     record.ok == null ->
                         if (record.size > 0 && record.uploaded > 0) {
                             Triple("上传中 ${record.uploaded * 100 / record.size}%", AppColors.BlueBg, AppColors.BlueFg)
@@ -600,8 +614,14 @@ private fun UploadRow(
                     else -> Triple("已上传", AppColors.GreenBg, AppColors.GreenFg)
                 }
                 StatusBadge(label, bg = bg, fg = fg)
-                // 操作按钮：上传中→暂停；已暂停→继续+取消；失败且有文件来源→重试
+                // 操作按钮：排队中→取消；上传中→暂停；已暂停→继续+取消；失败且有文件来源→重试
                 when {
+                    // 排队中还没开始传（无断点可留），只有取消；与上传中取消共用确认框链路
+                    record.ok == null && queuedPos != null -> {
+                        IconButton(onClick = onCancel) {
+                            Icon(Icons.Outlined.Close, contentDescription = "取消", tint = AppColors.RedFg)
+                        }
+                    }
                     record.ok == null && !record.paused -> {
                         IconButton(onClick = onPause) {
                             Icon(

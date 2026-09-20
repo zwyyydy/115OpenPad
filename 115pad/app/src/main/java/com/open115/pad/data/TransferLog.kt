@@ -4,10 +4,15 @@ import android.content.Context
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.sync.Semaphore
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
@@ -131,6 +136,7 @@ class TransferLog(private val context: Context) {
         uploadJobs.remove(id)
         pauseRequests.remove(id)
         cancelRequests.remove(id)
+        unmarkQueued(id)
         context.transferDataStore.edit { p ->
             val cur = decode<UploadRecord>(p[KEY_UPLOADS])
             val next = cur.map { r ->
@@ -191,6 +197,7 @@ class TransferLog(private val context: Context) {
         resuming.remove(id)
         uploadJobs.remove(id)
         pauseRequests.remove(id)
+        unmarkQueued(id)
         context.transferDataStore.edit { p ->
             val cur = decode<UploadRecord>(p[KEY_UPLOADS])
             p[KEY_UPLOADS] = Json.encodeToString(
@@ -223,6 +230,12 @@ class TransferLog(private val context: Context) {
     fun consumeCancelRequest(id: Long): Boolean = cancelRequests.remove(id)
 
     suspend fun removeUpload(id: Long) = context.transferDataStore.edit { p ->
+        activeUploads.remove(id)
+        resuming.remove(id)
+        uploadJobs.remove(id)
+        pauseRequests.remove(id)
+        cancelRequests.remove(id)
+        unmarkQueued(id)
         val cur = decode<UploadRecord>(p[KEY_UPLOADS])
         val next = cur.filterNot { it.id == id }
         if (next.size != cur.size) p[KEY_UPLOADS] = Json.encodeToString(next)
@@ -241,6 +254,8 @@ class TransferLog(private val context: Context) {
 
     private companion object {
         const val MAX_RECORDS = 200
+        /** 上传并发上限：115 上传接口对并发不友好，2 个够用且稳 */
+        const val MAX_CONCURRENT_UPLOADS = 2
         val KEY_DOWNLOADS = stringPreferencesKey("download_records")
         val KEY_UPLOADS = stringPreferencesKey("upload_records")
     }
@@ -255,4 +270,44 @@ class TransferLog(private val context: Context) {
     /** 暂停/取消意图登记：请求方先登记再 cancel 协程，catch 分支消费意图分类落地 */
     private val pauseRequests = mutableSetOf<Long>()
     private val cancelRequests = mutableSetOf<Long>()
+
+    // ==================== 上传并发闸 ====================
+
+    /**
+     * 同时最多 N 个上传真正在跑（含 SHA1 计算 / init 协商），超出的在 [uploadGate]
+     * 排队等许可——115 对上传接口有频控，多任务并跑只会互相拖慢并加重失败率。
+     * 排队状态是纯内存态（重启后由启动扫描重新入队），不落库。
+     */
+    private val uploadGate = Semaphore(MAX_CONCURRENT_UPLOADS)
+
+    /** 正在排队等许可的记录 id（按入队序），传输中心展示「排队中 · 第 N 位」用 */
+    private val _queuedUploads = MutableStateFlow<List<Long>>(emptyList())
+    val queuedUploads: StateFlow<List<Long>> = _queuedUploads
+
+    fun queuedPosition(id: Long): Int? =
+        _queuedUploads.value.indexOf(id).takeIf { it >= 0 }?.plus(1)
+
+    private fun markQueued(id: Long) =
+        _queuedUploads.update { it.filterNot { x -> x == id } + id }
+
+    private fun unmarkQueued(id: Long) =
+        _queuedUploads.update { it - id }
+
+    /**
+     * 排队等一个上传许可（挂起，可取消）。拿到许可后调用方必须在 finally 里
+     * [releaseUploadSlot]。排队期间被取消时抛 CancellationException，由调用方
+     * 现有的 catch 分类逻辑落地（取消→清记录；暂停/意外取消→保留记录）。
+     */
+    suspend fun acquireUploadSlot(id: Long) {
+        markQueued(id)
+        try {
+            uploadGate.acquire()
+        } catch (e: CancellationException) {
+            unmarkQueued(id)
+            throw e
+        }
+        unmarkQueued(id)
+    }
+
+    fun releaseUploadSlot() = uploadGate.release()
 }

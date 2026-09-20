@@ -66,9 +66,16 @@ object Uploader {
         val id = log.beginUpload(fileName, bytes.size.toLong(), targetCid, targetName)
         currentCoroutineContext()[Job]?.let { log.registerJob(id, it) }
         return try {
-            val r = uploadSmall(api, fileName, bytes, target = "U_1_$targetCid")
-            log.finishUpload(id, ok = true, reused = r.reused)
-            r
+            // 并发闸：超限排队等许可（传输中心显示「排队中」）。排队中取消走下面
+            // catch 清记录——小文件没有会话/进度可保留，语义与上传中取消一致
+            log.acquireUploadSlot(id)
+            try {
+                val r = uploadSmall(api, fileName, bytes, target = "U_1_$targetCid")
+                log.finishUpload(id, ok = true, reused = r.reused)
+                r
+            } finally {
+                log.releaseUploadSlot()
+            }
         } catch (e: Exception) {
             // 小文件没有可续传的会话，取消（用户/外部）直接清记录，不留「已取消」尸体；
             // 协程已取消，落库必须包 NonCancellable，否则 DataStore edit 被取消打断
@@ -394,9 +401,17 @@ object Uploader {
             onSession = { s, p, o -> log.updateUploadSession(id, s, p, o) },
         )
         return try {
-            val r = runOnce(null, null, null)
-            log.finishUpload(id, ok = true, reused = r.reused)
-            r
+            // 并发闸：超限排队等许可（SHA1/init 都在拿到许可后才发生，排队任务不抢 CPU/网络）。
+            // 排队中取消（无任何已传分片）→ consumeCancelRequest 命中清记录；排队中意外取消
+            // → pauseUpload 保留记录（无会话，继续时按全新上传走，链路兼容）
+            log.acquireUploadSlot(id)
+            try {
+                val r = runOnce(null, null, null)
+                log.finishUpload(id, ok = true, reused = r.reused)
+                r
+            } finally {
+                log.releaseUploadSlot()
+            }
         } catch (e: Exception) {
             if (e is kotlinx.coroutines.CancellationException) {
                 // 取消请求：清记录（会话缺 bucket/object/STS 无法 abort，交给服务端
@@ -404,7 +419,9 @@ object Uploader {
                 // 保留会话标记暂停，传输中心可「继续」或启动扫描按暂停状态保持不动。
                 // 协程已取消，落库必须包 NonCancellable，否则 edit 被取消打断静默失败
                 withContext(kotlinx.coroutines.NonCancellable) {
-                    if (log.consumeCancelRequest(id)) log.removeUpload(id)
+                    val wasCancel = log.consumeCancelRequest(id)
+                    Log.w(TAG, "uploadLargeLogged cancelled id=$id wasCancelRequest=$wasCancel")
+                    if (wasCancel) log.removeUpload(id)
                     else log.pauseUpload(id)
                 }
                 throw e
@@ -448,20 +465,27 @@ object Uploader {
         Log.i(TAG, "恢复中断上传 id=${rec.id} ${rec.name} size=${rec.size} 已传≈${rec.uploaded}")
         var lastPct = -1L
         return try {
-            val r = uploadLarge(
-                api, rec.name, pfd, rec.size, target = "U_1_${rec.targetCid}",
-                resumeSha1 = rec.fileSha1, resumePickCode = rec.pickCode, resumeUploadId = rec.ossUploadId,
-                onProgress = { up ->
-                    val pct = up * 100 / rec.size
-                    if (pct != lastPct) {
-                        lastPct = pct
-                        log.updateUploadProgress(rec.id, up)
-                    }
-                },
-                onSession = { s, p, o -> log.updateUploadSession(rec.id, s, p, o) },
-            )
-            log.finishUpload(rec.id, ok = true, reused = r.reused)
-            r
+            // 继续上传同样过并发闸（传输中心「继续/重试」与启动扫描恢复都走这里），
+            // 排队中取消/暂停由下面 catch 的意图分类落地：取消清记录，暂停保留会话
+            log.acquireUploadSlot(rec.id)
+            try {
+                val r = uploadLarge(
+                    api, rec.name, pfd, rec.size, target = "U_1_${rec.targetCid}",
+                    resumeSha1 = rec.fileSha1, resumePickCode = rec.pickCode, resumeUploadId = rec.ossUploadId,
+                    onProgress = { up ->
+                        val pct = up * 100 / rec.size
+                        if (pct != lastPct) {
+                            lastPct = pct
+                            log.updateUploadProgress(rec.id, up)
+                        }
+                    },
+                    onSession = { s, p, o -> log.updateUploadSession(rec.id, s, p, o) },
+                )
+                log.finishUpload(rec.id, ok = true, reused = r.reused)
+                r
+            } finally {
+                log.releaseUploadSlot()
+            }
         } catch (e: Exception) {
             if (e is kotlinx.coroutines.CancellationException) {
                 // 与 uploadLargeLogged 同规则：取消清记录；暂停/意外取消保留会话标记暂停
