@@ -8,9 +8,23 @@ import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
+import kotlinx.serialization.decodeFromString
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.json.Json
 
 private val Context.playerDataStore by preferencesDataStore(name = "player")
+
+/** 本地源续播表最多记这么多条，超了丢一批，避免无限涨 */
+private const val LOCAL_RESUME_MAX = 100
+
+/** 本地源续播表是 `uri → 毫秒` 的 JSON 串；解析失败一律当空表（宁可从头播也不要崩） */
+private val localResumeJson = Json { ignoreUnknownKeys = true }
+
+private fun decodeLocalResume(raw: String?): Map<String, Long> = runCatching {
+    localResumeJson.decodeFromString<Map<String, Long>>(raw ?: "{}")
+}.getOrDefault(emptyMap())
 
 /** 播放器偏好：缓存、手势参数 */
 class PlayerPrefs(private val context: Context) {
@@ -116,6 +130,24 @@ class PlayerPrefs(private val context: Context) {
     suspend fun setVrPanniniD(v: Float) = context.playerDataStore.edit { it[KEY_VR_PANNINI] = v }
     suspend fun setVrWindow(v: String) = context.playerDataStore.edit { it[KEY_VR_WINDOW] = v }
 
+    // ---- 本地/外部源的续播位置 ----
+    // 云盘片走 115 的观看记录；本地文件（已下载的、外部应用传进来的）没有那个接口，
+    // 只能在本机记一份。不做的话 40 分钟的下载片每次进都从头开始，体验像半成品。
+
+    /** 本地文件的续播位置（毫秒）；没有记录返回 0 */
+    suspend fun localResumeOf(uri: String): Long =
+        decodeLocalResume(context.playerDataStore.data.first()[KEY_LOCAL_RESUME])[uri] ?: 0L
+
+    suspend fun setLocalResume(uri: String, ms: Long) {
+        context.playerDataStore.edit { prefs ->
+            val next = decodeLocalResume(prefs[KEY_LOCAL_RESUME]) + (uri to ms)
+            prefs[KEY_LOCAL_RESUME] = localResumeJson.encodeToString(
+                if (next.size <= LOCAL_RESUME_MAX) next
+                else next.entries.toList().takeLast(LOCAL_RESUME_MAX).associate { it.key to it.value },
+            )
+        }
+    }
+
     private companion object {
         val KEY_CACHE_ENABLED = booleanPreferencesKey("cache_enabled")
         val KEY_CACHE_MB = intPreferencesKey("cache_max_mb")
@@ -137,5 +169,6 @@ class PlayerPrefs(private val context: Context) {
         val KEY_VR_FOV = floatPreferencesKey("vr_fov")
         val KEY_VR_PANNINI = floatPreferencesKey("vr_pannini_d")
         val KEY_VR_WINDOW = stringPreferencesKey("vr_window")
+        val KEY_LOCAL_RESUME = stringPreferencesKey("local_resume")
     }
 }

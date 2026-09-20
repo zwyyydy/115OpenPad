@@ -1,8 +1,10 @@
 package com.open115.pad.ui.theme
 
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxScope
@@ -121,11 +123,14 @@ val CardShape = RoundedCornerShape(16.dp)
 /**
  * 纯白悬浮卡片：微弥散投影（≈ 0 4px 16px rgba(0,0,0,0.03)）+ 1px 微描边 + 16dp 圆角。
  * onClick 为空时是纯展示卡片，否则整卡可点（带涟漪）。
+ * onLongClick 只在需要「长按出菜单」的地方传，单传它时点击是空操作。
  */
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 fun AppCard(
     modifier: Modifier = Modifier,
     onClick: (() -> Unit)? = null,
+    onLongClick: (() -> Unit)? = null,
     content: @Composable ColumnScope.() -> Unit,
 ) {
     val shape = CardShape
@@ -141,8 +146,14 @@ fun AppCard(
         .background(AppColors.Card)
         .border(1.dp, AppColors.CardBorder, shape)
     Column(
-        modifier = (if (onClick != null) base.clickable(onClick = onClick) else base)
-            .padding(16.dp),
+        modifier = when {
+            onLongClick != null -> base.combinedClickable(
+                onClick = onClick ?: {},
+                onLongClick = onLongClick,
+            )
+            onClick != null -> base.clickable(onClick = onClick)
+            else -> base
+        }.padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp),
         content = content,
     )

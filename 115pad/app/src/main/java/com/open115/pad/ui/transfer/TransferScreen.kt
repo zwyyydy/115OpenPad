@@ -30,6 +30,8 @@ import androidx.compose.material.icons.outlined.PlayArrow
 import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -58,6 +60,8 @@ import androidx.compose.ui.unit.dp
 import com.open115.pad.appContainer
 import com.open115.pad.data.UploadRecord
 import com.open115.pad.data.resumeUploadRecord
+import com.open115.pad.player.PlayerActivity
+import com.open115.pad.ui.components.isLocalPlayable
 import com.open115.pad.ui.theme.AppCard
 import com.open115.pad.ui.theme.AppChip
 import com.open115.pad.ui.theme.AppColors
@@ -161,6 +165,12 @@ private fun mimeOf(name: String, fromColumn: String?): String {
     return guessed
         ?: fromColumn?.takeIf { it.isNotBlank() && it != "application/octet-stream" }
         ?: "*/*"
+}
+
+/** 取下载文件的 content:// Uri（系统下载器授权的那个）。取不到 = 文件已被移走或权限已失效 */
+private fun localUriOf(context: Context, id: Long): String? {
+    val dm = context.getSystemService(Context.DOWNLOAD_SERVICE) as? DownloadManager ?: return null
+    return runCatching { dm.getUriForDownloadedFile(id) }.getOrNull()?.toString()
 }
 
 /** 打开已下载的文件：用系统下载器给本应用的 content URI 交给外部应用查看 */
@@ -361,7 +371,21 @@ fun TransferScreen(snackbarHostState: SnackbarHostState) {
                         tasks = tasks,
                         speeds = speeds,
                         startedAtById = startedAtById,
-                        onOpen = { t -> notify(openDownloaded(context, t.id, mimeOf(t.name, t.mime))) },
+                        onPlay = { t ->
+                            // 交给应用内播放器：下载的 VR180 也能直接用上反投影/手势/字幕
+                            val uri = localUriOf(context, t.id)
+                            if (uri == null) {
+                                notify("文件不存在或已被移动")
+                            } else {
+                                context.startActivity(
+                                    PlayerActivity.localIntent(context, uri, t.name)
+                                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+                                )
+                            }
+                        },
+                        onOpenExternal = { t ->
+                            notify(openDownloaded(context, t.id, mimeOf(t.name, t.mime)))
+                        },
                         onDelete = { t -> pendingDelete = t },
                     )
 
@@ -453,7 +477,8 @@ private fun DownloadList(
     tasks: List<DlTask>,
     speeds: Map<Long, Double>,
     startedAtById: Map<Long, Long>,
-    onOpen: (DlTask) -> Unit,
+    onPlay: (DlTask) -> Unit,
+    onOpenExternal: (DlTask) -> Unit,
     onDelete: (DlTask) -> Unit,
 ) {
     when {
@@ -477,7 +502,8 @@ private fun DownloadList(
                     task = t,
                     speed = speeds[t.id] ?: 0.0,
                     startedAt = startedAtById[t.id],
-                    onOpen = { onOpen(t) },
+                    onPlay = { onPlay(t) },
+                    onOpenExternal = { onOpenExternal(t) },
                     onDelete = { onDelete(t) },
                 )
             }
@@ -666,10 +692,27 @@ private fun DownloadRow(
     task: DlTask,
     speed: Double,
     startedAt: Long?,
-    onOpen: () -> Unit,
+    onPlay: () -> Unit,
+    onOpenExternal: () -> Unit,
     onDelete: () -> Unit,
 ) {
-    AppCard(Modifier.fillMaxWidth()) {
+    val ready = task.status == DownloadManager.STATUS_SUCCESSFUL && !task.fileGone
+    // 视频/音频交给应用内播放器（能顺带用上 VR 反投影、手势、字幕）；
+    // 其余类型（pdf/apk/图片…）应用内没有查看器，仍然交给外部应用。
+    val playable = ready && isLocalPlayable(task.name, mimeOf(task.name, task.mime))
+    val primary: (() -> Unit)? = when {
+        playable -> onPlay
+        ready -> onOpenExternal
+        else -> null
+    }
+    var menuOpen by remember { mutableStateOf(false) }
+    val openMenu: () -> Unit = { menuOpen = true }
+    AppCard(
+        Modifier.fillMaxWidth(),
+        // 没下完 / 文件已被移走的行不给点：点了没反应比不给点更像卡住
+        onClick = primary,
+        onLongClick = if (ready) openMenu else null,
+    ) {
         Column(Modifier.padding(horizontal = 14.dp, vertical = 12.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 KindBadge(task.name, isDir = false)
@@ -735,11 +778,11 @@ private fun DownloadRow(
                 Spacer(Modifier.width(8.dp))
                 val (label, colors) = statusVisual(task)
                 StatusBadge(label, bg = colors.first, fg = colors.second)
-                if (task.status == DownloadManager.STATUS_SUCCESSFUL && !task.fileGone) {
-                    IconButton(onClick = onOpen) {
+                if (ready) {
+                    IconButton(onClick = { primary?.invoke() }) {
                         Icon(
-                            Icons.Outlined.OpenInNew,
-                            contentDescription = "打开",
+                            if (playable) Icons.Outlined.PlayArrow else Icons.Outlined.OpenInNew,
+                            contentDescription = if (playable) "播放" else "打开",
                             tint = AppColors.AccentDeep,
                         )
                     }
@@ -763,6 +806,24 @@ private fun DownloadRow(
                 } else {
                     LinearProgressIndicator(modifier = Modifier.fillMaxWidth().height(4.dp))
                 }
+            }
+            // 长按菜单。长按不是可发现的交互，所以行内那个图标按钮做的是同一件事，
+            // 这里只是把「外部打开」和「删除」也挂到长按上。
+            DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
+                DropdownMenuItem(
+                    text = { Text("用其他应用打开") },
+                    onClick = {
+                        menuOpen = false
+                        onOpenExternal()
+                    },
+                )
+                DropdownMenuItem(
+                    text = { Text("删除") },
+                    onClick = {
+                        menuOpen = false
+                        onDelete()
+                    },
+                )
             }
         }
     }

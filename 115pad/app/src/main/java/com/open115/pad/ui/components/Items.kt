@@ -47,6 +47,21 @@ import androidx.compose.ui.text.font.FontWeight
 
 val imageExts = setOf("jpg", "jpeg", "png", "gif", "bmp", "webp", "heic", "avif", "tiff")
 val videoExts = setOf("mp4", "mkv", "avi", "mov", "wmv", "flv", "ts", "webm", "m4v", "mpg", "mpeg", "rmvb", "m2ts")
+val audioExts = setOf("mp3", "flac", "aac", "ogg", "wav", "m4a", "ape", "wma")
+
+/**
+ * 本地文件能不能交给应用内播放器播（视频/音频）。
+ *
+ * MIME 与扩展名**取或**，不能只看一边：DownloadManager 上报的 media_type 常是
+ * application/octet-stream 这类泛型，而部分机型的 MimeTypeMap 又不认 mkv/m2ts
+ * （返回 null），任何单边判据都会漏掉一批能播的片子。
+ */
+fun isLocalPlayable(name: String, mime: String?): Boolean {
+    val m = mime?.lowercase()
+    if (m != null && (m.startsWith("video/") || m.startsWith("audio/"))) return true
+    val ext = name.substringAfterLast('.', "").lowercase()
+    return ext in videoExts || ext in audioExts
+}
 
 fun iconForItem(item: FileItem): ImageVector {
     if (item.isDir) return Icons.Outlined.Folder
@@ -54,7 +69,7 @@ fun iconForItem(item: FileItem): ImageVector {
     return when {
         item.isv == 1 || ext in videoExts -> Icons.Outlined.OndemandVideo
         ext in imageExts -> Icons.Outlined.Image
-        ext in setOf("mp3", "flac", "aac", "ogg", "wav", "m4a", "ape", "wma") -> Icons.Outlined.MusicNote
+        ext in audioExts -> Icons.Outlined.MusicNote
         ext in setOf("doc", "docx", "xls", "xlsx", "ppt", "pptx", "pdf", "txt", "epub", "mobi") -> Icons.Outlined.Description
         ext in setOf("zip", "rar", "7z", "tar", "gz") -> Icons.Outlined.FolderZip
         ext == "apk" -> Icons.Outlined.Android

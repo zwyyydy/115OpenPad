@@ -57,11 +57,40 @@
             </intent-filter>
         </activity>
 
+        <!--
+          播放器同时充当「外部播放器」：文件管理器点开视频、别的应用「分享到」视频都进这里。
+
+          ⚠️ 这两个 intent-filter 必须挂在 PlayerActivity，**不能挂 MainActivity**：
+             MainActivity.extractDownloadUrl 对任何未识别的 VIEW 都 `return data.toString()`
+             当成下载链接提交到云端离线下载，视频 Uri 会被误投进去。
+             现有 MainActivity 的 filter 只匹配 mypad:// / pan115:// / magnet: 和 SEND text/plain，
+             不会截走视频，所以那边不用改。
+
+          不限定 scheme：content://（下载文件给的是这个）、file://、http(s):// 都能进来。
+        -->
         <activity
             android:name=".player.PlayerActivity"
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden"
-            android:exported="false"
-            android:supportsPictureInPicture="true" />
+            android:exported="true"
+            android:supportsPictureInPicture="true">
+
+            <!-- 文件管理器 / 浏览器点开视频、音频 -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:mimeType="video/*" />
+                <data android:mimeType="audio/*" />
+            </intent-filter>
+
+            <!-- 系统「分享到」：接收其它 App 分享的视频/音频（EXTRA_STREAM） -->
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="video/*" />
+                <data android:mimeType="audio/*" />
+            </intent-filter>
+        </activity>
     </application>
 
 </manifest>

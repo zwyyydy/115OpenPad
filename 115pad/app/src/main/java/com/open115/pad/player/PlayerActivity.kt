@@ -5,10 +5,12 @@ import android.content.Context
 import android.content.Intent
 import android.content.res.Configuration
 import android.media.AudioManager
+import android.net.Uri
 import android.os.Bundle
 import android.view.View
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.core.content.IntentCompat
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.LinearEasing
@@ -214,6 +216,7 @@ class PlayerActivity : ComponentActivity() {
         private const val EXTRA_NAME = "name"
         private const val EXTRA_PLAYLIST = "playlist"
         private const val EXTRA_INDEX = "index"
+        private const val EXTRA_SOURCE_URI = "source_uri"
 
         /**
          * @param playlist 当前视图的播放列表（可为空：此时上一集/下一集均置灰）。
@@ -236,13 +239,50 @@ class PlayerActivity : ComponentActivity() {
                 .putExtra(EXTRA_PLAYLIST, json)
                 .putExtra(EXTRA_INDEX, index)
         }
+
+        /**
+         * 播本地/外部文件（已下载的文件、别的应用分享过来的视频）。
+         *
+         * ⚠️ 这类源**没有任何 115 接口可用**：播放地址、字幕列表、观看记录全都拿不到，
+         * 所以加载链路是整条绕开的，不是把 pick_code 换成 uri 就行。
+         * 代价是没有跨设备观看记录（只在本机记续播位置）、没有在线字幕、没有转码清晰度。
+         *
+         * 不传 mime：播放时让 ExoPlayer 嗅探容器，比外部声明的类型更可靠
+         * （DownloadManager 常报 application/octet-stream，MimeTypeMap 又不认 mkv/m2ts）。
+         */
+        fun localIntent(context: Context, uri: String, name: String): Intent =
+            Intent(context, PlayerActivity::class.java)
+                .putExtra(EXTRA_SOURCE_URI, uri)
+                .putExtra(EXTRA_NAME, name)
+
+        /**
+         * 取要播的 Uri，两条来源都要认：
+         * - **本应用自己发起的显式 Intent**（传输中心点已下载的文件）→ Uri 放在 extra 里，
+         *   这种 Intent 没有 action，只看 action 会漏掉，直接 finish 掉什么都没发生
+         * - **外部调用** → `ACTION_VIEW` 取 `data`（文件管理器点开、浏览器点视频链接），
+         *   `ACTION_SEND` 取 `EXTRA_STREAM`（分享视频走这个）
+         *
+         * ⚠️ EXTRA_STREAM 必须用 IntentCompat 取：`getParcelableExtra(String)` 在 API 33+ 已废弃。
+         */
+        private fun Intent.sourceUriOrNull(): String? {
+            getStringExtra(EXTRA_SOURCE_URI)?.takeIf { it.isNotBlank() }?.let { return it }
+            return when (action) {
+                Intent.ACTION_VIEW -> data?.toString()
+                Intent.ACTION_SEND ->
+                    IntentCompat.getParcelableExtra(this, Intent.EXTRA_STREAM, Uri::class.java)?.toString()
+                else -> null
+            }
+        }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // 两种来源二选一：云盘（pick_code）或本地/外部（Uri）。都没有才退出 ——
+        // 以前只看 pick_code，外部应用传 Uri 进来会被直接 finish 掉。
+        val sourceUri = intent.sourceUriOrNull()
         val pickCode = intent.getStringExtra(EXTRA_PICK_CODE)
         val name = intent.getStringExtra(EXTRA_NAME) ?: ""
-        if (pickCode.isNullOrBlank()) {
+        if (sourceUri == null && pickCode.isNullOrBlank()) {
             finish()
             return
         }
@@ -257,8 +297,9 @@ class PlayerActivity : ComponentActivity() {
             Open115Theme {
                 PlayerScreen(
                     container = appContainer,
-                    initialPickCode = pickCode,
+                    initialPickCode = pickCode.orEmpty(),
                     initialName = name,
+                    initialLocalUri = sourceUri,
                     playlist = playlist,
                     initialIndex = index,
                     onBack = { finish() },
@@ -311,12 +352,25 @@ fun PlayerScreen(
     playlist: List<PlaylistEntry>,
     initialIndex: Int,
     onBack: () -> Unit,
+    /** 本地/外部源（见 [PlayerActivity.localIntent]）。非空时整条云盘链路绕开 */
+    initialLocalUri: String? = null,
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
 
-    // 当前条目：切集时改这两个状态，下方 LaunchedEffect(currentPickCode) 会自动整套重载
+    /**
+     * 本地/外部源。**不可变**：本地播放没有「切集」概念，播放队列恒为空。
+     */
+    val localUri = initialLocalUri
+
+    // 当前条目：切集时改这两个状态，下方 LaunchedEffect(itemKey) 会自动整套重载
     var currentPickCode by remember { mutableStateOf(initialPickCode) }
+    /**
+     * 「按条目记住偏好」的 key：云盘用 pick_code，本地用 uri。
+     * 直接拿 currentPickCode 当 key 的话，本地源恒为空串 ⇒ 所有本地片共享一份
+     * 手动覆盖状态（VR 模式被一部片改过，下一部也被当成改过）。
+     */
+    val itemKey = localUri ?: currentPickCode
     var currentIndex by remember { mutableStateOf(initialIndex) }
     var currentName by remember { mutableStateOf(initialName) }
     /**
@@ -459,9 +513,9 @@ fun PlayerScreen(
     //    那个模式被无条件套用到**后面每一条视频**（包括普通 16:9 视频）——
     //    表现就是"播完 VR 片再播普通片，VR 键还在、原手势全失效"。
     //    判定必须前置：分辨率猜不出 VR 布局 ⇒ 一律关闭。
-    LaunchedEffect(vsVideoSize, vrStoredMode, currentPickCode) {
+    LaunchedEffect(vsVideoSize, vrStoredMode, itemKey) {
         val stored = vrStoredMode ?: return@LaunchedEffect
-        if (vrTouchedFor == currentPickCode) return@LaunchedEffect
+        if (vrTouchedFor == itemKey) return@LaunchedEffect
         val guess = VrDetector.guess(vsVideoSize.width, vsVideoSize.height)
         val next = when {
             stored == VR_MODE_OFF -> null
@@ -483,7 +537,7 @@ fun PlayerScreen(
     LaunchedEffect(vrMode, vrStoredEye, vrStoredPannini) {
         vrState.rightEye = vrStoredEye
         // 用户在当前这条片子里拖过滑杆就不再回写，否则拖动过程中会被覆盖打断
-        if (vrTouchedFor != currentPickCode) {
+        if (vrTouchedFor != itemKey) {
             vrStoredPannini?.let {
                 vrState.setPannini(it)
                 vrPanniniUi = vrState.panniniD
@@ -493,9 +547,9 @@ fun PlayerScreen(
     }
 
     // 陀螺仪开关与持久化首值同步（只在未手动改过的条目上套用）
-    LaunchedEffect(vrStoredGyro, currentPickCode) {
+    LaunchedEffect(vrStoredGyro, itemKey) {
         val v = vrStoredGyro ?: return@LaunchedEffect
-        if (vrTouchedFor != currentPickCode) vrGyroOn = v
+        if (vrTouchedFor != itemKey) vrGyroOn = v
     }
 
     // 视窗档位是全局偏好：不随条目走，也不存在"拖到一半被回写打断"的问题，
@@ -968,8 +1022,33 @@ fun PlayerScreen(
         }
     }
 
-    // 首次进入与切集共用同一条加载链路：currentPickCode 一变就整套重载
-    LaunchedEffect(currentPickCode, prefs) {
+    // 首次进入与切集共用同一条加载链路：itemKey 一变就整套重载
+    LaunchedEffect(itemKey, prefs) {
+        // ---- 本地/外部源：整条绕开 115 接口 ----
+        // 播放地址、字幕列表、观看记录全都要 pick_code，本地文件一个都拿不到，
+        // 所以这里直接起播。下面那些由 data 驱动的 UI（清晰度、音轨）靠 data 保持
+        // null 自然隐藏，不用另外加开关。
+        if (localUri != null) {
+            val resumeMs = runCatching { container.playerPrefs.localResumeOf(localUri) }
+                .getOrDefault(0L)
+            runCatching {
+                player.setMediaItem(
+                    // mime 交给 mimeOfFileName：认得出的给准确值，认不出的给 null 让
+                    // ExoPlayer 嗅探容器（和「原盘」直链同一条路，mkv/m2ts 都能吃）
+                    buildMediaItem(localUri, mimeOfFileName(currentName)),
+                    resumePos(resumeMs),
+                )
+                player.prepare()
+                player.playWhenReady = true
+            }.onFailure { e ->
+                // 最常见的是 Uri 读权限失效（ACTION_VIEW 授的读权限不跨进程死亡，
+                // 冷启动恢复后就打不开了）。要提示而不是崩。
+                error = "无法读取该文件：${e.message}"
+            }
+            loading = false
+            pulseControlRow()
+            return@LaunchedEffect
+        }
         try {
             val parsed = parseVideoPlayResponse(container.openApi.videoPlay(currentPickCode))
             data = parsed
@@ -1061,6 +1140,18 @@ fun PlayerScreen(
                 val ended = player.playbackState == Player.STATE_ENDED
                 runCatching { container.openApi.videoHistorySave(currentPickCode, pos, if (ended) 1 else 0) }
             }
+        }
+    }
+
+    // 本地源的续播位置：没有云端观看记录可用，只能在本机记一份。
+    // 不复用上面那条上报链路 —— 它靠 `data != null` 把关（本地源恒为 null，天然跳过），
+    // key 也是 pick_code。
+    LaunchedEffect(localUri) {
+        val uri = localUri ?: return@LaunchedEffect
+        while (isActive) {
+            delay(10_000)
+            val pos = player.currentPosition
+            if (pos > 0) runCatching { container.playerPrefs.setLocalResume(uri, pos) }
         }
     }
 
@@ -1835,7 +1926,7 @@ fun PlayerScreen(
                                 pulseControlRow()
                             },
                             onPannini = { d ->
-                                vrTouchedFor = currentPickCode
+                                vrTouchedFor = itemKey
                                 vrPanniniUi = d
                                 vrState.setPannini(d)
                                 pushVrParams()
@@ -1854,7 +1945,7 @@ fun PlayerScreen(
                                 pulseControlRow()
                             },
                             onPick = { m ->
-                                vrTouchedFor = currentPickCode
+                                vrTouchedFor = itemKey
                                 vrMode = m
                                 m?.let { vrState.mode = it }
                                 vrState.resetForNewMode()
@@ -1863,7 +1954,7 @@ fun PlayerScreen(
                                 pulseControlRow()
                             },
                             onToggleEye = {
-                                vrTouchedFor = currentPickCode
+                                vrTouchedFor = itemKey
                                 val v = !vrStoredEye
                                 vrState.rightEye = v
                                 scope.launch { container.playerPrefs.setVrRightEye(v) }
@@ -1871,7 +1962,7 @@ fun PlayerScreen(
                                 pulseControlRow()
                             },
                             onToggleGyro = {
-                                vrTouchedFor = currentPickCode
+                                vrTouchedFor = itemKey
                                 val v = !vrGyroOn
                                 vrGyroOn = v
                                 vrState.gyroEnabled = v
@@ -2082,13 +2173,17 @@ fun PlayerScreen(
                                         )
                                     }
                                     DropdownMenu(expanded = subsMenuOpen, onDismissRequest = { subsMenuOpen = false }) {
-                                        DropdownMenuItem(
-                                            text = { Text("搜索在线字幕…") },
-                                            onClick = {
-                                                subsMenuOpen = false
-                                                onSubSearch()
-                                            },
-                                        )
+                                        // 在线字幕搜索是按 pick_code 去 115 搜的，本地源没有这个身份，
+                                        // 留着点了必然失败，干脆不显示（显示开关仍然保留）
+                                        if (localUri == null) {
+                                            DropdownMenuItem(
+                                                text = { Text("搜索在线字幕…") },
+                                                onClick = {
+                                                    subsMenuOpen = false
+                                                    onSubSearch()
+                                                },
+                                            )
+                                        }
                                         DropdownMenuItem(
                                             text = { Text(if (subsEnabled) "显示字幕 ✓" else "显示字幕（关）") },
                                             onClick = {
