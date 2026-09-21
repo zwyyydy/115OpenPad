@@ -4,6 +4,14 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
 
+    <!--
+      播放器截图存相册用。Android 10（API 29）起 MediaStore 不需要任何权限，
+      所以只在 28 及以下声明（maxSdkVersion 让新系统上这条权限根本不出现）。
+    -->
+    <uses-permission
+        android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+        android:maxSdkVersion="28" />
+
     <application
         android:name=".App115"
         android:allowBackup="true"

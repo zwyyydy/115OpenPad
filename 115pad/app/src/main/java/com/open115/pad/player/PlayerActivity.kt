@@ -6,10 +6,13 @@ import android.content.Intent
 import android.content.res.Configuration
 import android.media.AudioManager
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.view.View
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.IntentCompat
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.FastOutSlowInEasing
@@ -61,6 +64,7 @@ import androidx.compose.material.icons.outlined.LockOpen
 import androidx.compose.material.icons.outlined.MyLocation
 import androidx.compose.material.icons.outlined.PanoramaPhotosphere
 import androidx.compose.material.icons.outlined.Pause
+import androidx.compose.material.icons.outlined.PhotoCamera
 import androidx.compose.material.icons.outlined.PlayArrow
 import androidx.compose.material.icons.outlined.SkipNext
 import androidx.compose.material.icons.outlined.SkipPrevious
@@ -92,6 +96,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
@@ -379,12 +384,18 @@ fun PlayerScreen(
      */
     var playQueue by remember { mutableStateOf(playlist) }
     /**
-     * 切集后的起播位置覆盖值：
+     * 起播位置覆盖值（在下一次重新加载媒体时生效）：
      * - null → 沿用该视频自己的观看记录（首次从文件页进入时行为不变）
-     * - 0L   → 切集时强制从头播（需求：切集后进度归零）。
+     * - 0L   → 切集时强制从头播（需求：切集后进度归零）
+     * - 其它 → 就地重建播放器时（切换软/硬解）带回原位置，免得跳回云端观看记录
      * 若希望切集也续播，把 switchEpisode 里的 `pendingStartMs = 0L` 去掉即可。
      */
     var pendingStartMs by remember { mutableStateOf<Long?>(null) }
+    /**
+     * 重新加载时要保留的清晰度档位（只有"切换软/硬解重建播放器"会用到）。
+     * 不带的话重算 targetDef 会退回默认最高档，用户手动选的 1080P / 原盘会被悄悄改掉。
+     */
+    var pendingKeepDef by remember { mutableStateOf<Int?>(null) }
     var lastEpisodeSwitchAt by remember { mutableStateOf(0L) }
 
     var data by remember { mutableStateOf<VideoPlayData?>(null) }
@@ -556,6 +567,25 @@ fun PlayerScreen(
     // 所以直接单向同步即可，不需要 vrTouchedFor 那套保护
     LaunchedEffect(vrStoredWindow) {
         VrWindow.entries.firstOrNull { it.name == vrStoredWindow }?.let { vrWindow = it }
+    }
+
+    /**
+     * 换片 / 换集时把视角归到「复位」状态（含陀螺仪基准与视场角），
+     * 让**进片时的默认状态就等于按一次复位键之后的状态**。
+     *
+     * 不补这一段的话，同一 VR 模式下切到下一部片时上面那个 effect 不会触发
+     * `resetForNewMode`（模式没变），视角会带着上一部片的朝向进来，用户每次都得
+     * 先手动按一次复位。部分素材的默认朝向本来就不是用户想看的方向，这一步更省事。
+     *
+     * 只依赖 (itemKey, vrMode) 两个 key：用户拖视角、捏合缩放都不会触发它。
+     */
+    LaunchedEffect(itemKey, vrMode) {
+        if (vrMode == null) return@LaunchedEffect
+        // 视角自己"跳"回正前方时能一眼看出是谁干的：adb logcat -s PlayerVr
+        android.util.Log.d("PlayerVr", "视角归位 item=$itemKey mode=${vrMode?.name}")
+        vrState.resetView()
+        vrGyro.recenter()
+        pushVrParams()
     }
 
     // 陀螺仪生命周期：只在 VR 模式 + 开关打开 + 设备确实有传感器时才注册。
@@ -803,7 +833,10 @@ fun PlayerScreen(
         return entry.definition to buildMediaItem(trackUrl, MimeTypes.APPLICATION_M3U8)
     }
 
-    DisposableEffect(Unit) {
+    // ⚠️ key 必须是 player 而不是 Unit：切换软/硬解会换掉整个播放器实例（解码器是
+    //    构造期注入 RenderersFactory 的，换不掉只能重建），key 用 Unit 的话新实例
+    //    拿不到任何监听、旧实例也永远不会 release。
+    DisposableEffect(player) {
         val listener = object : Player.Listener {
             override fun onPlaybackStateChanged(state: Int) {
                 // 播放结束信号：续播决策在 loadEpisodeAt 之后的 LaunchedEffect(endedTick) 里
@@ -918,6 +951,12 @@ fun PlayerScreen(
         })
         // 调试日志：adb logcat -s EventLogger 可看完整播放器事件
         player.addAnalyticsListener(EventLogger())
+        // 视频输出面：普通路径由 VideoSurface 挂 TextureView（它随 player 一起重挂）；
+        // VR 路径要在这里补挂——GL 视图不会随播放器重建，它的 onSurfaceReady 也就不会
+        // 再触发，不补这一下切完软/硬解画面会一直是黑的。
+        if (vrMode != null) {
+            vrViewRef.get()?.currentSurface?.let { player.setVideoSurface(it) }
+        }
         onDispose {
             player.removeListener(listener)
             player.release()
@@ -944,6 +983,66 @@ fun PlayerScreen(
         controlRowVisible = true
     }
 
+    // ---- 截图（按钮在锁屏键上方，与右侧 VR 键对称）----
+    /** 渲染视图引用，由 VideoSurface 组合时透出（见 [FrameRefs] 注释） */
+    val frameRefs = remember { FrameRefs() }
+    /** 正在等写权限回调的截图请求（只有 API 28 及以下会走到） */
+    var pendingShot by remember { mutableStateOf(false) }
+
+    fun deliverShot(bitmap: android.graphics.Bitmap?) {
+        if (bitmap == null) {
+            toast("截图失败：画面未就绪")
+            return
+        }
+        scope.launch {
+            val where = withContext(Dispatchers.IO) { saveScreenshot(context, bitmap) }
+            toast(if (where == null) "截图保存失败" else "已保存：$where")
+        }
+    }
+
+    /**
+     * 抓当前画面存相册。
+     *
+     * 两条渲染路径要分别处理：普通模式是 TextureView（可直接读位图，旋转自己补），
+     * VR 模式是 GLSurfaceView（只能 PixelCopy，但拷出来就是反投影后的所见画面）。
+     * 字幕层单独叠上去 —— 位图里没有它，不叠的话带字幕的片子截出来是干净的原文。
+     */
+    fun takeScreenshot() {
+        pulseControlRow()
+        val gl = if (vrMode != null) vrViewRef.get() else null
+        if (vrMode != null && gl == null) {
+            toast("截图失败：画面未就绪")
+            return
+        }
+        scope.launch {
+            val bottomPercent = runCatching {
+                container.playerPrefs.subtitleBottomPercent.first()
+            }.getOrDefault(0)
+            if (gl != null) {
+                captureSurfaceFrame(gl) { bmp ->
+                    deliverShot(bmp?.let { overlaySubtitle(it, frameRefs.subtitle, bottomPercent) })
+                }
+            } else {
+                deliverShot(
+                    frameRefs.texture?.let {
+                        captureTextureFrame(it, videoRotation, frameRefs.subtitle, bottomPercent)
+                    },
+                )
+            }
+        }
+    }
+
+    // API 28 及以下第一次截图要先申请写权限。拒绝也照样截（落到应用自己的图片目录），
+    // 所以回调里不做二次请求、也不提示失败。
+    val legacyWritePerm = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) {
+        if (pendingShot) {
+            pendingShot = false
+            takeScreenshot()
+        }
+    }
+
     /**
      * 切换上一集 / 下一集。
      * @param delta -1 = 上一集，+1 = 下一集
@@ -964,6 +1063,8 @@ fun PlayerScreen(
 
         // 需求：切集后进度归零、总时长等待元数据、缓冲中
         pendingStartMs = 0L
+        // 切集要按新一集自己的规则重选档位，别把上一集"重建播放器"时留的档位带过来
+        pendingKeepDef = null
         positionMs = 0L
         durationMs = 0L
         bufferedMs = 0L
@@ -1022,15 +1123,21 @@ fun PlayerScreen(
         }
     }
 
-    // 首次进入与切集共用同一条加载链路：itemKey 一变就整套重载
-    LaunchedEffect(itemKey, prefs) {
+    // 首次进入与切集共用同一条加载链路：itemKey 一变就整套重载。
+    // key 用 player 而不是 prefs：播放器实例一换（切换软/硬解）新实例上还没有媒体，
+    // 必须重挂一遍，等价于原来的 prefs key。
+    LaunchedEffect(itemKey, player) {
         // ---- 本地/外部源：整条绕开 115 接口 ----
         // 播放地址、字幕列表、观看记录全都要 pick_code，本地文件一个都拿不到，
         // 所以这里直接起播。下面那些由 data 驱动的 UI（清晰度、音轨）靠 data 保持
         // null 自然隐藏，不用另外加开关。
         if (localUri != null) {
-            val resumeMs = runCatching { container.playerPrefs.localResumeOf(localUri) }
-                .getOrDefault(0L)
+            // 重建播放器（切换软/硬解）时带上原位置；否则读本机记录的续播点
+            val forcedStart = pendingStartMs
+            pendingStartMs = null
+            pendingKeepDef = null
+            val resumeMs = forcedStart
+                ?: runCatching { container.playerPrefs.localResumeOf(localUri) }.getOrDefault(0L)
             runCatching {
                 player.setMediaItem(
                     // mime 交给 mimeOfFileName：认得出的给准确值，认不出的给 null 让
@@ -1082,10 +1189,17 @@ fun PlayerScreen(
             else resumePos(rawStart, parsed.playLong * 1000)
 
             val d = parsed
+            // 重建播放器（切换软/硬解）时保留用户当前看的档位：重算会退回默认最高档
+            val keepDef = pendingKeepDef
+            pendingKeepDef = null
             // 用户在画质菜单里主动选过「原盘」→ 后续每集都沿用直链。
             // 这里用 flow.first() 直读而不是 collectAsState：后者首帧是默认值 false，
             // 会让"记住的原盘偏好"在第一集失效。
-            val targetDef = if (container.playerPrefs.preferOriginal.first() &&
+            val targetDef = if (keepDef != null &&
+                (keepDef == DEF_ORIGINAL_FILE || d.videoUrls.any { it.definition == keepDef })
+            ) {
+                keepDef
+            } else if (container.playerPrefs.preferOriginal.first() &&
                 fetchOriginalUrl(currentPickCode) != null
             ) {
                 DEF_ORIGINAL_FILE
@@ -1176,6 +1290,27 @@ fun PlayerScreen(
             player.prepare()
             player.playWhenReady = true
         }
+    }
+
+    /**
+     * 软/硬解就地切换。
+     *
+     * 为什么必须重建播放器：解码器选择器是构造期注入 `RenderersFactory` 的，而 ExoPlayer
+     * 换媒体时**默认复用同一个编解码器**（格式没变就不重新选解码器 —— `MediaCodecRenderer`
+     * 的 `flushOrReleaseCodec()` 只 flush 不 release），所以只重挂媒体是换不掉解码器的。
+     *
+     * 重建会重新走一遍加载链路（重新取地址），所以要把当前位置和当前档位显式带上，
+     * 否则会跳回云端观看记录的位置、档位也会被重算成默认最高档。
+     */
+    fun toggleDecode() {
+        val target = !prefs.softwareDecode
+        // resumePos 顺带处理"刚好停在片尾"的情况（那种位置续播会立刻 ENDED 变黑屏）
+        pendingStartMs = resumePos(player.currentPosition)
+        if (currentDef != 0) pendingKeepDef = currentDef
+        pv = prefs.copy(softwareDecode = target)
+        scope.launch { runCatching { container.playerPrefs.setSoftwareDecode(target) } }
+        setIndicator(if (target) "已切换软解（CPU）" else "已切换硬解", null)
+        pulseControlRow()
     }
 
     fun switchAudio(index: Int) {
@@ -1506,6 +1641,12 @@ fun PlayerScreen(
         onDispose { lifecycleOwner.lifecycle.removeObserver(obs) }
     }
 
+    /**
+     * 播放器实例的"最新值"句柄：给那些**生命周期长于某个播放器实例**的回调读。
+     * 直接捕 `player` 的话，回调里拿到的永远是创建它时那个实例。
+     */
+    val currentPlayer by rememberUpdatedState(player)
+
     @Composable
     fun VideoSurface(modifier: Modifier, onSubSearch: () -> Unit) {
         BoxWithConstraints(modifier) {
@@ -1539,14 +1680,17 @@ fun PlayerScreen(
                     factory = { ctx ->
                         VrViewportView(ctx).also { v ->
                             vrViewRef.set(v)
-                            v.onSurfaceReady = { s -> player.setVideoSurface(s) }
+                            // 用 rememberUpdatedState 而不是直接捕 player：播放器实例会被
+                            // 重建（切换软/硬解），GL 面重建时（切后台回来等）必须挂到**当时**
+                            // 那个实例上，捕旧实例的话画面会一直是黑的。
+                            v.onSurfaceReady = { s -> currentPlayer.setVideoSurface(s) }
                         }
                     },
                     update = { v -> v.updateParams(vrState.snapshot()) },
                     modifier = Modifier.fillMaxSize(),
                 )
             } else {
-                DisposableEffect(textureView) {
+                DisposableEffect(textureView, player) {
                     player.setVideoTextureView(textureView)
                     onDispose { player.clearVideoTextureView(textureView) }
                 }
@@ -1566,8 +1710,10 @@ fun PlayerScreen(
                 onDispose {
                     if (inVr) {
                         vrViewRef.set(null)
-                        player.clearVideoSurface()
-                        player.setVideoTextureView(textureView)
+                        // 读 currentPlayer 而不是捕 player：播放器可能已经被重建过
+                        // （切换软/硬解），要切的是当前那个实例的输出面
+                        currentPlayer.clearVideoSurface()
+                        currentPlayer.setVideoTextureView(textureView)
                     }
                 }
             }
@@ -1593,7 +1739,7 @@ fun PlayerScreen(
                     setApplyEmbeddedStyles(false)
                 }
             }
-            DisposableEffect(subtitleView) {
+            DisposableEffect(subtitleView, player) {
                 val cueListener = object : Player.Listener {
                     override fun onCues(cues: List<Cue>) {
                         subtitleView.setCues(cues)
@@ -1601,6 +1747,17 @@ fun PlayerScreen(
                 }
                 player.addListener(cueListener)
                 onDispose { player.removeListener(cueListener) }
+            }
+            // 把渲染视图透出给截图用（只透引用，视图实例仍归这里创建/销毁，见 FrameRefs 注释）
+            DisposableEffect(textureView, subtitleView) {
+                frameRefs.texture = textureView
+                frameRefs.subtitle = subtitleView
+                onDispose {
+                    // 横竖屏切换会换一套视图，只有还指向自己时才清（防旧实例的
+                    // onDispose 把新实例登记好的引用清掉）
+                    if (frameRefs.texture === textureView) frameRefs.texture = null
+                    if (frameRefs.subtitle === subtitleView) frameRefs.subtitle = null
+                }
             }
             if (vrMode == null) Box(
                 Modifier
@@ -1733,41 +1890,70 @@ fun PlayerScreen(
                         ) { lockWakeAt = System.currentTimeMillis() },
                 )
             }
-            // 锁按钮：左侧垂直居中，圆形半透明磨砂底。
-            // 未锁定时随控制排 4 秒淡出/单击唤出；锁定时常驻（仅透明度变化）
-            androidx.compose.animation.AnimatedVisibility(
-                visible = screenLocked || controlRowVisible,
-                enter = fadeIn(tween(160)),
-                exit = fadeOut(tween(200)),
-                modifier = Modifier.align(Alignment.CenterStart),
-            ) {
-            Surface(
-                color = Color.Black.copy(
-                    alpha = if (screenLocked && lockDimmed) 0.25f else 0.55f,
-                ),
-                shape = CircleShape,
+            // 左侧竖排：截图（上）+ 锁屏（下），与右侧「VR / 复位」竖排对称。
+            // 锁定态下截图键淡出，但**槽位常驻**：不常驻的话锁键会随它显隐上下跳。
+            Column(
+                horizontalAlignment = Alignment.CenterHorizontally,
                 modifier = Modifier
+                    .align(Alignment.CenterStart)
                     .padding(start = 18.dp),
             ) {
-                Box(
-                    modifier = Modifier
-                        .size(44.dp)
-                        .clickable(
-                            interactionSource = remember { MutableInteractionSource() },
-                            indication = null,
-                        ) { if (screenLocked) unlockScreen() else lockScreen() },
-                    contentAlignment = Alignment.Center,
-                ) {
-                    Icon(
-                        if (screenLocked) Icons.Filled.Lock else Icons.Outlined.LockOpen,
-                        contentDescription = if (screenLocked) "解锁屏幕" else "锁定屏幕",
-                        tint = Color.White.copy(
-                            alpha = if (screenLocked && lockDimmed) 0.5f else 1f,
-                        ),
-                        modifier = Modifier.size(20.dp),
-                    )
+                Box(Modifier.size(44.dp), contentAlignment = Alignment.Center) {
+                    androidx.compose.animation.AnimatedVisibility(
+                        visible = controlRowVisible && !screenLocked,
+                        enter = fadeIn(tween(160)),
+                        exit = fadeOut(tween(200)),
+                    ) {
+                        CircleIconButton(
+                            icon = Icons.Outlined.PhotoCamera,
+                            description = "截图",
+                            onClick = {
+                                // API 28 及以下存公共相册要先拿写权限；拿到/拒绝都继续截
+                                if (needsLegacyWritePermission(context)) {
+                                    pendingShot = true
+                                    legacyWritePerm.launch(
+                                        android.Manifest.permission.WRITE_EXTERNAL_STORAGE,
+                                    )
+                                } else {
+                                    takeScreenshot()
+                                }
+                            },
+                        )
+                    }
                 }
-            }
+                // 与右侧「VR / 复位」同间距，两列竖排视觉上对称
+                Spacer(Modifier.height(12.dp))
+                androidx.compose.animation.AnimatedVisibility(
+                    visible = screenLocked || controlRowVisible,
+                    enter = fadeIn(tween(160)),
+                    exit = fadeOut(tween(200)),
+                ) {
+                    Surface(
+                        color = Color.Black.copy(
+                            alpha = if (screenLocked && lockDimmed) 0.25f else 0.55f,
+                        ),
+                        shape = CircleShape,
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .size(44.dp)
+                                .clickable(
+                                    interactionSource = remember { MutableInteractionSource() },
+                                    indication = null,
+                                ) { if (screenLocked) unlockScreen() else lockScreen() },
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            Icon(
+                                if (screenLocked) Icons.Filled.Lock else Icons.Outlined.LockOpen,
+                                contentDescription = if (screenLocked) "解锁屏幕" else "锁定屏幕",
+                                tint = Color.White.copy(
+                                    alpha = if (screenLocked && lockDimmed) 0.5f else 1f,
+                                ),
+                                modifier = Modifier.size(20.dp),
+                            )
+                        }
+                    }
+                }
             }
             // 右侧竖排：VR 开关（识别到 VR 素材才出现）+ 旋转/复位。
             // VR 模式下这个位置变成「复位视角」：视窗本来就满屏，画面旋转对 VR 没意义，
@@ -1811,8 +1997,11 @@ fun PlayerScreen(
                                     modifier = Modifier.size(20.dp),
                                 )
                             }
-                            Spacer(Modifier.height(10.dp))
                         }
+                        // 间距必须放在两个 Surface **之间**：写在 Surface 里会被它的
+                        // Box 直接叠在按钮上（Surface 的内容是叠放而非竖排），两个圆钮
+                        // 就贴在一起了——这正是"VR 键和复位键连到一起"的原因。
+                        Spacer(Modifier.height(12.dp))
                         Surface(
                             color = Color.Black.copy(alpha = 0.55f),
                             shape = CircleShape,
@@ -2242,6 +2431,16 @@ fun PlayerScreen(
                                         }
                                     }
                                 }
+                                // 软/硬解就地切换（右下角最末位）：个别片源硬解会花屏、黑屏或
+                                // 直接起播失败，切软解绕过；切回来同理。切换会重建播放器，
+                                // 续播位置与当前档位保持不变（见 toggleDecode）。
+                                TextButton(onClick = { toggleDecode() }) {
+                                    Text(
+                                        if (prefs.softwareDecode) "软解" else "硬解",
+                                        color = Color.White,
+                                        style = MaterialTheme.typography.labelMedium,
+                                    )
+                                }
                             }
                         }
                     }
@@ -2646,6 +2845,33 @@ fun PlayerScreen(
             },
             onDismiss = { showSubSearch = false },
         )
+    }
+}
+
+/**
+ * 画面上的圆形半透明功能键（与锁屏键、复位键同规格：44dp 圆形 + 20dp 图标）。
+ * 无 Ripple、无点击态：播放页要的是"按下去不闪"，视觉上不能干扰画面。
+ */
+@Composable
+private fun CircleIconButton(
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    description: String,
+    onClick: () -> Unit,
+    color: Color = Color.Black.copy(alpha = 0.55f),
+) {
+    Surface(color = color, shape = CircleShape) {
+        Box(
+            modifier = Modifier
+                .size(44.dp)
+                .clickable(
+                    interactionSource = remember { MutableInteractionSource() },
+                    indication = null,
+                    onClick = onClick,
+                ),
+            contentAlignment = Alignment.Center,
+        ) {
+            Icon(icon, description, tint = Color.White, modifier = Modifier.size(20.dp))
+        }
     }
 }
 

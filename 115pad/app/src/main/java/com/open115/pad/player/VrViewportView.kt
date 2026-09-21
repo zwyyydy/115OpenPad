@@ -35,12 +35,25 @@ class VrViewportView(context: Context) : GLSurfaceView(context) {
     /** Surface 就绪/重建时回调，交给 ExoPlayer 当视频输出面 */
     var onSurfaceReady: ((Surface) -> Unit)? = null
 
+    /**
+     * 最近一次建好的输出面（GL 线程建好后 post 回主线程写入，主线程读）。
+     *
+     * 播放器实例被重建时（切换软/硬解）需要重新挂面：GL 视图本身不会重建，
+     * `onSurfaceReady` 也就不会再触发，没有这个引用就只能拿到一块黑屏。
+     */
+    @Volatile
+    var currentSurface: Surface? = null
+        private set
+
     init {
         setEGLContextClientVersion(2)
         // Renderer 是独立类（不是内部类），拿不到 GLSurfaceView.requestRender，
         // 所以用回调把"请求重绘"传进去
         renderer = VrRenderer(requestRender = { requestRender() }) { surface ->
-            post { onSurfaceReady?.invoke(surface) }
+            post {
+                currentSurface = surface
+                onSurfaceReady?.invoke(surface)
+            }
         }
         setRenderer(renderer)
         // 只在有新视频帧或视角变化时重绘，静止时不空转省电
