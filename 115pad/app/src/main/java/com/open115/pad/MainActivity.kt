@@ -27,6 +27,9 @@ class MainActivity : ComponentActivity() {
     @OptIn(ExperimentalMaterial3WindowSizeClassApi::class)
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // 沉浸式：主界面隐藏系统状态栏（灰色顶条），下滑可临时唤出。
+        // 放在 onWindowFocusChanged 再补一次：Dialog/权限窗抢焦点后系统会恢复状态栏。
+        hideSystemBars()
         consumeDownloadIntent(intent) // 冷启动带参
         setContent {
             Open115Theme {
@@ -46,6 +49,7 @@ class MainActivity : ComponentActivity() {
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
         if (!hasFocus) return
+        hideSystemBars()
         // Android 10+ 只在应用前台且持有焦点时允许读取剪贴板，早于焦点只能拿到 null。
         // 焦点刚拿到时系统"最后聚焦包"可能还没刷新，所以留 250ms 缓冲再读。
         clipboardJob?.cancel()
@@ -53,6 +57,15 @@ class MainActivity : ComponentActivity() {
             delay(250)
             appContainer.downloadLinks.checkClipboard()
         }
+    }
+
+    /** 隐藏系统状态栏/导航栏；BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE 让下滑以半透明浮层临时唤出 */
+    private fun hideSystemBars() {
+        androidx.core.view.WindowCompat.setDecorFitsSystemWindows(window, false)
+        val controller = androidx.core.view.WindowInsetsControllerCompat(window, window.decorView)
+        controller.systemBarsBehavior =
+            androidx.core.view.WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        controller.hide(androidx.core.view.WindowInsetsCompat.Type.systemBars())
     }
 
     /**
