@@ -167,6 +167,10 @@ internal fun VrGestureLayer(
                 var moved = false
                 var pinchPrev = 0f
                 var centroidPrev = Offset.Zero
+                // 上一帧是否处于双指状态：双指 → 单指的过渡帧要做基线重置，
+                // 否则 lastPos/pinchPrev 还是双指开始前的旧值，放开手指的一瞬间
+                // 会算出一次巨大的 pan/zoom 跳变（用户看到的"画面抖一下"）
+                var wasTwoFingers = false
 
                 while (true) {
                     val event = awaitPointerEvent()
@@ -205,9 +209,23 @@ internal fun VrGestureLayer(
                         }
                         centroidPrev = centroid
                         moved = true
+                        wasTwoFingers = true
                         event.changes.forEach { if (it.positionChanged()) it.consume() }
                     } else {
                         val ch = pressed[0]
+                        // 双指 → 单指的过渡帧：这里的 ch.position 相对上一帧没有基准
+                        // （lastPos 还停在双指开始前），直接按 pan 处理会跳一次视角。
+                        // 该帧只重置基线、不生效；下一帧起才是正常的单指拖动。
+                        if (wasTwoFingers) {
+                            wasTwoFingers = false
+                            lastPos = ch.position
+                            acc = Offset.Zero
+                            moved = true // 放开手指不触发单击/双击判定
+                            pinchPrev = 0f
+                            centroidPrev = Offset.Zero
+                            event.changes.forEach { if (it.positionChanged()) it.consume() }
+                            continue
+                        }
                         val d = ch.position - lastPos
                         acc += d
                         if (!moved && (abs(acc.x) > slop || abs(acc.y) > slop)) moved = true

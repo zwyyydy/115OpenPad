@@ -397,6 +397,8 @@ fun PlayerScreen(
      */
     var pendingKeepDef by remember { mutableStateOf<Int?>(null) }
     var lastEpisodeSwitchAt by remember { mutableStateOf(0L) }
+    /** 切清晰度请求序号：预载循环用它判断自己是否被新一轮切换接管（比较 currentDef 不够，旧值≠目标值恒成立） */
+    var qualitySwitchTick by remember { mutableStateOf(0) }
 
     var data by remember { mutableStateOf<VideoPlayData?>(null) }
     var currentDef by remember { mutableStateOf(0) }
@@ -761,6 +763,45 @@ fun PlayerScreen(
             .build()
     }
 
+    /**
+     * 切清晰度期间的预载播放器（非空 = 有切档预载在进行）。
+     * 与主播放器同参数（带宽计 / 缓存 / 解码器），它后台把目标档位加载到 READY，
+     * 期间主播放器继续播——旧流不黑屏。加载好了就地换流（见 switchQuality）。
+     * key 用 prefs：切软/硬解会重建主播放器，预载的参数与主播放器必须同步换。
+     */
+    val preloadPlayer = remember(prefs) {
+        // 与主播放器同一套构建参数（直接复制这段而不是抽函数，抽出去会把
+        // prefs 捕获时机搞乱——两处 remember(prefs) 各自独立重建即可）。
+        val bandwidthMeter = DefaultBandwidthMeter.Builder(context).build()
+        val httpFactory = DefaultHttpDataSource.Factory()
+            .setUserAgent(APP_USER_AGENT)
+            .setAllowCrossProtocolRedirects(true)
+            .setConnectTimeoutMs(15000)
+            .setReadTimeoutMs(30000)
+        val upstream = DefaultDataSource.Factory(context, httpFactory)
+        val mediaFactory = if (prefs.cacheEnabled) {
+            DefaultMediaSourceFactory(
+                CacheDataSource.Factory()
+                    .setCache(PlayerCache.get(context, prefs.cacheMaxMb.toLong() * 1024L * 1024L))
+                    .setUpstreamDataSourceFactory(upstream)
+                    .setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR)
+            )
+        } else {
+            DefaultMediaSourceFactory(upstream)
+        }
+        val renderersFactory = SdrOutputRenderersFactory(context)
+            .setEnableDecoderFallback(true)
+            .apply { if (prefs.softwareDecode) setMediaCodecSelector(SOFTWARE_FIRST_DECODER) }
+        ExoPlayer.Builder(context)
+            .setRenderersFactory(renderersFactory)
+            .setMediaSourceFactory(mediaFactory)
+            .setBandwidthMeter(bandwidthMeter)
+            .build()
+    }
+    DisposableEffect(preloadPlayer) {
+        onDispose { preloadPlayer.release() }
+    }
+
     // 手势指示器
     var indicator by remember { mutableStateOf<Pair<String, Float?>?>(null) }
     var indicatorAt by remember { mutableStateOf(0L) }
@@ -848,6 +889,22 @@ fun PlayerScreen(
 
             override fun onVideoSizeChanged(videoSize: VideoSize) {
                 vsVideoSize = videoSize
+            }
+
+            override fun onRenderedFirstFrame() {
+                // 播放 VR 视频时，每次"进片"（首帧真正渲染出来的时刻）默认就处于
+                // 复位视角（正前方 + 默认视场角，陀螺仪基准一并重置），
+                // 免得用户每次都要先按一次复位键。
+                //
+                // 挂在首帧而不是 (itemKey, vrMode) 变化上：VR 模式要等解码出分辨率才
+                // 判定/重建 GL 视图，那里归位推参数可能早于 GL 视图与视频流就绪，
+                // 首帧时序 100% 覆盖所有路径（首次进入 / 切集 / 手动开 VR / 切清晰度）。
+                // 只在 VR 模式生效，普通模式不受影响。
+                if (vrMode != null) {
+                    vrState.resetView()
+                    vrGyro.recenter()
+                    pushVrParams()
+                }
             }
 
             override fun onPlayerError(err: PlaybackException) {
@@ -1269,7 +1326,22 @@ fun PlayerScreen(
         }
     }
 
+    /** 清晰度显示名：优先用接口返回的映射，缺失时用内置名 */
+    fun labelOf(def: Int): String =
+        data?.definitionLabels?.get(def)?.takeIf { it.isNotBlank() } ?: defLabel(def)
+
+    /**
+     * 切清晰度：先预载后换流，旧流不停 → 无黑屏。
+     *
+     * 旧实现是直接 setMediaItem + prepare，主播放器整条重缓冲，画面一黑缓冲新的。
+     * 现在把目标档位交给 preloadPlayer 后台加载（与主播放器同缓存，同位置分片
+     * 直接命中缓存），加载 READY 前主播放器继续播；对齐好进度后一次 swap：
+     * 停旧 → 挂输出面 → seek → play。中间只有一次 flush，黑屏基本感知不到。
+     *
+     * 并发保护：预载中再点画质 → 先把上一轮预载取消（replace/clear），重新预载。
+     */
     fun switchQuality(def: Int) {
+        val tick = ++qualitySwitchTick
         scope.launch {
             val pos = resumePos(player.currentPosition)
             val built = buildItem(def)
@@ -1283,12 +1355,51 @@ fun PlayerScreen(
                 return@launch
             }
             val (d, item) = built
+            if (d == currentDef) return@launch
+
+            setIndicator("正在切换 ${labelOf(d)}…", null)
+            pulseControlRow()
+
+            // 预载：目标档位丢给 preloadPlayer 加载，主播放器照常播
+            val pre = preloadPlayer
+            pre.setMediaItem(item, pos)
+            pre.prepare()
+            // 轮询等 READY（预载失败也退出：出错时保持旧流继续播，给失败提示）
+            var ready = false
+            for (i in 1..600) { // 最多等 ~30s（500ms 一次）
+                delay(500)
+                if (qualitySwitchTick != tick) break // 被新一轮切换接管
+                when (pre.playbackState) {
+                    Player.STATE_READY -> { ready = true; break }
+                    Player.STATE_IDLE, Player.STATE_ENDED -> break
+                }
+            }
+            if (!ready || qualitySwitchTick != tick) {
+                if (qualitySwitchTick == tick) {
+                    setIndicator("切换超时，请稍后重试", null)
+                    pre.stop()
+                }
+                return@launch
+            }
+
+            // 对齐进度后一次换流：进度按新流总时长重校（跨档时长可能差一点）
+            val newPos = pre.duration.takeIf { it > 0 }
+                ?.let { resumePos(pre.currentPosition, it) }
+                ?: pre.currentPosition
             currentDef = d
             // 记住档位偏好：选了原盘就一直用原盘，选回转码档位则清除
             runCatching { container.playerPrefs.setPreferOriginal(d == DEF_ORIGINAL_FILE) }
-            player.setMediaItem(item, pos)
+            // 停旧流（暂停 + 清媒体，解码器不吐帧）、立刻 seek 到对齐位置起播新流。
+            // 用 stop 而不是只 setMediaItem：先停掉旧解码，避免换流瞬间新旧画面交错。
+            player.stop()
+            player.setMediaItem(item, newPos)
             player.prepare()
+            player.setPlaybackSpeed(currentSpeed)
             player.playWhenReady = true
+            // 预载器清干净，下次切档再用
+            pre.stop()
+            setIndicator("已切换到 ${labelOf(d)}", null)
+            pulseControlRow()
         }
     }
 
@@ -1330,10 +1441,6 @@ fun PlayerScreen(
         player.setPlaybackSpeed(s)
         setIndicator("倍速 x$s", null)
     }
-
-    /** 清晰度显示名：优先用接口返回的映射，缺失时用内置名 */
-    fun labelOf(def: Int): String =
-        data?.definitionLabels?.get(def)?.takeIf { it.isNotBlank() } ?: defLabel(def)
 
     /** 加载在线搜索的字幕：下载到本地缓存后作为外挂字幕重建媒体，记住进度 */
     fun loadOnlineSub(cfg: SubtitleCfg, bytes: ByteArray, ext: String) {
