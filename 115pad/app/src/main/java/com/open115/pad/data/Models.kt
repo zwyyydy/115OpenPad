@@ -153,6 +153,7 @@ data class FileItem(
     @Serializable(with = LenientIntSerializer::class) val ism: Int = 0,
     @Serializable(with = LenientIntSerializer::class) val isv: Int = 0,
     val thumb: String? = null,
+    val v_img: String? = null,
     val fco: String? = null,
     val uo: String? = null,
     @Serializable(with = LenientLongSerializer::class) val play_long: Long = 0,
@@ -179,6 +180,18 @@ data class FilesPage(
     val limit: Int? = null,
 )
 
+/**
+ * 按文件名判断是不是视频（115 搜索接口不返回 isv，归一化时按扩展名推断）。
+ * 集合与 ui.components.videoExts / FilterRules.TYPE_VIDEO 对齐（跨层不好互引，各自维护）。
+ */
+fun isVideoFile(name: String): Boolean {
+    val ext = name.substringAfterLast('.', "").lowercase()
+    return ext in setOf(
+        "mkv", "mp4", "avi", "mov", "wmv", "flv", "m4v", "ts", "m2ts", "rmvb", "rm",
+        "webm", "mpg", "mpeg", "vob", "3gp", "asf",
+    )
+}
+
 /** 搜索接口的字段名与列表接口不同，这里归一成 FileItem。 */
 @Serializable
 data class SearchRawItem(
@@ -195,12 +208,15 @@ data class SearchRawItem(
     fun toItem() = FileItem(
         fid = fileId,
         pid = parentId,
-        fc = if (fileCategory == "0") 0 else 1,
+        // 接口有时给数字 0（不是字符串 "0"），只按字符串比较会把文件夹判成文件
+        fc = if (fileCategory?.toIntOrNull() == 0) 0 else 1,
         fn = fileName ?: "",
         fs = fileSize,
         ico = ico,
         pc = pickCode,
         sha1 = sha1,
+        // 搜索接口不返回 isv，视频按扩展名补齐——否则点击搜索结果里的视频走不到播放分支
+        isv = if (fileName != null && isVideoFile(fileName)) 1 else 0,
         uppt = userPtime,
     )
 }

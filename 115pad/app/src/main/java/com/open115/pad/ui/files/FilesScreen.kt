@@ -388,7 +388,11 @@ class FilesViewModel(
 
     fun openDir(item: FileItem) {
         val fid = item.fid ?: return
-        _ui.update { it.copy(stack = it.stack + DirEntry(fid, item.fn), selection = emptySet()) }
+        // 从搜索结果点进子目录要退出搜索：否则 load() 里 s.searching 仍为 true，
+        // "进入"后加载的还是搜索结果而不是子目录内容。
+        _ui.update {
+            it.copy(stack = it.stack + DirEntry(fid, item.fn), selection = emptySet(), searching = false, searchQuery = "")
+        }
         loadCurrent()
     }
 
@@ -709,7 +713,11 @@ fun FilesScreen(
         ui.items.filter { isImageItem(it) }.map { it.toImageMediaItem() }
     }
     var searchMode by remember { mutableStateOf(false) }
-    var sideCollapsed by rememberSaveable { mutableStateOf(false) }
+    var sideCollapsed by rememberSaveable { mutableStateOf(true) }
+
+    fun notify(msg: String?) {
+        if (msg != null) scope.launch { snackbarHostState.showSnackbar(msg) }
+    }
 
     // 重命名任务结束后刷新列表。
     // 刷新**不能**放在面板里：任务归持久化队列管，关面板、切页、杀进程都不停，
@@ -734,10 +742,6 @@ fun FilesScreen(
     androidx.activity.compose.BackHandler(enabled = searchMode) {
         searchMode = false
         vm.exitSearch()
-    }
-
-    fun notify(msg: String?) {
-        if (msg != null) scope.launch { snackbarHostState.showSnackbar(msg) }
     }
 
     // ---- 断点续传：进程重启后恢复中断的大文件上传（每次进程只认领一次）----
@@ -894,6 +898,8 @@ fun FilesScreen(
         if (ui.selectMode) {
             vm.toggleSelect(item.fid)
         } else if (item.isDir) {
+            // 从搜索结果进入子目录时同步收起搜索栏（搜索状态已在 openDir 里退出）
+            if (ui.searching) searchMode = false
             vm.openDir(item)
         } else if (item.isv == 1) {
             // 播放列表 = 当前视图里可播放的视频，保持用户看到的顺序（已应用排序与筛选），

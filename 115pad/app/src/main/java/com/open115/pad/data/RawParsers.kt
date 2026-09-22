@@ -46,6 +46,7 @@ fun JsonObject.toFileItem(): FileItem = FileItem(
     ism = optInt("ism"),
     isv = optInt("isv"),
     thumb = optStr("thumb"),
+    v_img = optStr("v_img"),
     fco = optStr("fco"),
     uo = optStr("uo"),
     play_long = optLong("play_long"),
@@ -86,9 +87,10 @@ fun parseFilesResponse(root: JsonObject): FilesPage {
     if (!root.stateOk()) throw RuntimeException(root.msgOrNull() ?: "加载失败")
     val pathArr = ((root["data"] as? JsonObject)?.get("path") as? JsonArray)
         ?: (root["path"] as? JsonArray)
+    val parsed = itemsArrayOf(root).map { it.toFileItem() }
     return FilesPage(
         count = countOf(root),
-        items = itemsArrayOf(root).map { it.toFileItem() },
+        items = parsed,
         path = pathArr?.mapNotNull { e ->
             (e as? JsonObject)?.let { o ->
                 PathNode(name = o.optStr("name") ?: "", cid = o.optStr("cid"), pid = o.optStr("pid"))
