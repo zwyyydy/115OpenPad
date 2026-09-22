@@ -13,6 +13,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
+import java.io.File
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import com.jakewharton.retrofit2.converter.kotlinx.serialization.asConverterFactory
@@ -37,6 +38,9 @@ class AppContainer(context: Context) {
         isLenient = true
         coerceInputValues = true
     }
+
+    /** 应用私有缓存根目录：图片落盘（huge_img / media_img）都挂在这里 */
+    val cacheDir: File = File(context.cacheDir, "images")
 
     val session = Session(context)
     val playerPrefs = com.open115.pad.data.PlayerPrefs(context)
@@ -110,6 +114,10 @@ class AppContainer(context: Context) {
 
     /** 高级文件过滤：方案存储 + 文件页右上角总开关 */
     val filterPrefs = com.open115.pad.data.FilterPrefs(context)
+
+    /** 媒体库（类 Yamby）：Room 索引 + 手动扫描引擎。扫描由调用方在 transferScope 里 launch。 */
+    val mediaDatabase = com.open115.pad.data.media.MediaDatabase.build(context)
+    val mediaScanner = com.open115.pad.data.media.MediaScanner(openApi, okHttpClient, mediaDatabase.mediaDao())
 
     /** 云下载提交（含持久化的保存位置），手动添加/剪贴板/外部唤起共用 */
     val downloadSubmitter = com.open115.pad.data.DownloadSubmitter(downloadPrefs)

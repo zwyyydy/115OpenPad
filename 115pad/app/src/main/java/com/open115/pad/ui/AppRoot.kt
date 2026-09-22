@@ -9,6 +9,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.CloudDownload
+import androidx.compose.material.icons.outlined.Movie
 import androidx.compose.material.icons.outlined.Download
 import androidx.compose.material.icons.outlined.DriveFileRenameOutline
 import androidx.compose.material.icons.outlined.Folder
@@ -79,6 +80,7 @@ private data class Dest(val route: String, val label: String, val icon: ImageVec
 
 private val destinations = listOf(
     Dest("files", "文件", Icons.Outlined.Folder),
+    Dest("media", "媒体库", Icons.Outlined.Movie),
     Dest("filter", "过滤规则", Icons.Outlined.Tune),
     Dest("offline", "云下载", Icons.Outlined.CloudDownload),
     Dest("transfer", "传输中心", Icons.Outlined.Download),
@@ -282,6 +284,9 @@ private fun MainScaffold(container: AppContainer, widthClass: WindowWidthSizeCla
                                 destinations.firstOrNull { it.route == "filter" }?.let { navigate(it) }
                             },
                         )
+                    }
+                    composable("media") {
+                        com.open115.pad.ui.media.MediaLibraryScreen(container.openApi)
                     }
                     composable("filter") {
                         com.open115.pad.ui.filter.FilterRulesScreen(container)

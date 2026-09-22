@@ -147,15 +147,26 @@ class ImageUrlResolver(
      * 文件、白占 103MB。换成稳定 key 后同一张图永远命中同一份缓存。
      */
     suspend fun fetchToCache(stableKey: String, url: String, cacheDir: File): File =
+        fetchBytesToCache(stableKey, url, cacheDir, HUGE_DIR, HUGE_CACHE_MAX_BYTES)
+
+    /**
+     * 海报/背景图落盘（媒体库专用目录与容量）。
+     * 与 fetchToCache 同一套"稳定 key + 先写临时再改名"的规则，只是目录分开：
+     * 海报是常看常新的（海报墙每次进库都加载），和"超大图偶尔回看"分开计量互不挤占。
+     */
+    suspend fun fetchPosterToCache(stableKey: String, url: String, cacheDir: File): File =
+        fetchBytesToCache(stableKey, url, cacheDir, MEDIA_DIR, MEDIA_CACHE_MAX_BYTES)
+
+    private suspend fun fetchBytesToCache(stableKey: String, url: String, cacheDir: File, dirName: String, maxBytes: Long): File =
         // 加了稳定 key 之后，同一张图的**不同 URL**会指向同一个文件（以前是不同文件、互不干扰），
         // 所以这里必须串行化，否则两次并发下载会往同一个文件里交错写。
         // 实际只有一个当前页在下载，串行化的开销可以忽略。
         fetchLock.withLock {
             withContext(Dispatchers.IO) {
-                val dir = hugeCacheDir(cacheDir).apply { mkdirs() }
+                val dir = File(cacheDir, dirName).apply { mkdirs() }
                 val target = File(dir, "img_${stableKey.hashCode()}.bin")
                 if (target.exists() && target.length() > 0L) {
-                    // 复用时把 mtime 顶到现在：pruneHugeCache 的"最久未用"就是靠它判断的
+                    // 复用时把 mtime 顶到现在：pruneCache 的"最久未用"就是靠它判断的
                     target.setLastModified(System.currentTimeMillis())
                 } else {
                     val tmp = File(dir, "${target.name}.tmp")
@@ -173,7 +184,7 @@ class ImageUrlResolver(
                         tmp.delete()
                     }
                 }
-                pruneHugeCache(dir)
+                pruneCache(dir, maxBytes)
                 target
             }
         }
@@ -189,6 +200,15 @@ class ImageUrlResolver(
 
         /** 大图落盘目录名 */
         private const val HUGE_DIR = "huge_img"
+
+        /** 海报/背景图落盘目录名（媒体库：进库即加载，常看常新） */
+        const val MEDIA_DIR = "media_img"
+
+        /**
+         * 海报落盘目录的体积上限：竖版海报一张多则 1-2MB，500 张海报也就几百 MB。
+         * 超了按"最久未用"淘汰，与 huge_img 同一套规则。
+         */
+        const val MEDIA_CACHE_MAX_BYTES = 500L * 1024 * 1024
 
         /**
          * 大图落盘目录的体积上限，超了就按"最久未用"淘汰旧文件。
@@ -208,14 +228,25 @@ class ImageUrlResolver(
             hugeCacheDir(cacheDir).listFiles()?.forEach { it.delete() }
         }
 
-        /** 按"最久未用"把目录压回上限以内（mtime 兼作最近使用时间，由 fetchToCache 维护） */
-        private fun pruneHugeCache(dir: File) {
+        /** 海报落盘目录：媒体页与设置页（若加"清海报缓存"）共用同一份定义 */
+        fun mediaCacheDir(cacheDir: File): File = File(cacheDir, MEDIA_DIR)
+
+        fun mediaCacheSizeBytes(cacheDir: File): Long =
+            mediaCacheDir(cacheDir).listFiles()?.sumOf { it.length() } ?: 0L
+
+        /** 清空海报落盘目录（设置页清理入口用；下次进海报墙会重新解析+下载） */
+        fun clearMediaCache(cacheDir: File) {
+            mediaCacheDir(cacheDir).listFiles()?.forEach { it.delete() }
+        }
+
+        /** 按"最久未用"把目录压回上限以内（mtime 兼作最近使用时间，由 fetchBytesToCache 维护） */
+        private fun pruneCache(dir: File, maxBytes: Long) {
             runCatching {
                 val files = dir.listFiles()?.filter { it.isFile } ?: return
                 var total = files.sumOf { it.length() }
-                if (total <= HUGE_CACHE_MAX_BYTES) return
+                if (total <= maxBytes) return
                 for (f in files.sortedBy { it.lastModified() }) {
-                    if (total <= HUGE_CACHE_MAX_BYTES) break
+                    if (total <= maxBytes) break
                     val len = f.length()
                     if (f.delete()) total -= len
                 }
