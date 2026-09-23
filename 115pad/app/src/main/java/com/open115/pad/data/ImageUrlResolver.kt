@@ -219,6 +219,18 @@ class ImageUrlResolver(
         pruneCache(File(cacheDir, MEDIA_DIR), mediaCacheMaxBytes())
     }
 
+    /**
+     * 删掉这些 pick_code 对应的海报/背景图落盘文件（删媒体库时清该库的缓存）。
+     *
+     * 只删文件、不动直链 LRU：那里面只是字符串、且 20 分钟就过期，留着不影响正确性。
+     * 文件名走 [targetOf]，和 cachedPoster/fetchBytesToCache 共用同一份命名规则 ——
+     * 这里各写一遍的话，哪天命名规则改了就会静默删不掉。
+     */
+    suspend fun evictPosterCache(pickCodes: Collection<String>, cacheDir: File) = withContext(Dispatchers.IO) {
+        val dir = File(cacheDir, MEDIA_DIR)
+        pickCodes.filter { it.isNotBlank() }.distinct().forEach { targetOf(dir, it).delete() }
+    }
+
     private suspend fun fetchBytesToCache(stableKey: String, url: String, cacheDir: File, dirName: String, maxBytes: Long): File =
         // 加了稳定 key 之后，同一张图的**不同 URL**会指向同一个文件（以前是不同文件、互不干扰），
         // 所以这里必须串行化，否则两次并发下载会往同一个文件里交错写。

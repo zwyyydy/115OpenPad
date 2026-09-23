@@ -24,6 +24,13 @@ data class MovieCard(
     val videoName: String? = null,
 )
 
+/** 删库前收集的 pick_code：清该库对应的海报与 nfo 落盘缓存用 */
+data class MediaPickCodes(
+    val nfoPickCode: String?,
+    val posterPickCode: String?,
+    val fanartPickCode: String?,
+)
+
 @Dao
 interface MediaDao {
     @Upsert
@@ -136,6 +143,52 @@ interface MediaDao {
 
     @Query("SELECT * FROM movies WHERE mediaKey = :mediaKey")
     suspend fun movie(mediaKey: String): MovieEntity?
+
+    // ---- 删除媒体库：清掉这个库的全部索引 ----
+    // 一律用**子查询**而不是 `IN (:keys)` —— SQLite 的变量上限是 999，几千部片的库
+    // 直接 "too many SQL variables" 报错。子查询没有这个限制。
+
+    /** 删库前先收集要清缓存的 pick_code（投影，不取整个实体） */
+    @Query(
+        "SELECT nfoPickCode, posterPickCode, fanartPickCode FROM movies " +
+            "WHERE dirPath = :prefix OR dirPath LIKE :prefix || '/%'",
+    )
+    suspend fun pickCodesInPath(prefix: String): List<MediaPickCodes>
+
+    @Query(
+        "DELETE FROM movie_actors WHERE mediaKey IN " +
+            "(SELECT mediaKey FROM movies WHERE dirPath = :prefix OR dirPath LIKE :prefix || '/%')",
+    )
+    suspend fun unlinkActorsInPath(prefix: String)
+
+    @Query(
+        "DELETE FROM movie_tags WHERE mediaKey IN " +
+            "(SELECT mediaKey FROM movies WHERE dirPath = :prefix OR dirPath LIKE :prefix || '/%')",
+    )
+    suspend fun unlinkTagsInPath(prefix: String)
+
+    @Query(
+        "DELETE FROM episodes WHERE mediaKey IN " +
+            "(SELECT mediaKey FROM movies WHERE dirPath = :prefix OR dirPath LIKE :prefix || '/%')",
+    )
+    suspend fun deleteEpisodesInPath(prefix: String)
+
+    @Query("DELETE FROM movies WHERE dirPath = :prefix OR dirPath LIKE :prefix || '/%'")
+    suspend fun deleteMoviesInPath(prefix: String)
+
+    /** 扫描状态也要清：不清的话重新建一个同路径的库，增量扫描会把这些目录当成"已扫过"而全部跳过 */
+    @Query("DELETE FROM scan_state WHERE dirPath = :prefix OR dirPath LIKE :prefix || '/%'")
+    suspend fun deleteScanStateInPath(prefix: String)
+
+    /** 删除一个库根下的全部索引（影片 + 演员/标签关联 + 分集 + 扫描状态）。多根库对每根各调一次 */
+    @Transaction
+    suspend fun deleteLibraryContent(prefix: String) {
+        unlinkActorsInPath(prefix)
+        unlinkTagsInPath(prefix)
+        deleteEpisodesInPath(prefix)
+        deleteMoviesInPath(prefix)
+        deleteScanStateInPath(prefix)
+    }
 
     // ---- 重扫后的陈旧条目清理 ----
     // 必须清，两个理由：

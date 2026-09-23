@@ -124,10 +124,20 @@ class MediaCache(
      * 按前缀失效。**粗粒度是刻意的**：精确失效要维护 cid ↔ key 的反向索引，
      * 而写操作本来就不频繁，多清一点只是多一次网络往返。
      */
-    suspend fun invalidate(keyPrefix: String) = withContext(Dispatchers.IO) {
+    suspend fun invalidate(keyPrefix: String) = invalidateAll(listOf(keyPrefix))
+
+    /**
+     * 按多个前缀一次失效（删媒体库时清该库的全部 nfo）。
+     *
+     * 单独开这个方法是因为逐个调 [invalidate] 会退化成 O(n²)：每次都要把整个 key 索引
+     * 过滤一遍，几千部片就是几百万次字符串比较。
+     */
+    suspend fun invalidateAll(keyPrefixes: Collection<String>) = withContext(Dispatchers.IO) {
+        if (keyPrefixes.isEmpty()) return@withContext
+        val prefixes = keyPrefixes.toList()
         val doomed = lock.withLock {
             val idx = ensureIndexLocked()
-            idx.keys.filter { it.startsWith(keyPrefix) }.also { keys ->
+            idx.keys.filter { key -> prefixes.any { key.startsWith(it) } }.also { keys ->
                 keys.forEach { idx.remove(it) }
             }
         }

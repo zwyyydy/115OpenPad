@@ -38,6 +38,16 @@ class MediaScanner(
 ) {
     data class Progress(
         val running: Boolean = false,
+        /** 已请求停止、正在当前目录收尾（UI 据此把按钮置灰显示"停止中…"） */
+        val stopping: Boolean = false,
+        /** 本次是被停止的（而非正常跑完）—— 供 UI 提示"可以继续" */
+        val stopped: Boolean = false,
+        /**
+         * 本次扫描的库根 cid。
+         * 删媒体库时靠它判断"正在扫的是不是这个库" —— 是的话必须先停，
+         * 否则扫描会在删除之后把条目又写回来（见 MediaLibraryScreen 的删除确认）。
+         */
+        val rootCid: String = "",
         val doneDirs: Int = 0,
         val totalDirs: Int = 0,
         val currentDir: String = "",
@@ -49,6 +59,34 @@ class MediaScanner(
     val progress: StateFlow<Progress> = _progress
 
     private val mutex = Mutex()
+
+    /**
+     * 停止请求。runScan 在**列目录 / 每个目录 / 每个簇**的边界各查一次，
+     * 置位后收尾退出 —— 不会打断正在进行的单个网络请求，所以延迟上界约等于一次请求
+     * （限速开着的话再加一个 rateLimitMs），这也是删库时敢"等它停"的依据。
+     *
+     * 停止**不丢进度**：已经扫完的目录早已写进 scan_state，续扫（增量扫描）会跳过它们；
+     * 没扫完的那个目录**不写 scan_state**，所以续扫会把它重扫一遍。
+     */
+    private val stopRequested = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    /** 请求停止当前扫描（UI 的「停止」按钮、删库前的收尾）。没在跑就什么都不做 */
+    fun requestStop() {
+        if (!_progress.value.running) return
+        stopRequested.set(true)
+        _progress.value = _progress.value.copy(stopping = true)
+    }
+
+    /**
+     * 清掉"已停止"提示。
+     *
+     * 删库后要调：那条提示里写着"已完成 N/M 个目录"，而它指向的库已经没了，
+     * 留在界面上只会让人以为还有个没跑完的扫描（提示本来只在下一次扫描开始时才被清）。
+     */
+    fun clearStoppedNotice() {
+        if (_progress.value.running || !_progress.value.stopped) return
+        _progress.value = _progress.value.copy(stopped = false)
+    }
 
     /** 限速：相邻两次 115 API 请求的最小间隔（毫秒），0 = 不限 */
     private var lastRequestAt = 0L
@@ -79,76 +117,109 @@ class MediaScanner(
     ) {
         mutex.withLock {
             if (_progress.value.running) return
-            _progress.value = _progress.value.copy(running = true, doneDirs = 0, totalDirs = 0, moviesIndexed = 0)
+            // 清掉上一轮遗留的停止请求。**必须在 running 判断之后**——
+            // 放前面的话，一次被拒绝的并发调用会把正在跑的那轮扫描的停止标志擦掉。
+            stopRequested.set(false)
+            _progress.value = Progress(running = true, rootCid = rootCid, currentDir = rootPath)
         }
+        var stoppedEarly = false
         try {
             var movies = 0
             var skipped = 0
             var done = 0
-            _progress.value = _progress.value.copy(currentDir = rootPath)
             // 递归列目录。**这一步列到的结果直接传给下面复用**，不再对同一个目录重复请求
             // （早先是 collectDirs 列一遍找子目录、下面的循环再列一遍取文件，等于每目录 2 次）
             val allDirs = collectDirs(rootCid, rootPath, includeSubDirs, rateLimitMs)
-            _progress.value = _progress.value.copy(totalDirs = allDirs.size)
-            for (listing in allDirs) {
-                _progress.value = _progress.value.copy(currentDir = listing.path)
-                // includeSubDirs=false 时 collectDirs 没列过这个目录，这里补一次
-                val page = listing.page ?: listFiles(listing.cid, rateLimitMs)
-                val dirUpt = page.items.maxOfOrNull { it.upt } ?: 0L
-                if (incremental) {
-                    // 增量：目录上次扫完且列表 upt 未变 → 无新增/修改，跳过
-                    val state = dao.scanState(listing.cid)
-                    if (state != null && state.status == 2 && state.cloudUpt == dirUpt && dirUpt > 0) {
-                        skipped++
-                        done++
-                        _progress.value = _progress.value.copy(doneDirs = done, moviesIndexed = movies)
-                        continue
+            if (stopRequested.get()) {
+                // 列目录阶段没有写入，停在这里没有任何损失（续扫会重新列）
+                stoppedEarly = true
+                Log.i(TAG, "扫描在列目录阶段被停止")
+            } else {
+                _progress.value = _progress.value.copy(totalDirs = allDirs.size)
+                for (listing in allDirs) {
+                    if (stopRequested.get()) {
+                        stoppedEarly = true
+                        break
                     }
-                }
-                val files = page.items.filter { !it.isDir }.map {
-                    FileRef(name = it.fn, pickCode = it.pc ?: "", sizeBytes = it.fs, upt = it.upt)
-                }
-                val scan = sniffDirectory(files)
-                val produced = mutableSetOf<String>()
-                var failed = false
-                for (cluster in scan.clusters) {
-                    try {
-                        produced += indexCluster(listing.cid, listing.path, cluster, isEpisodeLike = scan.isMultiVideo, rateLimitMs = rateLimitMs)
-                        movies++
-                    } catch (e: Exception) {
-                        failed = true
-                        Log.w("MediaScanner", "索引失败 ${cluster.prefix}: ${e.message}")
+                    _progress.value = _progress.value.copy(currentDir = listing.path)
+                    // includeSubDirs=false 时 collectDirs 没列过这个目录，这里补一次
+                    val page = listing.page ?: listFiles(listing.cid, rateLimitMs)
+                    val dirUpt = page.items.maxOfOrNull { it.upt } ?: 0L
+                    if (incremental) {
+                        // 增量：目录上次扫完且列表 upt 未变 → 无新增/修改，跳过
+                        val state = dao.scanState(listing.cid)
+                        if (state != null && state.status == 2 && state.cloudUpt == dirUpt && dirUpt > 0) {
+                            skipped++
+                            done++
+                            _progress.value = _progress.value.copy(doneDirs = done, moviesIndexed = movies)
+                            continue
+                        }
                     }
-                }
-                // 清理这个目录里**本次没产出**的旧条目：云盘上已删的片、以及 mediaKey 变了的片
-                // （nfo 解析成功后 key 会从"目录前缀"变成 "tmdb-348"，旧键的行不清就是重复条目）。
-                //
-                // 有簇索引失败时**一条都不清** —— 那可能只是这次网络不好，删掉就把已索引的
-                // 元数据弄丢了，而重扫本来就是为了补数据。
-                if (!failed) {
-                    val stale = dao.mediaKeysInDir(listing.cid).filterNot { it in produced }
-                    if (stale.isNotEmpty()) {
-                        dao.deleteMovies(stale)
-                        Log.i(TAG, "清理 ${listing.path} 下 ${stale.size} 条陈旧条目")
+                    val files = page.items.filter { !it.isDir }.map {
+                        FileRef(name = it.fn, pickCode = it.pc ?: "", sizeBytes = it.fs, upt = it.upt)
                     }
+                    val scan = sniffDirectory(files)
+                    val produced = mutableSetOf<String>()
+                    var failed = false
+                    var aborted = false
+                    for (cluster in scan.clusters) {
+                        // 簇边界也查一次：一个大目录可能有很多簇，每个簇都要一次 downurl + 一次 nfo 下载
+                        if (stopRequested.get()) {
+                            aborted = true
+                            break
+                        }
+                        try {
+                            produced += indexCluster(listing.cid, listing.path, cluster, isEpisodeLike = scan.isMultiVideo, rateLimitMs = rateLimitMs)
+                            movies++
+                        } catch (e: Exception) {
+                            failed = true
+                            Log.w("MediaScanner", "索引失败 ${cluster.prefix}: ${e.message}")
+                        }
+                    }
+                    if (aborted) {
+                        // 这个目录**没扫完**：不写 scan_state（写了续扫就会当它已完成而跳过，
+                        // 剩下的簇永远补不上）、也不做陈旧清理（会把还没产出的那些行删掉）。
+                        // 已入库的簇是 upsert，续扫重来一遍无害。
+                        stoppedEarly = true
+                        break
+                    }
+                    // 清理这个目录里**本次没产出**的旧条目：云盘上已删的片、以及 mediaKey 变了的片
+                    // （nfo 解析成功后 key 会从"目录前缀"变成 "tmdb-348"，旧键的行不清就是重复条目）。
+                    //
+                    // 有簇索引失败时**一条都不清** —— 那可能只是这次网络不好，删掉就把已索引的
+                    // 元数据弄丢了，而重扫本来就是为了补数据。
+                    if (!failed) {
+                        val stale = dao.mediaKeysInDir(listing.cid).filterNot { it in produced }
+                        if (stale.isNotEmpty()) {
+                            dao.deleteMovies(stale)
+                            Log.i(TAG, "清理 ${listing.path} 下 ${stale.size} 条陈旧条目")
+                        }
+                    }
+                    dao.upsertScanState(
+                        ScanStateEntity(
+                            dirKey = listing.cid,
+                            dirPath = listing.path,
+                            status = 2,
+                            cloudUpt = dirUpt,
+                            scannedAt = System.currentTimeMillis(),
+                        ),
+                    )
+                    done++
+                    _progress.value = _progress.value.copy(doneDirs = done, moviesIndexed = movies)
                 }
-                dao.upsertScanState(
-                    ScanStateEntity(
-                        dirKey = listing.cid,
-                        dirPath = listing.path,
-                        status = 2,
-                        cloudUpt = dirUpt,
-                        scannedAt = System.currentTimeMillis(),
-                    ),
-                )
-                done++
-                _progress.value = _progress.value.copy(doneDirs = done, moviesIndexed = movies)
+                if (skipped > 0) Log.i(TAG, "增量扫描完成：跳过 $skipped/${allDirs.size} 个未变化目录")
             }
-            if (skipped > 0) Log.i(TAG, "增量扫描完成：跳过 $skipped/${allDirs.size} 个未变化目录")
-            _progress.value = _progress.value.copy(running = false, finishedAt = System.currentTimeMillis())
         } catch (e: Exception) {
             Log.w("MediaScanner", "扫描中断: ${e.message}")
-            _progress.value = _progress.value.copy(running = false, finishedAt = System.currentTimeMillis())
+        } finally {
+            // 收尾统一放 finally：正常结束、抛异常、被停止三条路都要把 running 落回去，
+            // 否则 UI 会永远停在"扫描中"、且 requestStop 之后的等待永远等不到
+            _progress.value = _progress.value.copy(
+                running = false,
+                stopping = false,
+                stopped = stoppedEarly,
+                finishedAt = System.currentTimeMillis(),
+            )
         }
     }
 
@@ -164,6 +235,10 @@ class MediaScanner(
      *
      * 只把有 fid 的目录收进来：早先 fid 为空时会拿空串当 cid 塞进结果，
      * 而空 cid 在 115 那边就是根目录 —— 会把根目录的内容当成某个子目录扫一遍。
+     *
+     * 停止请求在这里也查：大库的列目录阶段本身就是几百次请求、可能占掉整轮扫描的大半时间，
+     * 不在这里响应的话用户点了「停止」要等很久才有反应。中途退出返回的是**不完整**的列表，
+     * 所以调用方看到停止标志后必须整个放弃（那里也确实这么做了）。
      */
     private suspend fun collectDirs(
         rootCid: String,
@@ -181,6 +256,7 @@ class MediaScanner(
             dir.fid?.let { queue.add(it to "$rootPath/${dir.fn}") }
         }
         while (queue.isNotEmpty()) {
+            if (stopRequested.get()) break
             val (cid, path) = queue.removeFirst()
             val page = listFiles(cid, rateLimitMs)
             result.add(DirListing(cid, path, page))

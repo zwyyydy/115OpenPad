@@ -49,7 +49,9 @@ import com.open115.pad.data.FileItem
 import com.open115.pad.data.media.MediaLibraryEntity
 import com.open115.pad.data.media.MovieCard
 import com.open115.pad.ui.theme.AdaptiveBody
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -95,7 +97,8 @@ fun MediaLibraryScreen(api: com.open115.pad.data.OpenApi) {
                 }
             }
 
-            // 全局扫描进度条
+            // 全局扫描进度 + 停止。停止**在目录/簇边界生效**（不会打断正在进行的那个请求），
+            // 所以按钮点下去会先变成"停止中…"，等当前这一小步跑完才真的停。
             if (scanProgress.running) {
                 LinearProgressIndicator(
                     progress = {
@@ -105,9 +108,35 @@ fun MediaLibraryScreen(api: com.open115.pad.data.OpenApi) {
                         .fillMaxWidth()
                         .padding(horizontal = 16.dp),
                 )
+                Row(
+                    Modifier.fillMaxWidth().padding(start = 16.dp, end = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        // totalDirs 为 0 时还在列目录阶段 —— 大库这一阶段本身可能占掉整轮的大半时间，
+                        // 显示成"0/0 目录"会让人以为卡住了
+                        if (scanProgress.totalDirs > 0) {
+                            "正在扫描 ${scanProgress.currentDir}（${scanProgress.doneDirs}/${scanProgress.totalDirs} 目录，已索引 ${scanProgress.moviesIndexed} 部）"
+                        } else {
+                            "正在列目录 ${scanProgress.currentDir}…"
+                        },
+                        style = MaterialTheme.typography.bodySmall,
+                        modifier = Modifier.weight(1f).padding(vertical = 4.dp),
+                    )
+                    TextButton(
+                        onClick = { container.mediaScanner.requestStop() },
+                        enabled = !scanProgress.stopping,
+                    ) {
+                        Text(if (scanProgress.stopping) "停止中…" else "停止")
+                    }
+                }
+            } else if (scanProgress.stopped) {
+                // 停止后说清两件事：进度没丢、怎么继续（续扫走增量，它按 scan_state 跳过已扫完的目录）
                 Text(
-                    "正在扫描 ${scanProgress.currentDir}（${scanProgress.doneDirs}/${scanProgress.totalDirs} 目录，已索引 ${scanProgress.moviesIndexed} 部）",
+                    "扫描已停止（已完成 ${scanProgress.doneDirs}/${scanProgress.totalDirs} 个目录，已索引 ${scanProgress.moviesIndexed} 部）" +
+                        " · 用「增量扫描」可从断点继续",
                     style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
                 )
             }
@@ -151,7 +180,9 @@ fun MediaLibraryScreen(api: com.open115.pad.data.OpenApi) {
                                 }
                                 Text(
                                     "建于 " + SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.getDefault())
-                                        .format(Date(lib.createdAt)) + LibraryCount(dao, lib.rootPaths) +
+                                        .format(Date(lib.createdAt)) +
+                                        // 扫描结束后要重算，否则"还没有影片"会一直挂着
+                                        LibraryCount(dao, lib.rootPaths, scanProgress.finishedAt) +
                                         if (lib.rateLimitMs > 0) " · 限速 ${lib.rateLimitMs}ms" else "",
                                     style = MaterialTheme.typography.bodySmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -170,7 +201,7 @@ fun MediaLibraryScreen(api: com.open115.pad.data.OpenApi) {
                                         onDismissRequest = { scanMenuFor = null },
                                     ) {
                                         DropdownMenuItem(
-                                            text = { Text("增量扫描（按更新时间，只扫新增）") },
+                                            text = { Text("增量扫描（只扫新增；上次停止后也用它继续）") },
                                             onClick = {
                                                 scanMenuFor = null
                                                 scope.launch {
@@ -273,14 +304,22 @@ fun MediaLibraryScreen(api: com.open115.pad.data.OpenApi) {
     }
 
     deleteTarget?.let { lib ->
+        // 这个库正在被扫吗？是的话删除前必须先停 —— 否则扫描会在删除之后继续把条目写回来，
+        // 留下的孤儿行既没有库能进、也不会再被任何一次扫描清理（那个路径已经没有库了）
+        val scanningThis = scanProgress.running && scanProgress.rootCid in lib.rootCids
         AlertDialog(
             onDismissRequest = { deleteTarget = null },
             title = { Text("删除媒体库") },
-            text = { Text("删除「${lib.name}」？只删除索引记录，不会动云盘里的文件。") },
+            text = {
+                Text(
+                    "删除「${lib.name}」？只删除索引记录，不会动云盘里的文件。" +
+                        if (scanningThis) "\n\n该库正在扫描，删除会先停止扫描（已扫完的目录不会白跑）。" else "",
+                )
+            },
             confirmButton = {
                 TextButton(onClick = {
-                    scope.launch { dao.deleteLibrary(lib.id) }
                     deleteTarget = null
+                    scope.launch { deleteLibraryFully(container, dao, lib, waitForScan = scanningThis) }
                 }) { Text("删除") }
             },
             dismissButton = { TextButton(onClick = { deleteTarget = null }) { Text("取消") } },
@@ -288,10 +327,64 @@ fun MediaLibraryScreen(api: com.open115.pad.data.OpenApi) {
     }
 }
 
-/** 库内影片数：卡片上显示「N 部」，进库前就知道有没有内容（多根库取各根之和） */
+/**
+ * 彻底删除一个媒体库：停扫描（如果正在扫它）→ 清索引 → 清该库对应的落盘缓存。
+ *
+ * 顺序不能反：
+ * - 先停扫描再清索引 —— 扫描是协程，清完索引它还会继续 upsert，条目又回来了；
+ *   所以要先 requestStop 并**等它真的收尾**（running 落回 false）再动数据库。
+ *   等待是有界的：停止在目录/簇边界生效，上界约等于一次请求 + 一个限速间隔。
+ * - 先收集 pick_code 再清索引 —— 索引一删就查不到该清哪些缓存文件了。
+ */
+private suspend fun deleteLibraryFully(
+    container: com.open115.pad.AppContainer,
+    dao: com.open115.pad.data.media.MediaDao,
+    lib: MediaLibraryEntity,
+    waitForScan: Boolean,
+) {
+    if (waitForScan) {
+        container.mediaScanner.requestStop()
+        // 兜底超时：万一收尾卡住（比如某个请求挂死），不能让删除永远不执行。
+        // 超时后照常删 —— 最坏情况是留下几条孤儿行，比"删不掉"好。
+        withTimeoutOrNull(15_000) { container.mediaScanner.progress.first { !it.running } }
+    }
+
+    val paths = lib.rootPaths
+    val nfoCodes = mutableListOf<String>()
+    val imageCodes = mutableListOf<String>()
+    // 逐根处理而不是拼 5 参数 SQL：多根库本来就少见，循环更简单也不会踩 SQLite 变量上限
+    paths.forEach { prefix ->
+        dao.pickCodesInPath(prefix).forEach { p ->
+            p.nfoPickCode?.let(nfoCodes::add)
+            p.posterPickCode?.let(imageCodes::add)
+            p.fanartPickCode?.let(imageCodes::add)
+        }
+        dao.deleteLibraryContent(prefix)
+    }
+    dao.deleteLibrary(lib.id)
+    // 那条"扫描已停止（已完成 N/M 个目录）"提示指向的库已经没了，清掉它
+    container.mediaScanner.clearStoppedNotice()
+
+    // 清缓存。**按 pick_code 精确失效**，不能用粗粒度前缀：
+    // nfo 的 key 是 `nfo|<pickCode>|<upt>`，清 "nfo|" 会把别的库的 nfo 一起清掉。
+    container.mediaCache.invalidateAll(nfoCodes.distinct().map { "nfo|$it|" })
+    container.imageUrlResolver.evictPosterCache(imageCodes, container.cacheDir)
+}
+
+/**
+ * 库内影片数：卡片上显示「N 部」，进库前就知道有没有内容（多根库取各根之和）。
+ *
+ * [refreshKey] 必须传一个"扫描结束后会变"的值（这里传 scanProgress.finishedAt）：
+ * produceState 只在 key 变化时重算，而 rootPaths 在扫描前后是不变的 ——
+ * 只以它为 key 的话，刚扫完的库会一直显示扫描前的数字（"还没有影片"）。
+ */
 @Composable
-private fun LibraryCount(dao: com.open115.pad.data.media.MediaDao, rootPaths: List<String>): String {
-    val count by produceState(initialValue = -1, rootPaths) {
+private fun LibraryCount(
+    dao: com.open115.pad.data.media.MediaDao,
+    rootPaths: List<String>,
+    refreshKey: Long,
+): String {
+    val count by produceState(initialValue = -1, rootPaths, refreshKey) {
         value = rootPaths.sumOf { dao.movieCountIn(it) }
     }
     return when {
