@@ -330,4 +330,37 @@ class ClusterFilesTest {
         )
         notArt.forEach { assertFalse("$it 不该判成素材图", isArtImageFile(it)) }
     }
+
+    // ---------------- 入库主键（mediaKey 是主键，撞了就互相覆盖） ----------------
+
+    @Test
+    fun `整季 nfo 里是同一个 tmdb id 时_每集仍是独立主键`() {
+        // 「示例剧集三 (2021)」实测：36 集的 nfo 全写着同一个 uniqueid，拿它当主键
+        // 36 集就互相覆盖成一行 —— 海报墙只剩一张卡、点进去只有一集
+        val keys = (1..36).map {
+            mediaKeyOf("示例剧集三 - S01E%02d - 第%d集".format(it, it), nfoTmdbId = "1712692", isEpisodeLike = true)
+        }
+        assertEquals("36 集应该是 36 个不同的主键", 36, keys.distinct().size)
+        assertEquals("示例剧集三 - S01E07 - 第7集", keys[6])
+    }
+
+    @Test
+    fun `文件名里带 tmdb id 的分集也不能拿它当主键`() {
+        // 有些包把 {tmdbid-…} 写进每个文件名 —— 同样会撞
+        val a = mediaKeyOf("示例剧集三 (2021) {tmdbid-118759} - S01E01", null, isEpisodeLike = true)
+        val b = mediaKeyOf("示例剧集三 (2021) {tmdbid-118759} - S01E02", null, isEpisodeLike = true)
+        assertTrue("两集主键不能相同", a != b)
+    }
+
+    @Test
+    fun `影片优先用 nfo 的 tmdb id_换目录换文件名也是同一条`() {
+        assertEquals("tmdb-8078", mediaKeyOf("示例影片4 (1997)", "8078", isEpisodeLike = false))
+        assertEquals("tmdb-8078", mediaKeyOf("Sample Movie Resurrection 1997 1080p", "8078", isEpisodeLike = false))
+    }
+
+    @Test
+    fun `影片没有 nfo id 时退回前缀_番号式就是这样`() {
+        assertEquals("ABC-301", mediaKeyOf("ABC-301", null, isEpisodeLike = false))
+        assertEquals("tmdb-8078", mediaKeyOf("示例影片4 (1997) {tmdbid-8078}", null, isEpisodeLike = false))
+    }
 }

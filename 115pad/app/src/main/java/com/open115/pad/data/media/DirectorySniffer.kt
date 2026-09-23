@@ -48,10 +48,7 @@ data class Cluster(
     val poster: FileRef? = null,
     val fanart: FileRef? = null,
     val thumb: FileRef? = null,
-) {
-    /** 键：{tmdbid-348} 优先，否则取前缀本体（如 ABC-301 / 示例影片 (1979)） */
-    fun mediaKey(): String = TMDB_ID.find(prefix)?.groupValues?.get(1) ?: prefix
-}
+)
 
 /**
  * 一个云盘文件。
@@ -201,6 +198,29 @@ fun episodeKeyOf(prefix: String): String =
     Regex("""[Ss](\d{1,2})[Ee](\d{1,3})""").find(prefix)?.value
         ?: Regex("""[Ee][Pp]?(\d{1,3})""").find(prefix)?.value
         ?: prefix
+
+/**
+ * 入库主键（`movies.mediaKey` 是主键，撞了就是互相覆盖）。
+ *
+ * - **影片**：优先用 nfo 里的 tmdb id —— 同一部片换个目录、换个文件名还是同一条，不会重复入库；
+ *   没有 id 才退回前缀（番号式的 `ABC-301` 就是这样）。
+ * - **分集**：一律用**文件前缀**，**绝不用 nfo 的 id**。
+ *
+ * ★ 分集这条是踩出来的：实测「示例剧集三 (2021)」36 集的 nfo 里 `uniqueid` 全是同一个值
+ *   （刮削器把整部剧的 id 写进了每一集），拿它当主键 → 36 集全写进同一行，
+ *   最后写的那一集把其余 35 集覆盖掉，海报墙上就只剩一张卡、点进去只有一集。
+ *   前缀是每个文件自己的（`示例剧集三 - S01E07 - 第7集`），天然一集一个。
+ *
+ * 前缀也不带 tmdb id：有些包会把 `{tmdbid-118759}` 写进**每个**文件名里，那同样会撞。
+ *
+ * 影片那条统一成 `tmdb-<id>`（id 来自 nfo 或文件名都算）：早先两条路会产出 `tmdb-8078`
+ * 和 `8078` 两个不同形状的键，同一部片于是可能入库两次。
+ */
+fun mediaKeyOf(prefix: String, nfoTmdbId: String?, isEpisodeLike: Boolean): String {
+    if (isEpisodeLike) return prefix
+    val id = nfoTmdbId ?: TMDB_ID.find(prefix)?.groupValues?.get(1)
+    return if (id != null) "tmdb-$id" else prefix
+}
 
 /**
  * 集号排序键：`...S01E02...` → `1*10000 + 2 = 10002`；解析不出返回 Int.MAX_VALUE（沉底）。

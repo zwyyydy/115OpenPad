@@ -341,7 +341,9 @@ class MediaScanner(
                 }
             }
         }
-        val key = meta.uniqueTmdbid?.let { "tmdb-$it" } ?: cluster.mediaKey()
+        // 主键：影片用 nfo 的 tmdb id、分集一律用文件前缀（分集 nfo 的 id 常是整部剧的，
+        // 拿它当主键会把整季覆盖成一行 —— 见 mediaKeyOf 的注释）
+        val key = mediaKeyOf(cluster.prefix, meta.uniqueTmdbid, isEpisodeLike)
         val title = meta.title ?: cluster.prefix.substringBeforeLast('(').trim().ifEmpty { cluster.prefix }
         val actors = meta.actors.ifEmpty {
             // 演员式资源：nfo 没带演员时从目录名提取（`ABC-301 示例演员二,示例演员三`）

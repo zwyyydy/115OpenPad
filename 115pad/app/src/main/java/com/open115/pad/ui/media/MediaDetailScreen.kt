@@ -129,11 +129,19 @@ fun MediaDetailScreen(
     // 分集列表（显示与播放共用一份，**索引必须对齐**）：
     //  - 系列卡 → 它名下的分集行。按集号**数值**排：按标题字符串排会让 S01E2 排到 S01E10 后面
     //  - 番号式 / 多视频影片 → 它自己的 episodes 表行
+    //
+    // ★ 集号取自**文件名**而不是标题：刮削过的包标题是剧集名（示例剧集三那包是「示例剧集标题二」），
+    //   里面没有 S01E07，拿它排序等于按中文标题乱排。文件名一定带集号（示例剧集三 - S01E07 - 第7集.mp4）。
     val epList: List<Pair<String, String?>> = remember(data) {
         val d = data ?: return@remember emptyList()
         if (d.seriesEpisodes.isNotEmpty()) {
             d.seriesEpisodes
-                .sortedWith(compareBy({ episodeSortKey(it.title) }, { it.title }))
+                .sortedWith(
+                    compareBy(
+                        { episodeSortKey(it.videoName ?: it.title) },
+                        { it.videoName ?: it.title },
+                    ),
+                )
                 .map { it.title to it.videoPickCode }
         } else {
             d.episodes.map { it.episodeKey to it.videoPickCode }
