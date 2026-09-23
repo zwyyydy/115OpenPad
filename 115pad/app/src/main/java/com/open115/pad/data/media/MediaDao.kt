@@ -155,6 +155,34 @@ interface MediaDao {
     )
     fun byLibraryPaths(p0: String, p1: String, p2: String, p3: String, p4: String, limit: Int = 200): Flow<List<MovieCard>>
 
+    /**
+     * 本库可以拿来当**海报墙背景**的图：顶层条目的 fanart（= 详情页那张背景图）。
+     *
+     * 单独一条查询、只取一列，而不是往 [MovieCard] 上加字段 —— 那个投影有七八个查询在用，
+     * 加一列要同时改一圈，而这一个用途只需要 pick_code 本身。
+     *
+     * 只取 `seriesKey IS NULL`：分集的图是从系列继承来的，同一张会重复出现几十次，
+     * 轮播时看着就是"卡住不动"。
+     */
+    @Query(
+        "SELECT fanartPickCode FROM movies " +
+            "WHERE seriesKey IS NULL AND fanartPickCode IS NOT NULL AND fanartPickCode != '' " +
+            "AND (:p0 = '' OR dirPath = :p0 OR dirPath LIKE :p0 || '/%' " +
+            "OR dirPath = :p1 OR dirPath LIKE :p1 || '/%' " +
+            "OR dirPath = :p2 OR dirPath LIKE :p2 || '/%' " +
+            "OR dirPath = :p3 OR dirPath LIKE :p3 || '/%' " +
+            "OR dirPath = :p4 OR dirPath LIKE :p4 || '/%')",
+    )
+    suspend fun backdropsInPaths(p0: String, p1: String, p2: String, p3: String, p4: String): List<String>
+
+    /** 单根版：多根库超过 5 根时逐根补（与 byLibraryPath 的分工一致） */
+    @Query(
+        "SELECT fanartPickCode FROM movies " +
+            "WHERE seriesKey IS NULL AND fanartPickCode IS NOT NULL AND fanartPickCode != '' " +
+            "AND (dirPath = :prefix OR dirPath LIKE :prefix || '/%')",
+    )
+    suspend fun backdropsInPath(prefix: String): List<String>
+
     /** 多根媒体库的影片数（超过 5 根时前 5 根之外的用 byLibraryPath 逐个补）。同样只数顶层条目，和墙上看到的张数一致 */
     @Query(
         "SELECT COUNT(*) FROM movies " +

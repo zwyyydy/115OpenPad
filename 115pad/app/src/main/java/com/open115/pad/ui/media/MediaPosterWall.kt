@@ -1,5 +1,6 @@
 package com.open115.pad.ui.media
 
+import androidx.compose.animation.Crossfade
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
@@ -41,6 +42,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextFieldDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -67,8 +69,23 @@ import com.open115.pad.data.media.MovieCard
 import com.open115.pad.data.media.MovieDeleteResult
 import com.open115.pad.data.media.deleteMovie
 import com.open115.pad.ui.theme.AdaptiveBody
+import com.open115.pad.ui.components.dissolve
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+
+/** 背景轮播节奏：20 秒换一张。再快晃眼，再慢看不出在换 */
+private const val BACKDROP_ROTATE_MS = 20_000L
+
+/**
+ * 一次会话里最多轮几张背景。
+ *
+ * 每张没缓存过的 fanart 都要一次 downurl + 一次下载，而这是**无人值守**在换的：
+ * 一个 200 部的库全轮一遍就是 200 次解析、几十 MB —— 用户只是把墙开着没动。
+ * 所以每次进墙**随机取一段**来轮：既有"每次进来看到的不一样"，又把一次会话的额外请求
+ * 钉在 20 次以内。第二轮回来时图已经在落盘缓存里，零请求。
+ */
+private const val BACKDROP_MAX = 20
 
 /**
  * 海报墙：一个媒体库的海报网格。
@@ -103,6 +120,27 @@ fun PosterWallScreen(
             paths.flatMap { dao.byLibraryPath(it).first() }.distinctBy { it.mediaKey }
         }
     }
+    // 背景轮播用的图：本库顶层条目的 fanart（就是详情页那张背景图）
+    val backdrops by produceState(initialValue = emptyList<String>(), library.rootPaths, refreshKey) {
+        val paths = library.rootPaths
+        value = if (paths.size <= 5) {
+            val p = paths + List(5 - paths.size) { "" }
+            dao.backdropsInPaths(p[0], p[1], p[2], p[3], p[4])
+        } else {
+            paths.flatMap { dao.backdropsInPath(it) }
+        }
+    }
+    // 随机顺序 + 取一段（见 BACKDROP_MAX）；进一次墙洗一次牌
+    val rotation = remember(backdrops) { backdrops.distinct().shuffled().take(BACKDROP_MAX) }
+    var backdropIndex by remember(rotation) { mutableStateOf(0) }
+    LaunchedEffect(rotation) {
+        if (rotation.size <= 1) return@LaunchedEffect
+        while (true) {
+            delay(BACKDROP_ROTATE_MS)
+            backdropIndex = (backdropIndex + 1) % rotation.size
+        }
+    }
+
     var query by remember { mutableStateOf("") }
     // 标题搜索是全表查询，结果再按本库的 mediaKey 收敛，避免搜出别的库的影片
     val hits by produceState<List<MovieCard>?>(initialValue = null, query, all) {
@@ -119,9 +157,35 @@ fun PosterWallScreen(
     androidx.activity.compose.BackHandler(enabled = query.isNotBlank()) { query = "" }
     androidx.activity.compose.BackHandler(enabled = query.isBlank()) { onBack() }
 
-    // 不透明底：这两级"页"是浮在媒体库列表页之上的浮层，没有底色会把下层透出来
-    Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
-      Box(Modifier.fillMaxSize()) {
+    // 底色仍是**不透明**的：这两级"页"是浮在媒体库列表页之上的浮层，没有底色会把下层透出来
+    // （轮播图没加载出来、或者这个库一张 fanart 都没有时，就只剩这层底色）
+    Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
+        // ① 背景轮播：铺满整个窗口。
+        // ☠ 必须在 AdaptiveBody **之外** —— 它的内层是 960dp 居中容器，背景放进去会被框成中间一条，
+        //    左右各留一条死黑（详情页踩过同一个坑，见 MediaDetailScreen 的注释）
+        Crossfade(
+            targetState = rotation.getOrNull(backdropIndex),
+            animationSpec = tween(1600),
+            label = "wallBackdrop",
+        ) { pickCode ->
+            if (pickCode != null) {
+                // 下沿溶进底色，避免图的下边缘在屏幕上切出一条硬边
+                PickCodeImage(
+                    pickCode = pickCode,
+                    modifier = Modifier.fillMaxSize().dissolve(0.45f, 1f),
+                )
+            }
+        }
+        // ② 压暗：上面是深色卡片 + 浅色文字，亮剧照不压暗会把卡片边界和标题一起糊掉
+        Box(
+            Modifier.fillMaxSize().background(
+                Brush.verticalGradient(
+                    0.00f to Color.Black.copy(alpha = 0.62f),
+                    0.45f to Color.Black.copy(alpha = 0.55f),
+                    1.00f to Color.Black.copy(alpha = 0.80f),
+                ),
+            ),
+        )
         AdaptiveBody(modifier = Modifier.fillMaxSize()) {
             Column(Modifier.fillMaxSize()) {
                 // 顶部工作栏：返回键 + 标题弹性占位 + 搜索框收拢右上
@@ -194,8 +258,7 @@ fun PosterWallScreen(
                 }
             }
         }
-            SnackbarHost(snackbarHostState, Modifier.align(Alignment.BottomCenter))
-      }
+        SnackbarHost(snackbarHostState, Modifier.align(Alignment.BottomCenter))
     }
 
     deleteTarget?.let { target ->
