@@ -39,9 +39,26 @@ data class MovieEntity(
     /** 海报（竖版）/背景（横版）文件的 pick_code，加载时解析直链 */
     val posterPickCode: String? = null,
     val fanartPickCode: String? = null,
+    /** 自己目录里的缩略图（番号式的 `-thumb.jpg`、分集的剧照）。继承来的不算自己的 */
+    val thumbPickCode: String? = null,
     /** nfo 文件的 pick_code 与云盘 upt，增量重扫时跳过未变化的条目 */
     val nfoPickCode: String? = null,
     val nfoUpt: Long = 0,
+    /**
+     * 主视频 / nfo / 海报 / 背景 / 缩略图的 **file_id**（115 的 `ufile/delete` 只认 file_ids，
+     * pick_code 不认）。
+     *
+     * 只在「彻底删除」时用得上，所以扫描时顺手存下来 —— 不存的话删一个条目还得再列一次
+     * 它所在目录去换 id，而那个目录可能已经被用户改过了。
+     *
+     * 图片也要删：只删视频和 nfo 的话，那个目录里还剩 poster/fanart，
+     * 用户看到的"彻底删除"跟没删干净一样。
+     */
+    val videoFid: String? = null,
+    val nfoFid: String? = null,
+    val posterFid: String? = null,
+    val fanartFid: String? = null,
+    val thumbFid: String? = null,
     val sourceDirKey: String = "",
     val scannedAt: Long = 0,
 )

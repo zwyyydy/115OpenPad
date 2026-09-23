@@ -79,6 +79,14 @@ fun MediaLibraryScreen(api: com.open115.pad.data.OpenApi) {
     // 点库卡片进海报墙，再点海报进详情（两级都盖在本页之上，返回逐层退）
     var openedLib by remember { mutableStateOf<MediaLibraryEntity?>(null) }
     var detail by remember { mutableStateOf<Triple<MovieCard, List<MovieCard>, Int>?>(null) }
+    /**
+     * 海报墙的刷新信号，**墙和详情页共用**。
+     *
+     * 详情页是盖在墙上面的浮层，墙并没有被销毁 —— 在详情页里删掉一条之后返回，
+     * 墙还捧着删除前的列表（实测：DB 里已经 17 部，墙上仍显示 8 部）。
+     * 所以删除成功要由这一层往下传一个"变了"的信号，两边都跟着它重查。
+     */
+    var wallTick by remember { mutableStateOf(0) }
 
     AdaptiveBody(modifier = Modifier.fillMaxSize()) {
         Column(Modifier.fillMaxSize()) {
@@ -293,6 +301,8 @@ fun MediaLibraryScreen(api: com.open115.pad.data.OpenApi) {
         PosterWallScreen(
             library = lib,
             dao = dao,
+            refreshKey = wallTick,
+            onChanged = { wallTick++ },
             onBack = { openedLib = null },
             onOpenMovie = { card, list, index -> detail = Triple(card, list, index) },
         )
@@ -304,6 +314,7 @@ fun MediaLibraryScreen(api: com.open115.pad.data.OpenApi) {
             playlist = list,
             index = index,
             dao = dao,
+            onDeleted = { wallTick++ },
             onBack = { detail = null },
         )
     }

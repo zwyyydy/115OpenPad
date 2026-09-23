@@ -8,6 +8,7 @@ import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -34,6 +35,8 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextFieldDefaults
@@ -43,6 +46,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -60,8 +64,11 @@ import coil.compose.SubcomposeAsyncImage
 import com.open115.pad.data.media.MediaDao
 import com.open115.pad.data.media.MediaLibraryEntity
 import com.open115.pad.data.media.MovieCard
+import com.open115.pad.data.media.MovieDeleteResult
+import com.open115.pad.data.media.deleteMovie
 import com.open115.pad.ui.theme.AdaptiveBody
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.launch
 
 /**
  * 海报墙：一个媒体库的海报网格。
@@ -73,11 +80,21 @@ import kotlinx.coroutines.flow.first
 fun PosterWallScreen(
     library: MediaLibraryEntity,
     dao: MediaDao,
+    /** 外部刷新信号（详情页删完会把它 +1）：墙在详情浮层下面没被销毁，只靠自己删时加的 tick 不够 */
+    refreshKey: Int = 0,
+    /** 本页删完通知外面 —— 外面再加 refreshKey，避免两处各存一份状态 */
+    onChanged: () -> Unit = {},
     onBack: () -> Unit,
     onOpenMovie: (MovieCard, List<MovieCard>, Int) -> Unit,
 ) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val container = (context.applicationContext as com.open115.pad.App115).container
+    val snackbarHostState = remember { SnackbarHostState() }
+    var deleteTarget by remember { mutableStateOf<MovieCard?>(null) }
+
     // 多根库：任一路径匹配即纳入（byLibraryPaths 支持 5 根，更多时逐根查询合并去重）
-    val all by produceState(initialValue = emptyList(), library.rootPaths) {
+    val all by produceState(initialValue = emptyList(), library.rootPaths, refreshKey) {
         val paths = library.rootPaths
         value = if (paths.size <= 5) {
             val p = paths + List(5 - paths.size) { "" }
@@ -104,6 +121,7 @@ fun PosterWallScreen(
 
     // 不透明底：这两级"页"是浮在媒体库列表页之上的浮层，没有底色会把下层透出来
     Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
+      Box(Modifier.fillMaxSize()) {
         AdaptiveBody(modifier = Modifier.fillMaxSize()) {
             Column(Modifier.fillMaxSize()) {
                 // 顶部工作栏：返回键 + 标题弹性占位 + 搜索框收拢右上
@@ -166,12 +184,49 @@ fun PosterWallScreen(
                         modifier = Modifier.fillMaxSize(),
                     ) {
                         items(list, key = { it.mediaKey }) { card ->
-                            PosterCard(card = card, onClick = { onOpenMovie(card, list, list.indexOf(card)) })
+                            PosterCard(
+                                card = card,
+                                onClick = { onOpenMovie(card, list, list.indexOf(card)) },
+                                onLongClick = { deleteTarget = card },
+                            )
                         }
                     }
                 }
             }
         }
+            SnackbarHost(snackbarHostState, Modifier.align(Alignment.BottomCenter))
+      }
+    }
+
+    deleteTarget?.let { target ->
+        MovieDeleteDialog(
+            name = target.title,
+            // 只有系列卡才点明"连同名下的 N 集"：卡片的 isEpisodeLike 在系列卡上是 false，
+            // 而它的分集要靠查询才知道数量，这里先按"是不是分集"粗略区分
+            episodeCount = 0,
+            onDismiss = { deleteTarget = null },
+            onDelete = { alsoCloud ->
+                deleteTarget = null
+                scope.launch {
+                    val r = deleteMovie(
+                        api = container.openApi,
+                        dao = dao,
+                        mediaCache = container.mediaCache,
+                        imageUrlResolver = container.imageUrlResolver,
+                        cacheDir = container.cacheDir,
+                        mediaKey = target.mediaKey,
+                        alsoCloud = alsoCloud,
+                    )
+                    when (r) {
+                        MovieDeleteResult.Ok -> onChanged()
+                        is MovieDeleteResult.CloudFailed -> snackbarHostState.showSnackbar(r.message)
+                        MovieDeleteResult.NoCloudId -> snackbarHostState.showSnackbar(
+                            "这条索引是升级前的旧数据，没存云盘文件 id；重扫一次这个库再删（云端文件一个没动）",
+                        )
+                    }
+                }
+            },
+        )
     }
 }
 
@@ -182,14 +237,23 @@ fun PosterWallScreen(
  * - 下置式信息区（标题加粗 + 年份·分类），替代海报上的黑蒙层
  * - 浮动元数据微标：右上 ★ 评分 / 左下画质（4K HDR、1080P…），wrapContentSize 自包覆
  * - 图片加载 Shimmer 骨架占位
+ * - 长按弹删除菜单（[onLongClick]）
  */
+@OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
 @Composable
-fun PosterCard(card: MovieCard, onClick: () -> Unit) {
+fun PosterCard(card: MovieCard, onClick: () -> Unit, onLongClick: (() -> Unit)? = null) {
     Column(
         Modifier
             .fillMaxWidth()
             .clip(RoundedCornerShape(12.dp))
-            .clickable(onClick = onClick),
+            // 长按：用 combinedClickable 而不是叠加一个 clickable，否则两个手势会互相吃掉
+            .then(
+                if (onLongClick != null) {
+                    Modifier.combinedClickable(onClick = onClick, onLongClick = onLongClick)
+                } else {
+                    Modifier.clickable(onClick = onClick)
+                },
+            ),
     ) {
         Box(
             Modifier

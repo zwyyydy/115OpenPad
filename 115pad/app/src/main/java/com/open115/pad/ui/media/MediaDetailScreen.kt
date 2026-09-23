@@ -23,6 +23,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.ArrowBack
+import androidx.compose.material.icons.outlined.Delete
 import androidx.compose.material.icons.outlined.PlayArrow
 import androidx.compose.material.icons.outlined.Star
 import androidx.compose.material3.Button
@@ -38,9 +39,11 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Brush
@@ -54,6 +57,8 @@ import com.open115.pad.data.media.EpisodeEntity
 import com.open115.pad.data.media.MediaDao
 import com.open115.pad.data.media.MovieCard
 import com.open115.pad.data.media.MovieEntity
+import com.open115.pad.data.media.MovieDeleteResult
+import com.open115.pad.data.media.deleteMovie
 import com.open115.pad.data.media.episodeSortKey
 import com.open115.pad.player.PlayerActivity
 import com.open115.pad.ui.components.dissolve
@@ -89,12 +94,15 @@ fun MediaDetailScreen(
     playlist: List<MovieCard>,
     index: Int,
     dao: MediaDao,
+    /** 删成功时通知外面刷新海报墙（墙在详情浮层下面没被销毁，不会自己发现数据变了） */
+    onDeleted: () -> Unit = {},
     onBack: () -> Unit,
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val snackbarHostState = remember { SnackbarHostState() }
     val container = (context.applicationContext as com.open115.pad.App115).container
+    var showDelete by remember { mutableStateOf(false) }
 
     val data by produceState<MediaDetailData?>(initialValue = null, card.mediaKey) {
         val movie = dao.movie(card.mediaKey)
@@ -221,7 +229,11 @@ fun MediaDetailScreen(
                             color = Color.White,
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.weight(1f),
                         )
+                        IconButton(onClick = { showDelete = true }) {
+                            Icon(Icons.Outlined.Delete, contentDescription = "删除", tint = Color.White)
+                        }
                     }
 
                     Row(Modifier.padding(top = 8.dp)) {
@@ -343,6 +355,39 @@ fun MediaDetailScreen(
                 }
             }
         }
+    }
+
+    if (showDelete) {
+        MovieDeleteDialog(
+            name = data?.movie?.title ?: card.title,
+            // 只有系列卡才点明"连同名下的 N 集"（seriesEpisodes 只对系列有值）
+            episodeCount = data?.seriesEpisodes?.size ?: 0,
+            onDismiss = { showDelete = false },
+            onDelete = { alsoCloud ->
+                showDelete = false
+                scope.launch {
+                    val r = deleteMovie(
+                        api = container.openApi,
+                        dao = dao,
+                        mediaCache = container.mediaCache,
+                        imageUrlResolver = container.imageUrlResolver,
+                        cacheDir = container.cacheDir,
+                        mediaKey = card.mediaKey,
+                        alsoCloud = alsoCloud,
+                    )
+                    when (r) {
+                        MovieDeleteResult.Ok -> {
+                            onDeleted()
+                            onBack()
+                        }
+                        is MovieDeleteResult.CloudFailed -> snackbarHostState.showSnackbar(r.message)
+                        MovieDeleteResult.NoCloudId -> snackbarHostState.showSnackbar(
+                            "这条索引是升级前的旧数据，没存云盘文件 id；重扫一次这个库再删（云端文件一个没动）",
+                        )
+                    }
+                }
+            },
+        )
     }
 }
 

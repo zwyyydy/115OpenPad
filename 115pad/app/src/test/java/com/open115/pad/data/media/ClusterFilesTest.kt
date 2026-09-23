@@ -1,6 +1,7 @@
 package com.open115.pad.data.media
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -288,5 +289,45 @@ class ClusterFilesTest {
             minVideoBytes = 0,
         )
         assertEquals(2, cs.size)
+    }
+
+    // ---------------- 「彻底删除」收尾时哪些文件算素材图 ----------------
+
+    @Test
+    fun `目录里没有归属的素材图都认得出来`() {
+        // 名字来自真实目录 示例目录/示例影片（系列）/示例影片4 (1997)/：前两个正是扫描器不挂给任何条目的
+        // （folder.jpg 被同簇裸图顶掉、-logo.png 没有归属），也就是用户实测里
+        // "彻底删除后目录里还剩两张图"的那两张
+        val art = listOf(
+            "folder.jpg", "poster.jpg", "fanart.jpg", "backdrop.jpg", "thumb.jpg",
+            "logo.png", "clearlogo.png", "banner.jpg", "disc.png", "landscape.jpg",
+            "season01-poster.jpg", "season-specials-fanart.jpg",
+            "示例影片4 (1997) {tmdbid-8078}-logo.png",
+            "示例影片4 (1997) {tmdbid-8078}-fanart.jpg",
+            // 真实库里最常见的海报形态：跟视频同名、没有任何角色后缀。
+            // 按名字认会漏掉它 —— 这就是"只按扩展名认"的理由
+            "示例影片4 (1997) {tmdbid-8078}.jpg",
+            "随便什么名字.webp",
+        )
+        art.forEach { assertTrue("$it 应判成素材图", isArtImageFile(it)) }
+    }
+
+    @Test
+    fun `视频_nfo_字幕绝不算素材图`() {
+        // 最要紧的一条：名字像图的**视频**不能被当成素材图删掉 ——
+        // 收尾那一步是照着文件名认的，认错就是把用户的片子删了
+        val notArt = listOf(
+            "示例影片4 (1997) {tmdbid-8078}.iso",
+            "示例影片4 (1997) {tmdbid-8078}.nfo",
+            "movie-poster.mkv",
+            "movie-logo.mp4",
+            "poster.ts",
+            "字幕-fanart.srt",
+            "readme.txt",
+            "没有扩展名",
+            "poster",
+            ".jpg",
+        )
+        notArt.forEach { assertFalse("$it 不该判成素材图", isArtImageFile(it)) }
     }
 }

@@ -53,7 +53,19 @@ data class Cluster(
     fun mediaKey(): String = TMDB_ID.find(prefix)?.groupValues?.get(1) ?: prefix
 }
 
-data class FileRef(val name: String, val pickCode: String, val sizeBytes: Long, val upt: Long)
+/**
+ * 一个云盘文件。
+ *
+ * [fid] 是 115 的 file_id —— **删云端文件时只能用它**（`ufile/delete` 收的是 file_ids，
+ * pick_code 不认）。扫描时列表响应里就带着，顺手存下来，否则删的时候还得再列一次目录。
+ */
+data class FileRef(
+    val name: String,
+    val pickCode: String,
+    val sizeBytes: Long,
+    val upt: Long,
+    val fid: String = "",
+)
 
 /** 从文件名前缀提取 {tmdbid-348} 里的 348（右括号必须转义，否则 ICU 正则编译崩） */
 val TMDB_ID = Regex("""\{tmdbid-(\d+)\}""")
@@ -241,6 +253,25 @@ val SEASON_ART_FANART = Regex("""(?i)^season[-_ ]?(\d+|specials)[-_ ]*(fanart|ba
 
 /** 往上找祖先目录时最多爬几层（`Series/Season 1/Disc 1/` 这种更深的结构也够用） */
 const val MAX_INHERIT_HOPS = 3
+
+/**
+ * 这个文件是不是媒体库的素材图（海报 / 背景 / 缩略图 / logo…）。
+ *
+ * **只按扩展名认，不按文件名。** 真实库里最常见的海报就叫
+ * `示例影片4 (1997) {tmdbid-8078}.jpg`（跟视频同名、没有任何角色后缀），按名字认会漏掉它，
+ * 用户看到的就还是"删完目录里还剩一张图"。名字那套词汇表
+ * （[DIR_POSTER_NAMES] / [DECOR_SUFFIXES] / 季图正则）回答的是另一个问题 ——
+ * **这张图属于哪个条目**；这里只需要回答"这个文件是不是图"。
+ *
+ * 用在「彻底删除」的收尾上（见 MovieDeleter.sweepOrphanArt）：
+ * **目录里已经没有任何本库条目**时才清，所以不怕删到别人的图 —— 那里已经没有"别人的"了。
+ * 扩展名清单跟扫描器认图的那一份是同一个常量，不会走岔。
+ */
+fun isArtImageFile(name: String): Boolean {
+    val dot = name.lastIndexOf('.')
+    if (dot <= 0) return false
+    return name.substring(dot + 1).lowercase() in IMAGE_EXTS
+}
 
 /**
  * 从 [dirPath] 往上列出**要依次查询**的祖先路径（不含自己），到 [rootPath] 为止。

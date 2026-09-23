@@ -32,6 +32,30 @@ data class MediaPickCodes(
 )
 
 /**
+ * 删单个条目时要用的文件信息（**这条 + 它名下的分集**）。
+ *
+ * 那几个 `*Fid` 是云盘 file_id —— `ufile/delete` 只认它，pick_code 不认；
+ * 那几个 `*PickCode` 是清本地海报/nfo 落盘缓存用的。
+ *
+ * `sourceDirKey` 是条目所在目录的 cid：本地删除后要拿它把该目录的扫描状态作废，
+ * 否则下次增量扫描会因为"目录没变"整目录跳过，刚删掉的条目再也回不来。
+ */
+data class MovieFiles(
+    val mediaKey: String,
+    val videoFid: String?,
+    val nfoFid: String?,
+    val posterFid: String?,
+    val fanartFid: String?,
+    val thumbFid: String?,
+    val videoPickCode: String?,
+    val nfoPickCode: String?,
+    val posterPickCode: String?,
+    val fanartPickCode: String?,
+    val thumbPickCode: String?,
+    val sourceDirKey: String,
+)
+
+/**
  * 分集要用的"祖先行"：`seriesKey` 取它的 mediaKey，海报/背景取它的图。
  *
  * 只认 `isEpisodeLike = 0` 的行 —— 分集的上层必须是"系列/影片"，不能拿另一集当系列。
@@ -165,6 +189,20 @@ interface MediaDao {
     )
     suspend fun episodesOfSeries(seriesKey: String): List<MovieCard>
 
+    /**
+     * 这条**以及它名下的分集**的文件信息（删单个条目用）。
+     *
+     * 一条查询同时服务两件事：那几个 `*Fid` 给云端删除，几个 pickCode 给本地缓存清理，
+     * `sourceDirKey` 给扫描状态作废。
+     * 系列卡会把整季的分集一起带出来 —— 删系列就该连分集一起删，否则留下的是没有系列的孤儿分集。
+     */
+    @Query(
+        "SELECT mediaKey, videoFid, nfoFid, posterFid, fanartFid, thumbFid, " +
+            "videoPickCode, nfoPickCode, posterPickCode, fanartPickCode, thumbPickCode, sourceDirKey " +
+            "FROM movies WHERE mediaKey = :key OR seriesKey = :key",
+    )
+    suspend fun filesOf(key: String): List<MovieFiles>
+
     @Query("SELECT * FROM movies WHERE mediaKey = :mediaKey")
     suspend fun movie(mediaKey: String): MovieEntity?
 
@@ -283,6 +321,27 @@ interface MediaDao {
 
     @Query("SELECT COUNT(*) FROM scan_state WHERE status = 1")
     suspend fun scanningCount(): Int
+
+    /**
+     * 把一个目录的扫描状态作废，让下次**增量**扫描重新处理它。
+     *
+     * 增量跳过的条件是 `status == 2 && cloudUpt 未变`（见 MediaScanner）。而「仅从媒体库移除」
+     * 不碰云端，目录的 upt 自然不变 —— 于是那个目录永远被跳过，刚删掉的条目再也回不来，
+     * 只有全量扫描才能重新入库。这里把状态和 upt 一起抹掉，两条判据同时失效。
+     *
+     * 不用删行：留着 dirPath / scannedAt，重扫一遍状态就回来了。
+     */
+    @Query("UPDATE scan_state SET status = 0, cloudUpt = 0 WHERE dirKey = :dirKey")
+    suspend fun invalidateScanState(dirKey: String)
+
+    /**
+     * 这个目录里还剩多少条索引。
+     *
+     * 「彻底删除」的收尾判据：为 0 才说明用户把整个目录的内容都从库里删掉了，
+     * 这时目录里剩下的素材图（`folder.jpg`、`xxx-logo.png` 这种没有归属的）才可以一并清掉。
+     */
+    @Query("SELECT COUNT(*) FROM movies WHERE sourceDirKey = :dirKey")
+    suspend fun rowsInDir(dirKey: String): Int
 
     // ---- 媒体库（用户手动新建的库，一个库可含多个云盘根路径）----
     @Insert

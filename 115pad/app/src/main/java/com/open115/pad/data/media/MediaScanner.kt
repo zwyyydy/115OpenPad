@@ -160,7 +160,7 @@ class MediaScanner(
                         }
                     }
                     val files = page.items.filter { !it.isDir }.map {
-                        FileRef(name = it.fn, pickCode = it.pc ?: "", sizeBytes = it.fs, upt = it.upt)
+                        FileRef(name = it.fn, pickCode = it.pc ?: "", sizeBytes = it.fs, upt = it.upt, fid = it.fid ?: "")
                     }
                     val scan = sniffDirectory(files, minVideoSizeMb.toLong() * 1024 * 1024)
                     // 分集目录才需要往上找归属与继承的图；影片目录不找
@@ -363,7 +363,15 @@ class MediaScanner(
             // 自己的图优先；没有才用继承来的（分集继承系列的海报/背景）
             posterPickCode = cluster.poster?.pickCode ?: ancestor?.posterPickCode,
             fanartPickCode = cluster.fanart?.pickCode ?: ancestor?.fanartPickCode,
+            thumbPickCode = cluster.thumb?.pickCode,
             nfoPickCode = cluster.nfo?.pickCode,
+            // file_id：只在「彻底删除」时用，空串折成 null（115 的空 id 传上去是参数非法）。
+            // 图片的 fid 只存**自己目录里**的 —— 分集继承来的海报属于系列，删单集不该连带删掉系列封面
+            videoFid = cluster.video?.fid?.takeIf { it.isNotEmpty() },
+            nfoFid = cluster.nfo?.fid?.takeIf { it.isNotEmpty() },
+            posterFid = cluster.poster?.fid?.takeIf { it.isNotEmpty() },
+            fanartFid = cluster.fanart?.fid?.takeIf { it.isNotEmpty() },
+            thumbFid = cluster.thumb?.fid?.takeIf { it.isNotEmpty() },
             // 分集归属的系列：海报墙只显示 seriesKey IS NULL 的顶层条目，点进系列再列分集
             seriesKey = ancestor?.seriesKey,
             nfoUpt = cluster.nfo?.upt ?: 0,
