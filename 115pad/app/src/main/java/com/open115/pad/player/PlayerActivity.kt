@@ -126,6 +126,7 @@ import androidx.media3.common.Player
 import androidx.media3.datasource.DefaultDataSource
 import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.datasource.cache.CacheDataSource
+import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.mediacodec.MediaCodecSelector
 import androidx.media3.exoplayer.upstream.DefaultBandwidthMeter
@@ -214,6 +215,101 @@ private const val REFRESH_NEW_ROUND_GAP_MS = 300_000L
 
 /** 切集节流：连续狂点会让底层解码器反复销毁重建，500ms 内只受理一次 */
 private const val EPISODE_SWITCH_THROTTLE_MS = 500L
+
+// ---- 切清晰度的预载参数（切档链路见 PlayerScreen.switchQuality）----
+
+/**
+ * 预载到"可以换流"需要攒够的缓冲时长，同时作为预载播放器 LoadControl 的缓冲目标。
+ *
+ * 刻意不用 ExoPlayer 默认的 50 秒：默认值下预载器要下满 50 秒媒体才停手，而切「原盘」这种
+ * 高码率大文件（4K 原盘常见 60~130 Mbps）就是先下几百 MB——50 秒 × 100 Mbps ≈ 625 MB，
+ * 慢链路上几分钟都等不到，用户看到的就是"大文件切不过去"。
+ * 换流真正需要的只是"新流能起播"：换流后主播放器与预载器共用同一份缓存，
+ * 缺的那部分它自己会接着下，不需要预载先备满 50 秒。
+ */
+private const val PRELOAD_BUFFER_MS = 15_000L
+
+/** 预载等待的轮询间隔（同时是进度提示的刷新间隔） */
+private const val PRELOAD_POLL_MS = 500L
+
+/**
+ * 缓冲位置多久没有任何推进就判这一轮失败（停滞）。
+ * 注意这不是"总时长"：大文件起播天然慢，只要缓冲还在推进就一直等下去。
+ */
+private const val PRELOAD_STALL_MS = 90_000L
+
+/** 单轮等待的兜底上限：防"每 89 秒挪一点点"的僵尸链路把用户无限期卡在等待里 */
+private const val PRELOAD_MAX_WAIT_MS = 600_000L
+
+/** 预载最多几轮：第一轮失败后换一份新地址再试一轮（115 的直链与分片地址都带签名） */
+private const val PRELOAD_MAX_TRIES = 2
+
+/** 预载器起播/重缓冲阈值，与 ExoPlayer 默认一致（只改了缓冲目标时长，这两项保持默认语义） */
+private const val PRELOAD_START_MS = 2_500
+private const val PRELOAD_REBUFFER_MS = 5_000
+
+/** 一轮预载的结局，决定 switchQuality 下一步（重试／换地址／报错） */
+private enum class PreloadOutcome {
+    /** 攒够了可换流的缓冲 */
+    READY,
+
+    /** 播放器报错（错误本体在 preloadError 里） */
+    ERROR,
+
+    /** 直接到片尾：起播点落在新流的片尾（跨档时长差几秒时会出现） */
+    ENDED,
+
+    /** 缓冲长时间没有推进 */
+    STALL,
+
+    /** 单轮等待到达兜底上限 */
+    TIMEOUT,
+
+    /** 被新一轮切换接管（调用方直接退出，不出提示） */
+    CANCELLED,
+}
+
+/**
+ * 预载失败值不值得"换一份新地址再试一轮"。
+ *
+ * 只有地址／链路类错误值得：115 的播放地址与分片地址都带签名，过期、频控、连接被掐，
+ * 重新取一次地址往往就好了。解码、容器解析这类错误换地址没用（原盘常见：HEVC Main10
+ * 超出设备能力），重试只会让用户白等一遍。
+ * [err] 为 null 表示"停滞／超时"这类合成结局：没有明确的解码错误，按链路问题处理。
+ */
+private fun worthRetryPreload(err: PlaybackException?): Boolean = when (err?.errorCode) {
+    null,
+    PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_FAILED,
+    PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_TIMEOUT,
+    PlaybackException.ERROR_CODE_IO_BAD_HTTP_STATUS,
+    PlaybackException.ERROR_CODE_IO_FILE_NOT_FOUND,
+    PlaybackException.ERROR_CODE_IO_INVALID_HTTP_CONTENT_TYPE,
+    PlaybackException.ERROR_CODE_IO_UNSPECIFIED,
+    -> true
+
+    else -> false
+}
+
+/** 预载失败的原因，给用户看的一句话——别直接把 errorCodeName 甩出去 */
+private fun preloadFailReason(err: PlaybackException?): String {
+    if (err == null) return "加载中断"
+    return when (err.errorCode) {
+        PlaybackException.ERROR_CODE_IO_BAD_HTTP_STATUS -> "地址已失效"
+        PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_FAILED,
+        PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_TIMEOUT,
+        -> "网络连接失败"
+
+        PlaybackException.ERROR_CODE_DECODING_FAILED,
+        PlaybackException.ERROR_CODE_DECODING_FORMAT_UNSUPPORTED,
+        -> "设备不支持该档位的编码"
+
+        PlaybackException.ERROR_CODE_PARSING_CONTAINER_UNSUPPORTED,
+        PlaybackException.ERROR_CODE_PARSING_CONTAINER_MALFORMED,
+        -> "封装格式不支持"
+
+        else -> "加载失败（${err.errorCodeName}）"
+    }
+}
 
 class PlayerActivity : ComponentActivity() {
     companion object {
@@ -792,14 +888,41 @@ fun PlayerScreen(
         val renderersFactory = SdrOutputRenderersFactory(context)
             .setEnableDecoderFallback(true)
             .apply { if (prefs.softwareDecode) setMediaCodecSelector(SOFTWARE_FIRST_DECODER) }
+        // 预载只备"够起播"的量就停手，不做 50 秒预缓冲（原因见 PRELOAD_BUFFER_MS）。
+        // 只改预载器：主播放器仍用默认值，正常播放的缓冲策略不受影响。
+        val loadControl = DefaultLoadControl.Builder()
+            .setBufferDurationsMs(
+                PRELOAD_BUFFER_MS.toInt(),
+                PRELOAD_BUFFER_MS.toInt(),
+                PRELOAD_START_MS,
+                PRELOAD_REBUFFER_MS,
+            )
+            .build()
         ExoPlayer.Builder(context)
             .setRenderersFactory(renderersFactory)
             .setMediaSourceFactory(mediaFactory)
             .setBandwidthMeter(bandwidthMeter)
+            .setLoadControl(loadControl)
             .build()
     }
+
+    /**
+     * 预载播放器的最近一次错误。
+     * 没有它，等待循环只能看 playbackState——而"出错"和"正常停止"都是 IDLE，
+     * 于是失败一律被报成"切换超时"，真正的原因（403／解码不支持／连接被掐）全丢了。
+     */
+    var preloadError by remember { mutableStateOf<PlaybackException?>(null) }
     DisposableEffect(preloadPlayer) {
-        onDispose { preloadPlayer.release() }
+        val listener = object : Player.Listener {
+            override fun onPlayerError(err: PlaybackException) {
+                preloadError = err
+            }
+        }
+        preloadPlayer.addListener(listener)
+        onDispose {
+            preloadPlayer.removeListener(listener)
+            preloadPlayer.release()
+        }
     }
 
     // 手势指示器
@@ -1331,21 +1454,111 @@ fun PlayerScreen(
         data?.definitionLabels?.get(def)?.takeIf { it.isNotBlank() } ?: defLabel(def)
 
     /**
+     * 预载失败后换一份新地址：原盘档位每次 downUrl 拿到的都是新直链（buildItem 内部就是重新取），
+     * 转码档位要先刷一次 videoPlay 才能拿到新的分片地址——与主播放器的 403 自愈是同一套逻辑。
+     * 取不到新地址返回 null，调用方直接报错：拿旧地址再试一遍没有意义。
+     */
+    suspend fun refreshItemAfterPreloadFail(def: Int): MediaItem? {
+        if (def != DEF_ORIGINAL_FILE) {
+            val fresh = runCatching { parseVideoPlayResponse(container.openApi.videoPlay(currentPickCode)) }
+                .getOrNull() ?: return null
+            data = fresh
+        }
+        return runCatching { buildItem(def) }.getOrNull()?.second
+    }
+
+    /**
+     * 把 [item] 预载到"可换流"，返回这一轮的结局（见 [PreloadOutcome]）。
+     *
+     * 完成判定：起播点之后已经攒够 [PRELOAD_BUFFER_MS]，或播放器直接进 READY
+     * （整段都缓冲完的短素材走这条）。前者是大文件档位的主路径——不必干等 ExoPlayer
+     * 把状态机推到 READY，"够起播"就换。
+     *
+     * 失败判定：播放器报错（[preloadError]，由挂在预载器上的 listener 记下）、缓冲停滞
+     * [PRELOAD_STALL_MS]（链路死了但不报错）、单轮到达 [PRELOAD_MAX_WAIT_MS] 兜底。
+     * 全程不设固定等待时长：大文件起播天然慢，只要缓冲还在推进就一直等——旧实现
+     * （固定 600 次 × 500ms 上限、且一见 IDLE 就判失败）在几十 GB 的原盘上就是这里翻车：
+     * 按 500ms 轮询它本该等 5 分钟，但预载器一进 IDLE 就立刻"切换超时"，
+     * 真正的原因（地址失效/连接被掐/解码不支持）也一并丢掉。
+     *
+     * 等待期间每次轮询都刷新指示器：既给进度条，也让提示因为"有更新"而不被 900ms 的
+     * 自动淡出清掉——否则长等待期间界面毫无反馈，用户会以为卡死了。
+     */
+    suspend fun runPreload(
+        pre: ExoPlayer,
+        item: MediaItem,
+        startPos: Long,
+        tick: Int,
+        def: Int,
+    ): PreloadOutcome {
+        // 动预载器之前先确认这一轮没被接管：从取地址（网络往返）到这里的这段时间里，
+        // 用户可能又点了别的档位——那样一动手就把新一轮的预载换成了这个档位的
+        if (qualitySwitchTick != tick) return PreloadOutcome.CANCELLED
+        preloadError = null
+        // 清上一轮残留：stop 会把状态打回 IDLE，所以下面的 IDLE 判定只认"缓冲过之后回落"
+        pre.stop()
+        pre.setMediaItem(item, startPos)
+        pre.prepare()
+        val startedAt = System.currentTimeMillis()
+        var lastProgressAt = startedAt
+        var lastBufferedPos = -1L
+        var sawBuffering = false
+        while (true) {
+            delay(PRELOAD_POLL_MS)
+            if (qualitySwitchTick != tick) return PreloadOutcome.CANCELLED
+            if (preloadError != null) return PreloadOutcome.ERROR
+            when (pre.playbackState) {
+                Player.STATE_READY -> return PreloadOutcome.READY
+                Player.STATE_ENDED -> return PreloadOutcome.ENDED
+                Player.STATE_BUFFERING -> sawBuffering = true
+                // 缓冲过又回落 IDLE：预载器被停掉或内部失败，没什么可等的了
+                Player.STATE_IDLE -> if (sawBuffering) return PreloadOutcome.ERROR
+            }
+            // 起播点之后已经攒了多少（缓冲位置没动 = 还没开始出数据）
+            val buffered = (pre.bufferedPosition - startPos).coerceAtLeast(0L)
+            if (buffered >= PRELOAD_BUFFER_MS) return PreloadOutcome.READY
+            val now = System.currentTimeMillis()
+            if (pre.bufferedPosition != lastBufferedPos) {
+                lastBufferedPos = pre.bufferedPosition
+                lastProgressAt = now
+            }
+            setIndicator(
+                "正在切换 ${labelOf(def)}…",
+                (buffered.toFloat() / PRELOAD_BUFFER_MS).coerceIn(0f, 0.99f),
+            )
+            if (now - lastProgressAt > PRELOAD_STALL_MS) return PreloadOutcome.STALL
+            if (now - startedAt > PRELOAD_MAX_WAIT_MS) return PreloadOutcome.TIMEOUT
+        }
+    }
+
+    /**
      * 切清晰度：先预载后换流，旧流不停 → 无黑屏。
      *
      * 旧实现是直接 setMediaItem + prepare，主播放器整条重缓冲，画面一黑缓冲新的。
      * 现在把目标档位交给 preloadPlayer 后台加载（与主播放器同缓存，同位置分片
-     * 直接命中缓存），加载 READY 前主播放器继续播；对齐好进度后一次 swap：
+     * 直接命中缓存），加载到"可换流"之前主播放器继续播；对齐好进度后一次 swap：
      * 停旧 → 挂输出面 → seek → play。中间只有一次 flush，黑屏基本感知不到。
+     *
+     * 大文件（原盘动辄几十 GB、码率上百 Mbps）是这条链路最容易翻车的地方，两条对策：
+     * ① 预载只备"够起播"的量就换（[PRELOAD_BUFFER_MS]），不做默认的 50 秒预缓冲；
+     * ② 等待按"缓冲还在不在推进"判定（[runPreload]），失败还换一份新地址重试一轮。
      *
      * 并发保护：预载中再点画质 → 先把上一轮预载取消（replace/clear），重新预载。
      */
     fun switchQuality(def: Int) {
         val tick = ++qualitySwitchTick
         scope.launch {
-            val pos = resumePos(player.currentPosition)
-            val built = buildItem(def)
-            if (built == null) {
+            // 已经在播这个档位就直接返回：放在取地址之前，省掉一次没必要的
+            // videoPlay / downUrl 调用（115 对这两个接口有频控，原盘直链尤其金贵）。
+            // 顺手停掉可能还在跑的上一轮预载——用户点回当前档位就是"不切了"，
+            // 不该让它在后台继续下（tick 上面已自增，那一轮自己会退出，不会再换流）。
+            if (def == currentDef) {
+                if (qualitySwitchTick == tick) preloadPlayer.stop()
+                return@launch
+            }
+            var pos = resumePos(player.currentPosition)
+            val first = buildItem(def)
+            if (first == null) {
                 // 原盘直链取不到（无下载权限/接口频控/签名异常）时保持当前档位继续播，
                 // 只给个瞬时提示——切画质失败不该把正在看的画面打断。
                 setIndicator(
@@ -1354,35 +1567,57 @@ fun PlayerScreen(
                 )
                 return@launch
             }
-            val (d, item) = built
+            val (d, firstItem) = first
             if (d == currentDef) return@launch
+            var item = firstItem
 
-            setIndicator("正在切换 ${labelOf(d)}…", null)
+            setIndicator("正在切换 ${labelOf(d)}…", 0f)
             pulseControlRow()
 
-            // 预载：目标档位丢给 preloadPlayer 加载，主播放器照常播
             val pre = preloadPlayer
-            pre.setMediaItem(item, pos)
-            pre.prepare()
-            // 轮询等 READY（预载失败也退出：出错时保持旧流继续播，给失败提示）
-            var ready = false
-            for (i in 1..600) { // 最多等 ~30s（500ms 一次）
-                delay(500)
-                if (qualitySwitchTick != tick) break // 被新一轮切换接管
-                when (pre.playbackState) {
-                    Player.STATE_READY -> { ready = true; break }
-                    Player.STATE_IDLE, Player.STATE_ENDED -> break
+            val switchStartedAt = System.currentTimeMillis()
+            var tries = 0
+            var outcome = PreloadOutcome.TIMEOUT
+            while (true) {
+                outcome = runPreload(pre, item, pos, tick, d)
+                if (outcome == PreloadOutcome.READY) break
+                // 被新一轮切换接管：什么都不用做（新那轮自己会重设预载器），也别出提示
+                if (outcome == PreloadOutcome.CANCELLED) return@launch
+                pre.stop()
+                // 预载直接到片尾：起播点落在新流的片尾（跨档时长差几秒）——这不是失败，
+                // 归零重来一次，且不占下面的重试次数
+                if (outcome == PreloadOutcome.ENDED && pos > 0) {
+                    pos = 0L
+                    continue
                 }
+                tries++
+                if (tries >= PRELOAD_MAX_TRIES || !worthRetryPreload(preloadError)) break
+                // 换新地址再试一轮（只有地址/链路类错误值得，见 worthRetryPreload）
+                item = refreshItemAfterPreloadFail(d) ?: break
+                setIndicator("正在切换 ${labelOf(d)}…（换新地址重试）", 0f)
             }
-            if (!ready || qualitySwitchTick != tick) {
-                if (qualitySwitchTick == tick) {
-                    setIndicator("切换超时，请稍后重试", null)
-                    pre.stop()
+            if (outcome != PreloadOutcome.READY) {
+                // 失败用 Toast 而不是指示器：指示器 900ms 就淡出，这种长句子来不及看。
+                // 而且要明确告诉用户"没切成 + 为什么"（旧实现一律只报"切换超时"）
+                val why = when (outcome) {
+                    PreloadOutcome.STALL, PreloadOutcome.TIMEOUT -> "网络太慢"
+                    PreloadOutcome.ENDED -> "档位内容异常"
+                    else -> preloadFailReason(preloadError)
                 }
+                toast("切换 ${labelOf(d)} 失败：$why")
+                // 排障线索：adb logcat -s PlayerSwitch（切档耗时/失败原因是这套等待逻辑的唯一实测依据）
+                android.util.Log.w(
+                    "PlayerSwitch",
+                    "切档失败 def=$d outcome=$outcome err=${preloadError?.errorCodeName}" +
+                        " 耗时=${System.currentTimeMillis() - switchStartedAt}ms",
+                )
+                pre.stop()
                 return@launch
             }
 
             // 对齐进度后一次换流：进度按新流总时长重校（跨档时长可能差一点）
+            // 换流前再确认一次没被接管：预载成功到真正换流之间，用户可能又点了一个档位
+            if (qualitySwitchTick != tick) return@launch
             val newPos = pre.duration.takeIf { it > 0 }
                 ?.let { resumePos(pre.currentPosition, it) }
                 ?: pre.currentPosition
@@ -1397,6 +1632,12 @@ fun PlayerScreen(
             player.setPlaybackSpeed(currentSpeed)
             player.playWhenReady = true
             // 预载器清干净，下次切档再用
+            // 预载器清干净，下次切档再用（日志要赶在 stop 之前打：stop 会把缓冲位置清零）
+            android.util.Log.d(
+                "PlayerSwitch",
+                "切档完成 def=$d 预载耗时=${System.currentTimeMillis() - switchStartedAt}ms" +
+                    " 缓冲=${pre.bufferedPosition - newPos}ms 位置=${newPos}ms",
+            )
             pre.stop()
             setIndicator("已切换到 ${labelOf(d)}", null)
             pulseControlRow()
@@ -1754,6 +1995,14 @@ fun PlayerScreen(
      */
     val currentPlayer by rememberUpdatedState(player)
 
+    /**
+     * 双击三区配置（左右步长 = 设置页的"快进/快退秒数"）。
+     * 普通模式与 VR 模式共用同一份：VR 下双击也要能快退/暂停/快进，且行为与普通模式一致。
+     */
+    val doubleTapConfig = remember(prefs.seekSeconds) {
+        DoubleTapConfig(leftSeconds = prefs.seekSeconds, rightSeconds = prefs.seekSeconds)
+    }
+
     @Composable
     fun VideoSurface(modifier: Modifier, onSubSearch: () -> Unit) {
         BoxWithConstraints(modifier) {
@@ -1916,10 +2165,16 @@ fun PlayerScreen(
             ) {
                 Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { BufferingPill() }
             }
-            // VR 手势层：只在 VR 模式生效，与下面那套普通手势**互斥**（见两边的 enabled 条件）
+            // VR 手势层：只在 VR 模式生效，与下面那套普通手势**互斥**（见两边的 enabled 条件）。
+            // 互斥掉的是亮度/音量/横滑快进那套——它们和"横拖转视角、捏合调视场角"直接打架；
+            // 双击没有位移，两套不冲突，所以在 VR 里**保留**，并且走与普通模式同一份
+            // applyDoubleTapZone（左退 / 中暂停 / 右进），行为完全一致。
             if (vrMode != null) {
                 VrGestureLayer(
                     modifier = Modifier.fillMaxSize(),
+                    // 与普通手势层同样受防误触锁约束：锁定态下拖动/捏合/点击一概不响应
+                    // （锁按钮在更上层，仍然可点解锁）
+                    enabled = !screenLocked,
                     state = vrState,
                     onViewChanged = { pushVrParams() },
                     onToggleController = {
@@ -1930,7 +2185,12 @@ fun PlayerScreen(
                             pulseControlRow()
                         }
                     },
-                    onDoubleTap = { if (player.isPlaying) player.pause() else player.play() },
+                    onDoubleTap = { xRatio ->
+                        applyDoubleTapZone(player, doubleTapConfig, xRatio) { side, label ->
+                            pulseControlRow()
+                            dtFx = DoubleTapFx(side, label, System.currentTimeMillis())
+                        }
+                    },
                     onHud = { vrHudText = it },
                 )
             }
@@ -1938,14 +2198,12 @@ fun PlayerScreen(
             // **VR 模式下同样整体禁用**：此时画面是实时反投影的视窗，横拖要转视角、
             // 竖拖要抬低头，会和"横滑快进 / 左半屏调亮度 / 右半屏调音量"直接打架——
             // 两套同时生效的结果是拖动时亮度乱跳、进度条跟着乱 seek。
+            // （VR 下的双击三区不在这里，由上面的 VrGestureLayer 走同一份实现）
             PlayerGestureOverlay(
                 modifier = Modifier.fillMaxSize(),
                 enabled = !screenLocked && vrMode == null,
                 player = player,
-                config = DoubleTapConfig(
-                    leftSeconds = prefs.seekSeconds,
-                    rightSeconds = prefs.seekSeconds,
-                ),
+                config = doubleTapConfig,
                 longPressSpeed = prefs.speedBoost,
                 onToggleController = {
                     // 自带控制条已停用：单击切换右下角控制排的显隐

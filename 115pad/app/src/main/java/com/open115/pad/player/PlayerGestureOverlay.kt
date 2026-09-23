@@ -71,6 +71,44 @@ data class DoubleTapConfig(
 /** 双击水波纹反馈：side -1 左 / 1 右，id 用于区分动画轮次 */
 data class DoubleTapFx(val side: Int, val label: String, val id: Long)
 
+/**
+ * 双击三区动作：左区快退 / 右区快进 / 中间播放暂停（左右的动作与步长由 [config] 决定）。
+ *
+ * 普通手势层与 VR 手势层**共用这一份实现**。VR 里横拖是转视角、捏合是调视场角，
+ * 只有"轻点两下"这种零位移操作能安全复用；而两种模式下的双击行为必须完全一致，
+ * 各写一份迟早会走偏。
+ *
+ * @param xRatio 双击点的横向比例（0~1）。各手势层用自己 `PointerInputScope` 的宽度算好传进来，
+ *               这一层不必关心视图尺寸。
+ * @param onFx 水波纹反馈（side -1 左 / 1 右 + 步长文案）；中间区是播放/暂停，不触发
+ */
+internal fun applyDoubleTapZone(
+    player: Player,
+    config: DoubleTapConfig,
+    xRatio: Float,
+    onFx: (Int, String) -> Unit,
+) {
+    fun seekZone(side: Int, action: SeekAction, seconds: Int) {
+        val dur = player.duration
+        val target = when (action) {
+            SeekAction.SEEK_REWIND ->
+                (player.currentPosition - seconds * 1000L).coerceAtLeast(0L)
+
+            // 时长还没解析出来（dur<=0）时不做上界夹逼，否则"快进"会被夹到 0 直接跳回片头
+            SeekAction.SEEK_FORWARD ->
+                (player.currentPosition + seconds * 1000L)
+                    .coerceAtMost(if (dur > 0) dur else Long.MAX_VALUE)
+        }
+        player.seekTo(target)
+        onFx(side, (if (action == SeekAction.SEEK_REWIND) "-" else "+") + "${seconds}s")
+    }
+    when {
+        xRatio <= config.leftRatio -> seekZone(-1, config.leftAction, config.leftSeconds)
+        xRatio >= config.rightRatio -> seekZone(1, config.rightAction, config.rightSeconds)
+        else -> if (player.isPlaying) player.pause() else player.play()
+    }
+}
+
 internal enum class DragMode { NONE, SEEK, BRIGHTNESS, VOLUME }
 
 /** 一次手势周期内的状态（方向锁定后不再改变） */
@@ -249,43 +287,14 @@ internal fun PlayerGestureOverlay(
         layer = layer.pointerInput(config) {
             detectTapGestures(
                 onTap = { onToggleController() },
+                // 三区判定与 VR 模式共用一份（见 applyDoubleTapZone）
                 onDoubleTap = { offset ->
-                    val w = size.width
-                    when {
-                        offset.x <= w * config.leftRatio -> {
-                            val sec = config.leftSeconds
-                            val dur = player.duration.coerceAtLeast(0L)
-                            val target = when (config.leftAction) {
-                                SeekAction.SEEK_REWIND ->
-                                    (player.currentPosition - sec * 1000L).coerceAtLeast(0L)
-                                SeekAction.SEEK_FORWARD ->
-                                    (player.currentPosition + sec * 1000L).coerceAtMost(dur)
-                            }
-                            player.seekTo(target)
-                            onDoubleTapFx(
-                                -1,
-                                if (config.leftAction == SeekAction.SEEK_REWIND) "-${sec}s" else "+${sec}s",
-                            )
-                        }
-                        offset.x >= w * config.rightRatio -> {
-                            val sec = config.rightSeconds
-                            val dur = player.duration.coerceAtLeast(0L)
-                            val target = when (config.rightAction) {
-                                SeekAction.SEEK_REWIND ->
-                                    (player.currentPosition - sec * 1000L).coerceAtLeast(0L)
-                                SeekAction.SEEK_FORWARD ->
-                                    (player.currentPosition + sec * 1000L).coerceAtMost(dur)
-                            }
-                            player.seekTo(target)
-                            onDoubleTapFx(
-                                1,
-                                if (config.rightAction == SeekAction.SEEK_REWIND) "-${sec}s" else "+${sec}s",
-                            )
-                        }
-                        else -> {
-                            if (player.isPlaying) player.pause() else player.play()
-                        }
-                    }
+                    applyDoubleTapZone(
+                        player = player,
+                        config = config,
+                        xRatio = offset.x / size.width.toFloat().coerceAtLeast(1f),
+                        onFx = onDoubleTapFx,
+                    )
                 },
                 onLongPress = {
                     speedMode = true

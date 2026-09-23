@@ -142,23 +142,33 @@ class VrViewState {
  * 这里用单个 `awaitEachGesture` 自己解析，按手指数分流，行为完全确定。
  *
  * 注意调用方在 VR 模式下会把 `PlayerGestureOverlay` 整个关掉，
- * 所以这里不会和亮度/音量/快进那套手势打架。
+ * 所以亮度/音量/横滑快进那套手势不会和这里打架。
+ *
+ * 但**双击**是例外，VR 模式下也要保留：横拖/捏合都有位移，只有"轻点两下"
+ * 这种零位移操作能安全复用，所以双击三区（左退 / 中暂停 / 右进）通过
+ * [onDoubleTap] 交给调用方，由调用方走与普通模式同一份 `applyDoubleTapZone`。
+ *
+ * @param enabled 与普通手势层一致：锁屏（防误触锁）时整体不挂事件，
+ *                锁定态下拖动/捏合/点击一概不响应，只有锁按钮本身（更上层）可点。
+ * @param onDoubleTap 双击回调，参数是双击点的横向比例 0~1（三区判定交给调用方）
  */
 @Composable
 internal fun VrGestureLayer(
     modifier: Modifier,
+    enabled: Boolean,
     state: VrViewState,
     onViewChanged: () -> Unit,
     onToggleController: () -> Unit,
-    onDoubleTap: () -> Unit,
+    onDoubleTap: (Float) -> Unit,
     onHud: (String?) -> Unit,
 ) {
     val scope = rememberCoroutineScope()
     var lastTapAt = remember { longArrayOf(0L) }
     var pendingTap = remember { arrayOfNulls<Job>(1) }
 
-    Box(
-        modifier.pointerInput(state) {
+    var layer = modifier
+    if (enabled) {
+        layer = layer.pointerInput(state) {
             awaitEachGesture {
                 val down = awaitFirstDown(requireUnconsumed = false)
                 val slop = viewConfiguration.touchSlop
@@ -252,7 +262,9 @@ internal fun VrGestureLayer(
                         prev.cancel()
                         pendingTap[0] = null
                         lastTapAt[0] = 0L
-                        onDoubleTap()
+                        // 用当前这一击的位置判区（与 Compose 的 onDoubleTap 语义一致：
+                        // 取的是第二击），两击之间手指可能已经挪了位置
+                        onDoubleTap(down.position.x / size.width.toFloat().coerceAtLeast(1f))
                     } else {
                         lastTapAt[0] = now
                         pendingTap[0] = scope.launch {
@@ -262,8 +274,9 @@ internal fun VrGestureLayer(
                     }
                 }
             }
-        },
-    )
+        }
+    }
+    Box(layer)
 }
 
 /** VR 手势提示（顶部居中）：拖动显示角度，捏合显示视场角 */
