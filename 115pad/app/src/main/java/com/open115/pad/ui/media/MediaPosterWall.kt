@@ -1,5 +1,11 @@
 package com.open115.pad.ui.media
 
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -14,6 +20,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
@@ -22,7 +29,6 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.ArrowBack
 import androidx.compose.material.icons.outlined.Movie
 import androidx.compose.material.icons.outlined.Search
-import androidx.compose.material3.Card
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -30,6 +36,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextFieldDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -39,19 +46,22 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import coil.compose.SubcomposeAsyncImage
-import com.open115.pad.AppContainer
-import com.open115.pad.data.ImageMediaItem
 import com.open115.pad.data.media.MediaDao
 import com.open115.pad.data.media.MediaLibraryEntity
 import com.open115.pad.data.media.MovieCard
 import com.open115.pad.ui.theme.AdaptiveBody
+import kotlinx.coroutines.flow.first
 
 /**
  * 海报墙：一个媒体库的海报网格。
@@ -66,7 +76,16 @@ fun PosterWallScreen(
     onBack: () -> Unit,
     onOpenMovie: (MovieCard, List<MovieCard>, Int) -> Unit,
 ) {
-    val all by dao.byLibraryPath(library.rootPath).collectAsState(initial = emptyList())
+    // 多根库：任一路径匹配即纳入（byLibraryPaths 支持 5 根，更多时逐根查询合并去重）
+    val all by produceState(initialValue = emptyList(), library.rootPaths) {
+        val paths = library.rootPaths
+        value = if (paths.size <= 5) {
+            val p = paths + List(5 - paths.size) { "" }
+            dao.byLibraryPaths(p[0], p[1], p[2], p[3], p[4]).first()
+        } else {
+            paths.flatMap { dao.byLibraryPath(it).first() }.distinctBy { it.mediaKey }
+        }
+    }
     var query by remember { mutableStateOf("") }
     // 标题搜索是全表查询，结果再按本库的 mediaKey 收敛，避免搜出别的库的影片
     val hits by produceState<List<MovieCard>?>(initialValue = null, query, all) {
@@ -79,71 +98,107 @@ fun PosterWallScreen(
     }
     val list = hits ?: all
 
+    // 系统返回键 = 逐层退：有搜索词先清搜索，否则退回媒体库列表
+    androidx.activity.compose.BackHandler(enabled = query.isNotBlank()) { query = "" }
+    androidx.activity.compose.BackHandler(enabled = query.isBlank()) { onBack() }
+
     // 不透明底：这两级"页"是浮在媒体库列表页之上的浮层，没有底色会把下层透出来
     Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
-    AdaptiveBody(modifier = Modifier.fillMaxSize()) {
-        Column(Modifier.fillMaxSize()) {
-            Row(
-                Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                IconButton(onClick = onBack) {
-                    Icon(Icons.Outlined.ArrowBack, contentDescription = "返回")
-                }
-                Column(Modifier.weight(1f)) {
-                    Text(library.name, style = MaterialTheme.typography.titleLarge)
-                    Text(
-                        "${library.rootPath} · ${list.size} 部",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+        AdaptiveBody(modifier = Modifier.fillMaxSize()) {
+            Column(Modifier.fillMaxSize()) {
+                // 顶部工作栏：返回键 + 标题弹性占位 + 搜索框收拢右上
+                Row(
+                    Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    IconButton(onClick = onBack) {
+                        Icon(Icons.Outlined.ArrowBack, contentDescription = "返回")
+                    }
+                    Column(Modifier.weight(1f)) {
+                        Text(library.name, style = MaterialTheme.typography.titleLarge)
+                        Text(
+                            "${library.rootPath} · ${list.size} 部",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    OutlinedTextField(
+                        value = query,
+                        onValueChange = { query = it },
+                        placeholder = { Text("在系列内搜索…") },
+                        leadingIcon = { Icon(Icons.Outlined.Search, contentDescription = null) },
+                        singleLine = true,
+                        shape = RoundedCornerShape(50),
+                        colors = TextFieldDefaults.colors(
+                            focusedIndicatorColor = MaterialTheme.colorScheme.primary,
+                            unfocusedIndicatorColor = Color.Transparent,
+                            disabledIndicatorColor = Color.Transparent,
+                            focusedContainerColor = MaterialTheme.colorScheme.surfaceVariant,
+                            unfocusedContainerColor = MaterialTheme.colorScheme.surfaceVariant,
+                        ),
+                        // 轻量搜索框：宽屏下收拢在右上，不横拉整行
+                        modifier = Modifier
+                            .widthIn(min = 180.dp, max = 320.dp)
+                            .padding(end = 8.dp)
+                            .height(52.dp),
                     )
                 }
-            }
 
-            OutlinedTextField(
-                value = query,
-                onValueChange = { query = it },
-                label = { Text("按标题搜索") },
-                leadingIcon = { Icon(Icons.Outlined.Search, contentDescription = null) },
-                singleLine = true,
-                modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
-            )
-
-            if (list.isEmpty()) {
-                Column(
-                    Modifier.fillMaxSize().padding(32.dp),
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                    verticalArrangement = Arrangement.Center,
-                ) {
-                    Text(
-                        if (query.isBlank()) "这个库还没有影片，回列表点扫描" else "没有匹配「$query」的影片",
-                        style = MaterialTheme.typography.bodyLarge,
-                    )
-                }
-            } else {
-                LazyVerticalGrid(
-                    columns = GridCells.Adaptive(minSize = 148.dp),
-                    contentPadding = PaddingValues(16.dp),
-                    horizontalArrangement = Arrangement.spacedBy(12.dp),
-                    verticalArrangement = Arrangement.spacedBy(12.dp),
-                    modifier = Modifier.fillMaxSize(),
-                ) {
-                    items(list, key = { it.mediaKey }) { card ->
-                        MoviePosterCard(card = card, onClick = { onOpenMovie(card, list, list.indexOf(card)) })
+                if (list.isEmpty()) {
+                    Column(
+                        Modifier.fillMaxSize().padding(32.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.Center,
+                    ) {
+                        Text(
+                            if (query.isBlank()) "这个库还没有影片，回列表点扫描" else "没有匹配「$query」的影片",
+                            style = MaterialTheme.typography.bodyLarge,
+                        )
+                    }
+                } else {
+                    // 全屏自适应网格：手机 2~3 列 / 平板 4~5 列 / 2K/4K 大屏 6~8 列，
+                    // 列宽由系统按 minSize 均分铺满，横向拉伸只等比放大或增列，不留死白
+                    LazyVerticalGrid(
+                        columns = GridCells.Adaptive(minSize = 130.dp),
+                        contentPadding = PaddingValues(16.dp),
+                        horizontalArrangement = Arrangement.spacedBy(16.dp),
+                        verticalArrangement = Arrangement.spacedBy(16.dp),
+                        modifier = Modifier.fillMaxSize(),
+                    ) {
+                        items(list, key = { it.mediaKey }) { card ->
+                            PosterCard(card = card, onClick = { onOpenMovie(card, list, list.indexOf(card)) })
+                        }
                     }
                 }
             }
         }
     }
-    }
 }
 
-/** 竖版海报卡片：海报 + 评分角标 + 标题/年份；没有海报时用图标兜底，不留空白 */
+/**
+ * 海报卡片（自适应规范）：
+ * - 宽度继承网格单元格：fillMaxWidth()，严禁硬编码宽高
+ * - 高度按 2:3 黄金比例由列宽自动推导：fillMaxWidth().aspectRatio(2f / 3f)
+ * - 下置式信息区（标题加粗 + 年份·分类），替代海报上的黑蒙层
+ * - 浮动元数据微标：右上 ★ 评分 / 左下画质（4K HDR、1080P…），wrapContentSize 自包覆
+ * - 图片加载 Shimmer 骨架占位
+ */
 @Composable
-private fun MoviePosterCard(card: MovieCard, onClick: () -> Unit) {
-    Card(onClick = onClick, modifier = Modifier.fillMaxWidth()) {
-        Box(Modifier.fillMaxWidth().aspectRatio(2f / 3f)) {
+fun PosterCard(card: MovieCard, onClick: () -> Unit) {
+    Column(
+        Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(12.dp))
+            .clickable(onClick = onClick),
+    ) {
+        Box(
+            Modifier
+                .fillMaxWidth()
+                .aspectRatio(2f / 3f)
+                .clip(RoundedCornerShape(12.dp)),
+        ) {
             if (card.posterPickCode.isNullOrBlank()) {
+                // 无海报兜底：浅灰底 + 图标，不留空白
                 Box(
                     Modifier.fillMaxSize().background(MaterialTheme.colorScheme.surfaceVariant),
                     contentAlignment = Alignment.Center,
@@ -161,50 +216,93 @@ private fun MoviePosterCard(card: MovieCard, onClick: () -> Unit) {
                     modifier = Modifier.fillMaxSize(),
                 )
             }
-            // 底部渐变：保证白底海报上的标题也读得清
-            Box(
-                Modifier.fillMaxWidth().height(56.dp).align(Alignment.BottomCenter)
-                    .background(
-                        Brush.verticalGradient(
-                            listOf(Color.Transparent, Color.Black.copy(alpha = 0.75f)),
-                        ),
-                    ),
-            )
-            if (card.rating != null) {
+            // 浮动元数据微标：右上磨砂半透明胶囊 ★ 评分（自包覆，不设固定容器）
+            card.rating?.let { rating ->
                 Surface(
-                    color = Color.Black.copy(alpha = 0.6f),
-                    shape = RoundedCornerShape(bottomStart = 8.dp),
-                    modifier = Modifier.align(Alignment.TopEnd),
+                    color = Color.Black.copy(alpha = 0.55f),
+                    shape = RoundedCornerShape(50),
+                    modifier = Modifier.align(Alignment.TopEnd).padding(6.dp),
                 ) {
                     Text(
-                        "★ ${"%.1f".format(card.rating)}",
+                        "★ ${"%.1f".format(rating)}",
                         color = Color.White,
-                        style = MaterialTheme.typography.labelMedium,
-                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Medium,
+                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp),
                     )
                 }
             }
-            Column(
-                Modifier.align(Alignment.BottomStart).padding(8.dp),
-            ) {
+            // 左下画质微标：从主视频文件名启发式推导
+            qualityBadgeOf(card.videoName)?.let { q ->
+                Surface(
+                    color = Color.Black.copy(alpha = 0.55f),
+                    shape = RoundedCornerShape(50),
+                    modifier = Modifier.align(Alignment.BottomStart).padding(6.dp),
+                ) {
+                    Text(
+                        q,
+                        color = Color.White,
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp),
+                    )
+                }
+            }
+        }
+        // 下置式信息区：海报图下方相对间距排布，不压黑蒙层
+        Column(Modifier.fillMaxWidth().padding(top = 8.dp, start = 2.dp, end = 2.dp)) {
+            Text(
+                card.title,
+                style = MaterialTheme.typography.bodyMedium,
+                fontWeight = FontWeight.SemiBold,
+                color = MaterialTheme.colorScheme.onSurface,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            val subtitle = buildString {
+                card.year?.let { append(it) }
+                if (card.genre?.isNotBlank() == true) {
+                    if (isNotEmpty()) append(" · ")
+                    append(card.genre)
+                }
+            }
+            if (subtitle.isNotEmpty()) {
                 Text(
-                    card.title,
-                    color = Color.White,
-                    style = MaterialTheme.typography.bodyMedium,
-                    maxLines = 2,
+                    subtitle,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                 )
-                card.year?.let {
-                    Text("$it", color = Color.White.copy(alpha = 0.75f), style = MaterialTheme.typography.labelSmall)
-                }
             }
         }
     }
 }
 
+/** 画质微标：文件名启发式（4K/2160/HDR/1080/720…），推不出就返回 null 不显示 */
+private fun qualityBadgeOf(videoName: String?): String? {
+    if (videoName.isNullOrBlank()) return null
+    val n = videoName.lowercase()
+    val res = when {
+        "2160" in n || "4k" in n || "uhd" in n -> "4K"
+        "1080" in n -> "1080P"
+        "720" in n -> "720P"
+        else -> null
+    } ?: return null
+    val hdr = when {
+        "dolby" in n && "vision" in n -> " Dolby Vision"
+        "hdr10+" in n || "hdr10plus" in n -> " HDR10+"
+        "hdr" in n -> " HDR"
+        else -> ""
+    }
+    return res + hdr
+}
+
 /**
- * pick_code → 直链 → Coil 加载。
- * 解析失败/无图时留空（卡片底层已有图标或渐变兜底），绝不白屏崩溃。
+ * pick_code → 本地文件 / 直链 → Coil 加载。
+ *
+ * 命中本地落盘时**不解析直链**（见 [com.open115.pad.data.ImageUrlResolver.posterFor]）：
+ * 海报墙全命中时零接口调用。解析失败/无图时留空（卡片底层已有图标兜底），绝不白屏崩溃。
  */
 @Composable
 fun PickCodeImage(
@@ -214,24 +312,8 @@ fun PickCodeImage(
 ) {
     val context = LocalContext.current
     val container = (context.applicationContext as com.open115.pad.App115).container
-    // 磁盘缓存路径优先：resolve 出直链后把字节落到本地（media_img 目录），
-    // 下次冷启动同一 pickCode 直接命中文件，downurl 一次都不调。
     val model by produceState<Any?>(initialValue = null, pickCode) {
-        if (pickCode.isNullOrBlank()) return@produceState
-        val resolver = container.imageUrlResolver
-        val url = resolver.resolveOrigin(
-            ImageMediaItem(
-                fileId = null,
-                fileName = "",
-                fileSize = 0,
-                pickCode = pickCode,
-                thumbnailUrl = null,
-                originUrl = null,
-            ),
-        ) ?: return@produceState
-        value = runCatching {
-            resolver.fetchPosterToCache(pickCode, url, container.cacheDir).absolutePath
-        }.getOrDefault(url)
+        value = container.imageUrlResolver.posterFor(pickCode, container.cacheDir)
     }
     if (model != null) {
         SubcomposeAsyncImage(
@@ -239,14 +321,39 @@ fun PickCodeImage(
             contentDescription = null,
             contentScale = contentScale,
             modifier = modifier,
-            loading = {
-                Box(modifier, contentAlignment = Alignment.Center) {
-                    CircularProgressIndicator(Modifier.size(24.dp))
-                }
-            },
+            loading = { ShimmerPlaceholder(Modifier.fillMaxSize()) },
             error = {},
         )
     } else {
         Spacer(modifier)
+    }
+}
+
+/** Shimmer 骨架占位：斜向高光扫过，海报/背景图加载期间显示 */
+@Composable
+fun ShimmerPlaceholder(modifier: Modifier = Modifier) {
+    val transition = rememberInfiniteTransition(label = "shimmer")
+    val x by transition.animateFloat(
+        initialValue = -400f,
+        targetValue = 1200f,
+        animationSpec = infiniteRepeatable(tween(1100, easing = LinearEasing), RepeatMode.Restart),
+        label = "shimmerX",
+    )
+    Box(
+        modifier.background(MaterialTheme.colorScheme.surfaceVariant),
+    ) {
+        Box(
+            Modifier.fillMaxSize().background(
+                Brush.linearGradient(
+                    colors = listOf(
+                        Color.Transparent,
+                        Color.White.copy(alpha = 0.45f),
+                        Color.Transparent,
+                    ),
+                    start = Offset(x, 0f),
+                    end = Offset(x + 400f, 400f),
+                ),
+            ),
+        )
     }
 }

@@ -26,6 +26,12 @@ class ImageUrlResolver(
     private val api: OpenApi,
     /** 大图分块解码需要先把原图字节拉到本地，统一走带鉴权链的客户端 */
     private val client: OkHttpClient,
+    /**
+     * 媒体库海报/背景图缓存的上限（字节）与总开关，由容器从设置里读。
+     * 做成 lambda 而不是构造时取一次值：设置改完要**立刻生效**，不能等重启。
+     */
+    private val mediaCacheMaxBytes: () -> Long = { MEDIA_CACHE_MAX_BYTES },
+    private val mediaCacheEnabled: () -> Boolean = { true },
 ) {
 
     private data class Entry(val at: Long, val url: String)
@@ -155,7 +161,63 @@ class ImageUrlResolver(
      * 海报是常看常新的（海报墙每次进库都加载），和"超大图偶尔回看"分开计量互不挤占。
      */
     suspend fun fetchPosterToCache(stableKey: String, url: String, cacheDir: File): File =
-        fetchBytesToCache(stableKey, url, cacheDir, MEDIA_DIR, MEDIA_CACHE_MAX_BYTES)
+        fetchBytesToCache(stableKey, url, cacheDir, MEDIA_DIR, mediaCacheMaxBytes())
+
+    /**
+     * 媒体库图片（海报/背景）的统一加载入口，返回可直接交给图片加载器的 model。
+     *
+     * ★★ **先查本地字节，命中就返回本地路径，连直链都不解析。**
+     * 顺序反了会白打接口：早先是先 resolveOrigin 再 fetchPosterToCache，而直链 LRU
+     * 只在内存、冷启动必 miss —— 于是字节明明已经躺在磁盘上，每次冷启动进海报墙
+     * 还是要为**每一张**图打一次 downurl（滚一遍 200 部片 = 200 次，每次冷启动重来）。
+     * downurl 是 115 最容易触发频控的接口，这是媒体库侧最大的一处浪费。
+     *
+     * 返回三态：
+     *  - 命中 / 下载成功 → 本地文件路径（Coil 读本地文件，零网络）
+     *  - 没缓存且落盘失败 → 直链（让 Coil 自己去取，宁慢勿白屏）
+     *  - 连直链都拿不到 → null（调用方留占位底）
+     *
+     * 缓存关掉时**既不读本地也不落盘**，直接给直链，交给 Coil 自己的缓存去管。
+     */
+    suspend fun posterFor(pickCode: String?, cacheDir: File): Any? {
+        if (pickCode.isNullOrBlank()) return null
+        val enabled = mediaCacheEnabled()
+        if (enabled) {
+            cachedPoster(pickCode, cacheDir)?.let { return it.absolutePath }
+        }
+        val direct = resolveFromDownUrl(pickCode) ?: return null
+        if (!enabled) return direct
+        return runCatching { fetchPosterToCache(pickCode, direct, cacheDir).absolutePath }
+            .getOrDefault(direct)
+    }
+
+    /**
+     * 已落盘的海报文件；命中时把 mtime 顶到现在。**调用方负责判缓存开关**。
+     *
+     * 顶 mtime 不能省：pruneCache 的"最久未用"就是靠它判断的，而走了本方法的调用方
+     * **不会再经过 fetchBytesToCache 的复用分支** —— 不在这里顶，常看的海报反而会被
+     * 当成最旧的先淘汰掉。
+     */
+    private suspend fun cachedPoster(pickCode: String, cacheDir: File): File? = withContext(Dispatchers.IO) {
+        val target = targetOf(File(cacheDir, MEDIA_DIR), pickCode)
+        if (!target.exists() || target.length() <= 0L) return@withContext null
+        target.setLastModified(System.currentTimeMillis())
+        target
+    }
+
+    /** 落盘目标文件：命名规则的**唯一来源**，cachedPoster 与 fetchBytesToCache 必须一致 */
+    private fun targetOf(dir: File, stableKey: String): File =
+        File(dir, "img_${stableKey.hashCode()}.bin")
+
+    /**
+     * 按当前上限立刻淘汰海报目录。
+     *
+     * pruneCache 平时只在写入后跑，所以设置里把上限调小时必须显式调一次 ——
+     * 否则占用会一直超着，直到用户下次下载一张新海报才降下来。
+     */
+    suspend fun sweepPosterCache(cacheDir: File) = withContext(Dispatchers.IO) {
+        pruneCache(File(cacheDir, MEDIA_DIR), mediaCacheMaxBytes())
+    }
 
     private suspend fun fetchBytesToCache(stableKey: String, url: String, cacheDir: File, dirName: String, maxBytes: Long): File =
         // 加了稳定 key 之后，同一张图的**不同 URL**会指向同一个文件（以前是不同文件、互不干扰），
@@ -164,7 +226,7 @@ class ImageUrlResolver(
         fetchLock.withLock {
             withContext(Dispatchers.IO) {
                 val dir = File(cacheDir, dirName).apply { mkdirs() }
-                val target = File(dir, "img_${stableKey.hashCode()}.bin")
+                val target = targetOf(dir, stableKey)
                 if (target.exists() && target.length() > 0L) {
                     // 复用时把 mtime 顶到现在：pruneCache 的"最久未用"就是靠它判断的
                     target.setLastModified(System.currentTimeMillis())

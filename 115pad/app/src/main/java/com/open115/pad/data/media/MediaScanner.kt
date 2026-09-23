@@ -1,9 +1,13 @@
 package com.open115.pad.data.media
 
 import android.util.Log
+import com.open115.pad.data.FilesPage
 import com.open115.pad.data.OpenApi
 import com.open115.pad.data.envData
 import com.open115.pad.data.parseFilesResponse
+import kotlinx.serialization.decodeFromString
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -18,11 +22,19 @@ import okhttp3.Request
  * 扫描一个目录 = 列目录（响应里自带全部文件名，聚类零额外请求）→ 聚类 →
  * 逐条下载 .nfo（小文件）解析 → 入库（每条一个事务）→ 更新 scan_state。
  * 中断后重启能续跑：已完成的目录 cloudUpt 未变就跳过。
+ *
+ * 接口调用量（115 有频控，这里是媒体库最大的一处）：
+ * - 列目录：**每个目录每次扫描 1 次**。collectDirs 那次列目录的结果会传给扫描循环复用，
+ *   早先是列两遍（collectDirs 找子目录一遍、循环取文件又一遍）。
+ *   降不到 0 —— 判断"目录变没变"本身就得问服务器，scan_state.cloudUpt 只是记住上次的值。
+ * - .nfo：内容没变（pickCode + upt 相同）**零请求**，见 fetchNfoMeta。
  */
 class MediaScanner(
     private val openApi: OpenApi,
     private val okHttpClient: OkHttpClient,
     private val dao: MediaDao,
+    /** 媒体库落盘缓存。为 null = 不缓存（测试 / 没接容器时） */
+    private val cache: MediaCache? = null,
 ) {
     data class Progress(
         val running: Boolean = false,
@@ -38,44 +50,92 @@ class MediaScanner(
 
     private val mutex = Mutex()
 
-    /** 实际执行（调用方在自己的 scope 里 launch）：手动触发、可续跑、带进度 */
-    suspend fun runScan(rootCid: String, rootPath: String, includeSubDirs: Boolean = true) {
+    /** 限速：相邻两次 115 API 请求的最小间隔（毫秒），0 = 不限 */
+    private var lastRequestAt = 0L
+
+    private suspend fun throttle(rateLimitMs: Long) {
+        if (rateLimitMs <= 0) return
+        val now = System.currentTimeMillis()
+        val wait = lastRequestAt + rateLimitMs - now
+        if (wait > 0) kotlinx.coroutines.delay(wait)
+        lastRequestAt = System.currentTimeMillis()
+    }
+
+    /** 列目录（带限速）：响应里自带文件名，聚类零额外请求 */
+    private suspend fun listFiles(cid: String, rateLimitMs: Long) =
+        parseFilesResponse(run { throttle(rateLimitMs); openApi.files(cid = cid, limit = 200) })
+
+    /**
+     * 实际执行（调用方在自己的 scope 里 launch）：手动触发、可续跑、带进度。
+     * incremental=true 时按 scan_state 的 cloudUpt 增量跳过（目录列表 upt 未变 = 无新增资源）；
+     * false 为全量扫描（不跳过任何目录）。
+     */
+    suspend fun runScan(
+        rootCid: String,
+        rootPath: String,
+        includeSubDirs: Boolean = true,
+        incremental: Boolean = false,
+        rateLimitMs: Long = 0,
+    ) {
         mutex.withLock {
             if (_progress.value.running) return
             _progress.value = _progress.value.copy(running = true, doneDirs = 0, totalDirs = 0, moviesIndexed = 0)
         }
         try {
             var movies = 0
+            var skipped = 0
             var done = 0
-            val queue = ArrayDeque<Pair<String, String>>()
-            queue.add(rootCid to rootPath)
-            // 先统计总数（递归列目录），供进度条用
-            val allDirs = collectDirs(rootCid, rootPath, includeSubDirs)
+            _progress.value = _progress.value.copy(currentDir = rootPath)
+            // 递归列目录。**这一步列到的结果直接传给下面复用**，不再对同一个目录重复请求
+            // （早先是 collectDirs 列一遍找子目录、下面的循环再列一遍取文件，等于每目录 2 次）
+            val allDirs = collectDirs(rootCid, rootPath, includeSubDirs, rateLimitMs)
             _progress.value = _progress.value.copy(totalDirs = allDirs.size)
-            for ((cid, path) in allDirs) {
-                _progress.value = _progress.value.copy(currentDir = path)
-                val page = parseFilesResponse(openApi.files(cid = cid, limit = 200))
+            for (listing in allDirs) {
+                _progress.value = _progress.value.copy(currentDir = listing.path)
+                // includeSubDirs=false 时 collectDirs 没列过这个目录，这里补一次
+                val page = listing.page ?: listFiles(listing.cid, rateLimitMs)
                 val dirUpt = page.items.maxOfOrNull { it.upt } ?: 0L
-                // 手动扫描不增量跳过：nfo 链路修过一轮，旧扫描（解析坏掉的时期）留下的
-                // 空元数据要靠重扫补齐；nfo 都是小文件，重扫的代价只有每目录一次 files 列表
-                // + 每影片一次 downurl（签名期内 LRU 命中不重复）。
-                // state 保留在库里，将来数据量大再恢复增量。
+                if (incremental) {
+                    // 增量：目录上次扫完且列表 upt 未变 → 无新增/修改，跳过
+                    val state = dao.scanState(listing.cid)
+                    if (state != null && state.status == 2 && state.cloudUpt == dirUpt && dirUpt > 0) {
+                        skipped++
+                        done++
+                        _progress.value = _progress.value.copy(doneDirs = done, moviesIndexed = movies)
+                        continue
+                    }
+                }
                 val files = page.items.filter { !it.isDir }.map {
                     FileRef(name = it.fn, pickCode = it.pc ?: "", sizeBytes = it.fs, upt = it.upt)
                 }
                 val scan = sniffDirectory(files)
+                val produced = mutableSetOf<String>()
+                var failed = false
                 for (cluster in scan.clusters) {
                     try {
-                        indexCluster(cid, path, cluster, isEpisodeLike = scan.isMultiVideo)
+                        produced += indexCluster(listing.cid, listing.path, cluster, isEpisodeLike = scan.isMultiVideo, rateLimitMs = rateLimitMs)
                         movies++
                     } catch (e: Exception) {
+                        failed = true
                         Log.w("MediaScanner", "索引失败 ${cluster.prefix}: ${e.message}")
+                    }
+                }
+                // 清理这个目录里**本次没产出**的旧条目：云盘上已删的片、以及 mediaKey 变了的片
+                // （nfo 解析成功后 key 会从"目录前缀"变成 "tmdb-348"，旧键的行不清就是重复条目）。
+                //
+                // 有簇索引失败时**一条都不清** —— 那可能只是这次网络不好，删掉就把已索引的
+                // 元数据弄丢了，而重扫本来就是为了补数据。
+                if (!failed) {
+                    val stale = dao.mediaKeysInDir(listing.cid).filterNot { it in produced }
+                    if (stale.isNotEmpty()) {
+                        dao.deleteMovies(stale)
+                        Log.i(TAG, "清理 ${listing.path} 下 ${stale.size} 条陈旧条目")
                     }
                 }
                 dao.upsertScanState(
                     ScanStateEntity(
-                        dirKey = cid,
-                        dirPath = path,
+                        dirKey = listing.cid,
+                        dirPath = listing.path,
                         status = 2,
                         cloudUpt = dirUpt,
                         scannedAt = System.currentTimeMillis(),
@@ -84,6 +144,7 @@ class MediaScanner(
                 done++
                 _progress.value = _progress.value.copy(doneDirs = done, moviesIndexed = movies)
             }
+            if (skipped > 0) Log.i(TAG, "增量扫描完成：跳过 $skipped/${allDirs.size} 个未变化目录")
             _progress.value = _progress.value.copy(running = false, finishedAt = System.currentTimeMillis())
         } catch (e: Exception) {
             Log.w("MediaScanner", "扫描中断: ${e.message}")
@@ -91,32 +152,59 @@ class MediaScanner(
         }
     }
 
-    /** 递归收集子目录（手动扫描是一次性任务，不并发，控制频控代价） */
-    private suspend fun collectDirs(rootCid: String, rootPath: String, includeSubDirs: Boolean): List<Pair<String, String>> {
-        if (!includeSubDirs) return listOf(rootCid to rootPath)
-        val result = mutableListOf(rootCid to rootPath)
+    /** 一个目录 + **发现它时那一次列目录的结果**（扫描循环直接复用，不再重复请求） */
+    private data class DirListing(val cid: String, val path: String, val page: FilesPage?)
+
+    /**
+     * 递归收集子目录（手动扫描是一次性任务，不并发，控制频控代价）。
+     *
+     * 顺带把每个目录**已经列到的**那一页带回去：调用方拿它当文件来源，
+     * 于是"列目录"从每目录 2 次降到 1 次。列表值完全一样（同一次扫描内的快照），
+     * 增量跳过要的 dirUpt 也取自它。
+     *
+     * 只把有 fid 的目录收进来：早先 fid 为空时会拿空串当 cid 塞进结果，
+     * 而空 cid 在 115 那边就是根目录 —— 会把根目录的内容当成某个子目录扫一遍。
+     */
+    private suspend fun collectDirs(
+        rootCid: String,
+        rootPath: String,
+        includeSubDirs: Boolean,
+        rateLimitMs: Long,
+    ): List<DirListing> {
+        // 不递归时这里不列目录，交给调用方（它本来就要列一次）
+        if (!includeSubDirs) return listOf(DirListing(rootCid, rootPath, null))
+
+        val rootPage = listFiles(rootCid, rateLimitMs)
+        val result = mutableListOf(DirListing(rootCid, rootPath, rootPage))
         val queue = ArrayDeque<Pair<String, String>>()
-        queue.add(rootCid to rootPath)
+        rootPage.items.filter { it.isDir }.forEach { dir ->
+            dir.fid?.let { queue.add(it to "$rootPath/${dir.fn}") }
+        }
         while (queue.isNotEmpty()) {
             val (cid, path) = queue.removeFirst()
-            // 只列子目录：一页 200 足够大多数目录；目录数超出的极端情况后续增量补
-            val page = parseFilesResponse(openApi.files(cid = cid, limit = 200))
+            val page = listFiles(cid, rateLimitMs)
+            result.add(DirListing(cid, path, page))
             page.items.filter { it.isDir }.forEach { dir ->
-                result.add((dir.fid ?: "") to "$path/${dir.fn}")
-                if (dir.fid != null) queue.add(dir.fid to "$path/${dir.fn}")
+                dir.fid?.let { queue.add(it to "$path/${dir.fn}") }
             }
         }
         return result
     }
 
-    /** 单条入库：聚类 → 下载 nfo 解析 → 一个事务 */
-    private suspend fun indexCluster(dirCid: String, dirPath: String, cluster: Cluster, isEpisodeLike: Boolean) {
+    /** 单条入库：聚类 → 下载 nfo 解析 → 一个事务。**返回入库用的 mediaKey**（调用方拿它清陈旧条目） */
+    private suspend fun indexCluster(
+        dirCid: String,
+        dirPath: String,
+        cluster: Cluster,
+        isEpisodeLike: Boolean,
+        rateLimitMs: Long = 0,
+    ): String {
         var meta = NfoMeta()
         cluster.nfo?.let { nfo ->
             if (nfo.pickCode.isNotEmpty()) {
                 try {
-                    meta = fetchNfoMeta(nfo.pickCode)
-                    if (meta.plot == null && meta.rating == null && meta.title == null) {
+                    meta = fetchNfoMeta(nfo.pickCode, nfo.upt, rateLimitMs)
+                    if (!meta.hasContent) {
                         Log.w(TAG, "nfo 解析为空 ${cluster.prefix}（直链/内容异常），详情页会按需重拉")
                     }
                 } catch (e: Exception) {
@@ -168,22 +256,66 @@ class MediaScanner(
                 ),
             ),
         )
+        return key
     }
 
-    /** 下载 .nfo 并解析（直链由调用方解析后传入更优；这里先用 pickCode 走 downurl） */
-    private suspend fun fetchNfoMeta(pickCode: String): NfoMeta {
+    /**
+     * .nfo 内容（**缓存的是解析结果，不是原始 XML**）。
+     *
+     * 为什么缓存解析结果：原始字节现在走 `charStream()`，编码取决于响应头；存下来再读
+     * 等于多一层编码风险，而且命中时还得重新解析一遍 XML。
+     *
+     * key 带 upt：文件没变（pickCode 与 upt 都没变）就永久命中 —— **重扫一个库的 nfo
+     * 请求直接归零**，详情页的按需自愈也不会反复打 downurl。
+     *
+     * 空结果也缓存，但 TTL 短得多（见 [NFO_EMPTY_TTL_MS]）：nfo 本来就没写简介的片，
+     * 详情页自愈的判据是"plot/rating 为空"，不缓存它就会每次进详情页重打一次；
+     * 而"真失败"也长得一样，所以给个短 TTL，过一会儿还会重试。
+     */
+    private suspend fun fetchNfoMeta(pickCode: String, upt: Long, rateLimitMs: Long = 0): NfoMeta {
+        val cacheKey = "nfo|$pickCode|$upt"
+        val store = cache
+        if (store != null) {
+            store.getText(cacheKey)?.let { entry ->
+                val cached = runCatching { nfoJson.decodeFromString<NfoMeta>(entry.body) }.getOrNull()
+                val ttl = if (cached?.hasContent == true) NFO_TTL_MS else NFO_EMPTY_TTL_MS
+                if (cached != null && store.isFresh(entry, ttl)) return cached
+            }
+        }
+        val meta = downloadNfoMeta(pickCode, rateLimitMs) ?: return NfoMeta()
+        // 拉到了就存（内容为空也存，靠上面的短 TTL 兜住重试）
+        store?.putText(cacheKey, nfoJson.encodeToString(meta))
+        return meta
+    }
+
+    /**
+     * 下载并解析 .nfo。
+     *
+     * **返回 null = 没拉到**（直链失败 / HTTP 非 2xx / 空响应），
+     * 返回 `NfoMeta()` = 拉到了但里面没内容。缓存必须区分这两者：
+     * 前者不能缓存，否则一次网络抖动会被永久记成"这部片没有元数据"。
+     */
+    private suspend fun downloadNfoMeta(pickCode: String, rateLimitMs: Long): NfoMeta? {
+        throttle(rateLimitMs)
         val url = resolvePickCodeUrl(pickCode)
         if (url == null) {
             Log.w(TAG, "nfo 直链解析失败 pickCode=$pickCode（downurl 无数据/无 url 字段）")
-            return NfoMeta()
+            return null
         }
         val req = Request.Builder().url(url).build()
         okHttpClient.newCall(req).execute().use { resp ->
             if (!resp.isSuccessful) {
                 Log.w(TAG, "nfo 下载失败 HTTP ${resp.code} pickCode=$pickCode")
-                return NfoMeta()
+                return null
             }
-            val body = resp.body ?: return NfoMeta().also { Log.w(TAG, "nfo 下载空响应 pickCode=$pickCode") }
+            val body = resp.body ?: run {
+                Log.w(TAG, "nfo 下载空响应 pickCode=$pickCode")
+                return null
+            }
+            // 必须用 charStream()：它返回 OkHttp 的 BomAwareReader，会**剥掉 UTF-8 BOM**。
+            // 换成 bytes().inputStream().reader() 会让 BOM 留在 <?xml 前面 —— 那是非法 XML，
+            // 解析器第一步就抛，被 NfoParser 的容错接住之后返回一个全 null 的 NfoMeta
+            // （2026-09-22 实测：8 部片全部缓存成了空结果，界面上没有简介也没有评分）。
             val meta = body.charStream().use { NfoParser.parse(it) }
             Log.i(TAG, "nfo 解析完成 pickCode=$pickCode title=${meta.title} rating=${meta.rating} plot=${meta.plot?.take(30)}")
             return meta
@@ -209,27 +341,51 @@ class MediaScanner(
     companion object {
         private const val TAG = "MediaScanner"
 
+        /** nfo 解析结果的序列化器（缓存里存的是 NfoMeta 的 JSON） */
+        private val nfoJson = Json { ignoreUnknownKeys = true; encodeDefaults = true }
+
+        /** 有内容的 nfo：7 天。key 里带 upt，内容变了 key 就变，所以 TTL 只是兜底 */
+        private const val NFO_TTL_MS = 7L * 24 * 60 * 60 * 1000
+
+        /**
+         * 空 nfo：1 小时。
+         *
+         * 空结果分两种成因，长得一样但要求相反：nfo 本来就没写简介（重试一万次也还是空），
+         * 和这次网络/频控没拉到（过一会儿就该重试）。取短 TTL 是折中 —— 前者一小时最多打一次，
+         * 后者一小时内也会自己恢复。
+         */
+        private const val NFO_EMPTY_TTL_MS = 60L * 60 * 1000
+
         /**
          * 详情页按需自愈：扫描期 nfo 拉取失败（网络/频控）的影片没有简介/评分，
          * 这里重试一次并回写。幂等：nfo 本身还是那个 pick_code，拉不到就静默返回。
+         *
+         * 有缓存时这里通常是**零请求**：nfo 本来就没内容的片会命中那条空结果缓存，
+         * 不再每次进详情页都打一次 downurl（downurl 最容易触发频控）。
          */
-        suspend fun refetchNfo(openApi: OpenApi, okHttpClient: OkHttpClient, dao: MediaDao, mediaKey: String) {
+        suspend fun refetchNfo(
+            openApi: OpenApi,
+            okHttpClient: OkHttpClient,
+            dao: MediaDao,
+            cache: MediaCache?,
+            mediaKey: String,
+        ) {
             val movie = dao.movie(mediaKey) ?: return
             val nfoPc = movie.nfoPickCode?.takeIf { it.isNotEmpty() } ?: return
             // 已有简介/评分就不浪费一次 downurl（它最容易触发频控）
             if (!movie.plot.isNullOrBlank() || movie.rating != null) return
-            val scanner = MediaScanner(openApi, okHttpClient, dao)
+            val scanner = MediaScanner(openApi, okHttpClient, dao, cache)
             val meta = try {
                 // nfo 下载是同步网络请求：调用方（详情页 produceState）在主线程，
                 // 直接执行会抛 NetworkOnMainThreadException——必须切到 IO
                 kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-                    scanner.fetchNfoMeta(nfoPc)
+                    scanner.fetchNfoMeta(nfoPc, movie.nfoUpt)
                 }
             } catch (e: Exception) {
                 Log.w(TAG, "nfo 按需重拉失败 $mediaKey: ${e.message}")
                 return
             }
-            if (meta.plot == null && meta.rating == null && meta.title == null && meta.genres.isEmpty()) return
+            if (!meta.hasContent) return
             dao.upsertMovie(
                 movie.copy(
                     title = meta.title ?: movie.title,

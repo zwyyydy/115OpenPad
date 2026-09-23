@@ -5,6 +5,7 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -15,15 +16,20 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Add
 import androidx.compose.material.icons.outlined.Delete
+import androidx.compose.material.icons.outlined.Edit
 import androidx.compose.material.icons.outlined.Movie
 import androidx.compose.material.icons.outlined.Refresh
+import androidx.compose.material.icons.outlined.Settings
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -65,6 +71,9 @@ fun MediaLibraryScreen(api: com.open115.pad.data.OpenApi) {
 
     var showCreate by remember { mutableStateOf(false) }
     var deleteTarget by remember { mutableStateOf<MediaLibraryEntity?>(null) }
+    var editTarget by remember { mutableStateOf<MediaLibraryEntity?>(null) }
+    // 扫描菜单的展开状态（每个库卡片一个）
+    var scanMenuFor by remember { mutableStateOf<MediaLibraryEntity?>(null) }
     // 点库卡片进海报墙，再点海报进详情（两级都盖在本页之上，返回逐层退）
     var openedLib by remember { mutableStateOf<MediaLibraryEntity?>(null) }
     var detail by remember { mutableStateOf<Triple<MovieCard, List<MovieCard>, Int>?>(null) }
@@ -132,29 +141,68 @@ fun MediaLibraryScreen(api: com.open115.pad.data.OpenApi) {
                         ) {
                             Column(Modifier.weight(1f)) {
                                 Text(lib.name, style = MaterialTheme.typography.titleMedium)
-                                Text(
-                                    lib.rootPath,
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                )
+                                // 多根库逐行列出；单根只有一行，视觉上和原来一致
+                                lib.rootPaths.forEach { path ->
+                                    Text(
+                                        path,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    )
+                                }
                                 Text(
                                     "建于 " + SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.getDefault())
-                                        .format(Date(lib.createdAt)) + LibraryCount(dao, lib.rootPath),
+                                        .format(Date(lib.createdAt)) + LibraryCount(dao, lib.rootPaths) +
+                                        if (lib.rateLimitMs > 0) " · 限速 ${lib.rateLimitMs}ms" else "",
                                     style = MaterialTheme.typography.bodySmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 )
                             }
-                                IconButton(
-                                    onClick = {
-                                        scope.launch {
-                                            container.transferScope.launch {
-                                                container.mediaScanner.runScan(lib.rootCid, lib.rootPath)
-                                            }
-                                        }
-                                    },
-                                    enabled = !scanProgress.running,
-                                ) {
-                                    Icon(Icons.Outlined.Refresh, contentDescription = "扫描")
+                                // 扫描菜单：增量（按 upt 跳过未变化目录）/ 全量（不跳过）
+                                Box {
+                                    IconButton(
+                                        onClick = { scanMenuFor = lib },
+                                        enabled = !scanProgress.running,
+                                    ) {
+                                        Icon(Icons.Outlined.Refresh, contentDescription = "扫描")
+                                    }
+                                    DropdownMenu(
+                                        expanded = scanMenuFor == lib,
+                                        onDismissRequest = { scanMenuFor = null },
+                                    ) {
+                                        DropdownMenuItem(
+                                            text = { Text("增量扫描（按更新时间，只扫新增）") },
+                                            onClick = {
+                                                scanMenuFor = null
+                                                scope.launch {
+                                                    container.transferScope.launch {
+                                                        lib.rootCids.zip(lib.rootPaths).forEach { (cid, path) ->
+                                                            container.mediaScanner.runScan(
+                                                                cid, path, incremental = true, rateLimitMs = lib.rateLimitMs,
+                                                            )
+                                                        }
+                                                    }
+                                                }
+                                            },
+                                        )
+                                        DropdownMenuItem(
+                                            text = { Text("全量扫描（重新索引全部）") },
+                                            onClick = {
+                                                scanMenuFor = null
+                                                scope.launch {
+                                                    container.transferScope.launch {
+                                                        lib.rootCids.zip(lib.rootPaths).forEach { (cid, path) ->
+                                                            container.mediaScanner.runScan(
+                                                                cid, path, incremental = false, rateLimitMs = lib.rateLimitMs,
+                                                            )
+                                                        }
+                                                    }
+                                                }
+                                            },
+                                        )
+                                    }
+                                }
+                                IconButton(onClick = { editTarget = lib }) {
+                                    Icon(Icons.Outlined.Edit, contentDescription = "编辑")
                                 }
                                 IconButton(onClick = { deleteTarget = lib }) {
                                     Icon(Icons.Outlined.Delete, contentDescription = "删除")
@@ -168,15 +216,38 @@ fun MediaLibraryScreen(api: com.open115.pad.data.OpenApi) {
     }
 
     if (showCreate) {
-        CreateLibraryDialog(
+        LibraryEditDialog(
             api = api,
+            title = "新建媒体库",
+            existing = null,
             onDismiss = { showCreate = false },
-            onCreate = { name, cid, path ->
+            onSave = { name, cids, paths, rate, autoScan ->
                 scope.launch {
+                    val (cid, path) = MediaLibraryEntity.joinRoots(cids, paths)
                     dao.insertLibrary(
-                        MediaLibraryEntity(name = name, rootCid = cid, rootPath = path, createdAt = System.currentTimeMillis()),
+                        MediaLibraryEntity(
+                            name = name, rootCid = cid, rootPath = path,
+                            createdAt = System.currentTimeMillis(), rateLimitMs = rate,
+                            autoScanOnStart = autoScan,
+                        ),
                     )
                     showCreate = false
+                }
+            },
+        )
+    }
+
+    editTarget?.let { lib ->
+        LibraryEditDialog(
+            api = api,
+            title = "编辑媒体库",
+            existing = lib,
+            onDismiss = { editTarget = null },
+            onSave = { name, cids, paths, rate, autoScan ->
+                scope.launch {
+                    val (cid, path) = MediaLibraryEntity.joinRoots(cids, paths)
+                    dao.updateLibrary(lib.id, name, cid, path, rate, autoScan)
+                    editTarget = null
                 }
             },
         )
@@ -217,11 +288,11 @@ fun MediaLibraryScreen(api: com.open115.pad.data.OpenApi) {
     }
 }
 
-/** 库内影片数：卡片上显示「N 部」，进库前就知道有没有内容 */
+/** 库内影片数：卡片上显示「N 部」，进库前就知道有没有内容（多根库取各根之和） */
 @Composable
-private fun LibraryCount(dao: com.open115.pad.data.media.MediaDao, rootPath: String): String {
-    val count by produceState(initialValue = -1, rootPath) {
-        value = dao.movieCountIn(rootPath)
+private fun LibraryCount(dao: com.open115.pad.data.media.MediaDao, rootPaths: List<String>): String {
+    val count by produceState(initialValue = -1, rootPaths) {
+        value = rootPaths.sumOf { dao.movieCountIn(it) }
     }
     return when {
         count < 0 -> ""
@@ -230,20 +301,35 @@ private fun LibraryCount(dao: com.open115.pad.data.media.MediaDao, rootPath: Str
     }
 }
 
-/** 新建媒体库：输入名字 → 选云盘路径（懒加载目录树选择器，复用 DirMultiPickerDialog） */
+/**
+ * 新建/编辑媒体库共用：库名 + 云盘路径（可多选、可继续追加）+ 扫描限速。
+ * existing 非空为编辑模式：已选路径可逐条删除，再从目录树追加新路径。
+ */
 @Composable
-private fun CreateLibraryDialog(
+private fun LibraryEditDialog(
     api: com.open115.pad.data.OpenApi,
+    title: String,
+    existing: MediaLibraryEntity?,
     onDismiss: () -> Unit,
-    onCreate: (name: String, cid: String, path: String) -> Unit,
+    onSave: (name: String, cids: List<String>, paths: List<String>, rateLimitMs: Long, autoScanOnStart: Boolean) -> Unit,
 ) {
-    var name by remember { mutableStateOf("") }
-    var picked by remember { mutableStateOf<com.open115.pad.data.FilterRules.BoundDir?>(null) }
+    var name by remember { mutableStateOf(existing?.name ?: "") }
+    var picked by remember {
+        mutableStateOf(
+            existing?.rootCids.orEmpty().zip(existing?.rootPaths.orEmpty())
+                .map { (cid, path) -> com.open115.pad.data.FilterRules.BoundDir(cid = cid, name = path.substringAfterLast('/'), fullPath = path) },
+        )
+    }
+    var rateText by remember {
+        mutableStateOf(existing?.rateLimitMs?.takeIf { it > 0 }?.toString() ?: "")
+    }
+    var autoScan by remember { mutableStateOf(existing?.autoScanOnStart ?: false) }
     var picking by remember { mutableStateOf(false) }
+    val rate = rateText.toLongOrNull()?.coerceAtLeast(0) ?: 0L
 
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("新建媒体库") },
+        title = { Text(title) },
         text = {
             Column {
                 OutlinedTextField(
@@ -256,13 +342,61 @@ private fun CreateLibraryDialog(
                 Spacer(Modifier.height(12.dp))
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     TextButton(onClick = { picking = true }) {
-                        Text("选择云盘路径")
+                        Text(if (picked.isEmpty()) "选择云盘路径" else "添加路径")
                     }
                     Text(
-                        picked?.fullPath ?: "未选择",
+                        when {
+                            picked.isEmpty() -> "未选择"
+                            picked.size == 1 -> picked[0].fullPath
+                            else -> "已选 ${picked.size} 个目录"
+                        },
                         style = MaterialTheme.typography.bodyMedium,
-                        color = if (picked != null) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+                        color = if (picked.isNotEmpty()) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.weight(1f),
                     )
+                }
+                // 已选路径逐行列出，编辑时可逐条删除
+                picked.forEachIndexed { index, dir ->
+                    Row(
+                        Modifier
+                            .fillMaxWidth()
+                            .padding(start = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            dir.fullPath,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.weight(1f),
+                        )
+                        IconButton(onClick = { picked = picked.filterIndexed { i, _ -> i != index } }) {
+                            Icon(Icons.Outlined.Delete, contentDescription = "移除路径", modifier = Modifier.height(18.dp).width(18.dp))
+                        }
+                    }
+                }
+                Spacer(Modifier.height(8.dp))
+                OutlinedTextField(
+                    value = rateText,
+                    onValueChange = { rateText = it.filter { c -> c.isDigit() } },
+                    label = { Text("扫描限速（毫秒，留空不限）") },
+                    supportingText = { Text("相邻两次 115 API 请求的最小间隔，遇到频控可设为 500~1000") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                Spacer(Modifier.height(8.dp))
+                Row(
+                    Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Column(Modifier.weight(1f)) {
+                        Text("启动时自动增量扫描", style = MaterialTheme.typography.bodyMedium)
+                        Text(
+                            "程序启动登录后对这个库自动跑增量扫描（顺序执行，不与其他库并发）",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    Switch(checked = autoScan, onCheckedChange = { autoScan = it })
                 }
             }
         },
@@ -271,12 +405,18 @@ private fun CreateLibraryDialog(
                 // 存完整路径（fullPath）：只存叶子名的话，不同父目录下的同名目录
                 // 会在海报墙的前缀匹配里互相串数据
                 onClick = {
-                    picked?.let {
-                        onCreate(name.ifBlank { it.name }, it.cid, it.fullPath)
+                    if (picked.isNotEmpty()) {
+                        onSave(
+                            name.ifBlank { picked[0].name },
+                            picked.map { it.cid },
+                            picked.map { it.fullPath },
+                            rate,
+                            autoScan,
+                        )
                     }
                 },
-                enabled = picked != null,
-            ) { Text("创建") }
+                enabled = picked.isNotEmpty(),
+            ) { Text(if (existing == null) "创建" else "保存") }
         },
         dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } },
     )
@@ -284,10 +424,11 @@ private fun CreateLibraryDialog(
     if (picking) {
         com.open115.pad.ui.filter.DirMultiPickerDialog(
             api = api,
-            title = "选择媒体库根目录",
+            title = "选择媒体库根目录（可多选）",
             onDismiss = { picking = false },
             onConfirm = { dirs ->
-                picked = dirs.firstOrNull()
+                // 多次进入选择器是追加而不是覆盖；已选的跳过避免重复
+                picked = (picked + dirs).distinctBy { it.cid }
                 picking = false
             },
         )

@@ -3,6 +3,18 @@ package com.open115.pad.ui
 import android.app.Activity
 import android.content.Context
 import android.content.ContextWrapper
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.expandHorizontally
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.scaleIn
+import androidx.compose.animation.shrinkHorizontally
+import androidx.compose.animation.shrinkVertically
+import androidx.compose.animation.slideInHorizontally
+import androidx.compose.animation.slideInVertically
+import androidx.compose.animation.slideOutHorizontally
+import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
@@ -124,6 +136,9 @@ private fun MainScaffold(container: AppContainer, widthClass: WindowWidthSizeCla
     val backStack by navController.currentBackStackEntryAsState()
     val currentRoute = backStack?.destination?.route
     val expanded = widthClass != WindowWidthSizeClass.Compact
+    // 媒体库页隐藏导航栏（rail/bottomBar 都藏），全屏更有沉浸感；
+    // 媒体库页自己的海报墙/详情浮层盖在它上面，返回也逐层退，不依赖导航栏
+    val immersiveMedia = currentRoute == "media"
 
     fun navigate(dest: Dest) {
         navController.navigate(dest.route) {
@@ -226,7 +241,12 @@ private fun MainScaffold(container: AppContainer, widthClass: WindowWidthSizeCla
     Scaffold(
         snackbarHost = { SnackbarHost(snackbarHostState) },
         bottomBar = {
-            if (!expanded) {
+            // 手机底部导航栏：媒体库页下滑收起（滑出+收合高度），回到其他页滑回来
+            AnimatedVisibility(
+                visible = !expanded && !immersiveMedia,
+                enter = fadeIn(tween(250)) + slideInVertically(tween(300)) { it / 2 },
+                exit = fadeOut(tween(200)) + slideOutVertically(tween(300)) { it / 2 } + shrinkVertically(tween(300)),
+            ) {
                 NavigationBar {
                     destinations.forEach { dest ->
                         NavigationBarItem(
@@ -241,7 +261,12 @@ private fun MainScaffold(container: AppContainer, widthClass: WindowWidthSizeCla
         },
     ) { padding ->
         Row(Modifier.fillMaxSize().padding(padding)) {
-            if (expanded) {
+            // 平板左侧导航栏：进媒体库向左滑出 + 淡出，同时宽度收合让内容区丝滑扩满
+            AnimatedVisibility(
+                visible = expanded && !immersiveMedia,
+                enter = fadeIn(tween(250)) + slideInHorizontally(tween(300)) { -it / 2 } + expandHorizontally(tween(300)),
+                exit = fadeOut(tween(200)) + slideOutHorizontally(tween(300)) { -it / 2 } + shrinkHorizontally(tween(300)),
+            ) {
                 NavigationRail {
                     destinations.forEach { dest ->
                         NavigationRailItem(
@@ -285,7 +310,15 @@ private fun MainScaffold(container: AppContainer, widthClass: WindowWidthSizeCla
                             },
                         )
                     }
-                    composable("media") {
+                    // 媒体库页：淡入 + 轻微上浮缩放，配导航栏滑出，丝滑进全屏
+                    composable(
+                        "media",
+                        enterTransition = {
+                            fadeIn(tween(350)) + slideInVertically(tween(350)) { it / 24 } +
+                                scaleIn(initialScale = 0.96f, animationSpec = tween(350))
+                        },
+                        exitTransition = { fadeOut(tween(200)) },
+                    ) {
                         com.open115.pad.ui.media.MediaLibraryScreen(container.openApi)
                     }
                     composable("filter") {

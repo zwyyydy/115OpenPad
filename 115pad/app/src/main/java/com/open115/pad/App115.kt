@@ -12,6 +12,7 @@ import kotlinx.serialization.json.Json
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import java.io.File
 import okhttp3.MediaType.Companion.toMediaType
@@ -100,8 +101,18 @@ class AppContainer(context: Context) {
     val qrApi: QrApi = retrofit("https://qrcodeapi.115.com/").create(QrApi::class.java)
     val openApi: OpenApi = retrofit("https://proapi.115.com/").create(OpenApi::class.java)
 
-    /** 图片直链三级解析链（uo → downurl → thumb）+ downurl 防频控缓存 */
-    val imageUrlResolver = com.open115.pad.data.ImageUrlResolver(openApi, okHttpClient)
+    /**
+     * 图片直链三级解析链（uo → downurl → thumb）+ downurl 防频控缓存。
+     *
+     * 后两个参数是**媒体库海报缓存**的上限与开关：传 lambda 而不是当场取值，
+     * 所以这里虽然声明在 mediaCacheMaxBytes 之前也安全（调用发生在使用期，不是构造期）。
+     */
+    val imageUrlResolver = com.open115.pad.data.ImageUrlResolver(
+        openApi,
+        okHttpClient,
+        mediaCacheMaxBytes = { mediaCacheMaxBytes },
+        mediaCacheEnabled = { mediaCacheEnabled },
+    )
 
     /** 批量重命名的持久化任务队列：任务逐条落库，进程被杀后重启能精确续跑 */
     val renameQueue = com.open115.pad.data.RenameQueue(context)
@@ -117,7 +128,35 @@ class AppContainer(context: Context) {
 
     /** 媒体库（类 Yamby）：Room 索引 + 手动扫描引擎。扫描由调用方在 transferScope 里 launch。 */
     val mediaDatabase = com.open115.pad.data.media.MediaDatabase.build(context)
-    val mediaScanner = com.open115.pad.data.media.MediaScanner(openApi, okHttpClient, mediaDatabase.mediaDao())
+    val mediaPrefs = com.open115.pad.data.media.MediaPrefs(context)
+
+    /**
+     * 媒体库缓存设置的两份镜像（设置里改完要立刻生效，不能等重启）。
+     *
+     * 由下面的 collect 从 DataStore 灌进来，缓存层与海报加载器读的是这两个值 ——
+     * 它们只被主线程之外的协程读，用 @Volatile 保证可见性。
+     */
+    @Volatile
+    var mediaCacheEnabled: Boolean = true
+        private set
+
+    @Volatile
+    var mediaCacheMaxBytes: Long = com.open115.pad.data.media.MediaPrefs.DEFAULT_MAX_MB * 1024 * 1024
+        private set
+
+    /**
+     * 媒体库落盘缓存：nfo 的解析结果（文本）。
+     * 海报字节不在这里 —— 它必须是裸图片文件，走 ImageUrlResolver 的 media_img。
+     */
+    val mediaCache = com.open115.pad.data.media.MediaCache(
+        root = File(context.cacheDir, "media_cache"),
+        maxBytes = { com.open115.pad.data.media.MediaPrefs.textPoolBytes(mediaCacheMaxBytes / (1024 * 1024)) },
+        enabled = { mediaCacheEnabled },
+    )
+
+    val mediaScanner = com.open115.pad.data.media.MediaScanner(
+        openApi, okHttpClient, mediaDatabase.mediaDao(), mediaCache,
+    )
 
     /** 云下载提交（含持久化的保存位置），手动添加/剪贴板/外部唤起共用 */
     val downloadSubmitter = com.open115.pad.data.DownloadSubmitter(downloadPrefs)
@@ -137,10 +176,31 @@ class AppContainer(context: Context) {
                 .crossfade(true)
                 .build()
         )
-        // 登出（含因终态授权码被强制登出）后，本机缓存的目录列表必须作废：
-        // 不清的话，换个账号登录会直接看到上一个账号的目录内容
+        // 登出（含因终态授权码被强制登出）后，本机缓存必须作废：
+        // 不清的话，换个账号登录会直接看到上一个账号的目录内容 / 海报 / 简介
         scope.launch {
-            session.loggedInFlow.collect { if (!it) dirCache.clear() }
+            session.loggedInFlow.collect {
+                if (!it) {
+                    dirCache.clear()
+                    mediaCache.clear()
+                }
+            }
+        }
+
+        // 媒体库缓存设置 → 内存镜像。上限调小要**立刻**淘汰，不能等下次写入才生效
+        // （海报的 pruneCache 平时只在下载后跑，这里得显式补一次）。
+        scope.launch {
+            mediaPrefs.cacheEnabled.collect { mediaCacheEnabled = it }
+        }
+        scope.launch {
+            mediaPrefs.cacheMaxMb.collect { mb ->
+                val shrunk = mb < mediaCacheMaxBytes / (1024 * 1024)
+                mediaCacheMaxBytes = mb * 1024 * 1024
+                if (shrunk) {
+                    mediaCache.sweep()
+                    imageUrlResolver.sweepPosterCache(cacheDir)
+                }
+            }
         }
 
         // 改名队列按登录态启停。**启动即恢复**：worker 一跑起来就会捡起队列里所有
@@ -149,6 +209,23 @@ class AppContainer(context: Context) {
         scope.launch {
             session.loggedInFlow.collect { loggedIn ->
                 if (loggedIn) renameWorker.start(transferScope) else renameWorker.stop()
+            }
+        }
+
+        // 开关打开的库：登录后自动跑一轮**增量**扫描（upt 未变的目录全部跳过，
+        // 代价只有每目录一次列表请求；未登录不跑）。开关是**每库各自**的设置，
+        // mediaScanner 自带互斥，多个库连扫 + 用户随后手动扫描都不会并发。
+        scope.launch {
+            session.loggedInFlow.collect { loggedIn ->
+                if (!loggedIn) return@collect
+                val dao = mediaDatabase.mediaDao()
+                dao.libraries().first()
+                    .filter { it.autoScanOnStart }
+                    .forEach { lib ->
+                        lib.rootCids.zip(lib.rootPaths).forEach { (cid, path) ->
+                            mediaScanner.runScan(cid, path, incremental = true, rateLimitMs = lib.rateLimitMs)
+                        }
+                    }
             }
         }
     }

@@ -9,6 +9,7 @@ import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -16,6 +17,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
@@ -87,7 +89,7 @@ fun MediaDetailScreen(
             // 扫描期 nfo 拉取失败的影片：进详情页按需重拉一次（自愈），然后再查库
             val container = (context.applicationContext as com.open115.pad.App115).container
             com.open115.pad.data.media.MediaScanner.refetchNfo(
-                container.openApi, container.okHttpClient, dao, card.mediaKey,
+                container.openApi, container.okHttpClient, dao, container.mediaCache, card.mediaKey,
             )
         }
         val updated = dao.movie(card.mediaKey)
@@ -118,6 +120,9 @@ fun MediaDetailScreen(
             PlayerActivity.intent(context, pc, name, entries, at.coerceIn(0, (entries.size - 1).coerceAtLeast(0))),
         )
     }
+
+    // 系统返回键 = 顶栏返回键：退回海报墙
+    androidx.activity.compose.BackHandler { onBack() }
 
     Scaffold(
         snackbarHost = { SnackbarHost(snackbarHostState) },
@@ -170,16 +175,19 @@ fun MediaDetailScreen(
                     }
 
                     Row(Modifier.padding(top = 8.dp)) {
-                        // 海报：竖版 2:3，没有 posterPickCode 时留一个占位框
-                        Surface(
-                            color = MaterialTheme.colorScheme.surfaceVariant,
-                            shape = RoundedCornerShape(10.dp),
-                            modifier = Modifier.width(150.dp).aspectRatio(2f / 3f),
-                        ) {
-                            PickCodeImage(
-                                pickCode = current.movie.posterPickCode,
-                                modifier = Modifier.fillMaxSize(),
-                            )
+                        // 海报：竖版 2:3，宽度按可用宽度的比例约束（大屏不甩成半屏宽，窄屏不挤成一指宽），
+                        // 高度由 2:3 自动推导，无硬编码宽高
+                        BoxWithConstraints(Modifier.fillMaxWidth(0.32f).widthIn(min = 110.dp, max = 180.dp)) {
+                            Surface(
+                                color = MaterialTheme.colorScheme.surfaceVariant,
+                                shape = RoundedCornerShape(10.dp),
+                                modifier = Modifier.fillMaxWidth().aspectRatio(2f / 3f),
+                            ) {
+                                PickCodeImage(
+                                    pickCode = current.movie.posterPickCode,
+                                    modifier = Modifier.fillMaxSize(),
+                                )
+                            }
                         }
                         Column(Modifier.padding(start = 16.dp).weight(1f)) {
                             Text(

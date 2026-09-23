@@ -173,10 +173,22 @@ fun SettingsScreen(container: AppContainer) {
     /** 大图落盘缓存（cacheDir/huge_img）占用，-1 = 还在算 */
     var hugeCacheMb by remember { mutableStateOf(-1L) }
 
+    // ---- 媒体库缓存（海报 + .nfo）----
+    val mediaCacheEnabled by container.mediaPrefs.cacheEnabled.collectAsState(initial = true)
+    val mediaCacheMaxMb by container.mediaPrefs.cacheMaxMb
+        .collectAsState(initial = com.open115.pad.data.media.MediaPrefs.DEFAULT_MAX_MB)
+    /** 媒体库缓存占用（字节）：简介文本池 / 海报，-1 = 还在算 */
+    var mediaTextBytes by remember { mutableStateOf(-1L) }
+    var mediaPosterBytes by remember { mutableStateOf(-1L) }
+
     LaunchedEffect(Unit) {
         clientId = container.session.currentClientId()
         cacheSizeMb = PlayerCache.sizeBytes(context) / (1024 * 1024)
         hugeCacheMb = ImageUrlResolver.hugeCacheSizeBytes(context.cacheDir) / (1024 * 1024)
+        mediaTextBytes = container.mediaCache.sizeBytes()
+        // 海报在 container.cacheDir（= <cache>/images/media_img），和 huge_img **不是同一个根**
+        // —— huge_img 在 ImageGalleryDialog 里用的是裸 context.cacheDir。两者别抄串。
+        mediaPosterBytes = ImageUrlResolver.mediaCacheSizeBytes(container.cacheDir)
     }
 
     // 宽屏防拉伸：设置内容收进 960dp 居中容器
@@ -296,6 +308,54 @@ fun SettingsScreen(container: AppContainer) {
             },
         )
 
+        SectionTitle("媒体库")
+        SettingSwitch(
+            title = "媒体库缓存",
+            subtitle = "把海报与简介（.nfo）缓存到本机，减少 115 接口调用：" +
+                "已缓存的海报进海报墙不再解析直链，重扫一个库也不再重复下载 .nfo；" +
+                "关闭后不读写磁盘缓存（已存的不动，要腾空间点下面的清空）",
+            checked = mediaCacheEnabled,
+            onChange = { v -> scope.launch { container.mediaPrefs.setCacheEnabled(v) } },
+        )
+        SliderRow(
+            title = "缓存上限",
+            valueText = "$mediaCacheMaxMb MB",
+            value = mediaCacheMaxMb.toFloat(),
+            range = com.open115.pad.data.media.MediaPrefs.MIN_MAX_MB.toFloat()..
+                com.open115.pad.data.media.MediaPrefs.MAX_MAX_MB.toFloat(),
+            // Slider 的 steps 是"两端点之间的刻度数"，所以要减 1
+            steps = mediaCacheSliderSteps(),
+        ) { v ->
+            scope.launch {
+                container.mediaPrefs.setCacheMaxMb(
+                    (v / com.open115.pad.data.media.MediaPrefs.STEP_MB).toInt()
+                        .toLong() * com.open115.pad.data.media.MediaPrefs.STEP_MB,
+                )
+            }
+        }
+        SettingRow(
+            title = "缓存占用",
+            subtitle = when {
+                mediaTextBytes < 0 || mediaPosterBytes < 0 -> "计算中…"
+                else -> "海报 ${fmtBytes(mediaPosterBytes)} · 简介 ${fmtBytes(mediaTextBytes)}" +
+                    "（上限主要限制海报，简介按上限的 1/8 另算）"
+            },
+            onClick = null,
+        )
+        SettingRow(
+            title = "清空媒体库缓存",
+            subtitle = "清掉已缓存的海报与简介。下次进海报墙会重新解析直链并下载",
+            onClick = {
+                scope.launch {
+                    container.mediaCache.clear()
+                    ImageUrlResolver.clearMediaCache(container.cacheDir)
+                    // 重新读一次而不是直接置 0：个别文件删不掉时能如实显示出来
+                    mediaTextBytes = container.mediaCache.sizeBytes()
+                    mediaPosterBytes = ImageUrlResolver.mediaCacheSizeBytes(container.cacheDir)
+                }
+            },
+        )
+
         SectionTitle("图片")
         SettingRow(
             title = "清除大图缓存",
@@ -395,6 +455,27 @@ fun SettingsScreen(container: AppContainer) {
 private fun SectionTitle(text: String) {
     // 分组次级灰标题：拉开模块间距，替代生硬分隔线
     com.open115.pad.ui.theme.SectionHeader(text, Modifier.padding(top = 14.dp))
+}
+
+/** 媒体库缓存上限滑块的刻度数：Slider 的 steps 是"两端点之间的刻度数"，所以要减 1 */
+private fun mediaCacheSliderSteps(): Int {
+    val mp = com.open115.pad.data.media.MediaPrefs
+    return ((mp.MAX_MAX_MB - mp.MIN_MAX_MB) / mp.STEP_MB).toInt() - 1
+}
+
+/**
+ * 占用显示：不足 1MB 用 KB、不足 10MB 保留一位小数。
+ *
+ * 不能一律整数 MB —— 媒体库缓存起步只有几十 KB（简介是文本），整数截断会显示成
+ * "0 MB"，看起来像没缓存住；而海报动辄几百 MB，也不需要小数。
+ */
+private fun fmtBytes(bytes: Long): String {
+    val kb = bytes / 1024.0
+    return when {
+        kb < 1024 -> "%.0f KB".format(kb)
+        kb < 10 * 1024 -> "%.1f MB".format(kb / 1024)
+        else -> "%.0f MB".format(kb / 1024)
+    }
 }
 
 @Composable

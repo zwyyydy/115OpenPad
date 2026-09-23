@@ -92,13 +92,27 @@ data class ScanStateEntity(
     val scannedAt: Long = 0,
 )
 
-/** 用户建的媒体库：一个云盘根路径 = 一个库（如「示例系列」「演员目录」） */
+/** 用户建的媒体库：一个或多个云盘根路径 = 一个库（如「示例系列」「演员目录」） */
 @Entity(tableName = "libraries")
 data class MediaLibraryEntity(
     @PrimaryKey(autoGenerate = true) val id: Long = 0,
     val name: String,
-    /** 云盘根目录 cid */
+    /** 云盘根目录 cid，多根时以 \n 分隔 */
     val rootCid: String,
+    /** 云盘根目录完整路径，多根时以 \n 分隔（路径里不会出现换行） */
     val rootPath: String,
     val createdAt: Long = 0,
-)
+    /** 扫描限速：相邻两次 115 API 请求的最小间隔（毫秒），0 = 不限 */
+    val rateLimitMs: Long = 0,
+    /** 程序启动时对这个库自动跑增量扫描 */
+    val autoScanOnStart: Boolean = false,
+) {
+    val rootCids: List<String> get() = rootCid.split('\n').filter { it.isNotBlank() }
+    val rootPaths: List<String> get() = rootPath.split('\n').filter { it.isNotBlank() }
+
+    companion object {
+        fun joinRoots(cids: List<String>, paths: List<String>): Pair<String, String> =
+            cids.filter { it.isNotBlank() }.joinToString("\n") to
+                paths.filter { it.isNotBlank() }.joinToString("\n")
+    }
+}
