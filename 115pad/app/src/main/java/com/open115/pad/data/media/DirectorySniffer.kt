@@ -16,6 +16,30 @@ private val IMAGE_EXTS = setOf("jpg", "jpeg", "png", "webp", "bmp")
 /** 装饰后缀：命名规范里跟在前缀后面的角色标记 */
 private val DECOR_SUFFIXES = listOf("-fanart", "-poster", "-thumb", "-logo", "-banner", "-disc", "-backdrop", "-keyart", "-landscape", "-clearart")
 
+/**
+ * **无前缀**的"目录级"标准文件名（Kodi/Emby 约定）：它们属于整个目录，不参与前缀分组。
+ *
+ * ★ 必须在前缀分组之前认掉。`fanart.jpg` 早先会聚出一个前缀为 `fanart` 的组 ——
+ * 装饰后缀表里是**带连字符**的 `-fanart`，而文件名就是裸的 `fanart`，`endsWith` 匹配不上。
+ * `season01-poster.jpg` 同理聚出 `season01`。这两个多出来的组会把组数顶高，
+ * 直接害死下面那个海报兜底（见 [clusterFiles] 里 anchor 的注释）。
+ */
+private val DIR_POSTER_NAMES = setOf("poster", "folder")
+private val DIR_FANART_NAMES = setOf("fanart", "backdrop", "background")
+private val DIR_THUMB_NAMES = setOf("thumb")
+private val DIR_OTHER_NAMES = setOf("logo", "clearlogo", "banner", "disc", "landscape")
+
+/**
+ * 季描述文件的前缀：`season.nfo` / `season01.nfo` / `specials.nfo`。
+ *
+ * 它们**有 nfo 没视频**，能通过"有视频或有 nfo"那道过滤 → 凭空生成一条标题为「季 1」的
+ * 垃圾卡片（实测 2026-09-23：示例剧集 那个库多出一行 mediaKey=`season`）。
+ * 它描述的是"季"而不是影视条目，不该出现在海报墙上。
+ *
+ * `tvshow.nfo` **不在这里**：剧集根目录通常没有视频文件，系列条目正是靠它建起来的。
+ */
+private val SEASON_DESC_PREFIX = Regex("""(?i)^(season|specials)\d*$""")
+
 /** 一组文件：同公共前缀的 .nfo/.jpg/视频 归一类 */
 data class Cluster(
     val prefix: String,
@@ -36,8 +60,12 @@ val TMDB_ID = Regex("""\{tmdbid-(\d+)\}""")
 
 /**
  * 纯逻辑聚类（对文件名列表）。folder.jpg 是无前缀海报的兜底，归到唯一视频组。
+ *
+ * [minVideoBytes] > 0 时做**体积过滤**：小于它的视频当它不存在（预告/花絮/样本不该占卡片位）。
+ * 过滤必须在这里、而不是入库那一步 —— 否则"1 个正片 + 1 个预告"的目录会因为看到 2 个视频
+ * 被判成多集目录（`isMultiVideo`），一部电影被拆成两条。
  */
-fun clusterFiles(files: List<FileRef>): List<Cluster> {
+fun clusterFiles(files: List<FileRef>, minVideoBytes: Long = 0L): List<Cluster> {
     data class MutableCluster(
         val prefix: String,
         var video: FileRef? = null,
@@ -45,10 +73,15 @@ fun clusterFiles(files: List<FileRef>): List<Cluster> {
         var poster: FileRef? = null,
         var fanart: FileRef? = null,
         var thumb: FileRef? = null,
+        /** 这个组的视频存在、但因为太小被滤掉了 */
+        var videoTooSmall: Boolean = false,
     )
 
     val byPrefix = LinkedHashMap<String, MutableCluster>()
-    var folderJpg: FileRef? = null
+    // 目录级素材：不属于任何前缀组，最后挂给"锚点簇"
+    var dirPoster: FileRef? = null
+    var dirFanart: FileRef? = null
+    var dirThumb: FileRef? = null
 
     fun basePrefix(name: String): String? {
         val dot = name.lastIndexOf('.')
@@ -69,17 +102,26 @@ fun clusterFiles(files: List<FileRef>): List<Cluster> {
     }
 
     for (f in files) {
-        if (f.name.equals("folder.jpg", ignoreCase = true) || f.name.equals("poster.jpg", ignoreCase = true)) {
-            folderJpg = f
-            continue
-        }
-        val prefix = basePrefix(f.name) ?: continue
         val ext = f.name.substringAfterLast('.', "").lowercase()
         val stem = f.name.substringBeforeLast('.')
+        // 目录级标准文件名先认掉（必须在分组之前，否则会各自成组）
+        if (ext in IMAGE_EXTS) {
+            when (stem.lowercase()) {
+                in DIR_POSTER_NAMES -> { if (dirPoster == null) dirPoster = f; continue }
+                in DIR_FANART_NAMES -> { if (dirFanart == null) dirFanart = f; continue }
+                in DIR_THUMB_NAMES -> { if (dirThumb == null) dirThumb = f; continue }
+                in DIR_OTHER_NAMES -> continue
+            }
+        }
+        val prefix = basePrefix(f.name) ?: continue
         val decor = DECOR_SUFFIXES.firstOrNull { stem.lowercase().endsWith(it) }
         val c = byPrefix.getOrPut(prefix) { MutableCluster(prefix) }
         when {
-            ext in VIDEO_EXTS -> if (c.video == null) c.video = f
+            ext in VIDEO_EXTS -> when {
+                c.video != null -> Unit // 一组只要一个主视频
+                minVideoBytes > 0 && f.sizeBytes < minVideoBytes -> c.videoTooSmall = true
+                else -> c.video = f
+            }
             ext == "nfo" -> if (c.nfo == null) c.nfo = f
             ext in IMAGE_EXTS -> when (decor) {
                 "-poster" -> if (c.poster == null) c.poster = f
@@ -90,31 +132,55 @@ fun clusterFiles(files: List<FileRef>): List<Cluster> {
         }
     }
 
-    return byPrefix.values
+    // 条目 = 有视频或有 nfo 的组；季描述文件（season.nfo）除外
+    val entries = byPrefix.values
         .filter { it.video != null || it.nfo != null }
-        .map { c ->
-            Cluster(
-                prefix = c.prefix,
-                video = c.video,
-                nfo = c.nfo,
-                poster = c.poster ?: folderJpg.takeIf { byPrefix.size == 1 },
-                fanart = c.fanart,
-                thumb = c.thumb,
-            )
-        }
+        .filterNot { it.video == null && SEASON_DESC_PREFIX.matches(it.prefix) }
+        // 视频被体积滤掉的组**整条丢掉**：留着会变成"有海报有简介、点播放却说没有可播放文件"的卡片。
+        // 只丢"曾经有视频且被滤掉"的组 —— 纯 nfo 组（tvshow.nfo）照旧保留，剧集条目靠它建起来。
+        .filterNot { it.video == null && it.videoTooSmall }
+
+    // 目录级海报/背景挂给哪个簇（锚点）：
+    //   ① 本目录**唯一**带视频的簇 —— 单影片目录（示例影片那种）
+    //   ② 带 nfo 但没有视频的簇 —— 剧集根目录的 tvshow.nfo 就是"系列本身"，海报就该挂它
+    //   ③ 都没有就不挂（例如季目录里 9 集 + 一张季海报：挂给哪一集都是张冠李戴）
+    //
+    // ☠ 早先的条件是 `byPrefix.size == 1`，那对剧集根目录**永远不成立**：目录里
+    //    fanart.jpg / season01-poster.jpg 各自成组就够把组数顶到 3，于是整个兜底失效 ——
+    //    实测 2026-09-23「示例剧集」那个库：目录里明明有 poster.jpg(651KB) + fanart.jpg(390KB)，
+    //    索引里两个字段却都是 null，海报墙上系列卡是空白。
+    //
+    // ① 在 ② 之前：电影目录里混进一个无关的 xxx.nfo 时，海报不该挂到那个 nfo 组上。
+    val anchor = entries.singleOrNull { it.video != null }
+        ?: entries.firstOrNull { it.nfo != null && it.video == null }
+
+    return entries.map { c ->
+        val onAnchor = c === anchor
+        Cluster(
+            prefix = c.prefix,
+            video = c.video,
+            nfo = c.nfo,
+            poster = c.poster ?: dirPoster.takeIf { onAnchor },
+            fanart = c.fanart ?: dirFanart.takeIf { onAnchor },
+            thumb = c.thumb ?: dirThumb.takeIf { onAnchor },
+        )
+    }
 }
 
 /**
  * 剧集判定：一个目录里有多个视频组（季集目录），每组是一条集。
  * 影片判定：一个目录只聚出一组。
+ *
+ * [minVideoBytes] 见 [clusterFiles] —— 它在聚类阶段就滤掉了小视频，所以这里的计数
+ * 天然只算"留下的那些"，不会把预告片算进集数。
  */
 data class DirScan(
     val clusters: List<Cluster>,
     val isMultiVideo: Boolean,
 )
 
-fun sniffDirectory(files: List<FileRef>): DirScan {
-    val clusters = clusterFiles(files)
+fun sniffDirectory(files: List<FileRef>, minVideoBytes: Long = 0L): DirScan {
+    val clusters = clusterFiles(files, minVideoBytes)
     return DirScan(clusters = clusters, isMultiVideo = clusters.count { it.video != null } > 1)
 }
 
@@ -123,6 +189,19 @@ fun episodeKeyOf(prefix: String): String =
     Regex("""[Ss](\d{1,2})[Ee](\d{1,3})""").find(prefix)?.value
         ?: Regex("""[Ee][Pp]?(\d{1,3})""").find(prefix)?.value
         ?: prefix
+
+/**
+ * 集号排序键：`...S01E02...` → `1*10000 + 2 = 10002`；解析不出返回 Int.MAX_VALUE（沉底）。
+ *
+ * 返回单个 Int 而不是 Pair：`kotlin.Pair` **不实现 Comparable**，`compareBy` 用不了它。
+ *
+ * **不能按标题字符串排**：`S01E10` > `S01E09` 按字典序碰巧对，但 `S01E2` > `S01E10`
+ * 也成立 —— 集数一上两位数顺序就乱。集号一定得按数值比。
+ */
+fun episodeSortKey(title: String): Int {
+    val m = Regex("""[Ss](\d{1,2})[Ee](\d{1,3})""").find(title) ?: return Int.MAX_VALUE
+    return m.groupValues[1].toInt() * 10_000 + m.groupValues[2].toInt()
+}
 
 /**
  * 番号式目录名提演员：`ABC-301 示例演员二,示例演员三` → ["示例演员二", "示例演员三"]。
@@ -153,3 +232,34 @@ private fun splitActors(body: String): List<String> =
 
 /** 番号段：字母开头、可带数字，以 -/_ 接 2-6 位数字（ABC-301 / ABC-303） */
 private val CODE_PREFIX = Regex("""^[A-Za-z][A-Za-z0-9]{0,14}[-_]\d{2,6}\s*""")
+
+// ---------------- 分集继承（海报/背景图） ----------------
+
+/** 季级海报/背景：`season01-poster.jpg` / `Season 01 - Poster.jpg` / `season-specials-fanart.jpg` */
+val SEASON_ART_POSTER = Regex("""(?i)^season[-_ ]?(\d+|specials)[-_ ]*poster\.(jpg|jpeg|png|webp)$""")
+val SEASON_ART_FANART = Regex("""(?i)^season[-_ ]?(\d+|specials)[-_ ]*(fanart|backdrop|background)\.(jpg|jpeg|png|webp)$""")
+
+/** 往上找祖先目录时最多爬几层（`Series/Season 1/Disc 1/` 这种更深的结构也够用） */
+const val MAX_INHERIT_HOPS = 3
+
+/**
+ * 从 [dirPath] 往上列出**要依次查询**的祖先路径（不含自己），到 [rootPath] 为止。
+ *
+ * 分集继承用：剧集包通常只在**系列根目录**放 `poster.jpg`/`fanart.jpg`（`Season 1/` 里什么都没有），
+ * 于是整季的卡片全是空白。往上找第一个"有图"的祖先目录，就是系列根。
+ *
+ * 两条边界：
+ * - **不能越过库根**（`cur.length >= stop.length`）：越过就可能借到隔壁库的图
+ * - 层数封顶 [MAX_INHERIT_HOPS]：正常结构一层就命中，多留几层是给 Disc 子目录那种用的
+ */
+fun ancestorPaths(dirPath: String, rootPath: String, maxHops: Int = MAX_INHERIT_HOPS): List<String> {
+    val stop = rootPath.trimEnd('/')
+    val out = mutableListOf<String>()
+    var cur = dirPath.trimEnd('/').substringBeforeLast('/', "")
+    while (out.size < maxHops && cur.isNotEmpty() && cur.length >= stop.length) {
+        out += cur
+        if (cur == stop) break
+        cur = cur.substringBeforeLast('/', "")
+    }
+    return out
+}

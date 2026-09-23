@@ -319,7 +319,19 @@ private fun MainScaffold(container: AppContainer, widthClass: WindowWidthSizeCla
                         },
                         exitTransition = { fadeOut(tween(200)) },
                     ) {
-                        com.open115.pad.ui.media.MediaLibraryScreen(container.openApi)
+                        // 媒体库整条线走深色：列表 / 海报墙 / 详情页三屏连成一体，
+                        // 详情页是 fanart 铺满 + 取色底色，前两屏跟着暗才不割裂。
+                        // 在这里包一次即可 —— 三个页面都只用 MaterialTheme.colorScheme.*
+                        com.open115.pad.ui.theme.Open115DarkTheme {
+                            // 还要**显式铺一层深色底**：页面底色来自外层 Scaffold 的 containerColor，
+                            // 那个在深色方案之外，拿到的还是浅色（卡片会变暗、底却还是白的）
+                            androidx.compose.material3.Surface(
+                                color = androidx.compose.material3.MaterialTheme.colorScheme.background,
+                                modifier = Modifier.fillMaxSize(),
+                            ) {
+                                com.open115.pad.ui.media.MediaLibraryScreen(container.openApi)
+                            }
+                        }
                     }
                     composable("filter") {
                         com.open115.pad.ui.filter.FilterRulesScreen(container)

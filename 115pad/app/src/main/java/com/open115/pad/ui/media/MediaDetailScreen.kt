@@ -45,6 +45,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -53,8 +54,11 @@ import com.open115.pad.data.media.EpisodeEntity
 import com.open115.pad.data.media.MediaDao
 import com.open115.pad.data.media.MovieCard
 import com.open115.pad.data.media.MovieEntity
+import com.open115.pad.data.media.episodeSortKey
 import com.open115.pad.player.PlayerActivity
+import com.open115.pad.ui.components.dissolve
 import com.open115.pad.ui.theme.AdaptiveBody
+import com.open115.pad.ui.theme.rememberTone
 import kotlinx.coroutines.launch
 
 private data class MediaDetailData(
@@ -62,6 +66,14 @@ private data class MediaDetailData(
     val actors: List<String>,
     val tags: List<String>,
     val episodes: List<EpisodeEntity>,
+    /**
+     * 系列卡名下的分集（按集号排好）。非系列为空。
+     *
+     * 剧集包扫出来是"系列根一条 + 每季 N 条分集"，海报墙只显示系列卡，
+     * 分集就在这里列出来选集 —— 所以详情页有两种分集来源：
+     * 系列卡用 [seriesEpisodes]，番号式/多视频影片用它自己的 [episodes]。
+     */
+    val seriesEpisodes: List<MovieCard>,
 )
 
 /**
@@ -82,12 +94,12 @@ fun MediaDetailScreen(
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val snackbarHostState = remember { SnackbarHostState() }
+    val container = (context.applicationContext as com.open115.pad.App115).container
 
     val data by produceState<MediaDetailData?>(initialValue = null, card.mediaKey) {
         val movie = dao.movie(card.mediaKey)
         if (movie != null && movie.plot.isNullOrBlank() && movie.rating == null) {
             // 扫描期 nfo 拉取失败的影片：进详情页按需重拉一次（自愈），然后再查库
-            val container = (context.applicationContext as com.open115.pad.App115).container
             com.open115.pad.data.media.MediaScanner.refetchNfo(
                 container.openApi, container.okHttpClient, dao, container.mediaCache, card.mediaKey,
             )
@@ -101,24 +113,46 @@ fun MediaDetailScreen(
                 actors = dao.actorsOf(card.mediaKey),
                 tags = dao.tagsOf(card.mediaKey),
                 episodes = dao.episodesOf(card.mediaKey),
+                seriesEpisodes = dao.episodesOfSeries(card.mediaKey),
             )
         }
     }
 
-    // 库内播放列表（番号式影片经常一个目录多视频，episodes 优先，否则整库串联）
+    // 分集列表（显示与播放共用一份，**索引必须对齐**）：
+    //  - 系列卡 → 它名下的分集行。按集号**数值**排：按标题字符串排会让 S01E2 排到 S01E10 后面
+    //  - 番号式 / 多视频影片 → 它自己的 episodes 表行
+    val epList: List<Pair<String, String?>> = remember(data) {
+        val d = data ?: return@remember emptyList()
+        if (d.seriesEpisodes.isNotEmpty()) {
+            d.seriesEpisodes
+                .sortedWith(compareBy({ episodeSortKey(it.title) }, { it.title }))
+                .map { it.title to it.videoPickCode }
+        } else {
+            d.episodes.map { it.episodeKey to it.videoPickCode }
+        }
+    }
+    val epEntries = remember(epList) {
+        epList.mapNotNull { (label, pc) -> pc?.let { PlaylistEntry(it, label) } }
+    }
+    // 库内播放列表（播完一部自动接下一部）
     val movieEntries = remember(playlist) {
         playlist.mapNotNull { c -> c.videoPickCode?.let { pc -> PlaylistEntry(pc, c.title) } }
-    }
-    val episodeEntries = remember(data) {
-        data?.episodes?.mapNotNull { e ->
-            e.videoPickCode?.let { pc -> PlaylistEntry(pc, e.videoName ?: e.episodeKey) }
-        } ?: emptyList()
     }
 
     fun play(pc: String, name: String, entries: List<PlaylistEntry>, at: Int) {
         context.startActivity(
             PlayerActivity.intent(context, pc, name, entries, at.coerceIn(0, (entries.size - 1).coerceAtLeast(0))),
         )
+    }
+
+    /** 播第 i 集：用 pickCode 在播放列表里反查下标 —— 有集缺 pickCode 时下标会错位，不能直接用 i */
+    fun playEpisode(i: Int) {
+        val (label, pc) = epList.getOrNull(i) ?: return
+        if (pc.isNullOrBlank()) {
+            scope.launch { snackbarHostState.showSnackbar("这一集没有提取码，无法播放") }
+            return
+        }
+        play(pc, label, epEntries, epEntries.indexOfFirst { it.pc == pc })
     }
 
     // 系统返回键 = 顶栏返回键：退回海报墙
@@ -129,34 +163,50 @@ fun MediaDetailScreen(
         // 不透明黑底：详情页是浮在海报墙之上的浮层，fanart 没加载出来时不能透出下层
         containerColor = Color.Black,
     ) { padding ->
-        AdaptiveBody(modifier = Modifier.fillMaxSize().padding(padding)) {
-            Box(Modifier.fillMaxSize()) {
-                // fanart 铺底 + 渐变压暗，白底海报/文字都压得住
-                PickCodeImage(
-                    pickCode = data?.movie?.fanartPickCode,
-                    modifier = Modifier.fillMaxSize(),
-                )
-                Box(
-                    Modifier.fillMaxSize().background(
-                        Brush.verticalGradient(
-                            listOf(
-                                Color.Black.copy(alpha = 0.55f),
-                                Color.Black.copy(alpha = 0.82f),
-                                MaterialTheme.colorScheme.scrim.copy(alpha = 0.92f),
-                            ),
-                        ),
+        // 沉浸式：**背景铺满整个窗口，内容收在居中窄栏里**
+        //
+        // ☠ 背景层必须在 AdaptiveBody **之外**。早先整块（含 fanart）都包在 AdaptiveBody 里，
+        //    而它的内层是 `widthIn(max = 960.dp)` 的居中容器 —— 背景因此被框成"中间一条"，
+        //    左右各留一条死黑、宽度也只有容器那么宽，看起来就是"背景只有半屏"。
+        //
+        // 底色从**海报**取色（取不到回落纯黑）：每部片因此有自己的颜色，
+        // "示例影片"和"示例剧集"进详情页底色不一样。
+        val posterModel by produceState<Any?>(initialValue = null, data?.movie?.posterPickCode) {
+            value = container.imageUrlResolver.posterFor(data?.movie?.posterPickCode, container.cacheDir)
+        }
+        val tone = rememberTone(posterModel, fallback = Color.Black)
+        // tone 本身已经 clamp 在 v ≤ 0.68，再压到约三成亮度才压得住白字
+        val base = lerp(tone, Color.Black, 0.72f)
+
+        Box(Modifier.fillMaxSize().background(base)) {
+            // ① fanart 铺满；下沿用 dissolve 把**图自己的 alpha** 推到 0、溶进底色
+            //    （不是"在图上盖一层渐变" —— 那会留一块比周围略深的矩形，见 Dissolve.kt）
+            PickCodeImage(
+                pickCode = data?.movie?.fanartPickCode,
+                modifier = Modifier.fillMaxSize().dissolve(0.45f, 1.0f),
+            )
+            // ② 水平渐变：文字都在左半区，左侧压暗保证可读，右侧透出剧照主体
+            Box(
+                Modifier.fillMaxSize().background(
+                    Brush.horizontalGradient(
+                        0.00f to base.copy(alpha = 0.88f),
+                        0.45f to base.copy(alpha = 0.28f),
+                        1.00f to Color.Transparent,
                     ),
-                )
+                ),
+            )
 
-                val current = data
-                if (current == null) {
-                    // 还没加载完或已被删除：转圈，删除了就一直转——由用户点返回
-                    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                        CircularProgressIndicator(color = Color.White)
-                    }
-                    return@AdaptiveBody
+            val current = data
+            if (current == null) {
+                // 还没加载完或已被删除：转圈，删除了就一直转——由用户点返回
+                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                    CircularProgressIndicator(color = Color.White)
                 }
+                return@Scaffold
+            }
 
+            // 内容层：长文本在平板上不该横跨整屏，收进 960dp 居中栏；整页可滚
+            AdaptiveBody(modifier = Modifier.fillMaxSize().padding(padding)) {
                 Column(
                     Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp),
                 ) {
@@ -218,18 +268,21 @@ fun MediaDetailScreen(
                             }
                             Spacer(Modifier.height(14.dp))
                             val mainPc = current.movie.videoPickCode
+                            // 系列卡自己没有视频文件，播放按钮落到第一集
+                            val playFirstEpisode = mainPc.isNullOrBlank() && epList.isNotEmpty()
                             Button(
                                 onClick = {
-                                    if (mainPc.isNullOrBlank()) {
-                                        scope.launch { snackbarHostState.showSnackbar("没有找到可播放的视频文件") }
-                                    } else {
-                                        play(mainPc, current.movie.videoName ?: current.movie.title, movieEntries, index)
+                                    when {
+                                        playFirstEpisode -> playEpisode(0)
+                                        mainPc.isNullOrBlank() ->
+                                            scope.launch { snackbarHostState.showSnackbar("没有找到可播放的视频文件") }
+                                        else -> play(mainPc, current.movie.videoName ?: current.movie.title, movieEntries, index)
                                     }
                                 },
                             ) {
                                 Icon(Icons.Outlined.PlayArrow, contentDescription = null)
                                 Spacer(Modifier.width(6.dp))
-                                Text("播放")
+                                Text(if (playFirstEpisode) "播放第 1 集" else "播放")
                             }
                         }
                     }
@@ -255,34 +308,25 @@ fun MediaDetailScreen(
                         LabelFlow(current.tags)
                     }
 
-                    // 分集：番号式/ Emby 剧集目录会有多视频
-                    if (episodeEntries.isNotEmpty()) {
+                    // 分集：系列卡列它名下的分集；番号式/多视频影片列它自己的 episodes
+                    if (epList.isNotEmpty()) {
                         Spacer(Modifier.height(16.dp))
-                        Text("分集（${episodeEntries.size}）", style = MaterialTheme.typography.titleSmall, color = Color.White)
+                        Text("分集（${epList.size}）", style = MaterialTheme.typography.titleSmall, color = Color.White)
                         Spacer(Modifier.height(4.dp))
-                        current.episodes.forEachIndexed { i, ep ->
-                            val pc = ep.videoPickCode
+                        epList.forEachIndexed { i, (label, _) ->
                             Row(
                                 Modifier.fillMaxWidth().padding(vertical = 2.dp),
                                 verticalAlignment = Alignment.CenterVertically,
                             ) {
                                 Text(
-                                    ep.episodeKey,
+                                    label,
                                     color = Color.White.copy(alpha = 0.9f),
                                     style = MaterialTheme.typography.bodyMedium,
                                     maxLines = 1,
                                     overflow = TextOverflow.Ellipsis,
                                     modifier = Modifier.weight(1f),
                                 )
-                                IconButton(
-                                    onClick = {
-                                        if (pc.isNullOrBlank()) {
-                                            scope.launch { snackbarHostState.showSnackbar("这一集没有提取码，无法播放") }
-                                        } else {
-                                            play(pc, ep.videoName ?: ep.episodeKey, episodeEntries, i)
-                                        }
-                                    },
-                                ) {
+                                IconButton(onClick = { playEpisode(i) }) {
                                     Icon(Icons.Outlined.PlayArrow, contentDescription = "播放", tint = Color.White)
                                 }
                             }

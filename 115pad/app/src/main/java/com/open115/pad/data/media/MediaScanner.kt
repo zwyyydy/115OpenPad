@@ -107,6 +107,9 @@ class MediaScanner(
      * 实际执行（调用方在自己的 scope 里 launch）：手动触发、可续跑、带进度。
      * incremental=true 时按 scan_state 的 cloudUpt 增量跳过（目录列表 upt 未变 = 无新增资源）；
      * false 为全量扫描（不跳过任何目录）。
+     *
+     * [minVideoSizeMb] 是**每库**的体积过滤（0 = 不过滤）：小于它的视频不入库。
+     * 在聚类阶段就滤掉，见 [sniffDirectory]。
      */
     suspend fun runScan(
         rootCid: String,
@@ -114,6 +117,7 @@ class MediaScanner(
         includeSubDirs: Boolean = true,
         incremental: Boolean = false,
         rateLimitMs: Long = 0,
+        minVideoSizeMb: Int = 0,
     ) {
         mutex.withLock {
             if (_progress.value.running) return
@@ -158,7 +162,10 @@ class MediaScanner(
                     val files = page.items.filter { !it.isDir }.map {
                         FileRef(name = it.fn, pickCode = it.pc ?: "", sizeBytes = it.fs, upt = it.upt)
                     }
-                    val scan = sniffDirectory(files)
+                    val scan = sniffDirectory(files, minVideoSizeMb.toLong() * 1024 * 1024)
+                    // 分集目录才需要往上找归属与继承的图；影片目录不找
+                    // （一部电影不是某一集，给它套系列海报、认系列当爹都是错的）
+                    val ancestor = if (scan.isMultiVideo) ancestorInfoOf(listing.path, files, rootPath) else null
                     val produced = mutableSetOf<String>()
                     var failed = false
                     var aborted = false
@@ -169,7 +176,12 @@ class MediaScanner(
                             break
                         }
                         try {
-                            produced += indexCluster(listing.cid, listing.path, cluster, isEpisodeLike = scan.isMultiVideo, rateLimitMs = rateLimitMs)
+                            produced += indexCluster(
+                                listing.cid, listing.path, cluster,
+                                isEpisodeLike = scan.isMultiVideo,
+                                rateLimitMs = rateLimitMs,
+                                ancestor = ancestor,
+                            )
                             movies++
                         } catch (e: Exception) {
                             failed = true
@@ -267,6 +279,44 @@ class MediaScanner(
         return result
     }
 
+    /** 分集目录要用的上层信息：归属哪个系列、海报背景从哪继承 */
+    private data class AncestorInfo(
+        val seriesKey: String?,
+        val posterPickCode: String?,
+        val fanartPickCode: String?,
+    )
+
+    /**
+     * 分集目录往上找：**归属的系列**（往上第一个"系列/影片"行）与**要继承的图**。
+     *
+     * 图的顺序：
+     *  ① **本目录自己的季级图**（`season01-poster.jpg`）—— 它比系列海报更贴这一季
+     *  ② 往上第一个"系列/影片"行带的图 —— 标准剧集包只在系列根放 `poster.jpg`/`fanart.jpg`，
+     *     `Season 1/` 里什么都没有，整季卡片就会全空白
+     *
+     * 找不到祖先行时 `seriesKey` 为 null —— 这个目录的分集**不归到任何系列**，仍旧各占一张卡。
+     * 实测 `test/多视频目录`（一堆集但没刮系列元数据）就是这种：造一条虚拟系列行也能收拢，
+     * 但那会凭空多出一张没元数据没海报的卡，比现在更差。
+     */
+    private suspend fun ancestorInfoOf(dirPath: String, dirFiles: List<FileRef>, rootPath: String): AncestorInfo {
+        val sp = dirFiles.firstOrNull { SEASON_ART_POSTER.matches(it.name) }
+        val sf = dirFiles.firstOrNull { SEASON_ART_FANART.matches(it.name) }
+
+        var seriesKey: String? = null
+        var poster: String? = sp?.pickCode
+        var fanart: String? = sf?.pickCode
+        if (poster != null && fanart != null) return AncestorInfo(null, poster, fanart)
+
+        for (ancestor in ancestorPaths(dirPath, rootPath)) {
+            val row = dao.ancestorRowOf(ancestor) ?: continue
+            if (seriesKey == null) seriesKey = row.mediaKey
+            if (poster == null) poster = row.posterPickCode
+            if (fanart == null) fanart = row.fanartPickCode
+            if (seriesKey != null && poster != null && fanart != null) break
+        }
+        return AncestorInfo(seriesKey, poster, fanart)
+    }
+
     /** 单条入库：聚类 → 下载 nfo 解析 → 一个事务。**返回入库用的 mediaKey**（调用方拿它清陈旧条目） */
     private suspend fun indexCluster(
         dirCid: String,
@@ -274,6 +324,8 @@ class MediaScanner(
         cluster: Cluster,
         isEpisodeLike: Boolean,
         rateLimitMs: Long = 0,
+        /** 分集目录的上层信息：归哪个系列 + 继承的图；影片目录传 null */
+        ancestor: AncestorInfo? = null,
     ): String {
         var meta = NfoMeta()
         cluster.nfo?.let { nfo ->
@@ -308,9 +360,12 @@ class MediaScanner(
             dirPath = dirPath,
             videoPickCode = cluster.video?.pickCode,
             videoName = cluster.video?.name,
-            posterPickCode = cluster.poster?.pickCode,
-            fanartPickCode = cluster.fanart?.pickCode,
+            // 自己的图优先；没有才用继承来的（分集继承系列的海报/背景）
+            posterPickCode = cluster.poster?.pickCode ?: ancestor?.posterPickCode,
+            fanartPickCode = cluster.fanart?.pickCode ?: ancestor?.fanartPickCode,
             nfoPickCode = cluster.nfo?.pickCode,
+            // 分集归属的系列：海报墙只显示 seriesKey IS NULL 的顶层条目，点进系列再列分集
+            seriesKey = ancestor?.seriesKey,
             nfoUpt = cluster.nfo?.upt ?: 0,
             sourceDirKey = dirCid,
             scannedAt = System.currentTimeMillis(),

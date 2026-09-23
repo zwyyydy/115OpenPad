@@ -223,7 +223,11 @@ class AppContainer(context: Context) {
                     .filter { it.autoScanOnStart }
                     .forEach { lib ->
                         lib.rootCids.zip(lib.rootPaths).forEach { (cid, path) ->
-                            mediaScanner.runScan(cid, path, incremental = true, rateLimitMs = lib.rateLimitMs)
+                            mediaScanner.runScan(
+                                cid, path, incremental = true,
+                                rateLimitMs = lib.rateLimitMs,
+                                minVideoSizeMb = lib.minVideoSizeMb,
+                            )
                         }
                     }
             }

@@ -183,7 +183,8 @@ fun MediaLibraryScreen(api: com.open115.pad.data.OpenApi) {
                                         .format(Date(lib.createdAt)) +
                                         // 扫描结束后要重算，否则"还没有影片"会一直挂着
                                         LibraryCount(dao, lib.rootPaths, scanProgress.finishedAt) +
-                                        if (lib.rateLimitMs > 0) " · 限速 ${lib.rateLimitMs}ms" else "",
+                                        if (lib.rateLimitMs > 0) " · 限速 ${lib.rateLimitMs}ms" else "" +
+                                        if (lib.minVideoSizeMb > 0) " · 过滤 <${lib.minVideoSizeMb}MB" else "",
                                     style = MaterialTheme.typography.bodySmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 )
@@ -208,7 +209,9 @@ fun MediaLibraryScreen(api: com.open115.pad.data.OpenApi) {
                                                     container.transferScope.launch {
                                                         lib.rootCids.zip(lib.rootPaths).forEach { (cid, path) ->
                                                             container.mediaScanner.runScan(
-                                                                cid, path, incremental = true, rateLimitMs = lib.rateLimitMs,
+                                                                cid, path, incremental = true,
+                                                                rateLimitMs = lib.rateLimitMs,
+                                                                minVideoSizeMb = lib.minVideoSizeMb,
                                                             )
                                                         }
                                                     }
@@ -223,7 +226,9 @@ fun MediaLibraryScreen(api: com.open115.pad.data.OpenApi) {
                                                     container.transferScope.launch {
                                                         lib.rootCids.zip(lib.rootPaths).forEach { (cid, path) ->
                                                             container.mediaScanner.runScan(
-                                                                cid, path, incremental = false, rateLimitMs = lib.rateLimitMs,
+                                                                cid, path, incremental = false,
+                                                                rateLimitMs = lib.rateLimitMs,
+                                                                minVideoSizeMb = lib.minVideoSizeMb,
                                                             )
                                                         }
                                                     }
@@ -252,14 +257,14 @@ fun MediaLibraryScreen(api: com.open115.pad.data.OpenApi) {
             title = "新建媒体库",
             existing = null,
             onDismiss = { showCreate = false },
-            onSave = { name, cids, paths, rate, autoScan ->
+            onSave = { name, cids, paths, rate, autoScan, minSize ->
                 scope.launch {
                     val (cid, path) = MediaLibraryEntity.joinRoots(cids, paths)
                     dao.insertLibrary(
                         MediaLibraryEntity(
                             name = name, rootCid = cid, rootPath = path,
                             createdAt = System.currentTimeMillis(), rateLimitMs = rate,
-                            autoScanOnStart = autoScan,
+                            autoScanOnStart = autoScan, minVideoSizeMb = minSize,
                         ),
                     )
                     showCreate = false
@@ -274,10 +279,10 @@ fun MediaLibraryScreen(api: com.open115.pad.data.OpenApi) {
             title = "编辑媒体库",
             existing = lib,
             onDismiss = { editTarget = null },
-            onSave = { name, cids, paths, rate, autoScan ->
+            onSave = { name, cids, paths, rate, autoScan, minSize ->
                 scope.launch {
                     val (cid, path) = MediaLibraryEntity.joinRoots(cids, paths)
-                    dao.updateLibrary(lib.id, name, cid, path, rate, autoScan)
+                    dao.updateLibrary(lib.id, name, cid, path, rate, autoScan, minSize)
                     editTarget = null
                 }
             },
@@ -395,7 +400,7 @@ private fun LibraryCount(
 }
 
 /**
- * 新建/编辑媒体库共用：库名 + 云盘路径（可多选、可继续追加）+ 扫描限速。
+ * 新建/编辑媒体库共用：库名 + 云盘路径（可多选、可继续追加）+ 扫描限速 + 体积过滤。
  * existing 非空为编辑模式：已选路径可逐条删除，再从目录树追加新路径。
  */
 @Composable
@@ -404,7 +409,14 @@ private fun LibraryEditDialog(
     title: String,
     existing: MediaLibraryEntity?,
     onDismiss: () -> Unit,
-    onSave: (name: String, cids: List<String>, paths: List<String>, rateLimitMs: Long, autoScanOnStart: Boolean) -> Unit,
+    onSave: (
+        name: String,
+        cids: List<String>,
+        paths: List<String>,
+        rateLimitMs: Long,
+        autoScanOnStart: Boolean,
+        minVideoSizeMb: Int,
+    ) -> Unit,
 ) {
     var name by remember { mutableStateOf(existing?.name ?: "") }
     var picked by remember {
@@ -416,9 +428,13 @@ private fun LibraryEditDialog(
     var rateText by remember {
         mutableStateOf(existing?.rateLimitMs?.takeIf { it > 0 }?.toString() ?: "")
     }
+    var minSizeText by remember {
+        mutableStateOf(existing?.minVideoSizeMb?.takeIf { it > 0 }?.toString() ?: "")
+    }
     var autoScan by remember { mutableStateOf(existing?.autoScanOnStart ?: false) }
     var picking by remember { mutableStateOf(false) }
     val rate = rateText.toLongOrNull()?.coerceAtLeast(0) ?: 0L
+    val minSize = minSizeText.toIntOrNull()?.coerceIn(0, 100_000) ?: 0
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -477,6 +493,23 @@ private fun LibraryEditDialog(
                     modifier = Modifier.fillMaxWidth(),
                 )
                 Spacer(Modifier.height(8.dp))
+                OutlinedTextField(
+                    value = minSizeText,
+                    onValueChange = { minSizeText = it.filter { c -> c.isDigit() } },
+                    label = { Text("最小视频体积（MB，留空不限）") },
+                    supportingText = {
+                        Text(
+                            if (minSize > 0) {
+                                "小于 ${minSize}MB 的视频不入库（预告/花絮/样本）。改完要重扫一次才生效"
+                            } else {
+                                "按库单独设：正片库可设 100~200 挡掉预告，短片库留空"
+                            },
+                        )
+                    },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                Spacer(Modifier.height(8.dp))
                 Row(
                     Modifier.fillMaxWidth(),
                     verticalAlignment = Alignment.CenterVertically,
@@ -505,6 +538,7 @@ private fun LibraryEditDialog(
                             picked.map { it.fullPath },
                             rate,
                             autoScan,
+                            minSize,
                         )
                     }
                 },
