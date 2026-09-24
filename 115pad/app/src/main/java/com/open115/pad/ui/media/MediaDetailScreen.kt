@@ -1,6 +1,8 @@
 package com.open115.pad.ui.media
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -18,7 +20,13 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.pager.HorizontalPager
+import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
@@ -38,6 +46,7 @@ import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
@@ -46,13 +55,19 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.lerp
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import com.open115.pad.data.PlaylistEntry
+import com.open115.pad.data.media.ActorCard
 import com.open115.pad.data.media.EpisodeEntity
 import com.open115.pad.data.media.MediaDao
 import com.open115.pad.data.media.MovieCard
@@ -68,7 +83,7 @@ import kotlinx.coroutines.launch
 
 private data class MediaDetailData(
     val movie: MovieEntity,
-    val actors: List<String>,
+    val actors: List<ActorCard>,
     val tags: List<String>,
     val episodes: List<EpisodeEntity>,
     /**
@@ -79,6 +94,11 @@ private data class MediaDetailData(
      * 系列卡用 [seriesEpisodes]，番号式/多视频影片用它自己的 [episodes]。
      */
     val seriesEpisodes: List<MovieCard>,
+    /**
+     * 剧照（`extrafanart/fanart1.jpg…`）的 pick_code，已按自然序排好。
+     * 只在扫描时记了 pick_code，**字节是进这个页面才开始缓存的**（见下面的 LaunchedEffect）。
+     */
+    val fanarts: List<String> = emptyList(),
 )
 
 /**
@@ -118,13 +138,40 @@ fun MediaDetailScreen(
         } else {
             MediaDetailData(
                 movie = updated,
-                actors = dao.actorsOf(card.mediaKey),
+                actors = dao.actorCardsOf(card.mediaKey),
                 tags = dao.tagsOf(card.mediaKey),
                 episodes = dao.episodesOf(card.mediaKey),
                 seriesEpisodes = dao.episodesOfSeries(card.mediaKey),
+                fanarts = updated.extraFanartList,
             )
         }
     }
+
+    /**
+     * 剧照**进详情页就开始缓存**（用户要求的时机：扫描期不碰，点开才拉）。
+     *
+     * 两步走，顺序有意义：
+     *  ① [ImageUrlResolver.prefetch] 一次 downurl 换回全部直链（pick_code 支持逗号分隔多个）——
+     *     15 张图从 15 次 downurl 降到 1 次。downurl 是 115 最容易触发频控的接口，
+     *     而媒体库扫描本身也在打它。
+     *  ② 再逐张落盘（[ImageUrlResolver.posterFor]）。串行不并发：这是后台补图，
+     *     不该跟播放/滚动抢带宽。
+     *
+     * 命中本地字节的图在第 ① 步之后就是**零请求**（posterFor 先查本地再解析直链）。
+     * 页面退出时协程随 composition 取消，没拉完的下次进来接着拉。
+     */
+    LaunchedEffect(data?.fanarts) {
+        val list = data?.fanarts ?: return@LaunchedEffect
+        if (list.isEmpty()) return@LaunchedEffect
+        val resolver = container.imageUrlResolver
+        list.chunked(FANART_PREFETCH_BATCH).forEach { batch ->
+            runCatching { resolver.prefetch(batch) }
+            batch.forEach { runCatching { resolver.posterFor(it, container.cacheDir) } }
+        }
+    }
+
+    /** 剧照全屏查看的当前页；null = 没在看 */
+    var viewingFanart by remember { mutableStateOf<Int?>(null) }
 
     // 分集列表（显示与播放共用一份，**索引必须对齐**）：
     //  - 系列卡 → 它名下的分集行。按集号**数值**排：按标题字符串排会让 S01E2 排到 S01E10 后面
@@ -197,8 +244,10 @@ fun MediaDetailScreen(
         Box(Modifier.fillMaxSize().background(base)) {
             // ① fanart 铺满；下沿用 dissolve 把**图自己的 alpha** 推到 0、溶进底色
             //    （不是"在图上盖一层渐变" —— 那会留一块比周围略深的矩形，见 Dissolve.kt）
+            //    没有 fanart.jpg 的片用**第一张剧照**兜底：刮了 extrafanart 的目录往往没有单张背景图，
+            //    空着就是整屏纯色，有图总比没有强。
             PickCodeImage(
-                pickCode = data?.movie?.fanartPickCode,
+                pickCode = data?.movie?.fanartPickCode ?: data?.fanarts?.firstOrNull(),
                 modifier = Modifier.fillMaxSize().dissolve(0.45f, 1.0f),
             )
             // ② 水平渐变：文字都在左半区，左侧压暗保证可读，右侧透出剧照主体
@@ -318,7 +367,38 @@ fun MediaDetailScreen(
                         Spacer(Modifier.height(16.dp))
                         Text("演员", style = MaterialTheme.typography.titleSmall, color = Color.White)
                         Spacer(Modifier.height(6.dp))
-                        LabelFlow(current.actors)
+                        // 刮到过头像（`.actors/` 目录，同名演员在别的影片里刮到过也算）就铺头像卡；
+                        // 一个都没有时保持原来的药丸列表 —— 一排首字母圆底并不比药丸好读
+                        if (current.actors.any { !it.avatarPickCode.isNullOrBlank() }) {
+                            ActorAvatarRow(current.actors)
+                        } else {
+                            LabelFlow(current.actors.map { it.name })
+                        }
+                    }
+
+                    // 剧照（extrafanart）：横排缩略图，点开全屏翻页
+                    if (current.fanarts.isNotEmpty()) {
+                        Spacer(Modifier.height(16.dp))
+                        Text(
+                            "剧照（${current.fanarts.size}）",
+                            style = MaterialTheme.typography.titleSmall,
+                            color = Color.White,
+                        )
+                        Spacer(Modifier.height(6.dp))
+                        LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            itemsIndexed(current.fanarts) { i, pc ->
+                                Box(
+                                    Modifier
+                                        .width(196.dp)
+                                        .aspectRatio(16f / 9f)
+                                        .clip(RoundedCornerShape(8.dp))
+                                        .background(Color.White.copy(alpha = 0.08f))
+                                        .clickable { viewingFanart = i },
+                                ) {
+                                    PickCodeImage(pc, Modifier.fillMaxSize())
+                                }
+                            }
+                        }
                     }
 
                     if (current.tags.isNotEmpty()) {
@@ -396,6 +476,127 @@ fun MediaDetailScreen(
                 }
             },
         )
+    }
+
+    // 剧照全屏查看（Dialog 叠在最上层，自己处理返回键）
+    val fanarts = data?.fanarts.orEmpty()
+    val viewing = viewingFanart
+    if (viewing != null && fanarts.isNotEmpty()) {
+        FanartViewer(
+            pickCodes = fanarts,
+            initial = viewing,
+            onDismiss = { viewingFanart = null },
+        )
+    }
+}
+
+/** 剧照预取每次批量解析多少条直链（一次 downurl 能带多个 pick_code；十几张一批就够） */
+private const val FANART_PREFETCH_BATCH = 20
+
+/**
+ * 演员头像卡：圆形头像 + 名字。
+ *
+ * 头像是**按需加载**的（[PickCodeImage] → posterFor）：进入详情页时只有可见的那几张会去
+ * 解析直链、下载落盘，滚到谁才拉谁。没有头像的（同名演员也没刮到）退回首字母圆底 ——
+ * 不占位空白，也不假装有图。
+ */
+@Composable
+private fun ActorAvatarRow(actors: List<ActorCard>) {
+    LazyRow(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+        items(actors, key = { it.name }) { actor ->
+            Column(
+                Modifier.width(72.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+            ) {
+                Box(
+                    Modifier
+                        .size(64.dp)
+                        .clip(CircleShape)
+                        .background(Color.White.copy(alpha = 0.14f)),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    if (actor.avatarPickCode.isNullOrBlank()) {
+                        Text(
+                            actor.name.take(1),
+                            color = Color.White,
+                            style = MaterialTheme.typography.titleLarge,
+                        )
+                    } else {
+                        PickCodeImage(actor.avatarPickCode, Modifier.fillMaxSize())
+                    }
+                }
+                Spacer(Modifier.height(6.dp))
+                Text(
+                    actor.name,
+                    color = Color.White.copy(alpha = 0.9f),
+                    style = MaterialTheme.typography.labelMedium,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                    textAlign = TextAlign.Center,
+                )
+            }
+        }
+    }
+}
+
+/**
+ * 剧照全屏查看：左右翻页、点任意处或返回键退出。
+ *
+ * 用 Dialog 而不是页面内浮层：海报墙那边本来就叠着详情页浮层，再叠一层要自己管返回栈与层级。
+ * 图片 `Fit` 而不是 `Crop` —— 全屏看剧照时把画面裁掉一块是不能接受的。
+ */
+@Composable
+private fun FanartViewer(pickCodes: List<String>, initial: Int, onDismiss: () -> Unit) {
+    val pager = rememberPagerState(
+        initialPage = initial.coerceIn(0, (pickCodes.size - 1).coerceAtLeast(0)),
+    ) { pickCodes.size }
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(usePlatformDefaultWidth = false),
+    ) {
+        Box(
+            Modifier
+                .fillMaxSize()
+                .background(Color.Black.copy(alpha = 0.96f))
+                .clickable(
+                    interactionSource = remember { MutableInteractionSource() },
+                    indication = null,
+                    onClick = onDismiss,
+                ),
+        ) {
+            HorizontalPager(state = pager, modifier = Modifier.fillMaxSize()) { page ->
+                // 每页自己也吃掉点击：pager 只消费拖拽，点击会冒泡到外层那个 dismiss
+                Box(
+                    Modifier.fillMaxSize().clickable(
+                        interactionSource = remember { MutableInteractionSource() },
+                        indication = null,
+                        onClick = onDismiss,
+                    ),
+                ) {
+                    // getOrNull：数据若在看图期间刷新（列表变短），page 可能越界，
+                    // 直接下标会崩 —— 翻页看剧照崩掉是最没必要的一种崩
+                    pickCodes.getOrNull(page)?.let { pc ->
+                        PickCodeImage(
+                            pickCode = pc,
+                            modifier = Modifier.fillMaxSize().padding(horizontal = 24.dp, vertical = 56.dp),
+                            contentScale = ContentScale.Fit,
+                        )
+                    }
+                }
+            }
+            Surface(
+                color = Color.Black.copy(alpha = 0.55f),
+                shape = RoundedCornerShape(50),
+                modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 24.dp),
+            ) {
+                Text(
+                    "${pager.currentPage + 1} / ${pickCodes.size}",
+                    color = Color.White,
+                    style = MaterialTheme.typography.labelLarge,
+                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                )
+            }
+        }
     }
 }
 

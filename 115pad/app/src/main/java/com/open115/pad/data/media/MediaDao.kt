@@ -53,7 +53,55 @@ data class MovieFiles(
     val fanartPickCode: String?,
     val thumbPickCode: String?,
     val sourceDirKey: String,
+    /** 剧照 pick_code（\n 连接，见 [encodePickCodes]）：清本地缓存用 */
+    val extraFanartPickCodes: String? = null,
+    /**
+     * 剧照目录 / 演员头像目录的 cid：彻底删除时按它列一次子目录换 file_id。
+     * 这两个目录里的文件列**父目录**列不出来（见 deleteMovie 的注释）。
+     */
+    val extraFanartDirCid: String? = null,
+    val actorsDirCid: String? = null,
 )
+
+/**
+ * 详情页要的演员：名字 + 头像 pick_code（没有头像就是 null，UI 退回首字母圆底）。
+ *
+ * 头像存在 actors 表上（按名字唯一），所以这里读出来的就是"同名复用"后的结果 ——
+ * 同一个演员在别的影片里扫到过头像，这部片也直接有。
+ */
+data class ActorCard(
+    val name: String,
+    val avatarPickCode: String? = null,
+)
+
+/**
+ * 演员 + 它的头像落在哪儿（删影片时判断这个头像还能不能删）。
+ *
+ * [avatarDirCid] 是头像文件所在 `.actors` 目录的 cid：删掉这部片之后它可能已经不在
+ * 本次要清理的目录里了（比如这个头像是**之前删掉的另一部片**提供的），
+ * 那种情况下要单独去那个目录里删这一个文件。
+ */
+data class ActorAvatarRef(
+    val id: Long,
+    val name: String,
+    val avatarPickCode: String,
+    val avatarDirCid: String?,
+)
+
+/**
+ * 删影片时**哪些头像可以跟着删**：只有这个演员在库里再没有别的作品了才删。
+ *
+ * ★ 还有别的作品在用就必须留着（连同云端文件一起留）：头像按名字全局唯一，
+ *   而"同名复用"靠的就是这一份文件 —— 删了别的片就再也配不上头像，
+ *   要等它们各自的目录被重扫才会好（`.actors` 里还有副本的话）。
+ *
+ * 判据是 movie_actors 里的**幸存链接**（本次要删的影片已经排除），
+ * 纯逻辑所以单独提出来测。
+ */
+fun avatarsToDelete(
+    avatars: List<ActorAvatarRef>,
+    stillUsedNames: Set<String>,
+): List<ActorAvatarRef> = avatars.filter { it.name !in stillUsedNames }
 
 /**
  * 分集要用的"祖先行"：`seriesKey` 取它的 mediaKey，海报/背景取它的图。
@@ -108,6 +156,41 @@ interface MediaDao {
         val id = findActorId(name) ?: insertActor(ActorEntity(name = name))
         linkActor(MovieActorEntity(mediaKey, id))
     }
+
+    /**
+     * 关联演员并带上头像（来自影片目录里的 `.actors/<演员名>.jpg`）。
+     *
+     * ★ **已有头像就不覆盖** —— 这就是"同一个演员只需要一份头像"的实现：
+     *   A 片扫到过就存下了，B 片（同演员、目录里没 `.actors`）读到的自然是同一份；
+     *   即使 B 片自己也有一个副本，也不会去改写指向，于是那份副本永远不会被下载、
+     *   更不会被缓存第二遍（缓存按 pick_code 命名，改了指向就会多一份字节）。
+     *
+     * 只在演员行**还没有头像**时补写：老库升级上来时全是 null，重扫一次就补上。
+     */
+    @Transaction
+    suspend fun linkActorWithAvatar(
+        mediaKey: String,
+        name: String,
+        avatarPickCode: String,
+        avatarDirCid: String?,
+    ) {
+        val existing = findActorId(name)
+        if (existing == null) {
+            linkActor(MovieActorEntity(mediaKey, insertActor(
+                ActorEntity(name = name, avatarPickCode = avatarPickCode, avatarDirCid = avatarDirCid),
+            )))
+            return
+        }
+        setActorAvatarIfAbsent(existing, avatarPickCode, avatarDirCid)
+        linkActor(MovieActorEntity(mediaKey, existing))
+    }
+
+    /** 补头像：只在原本为空时写（空串也算空 —— 老数据/异常写入可能是空串而不是 NULL） */
+    @Query(
+        "UPDATE actors SET avatarPickCode = :pickCode, avatarDirCid = :dirCid " +
+            "WHERE id = :id AND (avatarPickCode IS NULL OR avatarPickCode = '')",
+    )
+    suspend fun setActorAvatarIfAbsent(id: Long, pickCode: String, dirCid: String?)
 
     @Transaction
     suspend fun linkTagByName(mediaKey: String, name: String) {
@@ -251,7 +334,8 @@ interface MediaDao {
      */
     @Query(
         "SELECT mediaKey, videoFid, nfoFid, posterFid, fanartFid, thumbFid, " +
-            "videoPickCode, nfoPickCode, posterPickCode, fanartPickCode, thumbPickCode, sourceDirKey " +
+            "videoPickCode, nfoPickCode, posterPickCode, fanartPickCode, thumbPickCode, sourceDirKey, " +
+            "extraFanartPickCodes, extraFanartDirCid, actorsDirCid " +
             "FROM movies WHERE mediaKey = :key OR seriesKey = :key",
     )
     suspend fun filesOf(key: String): List<MovieFiles>
@@ -356,11 +440,123 @@ interface MediaDao {
     @Query("SELECT * FROM episodes WHERE mediaKey = :mediaKey ORDER BY season, episode")
     suspend fun episodesOf(mediaKey: String): List<EpisodeEntity>
 
-    @Query("SELECT name FROM actors JOIN movie_actors ON actors.id = actorId WHERE mediaKey = :mediaKey")
-    suspend fun actorsOf(mediaKey: String): List<String>
+    /**
+     * 详情页的演员（带头像）。按演员 id 排：同一个演员表在库里是稳定的，
+     * 排序交给 SQL 比在 UI 层每次重排省事。
+     *
+     * 取代了原来的 `SELECT name` 版本 —— 详情页现在两样都要，没必要查两遍。
+     */
+    @Query(
+        "SELECT actors.name AS name, actors.avatarPickCode AS avatarPickCode " +
+            "FROM actors JOIN movie_actors ON actors.id = movie_actors.actorId " +
+            "WHERE movie_actors.mediaKey = :mediaKey ORDER BY actors.id",
+    )
+    suspend fun actorCardsOf(mediaKey: String): List<ActorCard>
+
+    /**
+     * 这些影片用到的演员里**有头像的**那些（删影片时逐个判断头像还能不能删）。
+     *
+     * 必须在删本地索引**之前**查 —— 删完 movie_actors 就查不出"这部片用了谁"了。
+     */
+    @Query(
+        "SELECT DISTINCT a.id AS id, a.name AS name, a.avatarPickCode AS avatarPickCode, " +
+            "a.avatarDirCid AS avatarDirCid FROM actors a JOIN movie_actors ma ON ma.actorId = a.id " +
+            "WHERE ma.mediaKey IN (:keys) AND a.avatarPickCode IS NOT NULL",
+    )
+    suspend fun actorAvatarsOfMovies(keys: List<String>): List<ActorAvatarRef>
+
+    /**
+     * 这些演员里**还有别的作品留在库里**的（本次要删的影片不算）。
+     *
+     * 判据就是 movie_actors 里还剩链接：有链接 = 详情页还会显示这个演员，
+     * 头像删了他就配不上了。
+     */
+    @Query(
+        "SELECT DISTINCT a.name FROM actors a JOIN movie_actors ma ON ma.actorId = a.id " +
+            "WHERE a.id IN (:actorIds) AND ma.mediaKey NOT IN (:doomedKeys)",
+    )
+    suspend fun actorNamesStillUsed(actorIds: List<Long>, doomedKeys: List<String>): List<String>
+
+    /** 清掉这些演员的头像引用（只在云端文件真的删掉之后调） */
+    @Query("UPDATE actors SET avatarPickCode = NULL, avatarDirCid = NULL WHERE id IN (:ids)")
+    suspend fun clearActorAvatars(ids: List<Long>)
 
     @Query("SELECT name FROM tags JOIN movie_tags ON tags.id = tagId WHERE mediaKey = :mediaKey")
     suspend fun tagsOf(mediaKey: String): List<String>
+
+    /**
+     * 这个目录里有多少条说明"分 CD 的合并结果还没到位、得重扫一遍"的行。
+     *
+     * 分 CD 合并是后加的逻辑，增量扫描本来会跳过没变化的目录 —— 那样老数据永远合不起来。
+     * 四种"没到位"的样子：
+     *  - 挂到别人名下（老数据里分集归了别的系列）
+     *  - 该挂到合成行名下却是顶层（老数据里各占一张卡）
+     *  - **`seriesKey = mediaKey` 的自引用**：第一张盘和合成行撞过键时留下的坏数据
+     *  - **合成行缺海报、而目录里明明有带海报的行**：合成卡的图是"第一张盘优先、
+     *    没有就借任意一张盘的"，借图那条也是后加的（实测 `ABC-204` 那种海报只挂在 cd2 上）
+     *
+     * 重扫一遍之后四种都不成立 → 永远为 0，不会反复重扫。
+     */
+    @Query(
+        "SELECT COUNT(*) FROM movies WHERE sourceDirKey = :dirKey AND (" +
+            "(seriesKey IS NOT NULL AND seriesKey != :base) OR " +
+            "(seriesKey IS NULL AND mediaKey != :base) OR " +
+            "seriesKey = mediaKey OR " +
+            "(mediaKey = :base AND posterPickCode IS NULL AND EXISTS (" +
+            "SELECT 1 FROM movies o WHERE o.sourceDirKey = :dirKey AND o.posterPickCode IS NOT NULL)))",
+    )
+    suspend fun cdGroupNeedsRescan(dirKey: String, base: String): Int
+
+    /**
+     * 这个目录里还有多少条**没记上侧挂素材**的行（只统计这个目录真正有的那几样）。
+     *
+     * 用于升级补数据：v9 及更早的库里这两列全是 NULL，而"没补过"和"这个目录根本没有
+     * `.actors`/`extrafanart`"在库里的样子**完全一样** —— 所以调用方先看父目录列表里
+     * 有没有这两个目录项（免费拿到），有哪样才统计哪样。两个条件都满足才去列一次，
+     * 补完这些行都带上了 cid，之后这个判断永远为假。
+     */
+    @Query(
+        "SELECT COUNT(*) FROM movies WHERE sourceDirKey = :dirKey AND (" +
+            "(:wantFanart AND extraFanartDirCid IS NULL) OR (:wantActors AND actorsDirCid IS NULL))",
+    )
+    suspend fun rowsMissingSideArt(dirKey: String, wantFanart: Boolean, wantActors: Boolean): Int
+
+    @Query(
+        "UPDATE movies SET extraFanartPickCodes = :fanartCodes, extraFanartDirCid = :fanartDirCid, " +
+            "actorsDirCid = :actorsDirCid WHERE sourceDirKey = :dirKey",
+    )
+    suspend fun updateSideArtInDir(
+        dirKey: String,
+        fanartCodes: String?,
+        fanartDirCid: String?,
+        actorsDirCid: String?,
+    )
+
+    /**
+     * 升级补数据：把一个目录的剧照/头像补到它名下**每一条**上（剧照是整目录共用的素材，
+     * 与扫描时的挂法一致），并按演员名把头像补进 actors 表（已有头像的不动）。
+     *
+     * 只在增量扫描的"跳过"分支里、且确实有行没补过时才调（见 MediaScanner）——
+     * 补完这些行就都带上目录 cid 了，这个判断之后永远为假，不会再列第二次。
+     */
+    @Transaction
+    suspend fun backfillSideArtInDir(
+        dirKey: String,
+        fanartCodes: String?,
+        fanartDirCid: String?,
+        actorsDirCid: String?,
+        actorAvatars: Map<String, String>,
+    ) {
+        updateSideArtInDir(dirKey, fanartCodes, fanartDirCid, actorsDirCid)
+        if (actorAvatars.isEmpty()) return
+        for (key in mediaKeysInDir(dirKey)) {
+            actorCardsOf(key).forEach { actor ->
+                actorAvatars[normalizeActorName(actor.name)]?.let { pc ->
+                    linkActorWithAvatar(key, actor.name, pc, actorsDirCid)
+                }
+            }
+        }
+    }
 
     // ---- 扫描状态 ----
     @Upsert
@@ -436,10 +632,29 @@ interface MediaDao {
         actors: List<String>,
         tags: List<String>,
         episodes: List<EpisodeEntity>,
+        /** 归一化演员名 → 头像 pick_code（来自 `.actors/`，见 [actorAvatarFilesOf]） */
+        actorAvatars: Map<String, String> = emptyMap(),
+        /** 头像文件所在目录 cid，随头像一起存（彻底删除时判断该不该清掉这个引用） */
+        actorsDirCid: String? = null,
     ) {
         upsertMovie(movie)
         replaceEpisodes(movie.mediaKey, episodes)
-        actors.forEach { linkActorByName(movie.mediaKey, it) }
+        // ★ 演员/标签**整表替换**：这次扫出来的就是权威结果，先清旧关联再挂新的。
+        //
+        // 不清的话旧名字会一直赖在影片上 —— 实测踩到：演员名的提取规则一改
+        // （目录名猜的 `-4K-C 示例演员` → 从 `.actors` 取的真名 `示例演员`），
+        // 重扫之后那条影片**同时挂着两个名字**，详情页两个演员卡并排显示。
+        // nfo 改演员表、换刮削器同理。
+        unlinkActors(listOf(movie.mediaKey))
+        unlinkTags(listOf(movie.mediaKey))
+        actors.forEach { name ->
+            val avatar = actorAvatars[normalizeActorName(name)]
+            if (avatar != null) {
+                linkActorWithAvatar(movie.mediaKey, name, avatar, actorsDirCid)
+            } else {
+                linkActorByName(movie.mediaKey, name)
+            }
+        }
         tags.forEach { linkTagByName(movie.mediaKey, it) }
     }
 }

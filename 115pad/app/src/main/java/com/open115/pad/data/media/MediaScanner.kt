@@ -1,6 +1,7 @@
 package com.open115.pad.data.media
 
 import android.util.Log
+import com.open115.pad.data.FileItem
 import com.open115.pad.data.FilesPage
 import com.open115.pad.data.ImageUrlResolver
 import com.open115.pad.data.OpenApi
@@ -36,6 +37,10 @@ import java.io.File
  * - .nfo：内容没变（pickCode + upt 相同）**零请求**，见 fetchNfoMeta。
  * - 海报：**首次扫描每条 1 次 downurl + 1 次下载**（[prefetchPoster]），
  *   之后命中落盘字节就零请求 —— 扫完进海报墙/详情页不必再等图。
+ * - 剧照（`extrafanart/`）与演员头像（`.actors/`）：**只在"这个目录需要重扫"时各列一次**
+ *   （见 [sideArtOf]），增量扫描跳过的目录**一次都不列**。字节一张都不下，留给详情页按需缓存。
+ *   这两个目录是刮削一次就不动的素材，不值得每轮扫描都问一遍 —— 实测某库 248 个目录里
+ *   164 个（66%）是它们，每轮都列等于把列目录阶段拖成三倍。
  */
 class MediaScanner(
     private val openApi: OpenApi,
@@ -252,31 +257,60 @@ class MediaScanner(
                         break
                     }
                     _progress.value = _progress.value.copy(currentDir = listing.path)
+                    // 被屏蔽的目录（侧挂素材 / 花絮）不该出现在 allDirs 里（collectDirs 已经剪掉），
+                    // 这道判断是兜底：万一以后有人改了剪枝、或者换了入口，混进来的后果不是报错
+                    // 而是静默多出垃圾条目。仍然算作"处理完一个目录"（进度条的分母是 allDirs.size）。
+                    val isRoot = listing.path.trimEnd('/') == rootPath.trimEnd('/')
+                    if (!isRoot && isIgnoredDirName(listing.path.substringAfterLast('/'))) {
+                        done++
+                        _progress.value = _progress.value.copy(doneDirs = done, moviesIndexed = movies)
+                        continue
+                    }
                     // includeSubDirs=false 时 collectDirs 没列过这个目录，这里补一次
                     val page = listing.page ?: listFiles(listing.cid, rateLimitMs)
+                    val files = fileRefsOf(page)
+                    // 以前扫进去的"附加内容"（花絮/预告）要清掉：那些目录现在被屏蔽了、
+                    // 不会再出现在 allDirs 里，靠循环末尾那套"陈旧条目清理"永远够不着它们，
+                    // 留在库里就是海报墙上一堆再也删不掉的垃圾卡。放在跳过判断**之前**跑，
+                    // 增量扫描跳过这个目录时也要清（纯本地查询，清完就是空集，不花请求）。
+                    purgeIgnoredSubDirs(listing, page)
                     val dirUpt = page.items.maxOfOrNull { it.upt } ?: 0L
                     // 指纹覆盖**所有条目**（含子目录项）：子目录被改名/挪走同样算这个目录变了。
                     // 条目本来就在手上，算它是纯本地开销，不多花一次请求。
-                    val dirFingerprint = dirFingerprintOf(
-                        page.items.map {
-                            FileRef(
-                                name = it.fn, pickCode = it.pc ?: "", sizeBytes = it.fs,
-                                upt = it.upt, fid = it.fid ?: "",
-                            )
-                        },
-                    )
+                    val dirFingerprint = dirFingerprintOf(fileRefsOf(page, includeDirs = true))
                     if (incremental) {
                         // 增量：目录上次扫完、且内容没变（指纹一致）→ 跳过。
                         // 两个判据都留着：upt 是老的、只挡得住"新增"，指纹才挡得住删除/改名/移入；
                         // 老数据（v9 之前）指纹是空串，这里必然不等 → 每个目录重扫一轮补上。
                         val state = dao.scanState(listing.cid)
-                        if (state != null && state.status == 2 && state.cloudUpt == dirUpt && dirUpt > 0 &&
-                            state.dirFingerprint == dirFingerprint
+                        // 例外：分 CD 的老数据还没合并（合并逻辑是后加的）→ 不能跳过，
+                        // 得重扫一遍把它们并成一条 + 分集。判据只看文件名，零请求。
+                        val cdPending = cdMergePending(listing.cid, files)
+                        if (!cdPending && state != null && state.status == 2 && state.cloudUpt == dirUpt &&
+                            dirUpt > 0 && state.dirFingerprint == dirFingerprint
                         ) {
                             // 跳过不等于不管：把库里已有条目的海报补到本地。
                             // 缓存被清过 / 新装机的机器上，增量扫描是用户最常用的那条路，
                             // 不补的话海报墙仍要一张张现下。已命中的不产生任何请求。
                             prefetchDirPosters(listing.cid, rateLimitMs)
+                            // 老库升级（v9 及更早）补剧照/头像：那些行这两列是 NULL，
+                            // 而"没补过"和"这个目录根本没有侧挂素材目录"在库里长得一样 ——
+                            // 用父目录列表里的目录项（免费）区分，确实有、且还有行没补上才列一次。
+                            // 补完这些行都带上了目录 cid，这个判断之后永远为假，不会重复列。
+                            val wantFanart = sideDirItem(page.items, EXTRAFANART_DIR_NAMES) != null
+                            val wantActors = sideDirItem(page.items, ACTORS_DIR_NAMES) != null
+                            if (includeSubDirs && (wantFanart || wantActors) &&
+                                dao.rowsMissingSideArt(listing.cid, wantFanart, wantActors) > 0
+                            ) {
+                                val art = sideArtOf(page.items, rateLimitMs)
+                                dao.backfillSideArtInDir(
+                                    dirKey = listing.cid,
+                                    fanartCodes = encodePickCodes(art.fanart.map { it.pickCode }),
+                                    fanartDirCid = art.fanartDirCid,
+                                    actorsDirCid = art.actorsDirCid,
+                                    actorAvatars = art.actorAvatars.mapValues { it.value.pickCode },
+                                )
+                            }
                             skipped++
                             done++
                             _progress.value = _progress.value.copy(
@@ -288,20 +322,64 @@ class MediaScanner(
                         }
                         // ☠ 以后要是加"删除检测"（拿本轮见到的集合去差掉索引里的孤儿），
                         //    **跳过分支里的目录必须先算作"见过"** —— 它们的条目没进本轮的产出集合，
-                        //    直接做差集会把没访问过的目录整个误删。115-strm-web 用 scan_token 标记本轮结果，
-                        //    并且专门有个 mark_cached_dir_as_seen 把被跳过目录的已知行搬进本轮，
-                        //    就是为这个；它还要求"本轮没有失败目录"才允许清理。
+                        //   直接做差集会把没访问过的目录整个误删。115-strm-web 用 scan_token 标记本轮结果，
+                        //   并且专门有个 mark_cached_dir_as_seen 把被跳过目录的已知行搬进本轮，
+                        //   就是为这个；它还要求"本轮没有失败目录"才允许清理。
                     }
-                    val files = page.items.filter { !it.isDir }.map {
-                        FileRef(name = it.fn, pickCode = it.pc ?: "", sizeBytes = it.fs, upt = it.upt, fid = it.fid ?: "")
-                    }
+                    // ★ 侧挂素材目录（extrafanart / .actors）**只在这里列**，而且只在这个目录
+                    //   真的要重扫时才列 —— 增量跳过的目录一次请求都不花。它们是"刮削一次就不动"
+                    //   的素材，实测某库 248 个目录里 164 个是它们，每轮都列等于把列目录阶段拖成三倍。
+                    //   代价：父目录指纹不含它们的内容，"只往 extrafanart 加图、nfo 没动"
+                    //   要等全量扫描才更新（重刮通常连 nfo 一起改，所以少见）。
+                    //   includeSubDirs=false 时传 null = "这次看不到" → 入库时保留原值。
+                    val sideArt = if (includeSubDirs) sideArtOf(page.items, rateLimitMs) else null
                     val scan = sniffDirectory(files, minVideoSizeMb.toLong() * 1024 * 1024)
+                    // 分 CD / 分片的资源（`ABC-201-cd1` + `-cd2`）**合成一条**：造一个"系列"行，
+                    // 各 CD 挂到它名下当分集 —— 海报墙出一张卡，点进去列 CD1/CD2。
+                    // 不合并的话每张盘都是一套完整的视频+nfo+海报，墙上就是 N 张几乎一样的卡。
+                    val cdBase = if (scan.isMultiVideo) cdGroupBaseOf(scan.clusters) else null
+                    // 元数据与图取"第一张盘"（列表顺序不稳定，不能直接用 first）
+                    val cdLead = if (cdBase != null) cdGroupLead(scan.clusters) else null
+                    // 合成卡的图：第一张盘优先，它没有就**借任意一张盘的** —— 实测 `ABC-204 示例演员/`
+                    // 第一张盘只有视频 + nfo，海报挂在 cd2 上，不借的话合并卡是空白的
+                    val cdArt = if (cdBase != null) {
+                        CdArt(
+                            poster = (cdLead?.poster ?: scan.clusters.firstNotNullOfOrNull { it.poster })?.pickCode,
+                            fanart = (cdLead?.fanart ?: scan.clusters.firstNotNullOfOrNull { it.fanart })?.pickCode,
+                        )
+                    } else {
+                        null
+                    }
                     // 分集目录才需要往上找归属与继承的图；影片目录不找
-                    // （一部电影不是某一集，给它套系列海报、认系列当爹都是错的）
-                    val ancestor = if (scan.isMultiVideo) ancestorInfoOf(listing.path, files, rootPath) else null
+                    // （一部电影不是某一集，给它套系列海报、认系列当爹都是错的）。
+                    // CD 组例外：它自己就是系列根，不往上继承。
+                    val ancestor = when {
+                        cdBase != null -> null
+                        scan.isMultiVideo -> ancestorInfoOf(listing.path, files, rootPath)
+                        else -> null
+                    }
                     val produced = mutableSetOf<String>()
                     var failed = false
                     var aborted = false
+                    if (cdBase != null && cdLead != null && cdArt != null) {
+                        try {
+                            produced += indexCdGroup(listing, cdBase, cdLead, cdArt, rateLimitMs, sideArt)
+                            movies++
+                        } catch (e: Exception) {
+                            failed = true
+                            Log.w(TAG, "CD 组合并入库失败 $cdBase: ${e.message}")
+                        }
+                    }
+                    // 各 CD 挂到合成行名下，并继承它的海报/背景兜底（自己带了图就用自己的）
+                    val cdAncestor = cdBase?.let { base ->
+                        AncestorInfo(base, cdArt?.poster, cdArt?.fanart)
+                    }
+                    // 各 CD 的键：第一张盘要改名（见 cdChildKeys 的注释，直接叫基名会和合成行撞）
+                    val cdKeys = if (cdBase != null) {
+                        scan.clusters.map { it.prefix }.let { ps -> ps.zip(cdChildKeys(cdBase, ps)).toMap() }
+                    } else {
+                        emptyMap()
+                    }
                     for (cluster in scan.clusters) {
                         // 簇边界也查一次：一个大目录可能有很多簇，每个簇都要一次 downurl + 一次 nfo 下载
                         if (stopRequested.get()) {
@@ -313,7 +391,9 @@ class MediaScanner(
                                 listing.cid, listing.path, cluster,
                                 isEpisodeLike = scan.isMultiVideo,
                                 rateLimitMs = rateLimitMs,
-                                ancestor = ancestor,
+                                ancestor = cdAncestor ?: ancestor,
+                                sideArt = sideArt,
+                                keyOverride = cdKeys[cluster.prefix],
                             )
                             movies++
                             // 大目录（一季几十集）里让"已入库/已缓存图"跟着动，不然进度条整段不动
@@ -408,6 +488,8 @@ class MediaScanner(
         val result = mutableListOf(DirListing(rootCid, rootPath, rootPage))
         val queue = ArrayDeque<Pair<String, String>>()
         rootPage.items.filter { it.isDir }.forEach { dir ->
+            // 屏蔽的目录不递归（理由见下面循环里那段）
+            if (isIgnoredDirName(dir.fn)) return@forEach
             dir.fid?.let { queue.add(it to "$rootPath/${dir.fn}") }
         }
         while (queue.isNotEmpty()) {
@@ -422,6 +504,11 @@ class MediaScanner(
                 currentDir = path,
             )
             page.items.filter { it.isDir }.forEach { dir ->
+                // ★ 屏蔽的目录（侧挂素材 extrafanart/.actors、附加内容 behind the scenes/extras…）
+                //   **不递归**：侧挂素材的内容由 [sideArtOf] 在"这个影片目录需要重扫"时单独列；
+                //   附加内容是整棵丢弃。列进这里等于每轮扫描都白问一遍（实测某库 248 个目录里
+                //   164 个是它们），附加内容还会把花絮当成正片入库。
+                if (isIgnoredDirName(dir.fn)) return@forEach
                 dir.fid?.let { queue.add(it to "$path/${dir.fn}") }
             }
         }
@@ -434,6 +521,92 @@ class MediaScanner(
         val posterPickCode: String?,
         val fanartPickCode: String?,
     )
+
+    /**
+     * 挂在影片目录上的**侧挂素材**：`extrafanart/` 剧照 + `.actors/` 演员头像。
+     */
+    private data class SideArt(
+        val fanart: List<FileRef>,
+        val fanartDirCid: String?,
+        val actorsDirCid: String?,
+        val actorAvatars: Map<String, FileRef>,
+    )
+
+    /** 分 CD 合并后那条**合成卡**用的图（第一张盘优先，它没有就借任意一张盘的） */
+    private data class CdArt(val poster: String?, val fanart: String?)
+
+    /**
+     * 列这个目录下的侧挂素材目录（`extrafanart/`、`.actors/`）。
+     *
+     * ★ **调用点必须在"增量跳过"判断之后**：跳过 = 不打扰云端，这两个目录也就一次都不列。
+     *   它们的内容是刮削一次就不动的素材（剧照十几张、头像几张），每轮扫描都重新列一遍
+     *   纯属浪费频控额度 —— 而"目录的 cid"是从**父目录的列表项**里免费拿到的，不需要额外请求。
+     *
+     * 没有这两个目录就返回空 SideArt（调用方据此清掉旧值）—— 与"这次拿不到清单"
+     * （includeSubDirs=false，调用方直接传 null）必须分开。
+     *
+     * 只认直接子目录（`X/extrafanart`、`X/.actors`）：这是刮削器的固定写法。
+     * 深一层（`.actors/<演员名>/folder.jpg`）是 Emby 另一套，实测库里没有，不做。
+     */
+    private suspend fun sideArtOf(parentItems: List<FileItem>, rateLimitMs: Long): SideArt {
+        val fanartDir = sideDirItem(parentItems, EXTRAFANART_DIR_NAMES)
+        val actorsDir = sideDirItem(parentItems, ACTORS_DIR_NAMES)
+        return SideArt(
+            fanart = fanartDir?.let { extraFanartFilesOf(fileRefsOf(listFiles(it.fid!!, rateLimitMs))) }
+                ?: emptyList(),
+            fanartDirCid = fanartDir?.fid,
+            actorsDirCid = actorsDir?.fid,
+            actorAvatars = actorsDir?.let { actorAvatarFilesOf(fileRefsOf(listFiles(it.fid!!, rateLimitMs))) }
+                ?: emptyMap(),
+        )
+    }
+
+    /** 父目录列表里那个侧挂素材目录项（名字不区分大小写；没有 fid 的用不了，跳过） */
+    private fun sideDirItem(items: List<FileItem>, names: List<String>): FileItem? =
+        items.firstOrNull { it.isDir && !it.fid.isNullOrEmpty() && it.fn.lowercase() in names }
+
+    /**
+     * 这个目录是不是"分 CD 的合并结果还没到位、得重扫一遍"：文件名看着是一组 CD
+     * （`X-cd1`+`X-cd2`），而库里的行不符合合并后的样子（见 dao.cdGroupNeedsRescan）。
+     *
+     * 只看文件名 + 一次本地查询，**零请求**。合并到位之后这个判断永远为假，不会再逼着重扫。
+     */
+    private suspend fun cdMergePending(dirCid: String, files: List<FileRef>): Boolean {
+        val base = cdGroupBaseOf(clusterFiles(files)) ?: return false
+        return dao.cdGroupNeedsRescan(dirCid, base) > 0
+    }
+
+    /**
+     * 清掉**被屏蔽目录**里以前扫进去的条目（花絮 / 预告 / 访谈）。
+     *
+     * 这些目录现在整棵不扫，也就不再出现在 allDirs 里 —— 循环末尾那套"陈旧条目清理"
+     * 是按目录走的，永远够不着它们。不清的话，用户升级前扫进去的花絮条目会永久留在
+     * 海报墙上（既不会更新也不会被清），正是这次要修的现象。
+     *
+     * 只删**索引**，云端文件一个不动（和扫描的其它行为一致）。
+     * 每次扫描对这个目录跑一次本地查询，第一次清完就是空集，之后零成本。
+     */
+    private suspend fun purgeIgnoredSubDirs(listing: DirListing, page: FilesPage) {
+        for (dir in page.items) {
+            if (!dir.isDir || !isIgnoredDirName(dir.fn)) continue
+            val cid = dir.fid?.takeIf { it.isNotEmpty() } ?: continue
+            val keys = dao.mediaKeysInDir(cid)
+            if (keys.isEmpty()) continue
+            dao.deleteMovies(keys)
+            // 扫描状态也清掉：留着会让"已扫过 N 个目录"的统计把它算进去
+            dao.deleteScanStateInPath("${listing.path.trimEnd('/')}/${dir.fn}")
+            Log.i(TAG, "清理被屏蔽目录 ${dir.fn} 下的 ${keys.size} 条旧条目")
+        }
+    }
+
+    /** 列表项 → FileRef（扫描期反复用，抽出来免得三处各写一遍字段映射） */
+    private fun fileRefsOf(page: FilesPage?, includeDirs: Boolean = false): List<FileRef> =
+        page?.items.orEmpty().filter { includeDirs || !it.isDir }.map {
+            FileRef(
+                name = it.fn, pickCode = it.pc ?: "", sizeBytes = it.fs,
+                upt = it.upt, fid = it.fid ?: "",
+            )
+        }
 
     /**
      * 分集目录往上找：**归属的系列**（往上第一个"系列/影片"行）与**要继承的图**。
@@ -475,6 +648,21 @@ class MediaScanner(
         rateLimitMs: Long = 0,
         /** 分集目录的上层信息：归哪个系列 + 继承的图；影片目录传 null */
         ancestor: AncestorInfo? = null,
+        /**
+         * 这个簇要挂的侧挂素材（剧照/头像）。**同一个目录里的每个簇都挂同一份**。
+         *
+         * 不搞"只挂给锚点"那套：剧照/头像是**整个目录**的素材，而一个目录里可能有多个簇
+         * （`ABC-101-4K-C 示例演员/` 里 nfo 叫 `ABC-101-4K-C.nfo`、视频却叫 `ABC-101-U.wmv`，
+         * 于是有元数据的那条和能播的那条**不是同一个簇**）—— 只挂锚点的话，用户点开
+         * 海报墙上那张有简介有评分的卡，反而一张剧照都没有。
+         * 代价只是十几条 pick_code 在同一个目录的几条行里各存一遍（每条约几百字节）。
+         *
+         * **null = 这次看不到**（includeSubDirs=false）→ 保留库里的原值，
+         * 不能当成"没有剧照"把老数据抹掉。
+         */
+        sideArt: SideArt? = null,
+        /** 分 CD 时由调用方指定的键（第一张盘要改名，见 [cdChildKeys]）；null = 按前缀算 */
+        keyOverride: String? = null,
     ): String {
         var meta = NfoMeta()
         cluster.nfo?.let { nfo ->
@@ -491,13 +679,22 @@ class MediaScanner(
             }
         }
         // 主键：影片用 nfo 的 tmdb id、分集一律用文件前缀（分集 nfo 的 id 常是整部剧的，
-        // 拿它当主键会把整季覆盖成一行 —— 见 mediaKeyOf 的注释）
-        val key = mediaKeyOf(cluster.prefix, meta.uniqueTmdbid, isEpisodeLike)
+        // 拿它当主键会把整季覆盖成一行 —— 见 mediaKeyOf 的注释）。
+        // 分 CD 时由调用方给定（第一张盘要避开合成行的键）。
+        val key = keyOverride ?: mediaKeyOf(cluster.prefix, meta.uniqueTmdbid, isEpisodeLike)
         val title = meta.title ?: cluster.prefix.substringBeforeLast('(').trim().ifEmpty { cluster.prefix }
-        val actors = meta.actors.ifEmpty {
-            // 演员式资源：nfo 没带演员时从目录名提取（`ABC-301 示例演员二,示例演员三`）
-            actorsFromDirName(dirPath)
-        }
+        // 演员名以 **nfo 为准**；nfo 没带才退到 `.actors` 里的文件名，再没有才从目录名猜
+        // （见 actorsOf 的注释：`.actors` 的文件名正是头像的键，从这里取名字头像一定配得上）
+        val actors = actorsOf(
+            nfoActors = meta.actors,
+            actorAvatarNames = sideArt?.actorAvatars?.values
+                ?.map { it.name.substringBeforeLast('.') }
+                ?.sortedWith { a, b -> compareNatural(a, b) }
+                .orEmpty(),
+            dirPath = dirPath,
+        )
+        // sideArt == null 表示"这次看不到子目录"→ 保留旧值；非 null 时以它为准（空列表就是没有）
+        val prev = if (sideArt == null) dao.movie(key) else null
         val movie = MovieEntity(
             mediaKey = key,
             title = title,
@@ -525,6 +722,15 @@ class MediaScanner(
             thumbFid = cluster.thumb?.fid?.takeIf { it.isNotEmpty() },
             // 分集归属的系列：海报墙只显示 seriesKey IS NULL 的顶层条目，点进系列再列分集
             seriesKey = ancestor?.seriesKey,
+            // 剧照（extrafanart/）：**只存 pick_code，不下载字节** —— 十几张图在扫描期全下会把
+            // 扫描拖长好几倍，详情页打开时按需缓存更划算（用户要求的就是这个时机）。
+            extraFanartPickCodes = if (sideArt != null) {
+                encodePickCodes(sideArt.fanart.map { it.pickCode })
+            } else {
+                prev?.extraFanartPickCodes
+            },
+            extraFanartDirCid = if (sideArt != null) sideArt.fanartDirCid else prev?.extraFanartDirCid,
+            actorsDirCid = if (sideArt != null) sideArt.actorsDirCid else prev?.actorsDirCid,
             nfoUpt = cluster.nfo?.upt ?: 0,
             sourceDirKey = dirCid,
             scannedAt = System.currentTimeMillis(),
@@ -545,11 +751,91 @@ class MediaScanner(
                     nfoPickCode = cluster.nfo?.pickCode,
                 ),
             ),
+            // 头像按**归一化演员名**配（nfo 里的名字与 .actors 文件名大小写/空格未必一致）
+            actorAvatars = sideArt?.actorAvatars?.mapValues { it.value.pickCode }.orEmpty(),
+            actorsDirCid = sideArt?.actorsDirCid,
         )
         // 顺手把海报字节取到本地：扫完进海报墙/详情页就不必再等图。
         // 放在入库**之后** —— 预取失败或被打断都不影响这条已经进库。
         if (prefetchPoster(movie.posterPickCode, rateLimitMs)) postersFetched++
         return key
+    }
+
+    /**
+     * 分 CD 资源的**合成行**：`ABC-201-cd1` + `ABC-201-cd2` → 一条 `ABC-201`。
+     *
+     * 元数据全取**第一个 CD**（同一部片每张盘的 nfo 基本一样，标题把尾巴上的 CD 标记去掉：
+     * `… 8 小时 BEST CD1` → `… 8 小时 BEST`），海报/背景同理。
+     *
+     * 它自己**没有视频**：详情页的播放按钮因此落到"播放第 1 集"（与剧集系列卡一致），
+     * 分集列表由各 CD 行（seriesKey 指向这条）撑起来。
+     *
+     * nfo 走同一个 [fetchNfoMeta] 缓存，紧接着扫第一个 CD 时会命中，**不多花请求**。
+     */
+    private suspend fun indexCdGroup(
+        listing: DirListing,
+        baseKey: String,
+        lead: Cluster,
+        art: CdArt,
+        rateLimitMs: Long,
+        sideArt: SideArt?,
+    ): String {
+        val first = lead
+        var meta = NfoMeta()
+        first.nfo?.takeIf { it.pickCode.isNotEmpty() }?.let { nfo ->
+            meta = runCatching { fetchNfoMeta(nfo.pickCode, nfo.upt, rateLimitMs) }.getOrDefault(NfoMeta())
+        }
+        val actors = actorsOf(
+            nfoActors = meta.actors,
+            actorAvatarNames = sideArt?.actorAvatars?.values
+                ?.map { it.name.substringBeforeLast('.') }
+                ?.sortedWith { a, b -> compareNatural(a, b) }
+                .orEmpty(),
+            dirPath = listing.path,
+        )
+        val prev = if (sideArt == null) dao.movie(baseKey) else null
+        val movie = MovieEntity(
+            mediaKey = baseKey,
+            title = stripCdMarker(meta.title ?: first.prefix).ifEmpty { baseKey },
+            year = meta.year,
+            rating = meta.rating,
+            plot = meta.plot,
+            genre = meta.genres.joinToString(" / ").ifEmpty { null },
+            // 不是"番号式剧"，就是一部片（只是分了几张盘存）
+            isEpisodeLike = false,
+            seriesKey = null,
+            dirCid = listing.cid,
+            dirPath = listing.path,
+            // 自己没有视频：播放按钮落到"播放第 1 集"
+            videoPickCode = null,
+            // 文件名留着：海报墙的画质角标（4K/1080P）从它推
+            videoName = first.video?.name,
+            posterPickCode = art.poster,
+            fanartPickCode = art.fanart,
+            thumbPickCode = first.thumb?.pickCode,
+            nfoPickCode = first.nfo?.pickCode,
+            nfoUpt = first.nfo?.upt ?: 0,
+            extraFanartPickCodes = if (sideArt != null) {
+                encodePickCodes(sideArt.fanart.map { it.pickCode })
+            } else {
+                prev?.extraFanartPickCodes
+            },
+            extraFanartDirCid = if (sideArt != null) sideArt.fanartDirCid else prev?.extraFanartDirCid,
+            actorsDirCid = if (sideArt != null) sideArt.actorsDirCid else prev?.actorsDirCid,
+            sourceDirKey = listing.cid,
+            scannedAt = System.currentTimeMillis(),
+        )
+        dao.upsertMovieWithPeople(
+            movie = movie,
+            actors = actors,
+            tags = meta.genres,
+            episodes = emptyList(),
+            actorAvatars = sideArt?.actorAvatars?.mapValues { it.value.pickCode }.orEmpty(),
+            actorsDirCid = sideArt?.actorsDirCid,
+        )
+        // 海报字节顺手取到本地（第一个 CD 稍后也要这张，命中就不会重复下）
+        if (prefetchPoster(movie.posterPickCode, rateLimitMs)) postersFetched++
+        return baseKey
     }
 
     /**

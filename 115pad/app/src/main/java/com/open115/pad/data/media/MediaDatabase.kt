@@ -18,7 +18,7 @@ import androidx.sqlite.db.SupportSQLiteDatabase
         ScanStateEntity::class,
         MediaLibraryEntity::class,
     ],
-    version = 9,
+    version = 10,
     exportSchema = false,
 )
 abstract class MediaDatabase : RoomDatabase() {
@@ -111,11 +111,34 @@ abstract class MediaDatabase : RoomDatabase() {
         }
     }
 
+    /**
+     * 剧照（`extrafanart/`）与演员头像（`.actors/`）：movies 加三列、actors 加两列。
+     *
+     * 老数据全是 NULL = 没有剧照、演员没头像，详情页表现跟以前一样（剧照区不出现、
+     * 演员仍是药丸）。
+     *
+     * ★ 这两列只能靠重扫填上，而增量扫描的跳过判据（目录指纹）跟升级前**一模一样** ——
+     *   照理该在这里把指纹清空、逼每个目录重扫一遍。没那么做：**增量扫描的跳过分支里
+     *   加了"补数据"**（父目录列表里能看到侧挂素材目录、而库里还有行没补过时才列一次，
+     *   见 MediaScanner），代价一样是每部片 1~2 次请求，但不用把整库重新索引一遍、
+     *   也不用让用户莫名其妙等一次长扫描。
+     */
+    private val MIGRATION_9_10 = object : Migration(9, 10) {
+        override fun migrate(db: SupportSQLiteDatabase) {
+            db.execSQL("ALTER TABLE movies ADD COLUMN extraFanartPickCodes TEXT")
+            db.execSQL("ALTER TABLE movies ADD COLUMN extraFanartDirCid TEXT")
+            db.execSQL("ALTER TABLE movies ADD COLUMN actorsDirCid TEXT")
+            db.execSQL("ALTER TABLE actors ADD COLUMN avatarPickCode TEXT")
+            db.execSQL("ALTER TABLE actors ADD COLUMN avatarDirCid TEXT")
+        }
+    }
+
     fun build(context: Context): MediaDatabase =
         Room.databaseBuilder(context, MediaDatabase::class.java, "media.db")
             .addMigrations(
                 MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5,
                 MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9,
+                MIGRATION_9_10,
             )
             .fallbackToDestructiveMigration()
             .build()

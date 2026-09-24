@@ -264,6 +264,25 @@ fun episodeSortKey(title: String): Int {
 }
 
 /**
+ * 演员名从哪来（按优先级）——**nfo 是权威**，目录名只是最后手段。
+ *
+ *  ① nfo 的 `<actor><name>`：刮削器写的演员表，顺序也是演职员表顺序
+ *  ② `.actors/` 目录里的文件名：同样出自刮削器，而且**正是头像的键** ——
+ *     名字从这里取，头像就一定配得上（实测 `ABC-101-U` 那种没 nfo 的分集，
+ *     目录名启发式会猜出 `-4K-C 示例演员` 这种脏名字，而 `.actors/示例演员.jpg`
+ *     给的是干净的真名）
+ *  ③ [actorsFromDirName]：番号式目录名里带演员（`ABC-301 示例演员二,示例演员三`）。
+ *     两个来源都没有时才用，属于"猜"，所以排在最后。
+ */
+fun actorsOf(
+    nfoActors: List<String>,
+    actorAvatarNames: List<String>,
+    dirPath: String,
+): List<String> = nfoActors.ifEmpty {
+    actorAvatarNames.distinct().takeIf { it.isNotEmpty() } ?: actorsFromDirName(dirPath)
+}
+
+/**
  * 番号式目录名提演员：`ABC-301 示例演员二,示例演员三` → ["示例演员二", "示例演员三"]。
  *
  * 只在影片自己的目录名以「字母+数字的番号段」开头时才认（ABC-301 / ABC-303）：
@@ -320,6 +339,210 @@ fun isArtImageFile(name: String): Boolean {
     if (dot <= 0) return false
     return name.substring(dot + 1).lowercase() in IMAGE_EXTS
 }
+
+// ---------------- 侧挂素材：剧照（extrafanart）与演员头像（.actors） ----------------
+//
+// 刮削好的影片目录里常见两个子目录（实测结构，见用户库 ABC-103-C）：
+//   `extrafanart/fanart1.jpg … fanart15.jpg`  剧照，十几张
+//   `.actors/<演员名>.jpg`                     演员头像（TinyMediaManager 那套）
+// 它们**不是**独立条目：文件本身没有视频也没有 nfo，聚类天然聚不出东西来，
+// 所以是"挂在影片目录上的附属素材"。这两个目录的清单在扫描期**本来就会列到**
+// （collectDirs 递归列全部子目录），取它们零额外请求。
+
+/** 剧照目录名（不区分大小写匹配目录项） */
+val EXTRAFANART_DIR_NAMES = listOf("extrafanart")
+
+/** 演员头像目录名：TMM 写 `.actors`，也有刮削器写不带点的 `actors` */
+val ACTORS_DIR_NAMES = listOf(".actors", "actors")
+
+/**
+ * 剧照目录里的图，按**自然序**排。
+ *
+ * 自然序不是锦上添花：`fanart10.jpg` 按字符串排会跑到 `fanart2.jpg` 前面，
+ * 详情页里剧照顺序看着就是乱的。
+ * 非图片（`Thumbs.db`、`desktop.ini`、字幕）一律不算剧照。
+ */
+fun extraFanartFilesOf(files: List<FileRef>): List<FileRef> =
+    files.filter { isArtImageFile(it.name) }.sortedWith { a, b -> compareNatural(a.name, b.name) }
+
+/**
+ * 演员头像目录：**归一化后的演员名 → 头像文件**。
+ *
+ * 文件名就是演员名（`示例演员.jpg`）。用归一化的名字做键，是因为同一部片的演员名
+ * 可能来自 nfo、也可能来自目录名，两处的大小写/空格不会完全一致（见 [normalizeActorName]）。
+ *
+ * 同名多份（`张三.jpg` 与 `张三.png`）只留先到的那份：头像只需要一张。
+ */
+fun actorAvatarFilesOf(files: List<FileRef>): Map<String, FileRef> {
+    val out = LinkedHashMap<String, FileRef>()
+    for (f in files) {
+        if (!isArtImageFile(f.name)) continue
+        val name = f.name.substringBeforeLast('.')
+        val key = normalizeActorName(name)
+        if (key.isNotEmpty()) out.putIfAbsent(key, f)
+    }
+    return out
+}
+
+/**
+ * 演员名归一化：只用于**配对**（`.actors` 里的文件名 ↔ nfo/目录名里的演员名）。
+ *
+ * 去掉全部空白（含全角空格）并转小写：`"John Doe"` / `"john doe"` / `"John  Doe"` 归一成同一个键。
+ * 日文汉字与假名不做转换 —— 那种差异（`示例演员假名` vs `示例演员`）本质是两个不同的名字写法，
+ * 猜错了会给演员配错头像，不如不配。
+ */
+fun normalizeActorName(name: String): String =
+    name.filterNot { it.isWhitespace() }.lowercase()
+
+/**
+ * 自然序比较：数字段按**数值**比，其余按字符比（不区分大小写）。
+ * 让 `fanart2.jpg` 排在 `fanart10.jpg` 前面，也让 `S01E2` 排在 `S01E10` 前面。
+ */
+fun compareNatural(a: String, b: String): Int {
+    var i = 0
+    var j = 0
+    while (i < a.length && j < b.length) {
+        val ca = a[i]
+        val cb = b[j]
+        if (ca.isDigit() && cb.isDigit()) {
+            var i2 = i
+            while (i2 < a.length && a[i2].isDigit()) i2++
+            var j2 = j
+            while (j2 < b.length && b[j2].isDigit()) j2++
+            // 去前导零后再比：先比长度（长的数值大），同长再比字典序
+            val na = a.substring(i, i2).trimStart('0').ifEmpty { "0" }
+            val nb = b.substring(j, j2).trimStart('0').ifEmpty { "0" }
+            val c = if (na.length != nb.length) na.length - nb.length else na.compareTo(nb)
+            if (c != 0) return c
+            i = i2
+            j = j2
+        } else {
+            val c = ca.lowercaseChar().compareTo(cb.lowercaseChar())
+            if (c != 0) return c
+            i++
+            j++
+        }
+    }
+    // 一个是另一个的前缀：短的排前面（fanart1.jpg 在 fanart1a.jpg 前）
+    return (a.length - i) - (b.length - j)
+}
+
+/**
+ * 这个目录项是不是"侧挂素材目录"（剧照 / 演员头像）。
+ *
+ * 扫描循环靠它把这两个目录**从条目的文件来源里排除**：它们的内容已经按附属素材
+ * 处理过了，再当普通文件参与聚类只会白跑一遍（虽然聚不出东西）。
+ */
+fun isSideArtDirName(name: String): Boolean {
+    val n = name.lowercase()
+    return n in EXTRAFANART_DIR_NAMES || n in ACTORS_DIR_NAMES
+}
+
+// ---------------- 屏蔽的子目录：花絮 / 预告 / 访谈 ----------------
+//
+// Kodi / Emby 约定的"附加内容"目录名。它们**既不当条目、也不当素材**：整棵子树都不扫。
+// 不屏蔽的话，里面的视频会各自聚成条目——实测 `ABC-201 示例演员/behind the scenes/`
+// 里每一段花絮都变成海报墙上的一张卡，还带自己的 nfo/海报，混在正片里根本分不出来。
+//
+// ★ 不含 `Specials`：剧集包里那是"特别篇"季（S00），是真的分集。
+// ★ 也不含 `Sample`：小样该由**每库的体积过滤**（minVideoSizeMb）挡，按目录名一刀切
+//   容易误伤（有的库把正片放在叫 sample 的目录里？不至于，但体积过滤已经够用）。
+private val EXTRA_DIR_NAMES = setOf(
+    "behind the scenes", "behindthescenes", "behind_the_scenes", "behind scenes",
+    "extras", "extra", "featurettes", "featurette",
+    "trailers", "trailer", "interviews", "interview",
+    "deleted scenes", "deletedscenes", "deleted_scenes",
+    "shorts", "clips", "bonus",
+)
+
+/** 是不是"附加内容"目录（花絮/预告/访谈…）——整棵子树不扫 */
+fun isExtraDirName(name: String): Boolean = name.trim().lowercase() in EXTRA_DIR_NAMES
+
+/**
+ * 扫描时要**整棵跳过**的目录名：侧挂素材（内容归父目录）+ 附加内容（丢弃）。
+ *
+ * 两者处理方式不同（见 [sideArtOf]），但"不进递归、不当条目"是一样的 ——
+ * 放在一起是为了不漏：新增一类要屏蔽的目录时只改这一个判断。
+ */
+fun isIgnoredDirName(name: String): Boolean = isSideArtDirName(name) || isExtraDirName(name)
+
+// ---------------- 分 CD / 分片的资源：合成一条 ----------------
+
+/**
+ * CD/分片后缀：`-cd1` `_CD2` `.part3` `-disc1` `-dvd1` `-vol2` `X - disc 1`。
+ *
+ * 两边的分隔符用 `*` 而不是 `?`：`X - disc 1` 里关键字前面是「空格 减号 空格」三个字符，
+ * 只吃一个的话基名会剩下 `X -`（实测踩到，标题尾巴上挂个减号很难看）。
+ *
+ * 只认这几个关键词：`xxx-1`/`xxx-2` 这种纯数字编号太容易误伤（`1080p`/`720p` 也是数字结尾）。
+ */
+private val CD_SUFFIX = Regex("""(?i)[-_. ]*(cd|disc|disk|dvd|part|pt|vol)[-_. ]*\d{1,2}$""")
+
+/**
+ * 这一组簇是不是**同一部片的多个 CD/分片**（`ABC-201-cd1` + `ABC-201-cd2`）。
+ *
+ * 是就返回**合并后那条的基名**（`ABC-201`），不是返回 null。
+ *
+ * 为什么要合并：分 CD 存的资源每张盘都是一套完整的视频 + nfo + 海报，
+ * 扫描时会被当成 N 部独立的片，海报墙上就是 N 张几乎一样的卡（实测 `ABC-201 示例演员`
+ * 那个目录出 2 张）。它们本来就是一部片，应该是一张卡 + 里面列 CD1/CD2 两集。
+ *
+ * 判据（三条都要满足，宁可不合并也别乱合并）：
+ *  ① 至少两个簇；
+ *  ② **至少有一个**前缀真的带 CD 后缀（全都不带就是普通的多视频目录：一季的集、不同清晰度）；
+ *  ③ 去掉后缀后是同一个基名 —— 注意 `X` 与 `X-cd2` 算同一个基名，
+ *     实测库里一半的分盘就是这种"第一张盘不带后缀"的命名（`ABC-202` + `ABC-202-cd2`）。
+ *
+ * 所以 `S01E01/S01E02`（剧集）、`xxx-1080p/xxx-720p`（同一部片的不同清晰度）都不会被合并 ——
+ * 前者一条都不带 CD 后缀，后者的基名各不相同。
+ */
+fun cdGroupBaseOf(clusters: List<Cluster>): String? {
+    if (clusters.size < 2) return null
+    if (clusters.none { CD_SUFFIX.containsMatchIn(it.prefix) }) return null
+    val bases = clusters.map { it.prefix.replace(CD_SUFFIX, "").trim() }
+    val base = bases.first()
+    if (base.isEmpty() || bases.any { it != base }) return null
+    return base
+}
+
+/**
+ * CD 组的**代表**：合并后那条的元数据与图取它 —— 按自然序最小的那个前缀，
+ * 也就是第一张盘（`ABC-202` 或 `ABC-201-cd1`）。
+ *
+ * 为什么不能直接取 `first()`：115 的列表顺序是 upt 倒序、不稳定，
+ * 取到 cd2 的话合并卡的标题/海报就成了第二张盘的（标题去掉 CD 标记后一样，海报不一定）。
+ */
+fun cdGroupLead(clusters: List<Cluster>): Cluster? =
+    clusters.minWithOrNull { a, b -> compareNatural(a.prefix, b.prefix) }
+
+/**
+ * 各 CD 的入库键（`mediaKey`）。
+ *
+ * ★ **第一张盘不能直接用基名当键**：实测库里一半的分盘第一张就叫基名
+ *   （`ABC-202.mp4` + `ABC-202-cd2.mp4`），而合成行用的正是基名 —— 撞了的话
+ *   合成行会被第一张盘那条覆盖，变成 `seriesKey = 自己` 的自引用行，
+ *   海报墙上直接消失（顶层只出 seriesKey IS NULL 的）。所以第一张盘改名成 `基名-cd1`。
+ *
+ * 顺带把"真有一个叫 `X-cd1` 的文件"这种撞车也躲开（往后顺延成 -cd2/-cd3…，
+ * 名字只是内部键，界面上的标签来自各自的标题）。
+ */
+fun cdChildKeys(base: String, prefixes: List<String>): List<String> {
+    val used = mutableSetOf(base)
+    val out = mutableListOf<String>()
+    for (p in prefixes) {
+        var n = 1
+        var key = if (p == base) "$base-cd1" else p
+        while (!used.add(key)) {
+            n++
+            key = "$base-cd$n"
+        }
+        out += key
+    }
+    return out
+}
+
+/** 去掉标题尾巴上的 CD 标记：`… 8 小时 BEST CD1` → `… 8 小时 BEST`（合并后的卡片标题用） */
+fun stripCdMarker(title: String): String = title.replace(CD_SUFFIX, "").trim()
 
 /**
  * 从 [dirPath] 往上列出**要依次查询**的祖先路径（不含自己），到 [rootPath] 为止。
