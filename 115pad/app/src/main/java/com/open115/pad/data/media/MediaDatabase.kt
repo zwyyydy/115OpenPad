@@ -18,7 +18,7 @@ import androidx.sqlite.db.SupportSQLiteDatabase
         ScanStateEntity::class,
         MediaLibraryEntity::class,
     ],
-    version = 11,
+    version = 12,
     exportSchema = false,
 )
 abstract class MediaDatabase : RoomDatabase() {
@@ -148,12 +148,28 @@ abstract class MediaDatabase : RoomDatabase() {
         }
     }
 
+    /**
+     * 作品列表排序要用两个键：首映日期与入库时间（nfo 的 `<premiered>` / `<dateadded>`）。
+     *
+     * 提成独立列而不是每次 `json_extract(nfoJson, ...)`：JSON1 在 Android 各版本上不一定编进去，
+     * 而 ORDER BY 走列是最稳的（以后还能加索引）。
+     *
+     * 老数据这两列是 NULL —— 排序会退化成"按本机索引时间"（见 DAO 里的兜底），
+     * 重扫一次或打开详情页补上（解析器版本一起 +1 了，见 NfoParser.PARSER_VERSION）。
+     */
+    private val MIGRATION_11_12 = object : Migration(11, 12) {
+        override fun migrate(db: SupportSQLiteDatabase) {
+            db.execSQL("ALTER TABLE movies ADD COLUMN premiered TEXT")
+            db.execSQL("ALTER TABLE movies ADD COLUMN dateAdded INTEGER")
+        }
+    }
+
     fun build(context: Context): MediaDatabase =
         Room.databaseBuilder(context, MediaDatabase::class.java, "media.db")
             .addMigrations(
                 MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5,
                 MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9,
-                MIGRATION_9_10, MIGRATION_10_11,
+                MIGRATION_9_10, MIGRATION_10_11, MIGRATION_11_12,
             )
             .fallbackToDestructiveMigration()
             .build()

@@ -46,6 +46,9 @@ data class MediaPickCodes(
     val fanartPickCode: String?,
 )
 
+/** 一条"作品 → 名字"（标签名 / 演员名，给列表筛选批量取用，见 [MediaDao.tagNamesOf] / [MediaDao.actorNamesOf]） */
+data class MovieNameRow(val mediaKey: String, val name: String)
+
 /**
  * 删单个条目时要用的文件信息（**这条 + 它名下的分集**）。
  *
@@ -241,9 +244,17 @@ interface MediaDao {
             "SELECT COALESCE(x.seriesKey, x.mediaKey) FROM movies x " +
             "JOIN movie_tags mt ON x.mediaKey = mt.mediaKey " +
             "JOIN tags t ON mt.tagId = t.id WHERE t.name LIKE '%' || :keyword || '%') " +
-            "ORDER BY rating IS NULL, rating DESC LIMIT :limit",
+            "ORDER BY " +
+                // 排序按序号分派（见 WorksSort）：一条查询管全部，不写六条几乎一样的 SQL。
+                // NULL 在 SQLite 的 DESC 里自然沉底，所以"没评分/没日期"的行不会顶到最前。
+                "CASE WHEN :sort = 0 THEN rating END DESC, " +
+                "CASE WHEN :sort = 1 THEN premiered END DESC, " +
+                "CASE WHEN :sort = 2 THEN COALESCE(dateAdded, scannedAt) END DESC, " +
+                "CASE WHEN :sort = 3 THEN title END ASC, " +
+                "CASE WHEN :sort = 4 THEN RANDOM() END, " +
+                "title ASC LIMIT :limit",
     )
-    suspend fun searchAll(keyword: String, limit: Int = 200): List<MovieCard>
+    suspend fun searchAll(keyword: String, limit: Int = 200, sort: Int = 0): List<MovieCard>
 
     /** 全库按评分排（当前无调用方，留着当通用入口）。同样只出顶层条目 */
     @Query(
@@ -259,9 +270,17 @@ interface MediaDao {
             // 否则库 "test" 会把库 "test001" 的影片也收进来。
             // seriesKey IS NULL：海报墙只出顶层条目（影片 / 系列本身），分集归到系列卡里选集
             "WHERE (dirPath = :prefix OR dirPath LIKE :prefix || '/%') AND seriesKey IS NULL " +
-            "ORDER BY rating IS NULL, rating DESC LIMIT :limit",
+            "ORDER BY " +
+                // 排序按序号分派（见 WorksSort）：一条查询管全部，不写六条几乎一样的 SQL。
+                // NULL 在 SQLite 的 DESC 里自然沉底，所以"没评分/没日期"的行不会顶到最前。
+                "CASE WHEN :sort = 0 THEN rating END DESC, " +
+                "CASE WHEN :sort = 1 THEN premiered END DESC, " +
+                "CASE WHEN :sort = 2 THEN COALESCE(dateAdded, scannedAt) END DESC, " +
+                "CASE WHEN :sort = 3 THEN title END ASC, " +
+                "CASE WHEN :sort = 4 THEN RANDOM() END, " +
+                "title ASC LIMIT :limit",
     )
-    fun byLibraryPath(prefix: String, limit: Int = 200): Flow<List<MovieCard>>
+    fun byLibraryPath(prefix: String, limit: Int = 200, sort: Int = 0): Flow<List<MovieCard>>
 
     /**
      * 多根媒体库：任一路径匹配（精确等于或以其为前缀）即纳入。
@@ -280,9 +299,21 @@ interface MediaDao {
             "OR (:p2 <> '' AND (dirPath = :p2 OR dirPath LIKE :p2 || '/%')) " +
             "OR (:p3 <> '' AND (dirPath = :p3 OR dirPath LIKE :p3 || '/%')) " +
             "OR (:p4 <> '' AND (dirPath = :p4 OR dirPath LIKE :p4 || '/%'))) " +
-            "ORDER BY rating IS NULL, rating DESC LIMIT :limit",
+            "ORDER BY " +
+                // 排序按序号分派（见 WorksSort）：一条查询管全部，不写六条几乎一样的 SQL。
+                // NULL 在 SQLite 的 DESC 里自然沉底，所以"没评分/没日期"的行不会顶到最前。
+                "CASE WHEN :sort = 0 THEN rating END DESC, " +
+                "CASE WHEN :sort = 1 THEN premiered END DESC, " +
+                "CASE WHEN :sort = 2 THEN COALESCE(dateAdded, scannedAt) END DESC, " +
+                "CASE WHEN :sort = 3 THEN title END ASC, " +
+                "CASE WHEN :sort = 4 THEN RANDOM() END, " +
+                "title ASC LIMIT :limit",
     )
-    fun byLibraryPaths(p0: String, p1: String, p2: String, p3: String, p4: String, limit: Int = 200): Flow<List<MovieCard>>
+    fun byLibraryPaths(
+        p0: String, p1: String, p2: String, p3: String, p4: String,
+        limit: Int = 200,
+        sort: Int = 0,
+    ): Flow<List<MovieCard>>
 
     /**
      * 本库可以拿来当**海报墙背景**的图：顶层条目的 fanart（= 详情页那张背景图）。
@@ -356,9 +387,17 @@ interface MediaDao {
             "m.mediaKey IN (SELECT ma.mediaKey FROM movie_actors ma JOIN actors a ON ma.actorId = a.id WHERE a.name = :name) " +
             "OR m.mediaKey IN (SELECT s.seriesKey FROM movies s JOIN movie_actors ma2 ON s.mediaKey = ma2.mediaKey " +
             "JOIN actors a2 ON ma2.actorId = a2.id WHERE a2.name = :name AND s.seriesKey IS NOT NULL)) " +
-            "ORDER BY m.rating IS NULL, m.rating DESC LIMIT 1000",
+            "ORDER BY " +
+                // 排序按序号分派（见 WorksSort）：一条查询管全部，不写六条几乎一样的 SQL。
+                // NULL 在 SQLite 的 DESC 里自然沉底，所以"没评分/没日期"的行不会顶到最前。
+                "CASE WHEN :sort = 0 THEN rating END DESC, " +
+                "CASE WHEN :sort = 1 THEN premiered END DESC, " +
+                "CASE WHEN :sort = 2 THEN COALESCE(dateAdded, scannedAt) END DESC, " +
+                "CASE WHEN :sort = 3 THEN title END ASC, " +
+                "CASE WHEN :sort = 4 THEN RANDOM() END, " +
+                "title ASC LIMIT 1000",
     )
-    suspend fun byActor(name: String): List<MovieCard>
+    suspend fun byActor(name: String, sort: Int = 0): List<MovieCard>
 
     /** 某个标签的全部作品。口径与 [byActor] 一致：跨库、只出顶层条目、剧集归到系列卡 */
     @Query(
@@ -368,9 +407,17 @@ interface MediaDao {
             "m.mediaKey IN (SELECT mt.mediaKey FROM movie_tags mt JOIN tags t ON mt.tagId = t.id WHERE t.name = :name) " +
             "OR m.mediaKey IN (SELECT s.seriesKey FROM movies s JOIN movie_tags mt2 ON s.mediaKey = mt2.mediaKey " +
             "JOIN tags t2 ON mt2.tagId = t2.id WHERE t2.name = :name AND s.seriesKey IS NOT NULL)) " +
-            "ORDER BY m.rating IS NULL, m.rating DESC LIMIT 1000",
+            "ORDER BY " +
+                // 排序按序号分派（见 WorksSort）：一条查询管全部，不写六条几乎一样的 SQL。
+                // NULL 在 SQLite 的 DESC 里自然沉底，所以"没评分/没日期"的行不会顶到最前。
+                "CASE WHEN :sort = 0 THEN rating END DESC, " +
+                "CASE WHEN :sort = 1 THEN premiered END DESC, " +
+                "CASE WHEN :sort = 2 THEN COALESCE(dateAdded, scannedAt) END DESC, " +
+                "CASE WHEN :sort = 3 THEN title END ASC, " +
+                "CASE WHEN :sort = 4 THEN RANDOM() END, " +
+                "title ASC LIMIT 1000",
     )
-    suspend fun byTag(name: String): List<MovieCard>
+    suspend fun byTag(name: String, sort: Int = 0): List<MovieCard>
 
     /** 系列下的分集（海报墙上点进系列卡后用）。排序交给调用方按集号排（见 episodeSortKey） */
     @Query(
@@ -537,6 +584,29 @@ interface MediaDao {
 
     @Query("SELECT name FROM tags JOIN movie_tags ON tags.id = tagId WHERE mediaKey = :mediaKey")
     suspend fun tagsOf(mediaKey: String): List<String>
+
+    /**
+     * 一批作品的**演员**（同 [tagNamesOf]：关联表里的东西，一次查完给筛选用）。
+     */
+    @Query(
+        "SELECT movie_actors.mediaKey AS mediaKey, actors.name AS name " +
+            "FROM movie_actors JOIN actors ON movie_actors.actorId = actors.id " +
+            "WHERE movie_actors.mediaKey IN (:keys)",
+    )
+    suspend fun actorNamesOf(keys: List<String>): List<MovieNameRow>
+
+    /**
+     * 一批作品的标签（**一次查完**，给列表筛选用）。
+     *
+     * `MovieCard` 投影里没有标签（它在一张关联表里），而筛选要按标签判断 ——
+     * 每部片现查一次就是 N 次查询，所以这里一次把整批的取回来，调用方建映射再用。
+     */
+    @Query(
+        "SELECT movie_tags.mediaKey AS mediaKey, tags.name AS name " +
+            "FROM movie_tags JOIN tags ON movie_tags.tagId = tags.id " +
+            "WHERE movie_tags.mediaKey IN (:keys)",
+    )
+    suspend fun tagNamesOf(keys: List<String>): List<MovieNameRow>
 
     /**
      * 这个目录里有多少条说明"分 CD 的合并结果还没到位、得重扫一遍"的行。

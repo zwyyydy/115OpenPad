@@ -1,5 +1,7 @@
 package com.open115.pad.ui.media
 
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -9,7 +11,12 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -45,6 +52,11 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
@@ -55,6 +67,7 @@ import com.open115.pad.data.FileItem
 import com.open115.pad.data.media.MediaLibraryEntity
 import com.open115.pad.data.media.MediaScanner
 import com.open115.pad.data.media.MovieCard
+import com.open115.pad.data.media.WorksSort
 import com.open115.pad.ui.theme.AdaptiveBody
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
@@ -104,6 +117,21 @@ fun MediaLibraryScreen(api: com.open115.pad.data.OpenApi) {
      */
     var wallTick by remember { mutableStateOf(0) }
 
+    /**
+     * 这一页的搜索：与海报墙**同一个查询**（片名/演员/标签，跨所有媒体库）。
+     * 有搜索词时列表换成结果网格，点结果直接开详情浮层（走上面那个浮层栈）。
+     */
+    var query by remember { mutableStateOf("") }
+    // 搜索结果跟着"作品排序"设置走（与海报墙/作品页同一个设置，不在这里再放一个菜单）
+    val sort by container.mediaPrefs.worksSort.collectAsState(initial = WorksSort.DEFAULT)
+    val hits by produceState<List<MovieCard>?>(initialValue = null, query, sort) {
+        value = if (query.isBlank()) null else dao.searchAll(query, 200, sort.sql)
+    }
+    // 返回键：正在搜索就先清搜索（与海报墙一致）
+    androidx.activity.compose.BackHandler(enabled = query.isNotBlank()) { query = "" }
+
+    // 极光底：几团很淡的径向渐变，给毛玻璃卡片一点"透出来的东西"（纯绘制、零请求）
+    Box(Modifier.fillMaxSize().auroraBackdrop()) {
     AdaptiveBody(modifier = Modifier.fillMaxSize()) {
         Column(Modifier.fillMaxSize()) {
             // 顶栏：标题 + 新建
@@ -115,7 +143,20 @@ fun MediaLibraryScreen(api: com.open115.pad.data.OpenApi) {
             ) {
                 Icon(Icons.Outlined.Movie, contentDescription = null)
                 Spacer(Modifier.width(8.dp))
-                Text("媒体库", style = MaterialTheme.typography.titleLarge, modifier = Modifier.weight(1f))
+                Text(
+                    if (query.isBlank()) "媒体库" else "全局搜索「$query」",
+                    style = MaterialTheme.typography.titleLarge,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f),
+                )
+                // 毛玻璃搜索框（这一页没有背景图可透，退化成半透明胶囊）
+                FrostedSearchField(
+                    value = query,
+                    onValueChange = { query = it },
+                    backdrop = null,
+                    modifier = Modifier.widthIn(min = 200.dp, max = 340.dp).padding(end = 4.dp),
+                )
                 IconButton(onClick = { showCreate = true }) {
                     Icon(Icons.Outlined.Add, contentDescription = "新建媒体库")
                 }
@@ -139,7 +180,47 @@ fun MediaLibraryScreen(api: com.open115.pad.data.OpenApi) {
                 )
             }
 
-            if (libraries.isEmpty()) {
+            // 搜索态：结果网格（跨库）。点结果直接开详情浮层，返回逐层退
+            val results = hits
+            if (results != null) {
+                Text(
+                    "片名 / 演员 / 标签 · ${results.size} 部 · 全部媒体库",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 2.dp),
+                )
+                if (results.isEmpty()) {
+                    Column(
+                        Modifier.fillMaxSize().padding(32.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.Center,
+                    ) {
+                        Text(
+                            "全部媒体库里都没有匹配「$query」的片名 / 演员 / 标签",
+                            style = MaterialTheme.typography.bodyLarge,
+                        )
+                    }
+                } else {
+                    LazyVerticalGrid(
+                        columns = GridCells.Adaptive(minSize = 130.dp),
+                        contentPadding = PaddingValues(16.dp),
+                        horizontalArrangement = Arrangement.spacedBy(16.dp),
+                        verticalArrangement = Arrangement.spacedBy(16.dp),
+                        modifier = Modifier.weight(1f),
+                    ) {
+                        items(results, key = { it.mediaKey }) { card ->
+                            PosterCard(
+                                card = card,
+                                onClick = {
+                                    overlays.add(
+                                        MediaOverlay.Detail(card, results, results.indexOf(card)),
+                                    )
+                                },
+                            )
+                        }
+                    }
+                }
+            } else if (libraries.isEmpty()) {
                 Column(
                     Modifier
                         .fillMaxSize()
@@ -154,15 +235,15 @@ fun MediaLibraryScreen(api: com.open115.pad.data.OpenApi) {
             } else {
                 LazyColumn(Modifier.weight(1f)) {
                     items(libraries, key = { it.id }) { lib ->
-                        Card(
+                        GlassCard(
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .padding(horizontal = 16.dp, vertical = 6.dp),
+                                .padding(horizontal = 16.dp, vertical = 8.dp),
+                            onClick = { openedLib = lib },
                         ) {
                         Row(
                             Modifier
                                 .fillMaxWidth()
-                                .clickable { openedLib = lib }
                                 .padding(16.dp),
                             verticalAlignment = Alignment.CenterVertically,
                         ) {
@@ -349,6 +430,7 @@ fun MediaLibraryScreen(api: com.open115.pad.data.OpenApi) {
             dismissButton = { TextButton(onClick = { deleteTarget = null }) { Text("取消") } },
         )
     }
+    }   // 极光底 Box 收尾
 }
 
 /**
@@ -667,4 +749,83 @@ private sealed interface MediaOverlay {
 
     /** 同一个演员 / 同一个标签的全部作品（**跨所有媒体库**，见 dao.byActor/byTag） */
     data class Works(val kind: WorksKind, val name: String) : MediaOverlay
+}
+
+/**
+ * 毛玻璃卡片：半透明白玻璃 + 上亮下暗的细描边 + 主色光晕。
+ *
+ * - 玻璃本体是**竖向渐变**（上 10% 白 → 下 3.5% 白）：均匀半透明看着像一块塑料，
+ *   上亮下暗才有"一块玻璃立在那儿"的立体感
+ * - 描边同样上亮下暗：顶边是环境光反射，底边几乎没有
+ * - 光晕走 [androidx.compose.ui.draw.shadow] 的 spotColor/ambientColor（API 28+ 生效，
+ *   更低版本退化成普通阴影，不会报错）
+ */
+@Composable
+private fun GlassCard(
+    modifier: Modifier = Modifier,
+    onClick: () -> Unit,
+    content: @Composable () -> Unit,
+) {
+    val shape = RoundedCornerShape(18.dp)
+    val accent = MaterialTheme.colorScheme.primary
+    Box(
+        modifier
+            .shadow(
+                elevation = 14.dp,
+                shape = shape,
+                spotColor = accent.copy(alpha = 0.55f),
+                ambientColor = accent.copy(alpha = 0.30f),
+            )
+            .clip(shape)
+            .background(
+                Brush.verticalGradient(
+                    listOf(Color.White.copy(alpha = 0.10f), Color.White.copy(alpha = 0.035f)),
+                ),
+            )
+            .border(
+                width = 1.dp,
+                brush = Brush.verticalGradient(
+                    listOf(Color.White.copy(alpha = 0.28f), Color.White.copy(alpha = 0.04f)),
+                ),
+                shape = shape,
+            )
+            .clickable(onClick = onClick),
+    ) { content() }
+}
+
+/**
+ * 极光底：三团很淡的径向渐变（主色 / 青 / 主色），给毛玻璃卡片一点"透出来的东西"。
+ *
+ * 这一页没有海报可铺（库列表页只有文字卡片），用色块造层次最省 —— 纯绘制、零请求、
+ * 也不会像背景图那样喧宾夺主。位置刻意错开（左上 / 右侧 / 下方），避免看起来是三条带子。
+ */
+@Composable
+private fun Modifier.auroraBackdrop(): Modifier {
+    val base = MaterialTheme.colorScheme.background
+    val accent = MaterialTheme.colorScheme.primary
+    val cyan = MaterialTheme.colorScheme.secondary
+    return drawBehind {
+        drawRect(base)
+        drawRect(
+            Brush.radialGradient(
+                colors = listOf(accent.copy(alpha = 0.20f), Color.Transparent),
+                center = Offset(size.width * 0.16f, size.height * 0.04f),
+                radius = size.width * 0.55f,
+            ),
+        )
+        drawRect(
+            Brush.radialGradient(
+                colors = listOf(cyan.copy(alpha = 0.13f), Color.Transparent),
+                center = Offset(size.width * 0.96f, size.height * 0.34f),
+                radius = size.width * 0.50f,
+            ),
+        )
+        drawRect(
+            Brush.radialGradient(
+                colors = listOf(accent.copy(alpha = 0.10f), Color.Transparent),
+                center = Offset(size.width * 0.42f, size.height * 1.02f),
+                radius = size.width * 0.60f,
+            ),
+        )
+    }
 }

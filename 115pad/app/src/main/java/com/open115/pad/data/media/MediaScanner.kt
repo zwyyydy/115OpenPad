@@ -734,6 +734,9 @@ class MediaScanner(
             nfoUpt = cluster.nfo?.upt ?: 0,
             // nfo 的**完整解析结果**整份存 JSON（长尾字段不进表，见 MovieEntity.nfoJson）
             nfoJson = meta.takeIf { it.hasContent }?.let { nfoJson.encodeToString(it) },
+            // 排序用的两个键提成独立列（首映日期 / 入库时间）
+            premiered = meta.premiered?.takeIf { it.isNotBlank() },
+            dateAdded = parseNfoDateMillis(meta.dateAdded),
             sourceDirKey = dirCid,
             scannedAt = System.currentTimeMillis(),
         )
@@ -819,6 +822,8 @@ class MediaScanner(
             nfoUpt = first.nfo?.upt ?: 0,
             // 合成行也存整份解析结果（长尾字段详情页要用，见 MovieEntity.nfoJson）
             nfoJson = meta.takeIf { it.hasContent }?.let { nfoJson.encodeToString(it) },
+            premiered = meta.premiered?.takeIf { it.isNotBlank() },
+            dateAdded = parseNfoDateMillis(meta.dateAdded),
             extraFanartPickCodes = if (sideArt != null) {
                 encodePickCodes(sideArt.fanart.map { it.pickCode })
             } else {
@@ -1009,6 +1014,8 @@ class MediaScanner(
                     genre = movie.genre ?: meta.genres.joinToString(" / ").ifEmpty { null },
                     // 完整解析结果（详情页的长尾字段）：这次拉到就一起补上
                     nfoJson = nfoJson.encodeToString(meta),
+                    premiered = meta.premiered?.takeIf { it.isNotBlank() } ?: movie.premiered,
+                    dateAdded = parseNfoDateMillis(meta.dateAdded) ?: movie.dateAdded,
                 ),
             )
         }

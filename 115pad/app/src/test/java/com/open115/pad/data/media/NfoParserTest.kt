@@ -244,6 +244,43 @@ class NfoParserTest {
     }
 
     @Test
+    fun `入库时间_三种写法都解成毫秒`() {
+        val base = parseNfoDateMillis("2024-05-31 11:28:16")!!
+        assertEquals(0, base % 1000)
+        // 同一天的"只有日期"版本 = 当天零点，比带时分秒的早
+        assertTrue(parseNfoDateMillis("2024-05-31")!! < base)
+        // ISO（Jellyfin 常带 T 和 Z）与空格写法是同一个时刻
+        assertEquals(base, parseNfoDateMillis("2024-05-31T11:28:16Z"))
+        // 缺秒的也认
+        assertEquals(parseNfoDateMillis("2024-05-31 11:28:00")!!, parseNfoDateMillis("2024-05-31 11:28")!!)
+        assertNull(parseNfoDateMillis(null))
+        assertNull(parseNfoDateMillis("  "))
+        assertNull(parseNfoDateMillis("未知"))
+    }
+
+    @Test
+    fun `入库时间转毫秒是为了能跟 scannedAt 混比`() {
+        val may = parseNfoDateMillis("2024-05-09")!!
+        val oct = parseNfoDateMillis("2024-10-01")!!
+        assertTrue("5 月要早于 10 月", may < oct)
+        // 毫秒量级要对（2024 年的 epoch 毫秒约 1.7e12）—— 它要跟 movies.scannedAt 直接比大小，
+        // 单位错了排序就静默全乱（这正是 premiered 能留字符串、dateAdded 必须转毫秒的原因：
+        // premiered 是零填充 ISO，字符串序就是时间序；而 dateAdded 要跟毫秒时间戳混用）
+        assertTrue(may > 1_600_000_000_000L && may < 1_900_000_000_000L)
+    }
+
+    @Test
+    fun `排序方式_存名字不存序号`() {
+        assertEquals(WorksSort.Rating, WorksSort.ofName("Rating"))
+        assertEquals(WorksSort.Random, WorksSort.ofName("Random"))
+        // 认不出来（老值 / 手改）回落默认，不是崩
+        assertEquals(WorksSort.DEFAULT, WorksSort.ofName("不存在的"))
+        assertEquals(WorksSort.DEFAULT, WorksSort.ofName(null))
+        // 序号唯一（DAO 里靠它分派；重了就是两种排序撞一起）
+        assertEquals(WorksSort.entries.size, WorksSort.entries.map { it.sql }.distinct().size)
+    }
+
+    @Test
     fun `时长与分辨率文案`() {
         val m = parse("<movie><title>X</title><runtime>128</runtime><fileinfo><streamdetails><video><width>3840</width><height>2160</height></video></streamdetails></fileinfo></movie>")
         assertEquals("2 小时 8 分", m.runtimeText)

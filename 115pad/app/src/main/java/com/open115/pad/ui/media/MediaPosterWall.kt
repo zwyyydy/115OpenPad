@@ -34,10 +34,14 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.ArrowBack
+import androidx.compose.material.icons.outlined.Check
+import androidx.compose.material.icons.outlined.Sort
 import androidx.compose.material.icons.outlined.Close
 import androidx.compose.material.icons.outlined.Movie
 import androidx.compose.material.icons.outlined.Search
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -83,8 +87,13 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import coil.compose.SubcomposeAsyncImage
 import com.open115.pad.data.media.backgroundSourceOf
+import com.open115.pad.data.media.WorksSort
 import com.open115.pad.data.media.MediaDao
 import com.open115.pad.data.media.MediaLibraryEntity
+import com.open115.pad.data.media.WorksFilter
+import com.open115.pad.data.media.facetsOf
+import com.open115.pad.data.media.CardFacets
+import com.open115.pad.data.media.cardFacetsOf
 import com.open115.pad.data.media.MovieCard
 import com.open115.pad.data.media.MovieDeleteResult
 import com.open115.pad.data.media.deleteMovie
@@ -131,13 +140,18 @@ fun PosterWallScreen(
     var deleteTarget by remember { mutableStateOf<MovieCard?>(null) }
 
     // 多根库：任一路径匹配即纳入（byLibraryPaths 支持 5 根，更多时逐根查询合并去重）
-    val all by produceState(initialValue = emptyList(), library.rootPaths, refreshKey) {
+    // 排序方式（表头那个菜单选的）：与作品页共用同一个设置（存 MediaPrefs）
+    val sort by container.mediaPrefs.worksSort.collectAsState(initial = WorksSort.DEFAULT)
+    var sortMenu by remember { mutableStateOf(false) }
+    val all by produceState(initialValue = emptyList(), library.rootPaths, refreshKey, sort) {
         val paths = library.rootPaths
         value = if (paths.size <= 5) {
             val p = paths + List(5 - paths.size) { "" }
-            dao.byLibraryPaths(p[0], p[1], p[2], p[3], p[4]).first()
+            dao.byLibraryPaths(p[0], p[1], p[2], p[3], p[4], sort = sort.sql).first()
         } else {
-            paths.flatMap { dao.byLibraryPath(it).first() }.distinctBy { it.mediaKey }
+            paths.flatMap { dao.byLibraryPath(it, sort = sort.sql).first() }
+                .distinctBy { it.mediaKey }
+                .let { list -> sortListInMemory(list, sort) }
         }
     }
     // 背景轮播用的图：本库顶层条目的 fanart（就是详情页那张背景图）
@@ -168,11 +182,24 @@ fun PosterWallScreen(
      * 早先是"在本库内搜片名"（结果再按本库的 mediaKey 收敛）—— 演员和标签搜不到，
      * 别的库里的同演员作品也搜不到。现在搜出来的就是全库的，卡片、海报、点进去都一样。
      */
-    val hits by produceState<List<MovieCard>?>(initialValue = null, query, all) {
-        value = if (query.isBlank()) null else dao.searchAll(query, 200)
+    val hits by produceState<List<MovieCard>?>(initialValue = null, query, all, sort) {
+        value = if (query.isBlank()) null else dao.searchAll(query, 200, sort.sql)
     }
     val searching = !hits.isNullOrEmpty() || query.isNotBlank()
-    val list = hits ?: all
+    // 筛选（年份/类型·标签/演员，多选）：选项从"这个库实际有的"现算，纯本地过滤
+    var filter by remember { mutableStateOf(WorksFilter()) }
+    var filterDialog by remember { mutableStateOf(false) }
+    // 标签与演员都在关联表里，MovieCard 上没有 —— 一次查完整批建映射（不是每部片查一次）
+    val extraOfKey by produceState<Map<String, CardFacets>>(emptyMap(), all, hits) {
+        val keys = (all.map { it.mediaKey } + hits.orEmpty().map { it.mediaKey }).distinct()
+        value = cardFacetsOf(dao, keys)
+    }
+    fun extraOf(card: MovieCard): CardFacets = extraOfKey[card.mediaKey] ?: CardFacets.Empty
+    val facets = remember(all, extraOfKey) { facetsOf(all) { extraOf(it) } }
+
+    val list = (hits ?: all).let { base ->
+        if (filter.isEmpty) base else base.filter { filter.matches(it, extraOf(it)) }
+    }
 
     // 系统返回键 = 逐层退：有搜索词先清搜索，否则退回媒体库列表
     androidx.activity.compose.BackHandler(enabled = query.isNotBlank()) { query = "" }
@@ -226,7 +253,8 @@ fun PosterWallScreen(
                         )
                         Text(
                             if (query.isBlank()) {
-                                "${library.rootPath} · ${list.size} 部"
+                                "${library.rootPath} · ${list.size} 部 · ${sort.label}" +
+                                    if (filter.isEmpty) "" else " · 已筛选 ${filter.selectedCount} 项"
                             } else {
                                 // 明说跨库：搜出来的结果不限于当前这个库
                                 "片名 / 演员 / 标签 · ${list.size} 部 · 全部媒体库"
@@ -234,6 +262,29 @@ fun PosterWallScreen(
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
+                    }
+                    FilterButton(filter) { filterDialog = true }
+                    // 排序菜单：与作品页同一个设置，选完立刻重排（sort 进了 produceState 的 key）
+                    Box {
+                        IconButton(onClick = { sortMenu = true }) {
+                            Icon(Icons.Outlined.Sort, contentDescription = "排序方式")
+                        }
+                        DropdownMenu(expanded = sortMenu, onDismissRequest = { sortMenu = false }) {
+                            WorksSort.entries.forEach { option ->
+                                DropdownMenuItem(
+                                    text = { Text(option.label) },
+                                    leadingIcon = {
+                                        if (option == sort) {
+                                            Icon(Icons.Outlined.Check, contentDescription = null)
+                                        }
+                                    },
+                                    onClick = {
+                                        sortMenu = false
+                                        scope.launch { container.mediaPrefs.setWorksSort(option) }
+                                    },
+                                )
+                            }
+                        }
                     }
                     // 毛玻璃搜索框：背后是背景轮播那张图（模糊副本 + 半透明白边）
                     FrostedSearchField(
@@ -283,6 +334,15 @@ fun PosterWallScreen(
             }
         }
         SnackbarHost(snackbarHostState, Modifier.align(Alignment.BottomCenter))
+    }
+
+    if (filterDialog) {
+        WorksFilterDialog(
+            facets = facets,
+            filter = filter,
+            onChange = { filter = it },
+            onDismiss = { filterDialog = false },
+        )
     }
 
     deleteTarget?.let { target ->
@@ -571,7 +631,7 @@ fun ShimmerPlaceholder(modifier: Modifier = Modifier) {
  * 要盖成玻璃得把一整套 colors 都改掉，反而更绕。
  */
 @Composable
-private fun FrostedSearchField(
+internal fun FrostedSearchField(
     value: String,
     onValueChange: (String) -> Unit,
     /** 背后那张图（与墙上轮播用同一张，位置才对得上） */
@@ -648,4 +708,17 @@ private fun FrostedSearchField(
             }
         }
     }
+}
+
+/**
+ * 多根库（>5 根）时逐根查询再合并，SQL 里的 ORDER BY 管不到合并后的整体顺序 ——
+ * 在内存里按同一套规则重排一次。只在"根数超过 5"这种少见的库上走到。
+ *
+ * 首映/入库用 SQL 那份一致的规则：没有值的沉底（`nullsLast` 的效果靠比较函数自己给）。
+ */
+private fun sortListInMemory(list: List<MovieCard>, sort: WorksSort): List<MovieCard> = when (sort) {
+    WorksSort.Rating -> list.sortedWith(compareBy(nullsLast(reverseOrder())) { it.rating })
+    WorksSort.Premiered, WorksSort.DateAdded -> list   // 没有对应字段可排：保持库内顺序（各根内部已按 SQL 排好）
+    WorksSort.Title -> list.sortedBy { it.title }
+    WorksSort.Random -> list.shuffled()
 }

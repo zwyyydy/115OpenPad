@@ -291,3 +291,111 @@ class SideArtTest {
         assertNull(backgroundSourceOf("  ", ""))
     }
 }
+
+/**
+ * 列表筛选：年份 / 类型 / 标签三个维度，维度之间"与"、同维度内"或"。
+ *
+ * 规则写错的方向都不报错、只是"筛出来不对"（少了几部 / 多了别的年份），所以钉住。
+ */
+class WorksFilterTest {
+
+    private fun card(key: String, year: Int?, genre: String? = null) =
+        MovieCard(mediaKey = key, title = key, year = year, rating = 4.5, posterPickCode = null, isEpisodeLike = false, genre = genre)
+
+    private val movies = listOf(
+        card("a", 2024, "动作 / 科幻"),
+        card("b", 2023, "动作 / 喜剧"),
+        card("c", 2024, null),
+        card("d", null, "科幻"),
+    )
+
+    /** 标签与演员都在关联表里：测试里直接给一份"卡片上查不到的那些维度" */
+    private val extras = mapOf(
+        "a" to CardFacets(tags = setOf("4K", "中文字幕"), actors = setOf("甲", "乙")),
+        "b" to CardFacets(tags = setOf("4K"), actors = setOf("乙")),
+        "c" to CardFacets(tags = emptySet(), actors = setOf("丙")),
+        "d" to CardFacets(tags = setOf("中文字幕"), actors = emptySet()),
+    )
+
+    private fun run(f: WorksFilter) =
+        movies.filter { f.matches(it, extras[it.mediaKey] ?: CardFacets.Empty) }.map { it.mediaKey }
+
+    @Test
+    fun `不筛时全都留下`() {
+        assertEquals(listOf("a", "b", "c", "d"), run(WorksFilter()))
+        assertTrue(WorksFilter().isEmpty)
+    }
+
+    @Test
+    fun `年份同维度内是或`() {
+        assertEquals(listOf("a", "b", "c"), run(WorksFilter(years = setOf(2024, 2023))))
+    }
+
+    @Test
+    fun `年份缺失的不会被年份筛选中`() {
+        // d 没有年份：勾了任何年份都不该出现（而不是"当成 0 蒙混过关"）
+        assertEquals(listOf("a", "c"), run(WorksFilter(years = setOf(2024))))
+    }
+
+    @Test
+    fun `类型按列里的分隔串拆开比`() {
+        assertEquals(listOf("a", "b"), run(WorksFilter(kinds = setOf("动作"))))
+        assertEquals(listOf("a", "d"), run(WorksFilter(kinds = setOf("科幻"))))
+        // 整串匹配是错的（列里存的是 "动作 / 科幻"）
+        assertEquals(emptyList<String>(), run(WorksFilter(kinds = setOf("动作 / 科幻"))))
+    }
+
+    @Test
+    fun `标签命中其一即可`() {
+        assertEquals(listOf("a", "d"), run(WorksFilter(kinds = setOf("中文字幕"))))
+        assertEquals(listOf("a", "b", "d"), run(WorksFilter(kinds = setOf("4K", "中文字幕"))))
+    }
+
+    @Test
+    fun `演员命中其一即可_不同维度之间仍是与`() {
+        assertEquals(listOf("a", "b"), run(WorksFilter(actors = setOf("乙"))))
+        assertEquals(listOf("a", "c"), run(WorksFilter(actors = setOf("甲", "丙"))))   // b 只有乙
+        // 演员 + 年份：都要满足
+        assertEquals(listOf("b"), run(WorksFilter(years = setOf(2023), actors = setOf("乙"))))
+        // 没有演员的行（d）勾了演员就出局
+        assertEquals(listOf("c"), run(WorksFilter(actors = setOf("丙"))))
+    }
+
+    @Test
+    fun `不同维度之间是与`() {
+        assertEquals(
+            listOf("a"),
+            run(WorksFilter(years = setOf(2024), kinds = setOf("动作"))),
+        )
+        assertEquals(
+            emptyList<String>(),
+            run(WorksFilter(years = setOf(2023), kinds = setOf("科幻"))),
+        )
+    }
+
+    @Test
+    fun `选项是从这批作品现算的`() {
+        val f = facetsOf(movies) { extras[it.mediaKey] ?: CardFacets.Empty }
+        assertEquals("年份新的在前", listOf(2024, 2023), f.years)
+        // 类型/标签按出现次数排序（同次数按字典序）
+        // 类型与标签合并后按出现次数排（同次数按字典序）
+        assertEquals(listOf("4K", "中文字幕", "动作", "科幻", "喜剧"), f.kinds)
+        assertEquals(listOf("乙", "丙", "甲"), f.actors.orEmpty())   // 出现次数多的在前
+        assertTrue(facetsOf(emptyList<MovieCard>()) { CardFacets.Empty }.isEmpty)
+    }
+
+    @Test
+    fun `类型与标签重复的词只列一次`() {
+        // 实测某库的 nfo 把同一批词既写进 <genre> 也写进 <tag>（两份一样的选项没意义）
+        val dup = listOf(card("a", 2024, "动作"), card("b", 2024, "动作"))
+        val f = facetsOf(dup) { CardFacets(tags = setOf("动作", "4K")) }
+        assertEquals(listOf("4K"), f.kinds.filter { it != "动作" })
+        assertEquals(1, f.kinds.count { it == "动作" })
+    }
+
+    @Test
+    fun `勾了几项要能显示出来`() {
+        assertEquals(0, WorksFilter().selectedCount)
+        assertEquals(3, WorksFilter(years = setOf(2024), kinds = setOf("动作"), actors = setOf("甲")).selectedCount)
+    }
+}

@@ -169,8 +169,10 @@ object NfoParser {
      *
      * v2：从 13 个字段补到 47 个（原名/标语/时长/国家/语言/编剧/合集/技术参数/角色名…）
      * v3：修"读完文本多推一次事件"（紧凑 XML 隔一个丢一个）+ 评分归一化（百分制折算、票数脏值丢弃）
+     * v4：解析字段没变，但**落库的形状变了** —— 首映日期/入库时间从 JSON 提到独立列（DB v12），
+     *     存量数据要靠版本比较被认出来重拉一次才填得上
      */
-    const val PARSER_VERSION = 3
+    const val PARSER_VERSION = 4
 
     /** Archos NfoParser.STRING_SPLITTERS */
     private val STRING_SPLITTERS = charArrayOf('|', ',', '/')

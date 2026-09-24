@@ -4,6 +4,7 @@ import android.content.Context
 import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.longPreferencesKey
+import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
@@ -25,6 +26,13 @@ class MediaPrefs(private val context: Context) {
     /** 缓存上限（MB），默认 2 GB。主要限制海报字节，nfo 是 KB 级的 */
     val cacheMaxMb: Flow<Long> = context.mediaDataStore.data.map { it[KEY_CACHE_MAX_MB] ?: DEFAULT_MAX_MB }
 
+    /** 作品列表的排序方式（作品页表头那个菜单选的），存名字不存序号 —— 序号改了不至于串味 */
+    val worksSort: Flow<WorksSort> =
+        context.mediaDataStore.data.map { WorksSort.ofName(it[KEY_WORKS_SORT]) }
+
+    suspend fun setWorksSort(sort: WorksSort) =
+        context.mediaDataStore.edit { it[KEY_WORKS_SORT] = sort.name }
+
     suspend fun setCacheEnabled(enabled: Boolean) =
         context.mediaDataStore.edit { it[KEY_CACHE_ENABLED] = enabled }
 
@@ -41,6 +49,7 @@ class MediaPrefs(private val context: Context) {
 
         private val KEY_CACHE_ENABLED = booleanPreferencesKey("cache_enabled")
         private val KEY_CACHE_MAX_MB = longPreferencesKey("cache_max_mb")
+        private val KEY_WORKS_SORT = stringPreferencesKey("works_sort")
 
         /**
          * nfo 文本池从总上限里分到的份额。

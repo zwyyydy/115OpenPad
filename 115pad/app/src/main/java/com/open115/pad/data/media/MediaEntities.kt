@@ -76,6 +76,20 @@ data class MovieEntity(
      */
     val nfoJson: String? = null,
     /**
+     * 首映日期（nfo 的 `<premiered>`，原样 `yyyy-MM-dd`）。
+     *
+     * 提成独立列只为**排序**（作品列表可按首映时间排）—— 字符串序就是时间序，
+     * 不用转时间戳。详情页显示的那份仍在 [nfoJson] 里。
+     */
+    val premiered: String? = null,
+    /**
+     * 入库时间（nfo 的 `<dateadded>`，**epoch 毫秒**）。
+     *
+     * 存毫秒而不是原字符串：排序时要跟本机索引时间 [scannedAt]（毫秒）兜底混用，
+     * 字符串和数字没法比大小。解析见 [parseNfoDateMillis]。
+     */
+    val dateAdded: Long? = null,
+    /**
      * 主视频 / nfo / 海报 / 背景 / 缩略图的 **file_id**（115 的 `ufile/delete` 只认 file_ids，
      * pick_code 不认）。
      *
