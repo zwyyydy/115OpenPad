@@ -68,6 +68,34 @@ data class FileRef(
 val TMDB_ID = Regex("""\{tmdbid-(\d+)\}""")
 
 /**
+ * 目录指纹：把目录里**所有条目**（含子目录项）的身份压成一个定长哈希。
+ *
+ * 增量扫描靠它判断"这个目录变没变"。原来的判据是"目录内 upt 的最大值"，只反映
+ * "有没有出现比它更新的东西"，**删除、改名、把文件移进来都不会让它变** ——
+ * 实测「示例影片（系列）」的 upt 从建库那天起就没动过，而里面先后加过片子、删过文件、还原过文件。
+ * 115 里目录项自己的 upt 就是创建时间，内容变化根本不顶它。
+ *
+ * 取四项：
+ *  - `name` / `sizeBytes` / `upt` —— 云盘上这个东西本身变了吗
+ *  - `pickCode` —— **我们存下来的那个字段**变了吗（重传/替换后 pickCode 会换，索引得跟着更新）
+ *
+ * ★ 必须**排序后再哈希**：115 的列表顺序不稳定（按 upt 倒序返回），顺序进了指纹
+ *   就会天天判成"变了"，把增量扫描退化成全量。
+ * ★ 分隔符用 NUL：文件名里不可能出现它，拼接不会歧义（用 `|` 之类就可能）。
+ * ★ 用 MD5 而不是 `hashCode()`：32 位哈希在几千个目录上有可观的碰撞概率，
+ *   一次碰撞就是"某个目录永远被跳过"。
+ */
+fun dirFingerprintOf(files: List<FileRef>): String {
+    if (files.isEmpty()) return ""
+    val joined = files
+        .map { "${it.name}\u0000${it.sizeBytes}\u0000${it.upt}\u0000${it.pickCode}" }
+        .sorted()
+        .joinToString("\u0001")
+    val digest = java.security.MessageDigest.getInstance("MD5").digest(joined.toByteArray(Charsets.UTF_8))
+    return digest.joinToString("") { "%02x".format(it) }
+}
+
+/**
  * 纯逻辑聚类（对文件名列表）。folder.jpg 是无前缀海报的兜底，归到唯一视频组。
  *
  * [minVideoBytes] > 0 时做**体积过滤**：小于它的视频当它不存在（预告/花絮/样本不该占卡片位）。

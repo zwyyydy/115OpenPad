@@ -18,7 +18,7 @@ import androidx.sqlite.db.SupportSQLiteDatabase
         ScanStateEntity::class,
         MediaLibraryEntity::class,
     ],
-    version = 8,
+    version = 9,
     exportSchema = false,
 )
 abstract class MediaDatabase : RoomDatabase() {
@@ -97,11 +97,25 @@ abstract class MediaDatabase : RoomDatabase() {
         }
     }
 
+    /**
+     * 增量扫描改用**目录指纹**：scan_state 加 dirFingerprint。
+     *
+     * 起因是 upt 判据发现不了删除/改名/移入（详见 [dirFingerprintOf] 的注释）。
+     * 老数据这一列是空串 → 与算出来的指纹不相等 → **每个目录会被重扫一遍**（就一次），
+     * 重扫时补上指纹，之后恢复正常跳过。这是有意的：宁可多扫一轮，也不能让老数据
+     * 一直带着"永远跳过"的错判。
+     */
+    private val MIGRATION_8_9 = object : Migration(8, 9) {
+        override fun migrate(db: SupportSQLiteDatabase) {
+            db.execSQL("ALTER TABLE scan_state ADD COLUMN dirFingerprint TEXT NOT NULL DEFAULT ''")
+        }
+    }
+
     fun build(context: Context): MediaDatabase =
         Room.databaseBuilder(context, MediaDatabase::class.java, "media.db")
             .addMigrations(
                 MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5,
-                MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8,
+                MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9,
             )
             .fallbackToDestructiveMigration()
             .build()

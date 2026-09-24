@@ -331,6 +331,57 @@ class ClusterFilesTest {
         notArt.forEach { assertFalse("$it 不该判成素材图", isArtImageFile(it)) }
     }
 
+    // ---------------- 目录指纹（增量扫描"这个目录变没变"的判据） ----------------
+
+    private fun fr(name: String, size: Long = 1000, upt: Long = 100, pc: String = "pc:$name") =
+        FileRef(name = name, pickCode = pc, sizeBytes = size, upt = upt)
+
+    @Test
+    fun `指纹与列表顺序无关`() {
+        // 115 按 upt 倒序返回，同一个目录两次请求的顺序可能不一样 ——
+        // 顺序进了指纹就会天天判成"变了"，增量扫描直接退化成全量
+        val a = listOf(fr("a.mkv"), fr("b.mkv"), fr("c.mkv"))
+        val b = listOf(fr("c.mkv"), fr("a.mkv"), fr("b.mkv"))
+        assertEquals(dirFingerprintOf(a), dirFingerprintOf(b))
+    }
+
+    @Test
+    fun `删除一个不是最新的文件也能发现_这是 upt 判据的死角`() {
+        // 场景：目录里 b 最新，删掉 a —— max(upt) 不变，upt 判据看不见
+        val before = listOf(
+            fr("a.mkv", upt = 100),
+            fr("b.mkv", upt = 900),
+            fr("c.mkv", upt = 500),
+        )
+        val after = listOf(fr("b.mkv", upt = 900), fr("c.mkv", upt = 500))
+        assertEquals("max(upt) 确实没变（所以老判据发现不了）", 900L, after.maxOf { it.upt })
+        assertTrue("指纹必须变", dirFingerprintOf(before) != dirFingerprintOf(after))
+    }
+
+    @Test
+    fun `改名_换文件_加文件都能发现`() {
+        val base = listOf(fr("a.mkv", size = 100, upt = 100, pc = "p1"), fr("b.mkv"))
+        assertTrue("改名", dirFingerprintOf(base) != dirFingerprintOf(listOf(fr("a2.mkv", size = 100, upt = 100, pc = "p1"), fr("b.mkv"))))
+        assertTrue("换文件（大小变了）", dirFingerprintOf(base) != dirFingerprintOf(listOf(fr("a.mkv", size = 200, upt = 100, pc = "p1"), fr("b.mkv"))))
+        assertTrue("重新上传（upt 变了）", dirFingerprintOf(base) != dirFingerprintOf(listOf(fr("a.mkv", size = 100, upt = 300, pc = "p1"), fr("b.mkv"))))
+        // pickCode 是"我们存下来的字段"：它变了索引也得跟着更新，哪怕名字大小时间都没动
+        assertTrue("pickCode 变了", dirFingerprintOf(base) != dirFingerprintOf(listOf(fr("a.mkv", size = 100, upt = 100, pc = "p9"), fr("b.mkv"))))
+        assertTrue("多一个文件", dirFingerprintOf(base) != dirFingerprintOf(base + fr("c.mkv")))
+    }
+
+    @Test
+    fun `空目录的指纹是空串_不参与比对`() {
+        assertEquals("", dirFingerprintOf(emptyList()))
+    }
+
+    @Test
+    fun `名字里带分隔符也不会撞车`() {
+        // 用 NUL 当分隔符就是为这个：文件名里可以有任意字符（除了 NUL）
+        val a = listOf(fr("a\u0001b.mkv"))
+        val b = listOf(fr("a.mkv"), fr("b.mkv"))
+        assertTrue("拼接歧义会撞成同一个指纹", dirFingerprintOf(a) != dirFingerprintOf(b))
+    }
+
     // ---------------- 入库主键（mediaKey 是主键，撞了就互相覆盖） ----------------
 
     @Test

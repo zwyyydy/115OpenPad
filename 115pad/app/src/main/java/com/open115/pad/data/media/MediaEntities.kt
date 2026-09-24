@@ -117,6 +117,13 @@ data class ScanStateEntity(
     val status: Int = 0,
     /** 目录的最近修改时间（列表 upt），未变则跳过 */
     val cloudUpt: Long = 0,
+    /**
+     * 目录指纹（见 [dirFingerprintOf]）：目录里所有条目的名字+大小+upt+pickCode 的哈希。
+     *
+     * 比 `cloudUpt` 准：删除、改名、移动进来都会让它变，而 upt 的最大值不会。
+     * 空串 = 还没算过（v9 之前的老数据），下一次扫描会重扫一遍这个目录并补上。
+     */
+    val dirFingerprint: String = "",
     val scannedAt: Long = 0,
 )
 

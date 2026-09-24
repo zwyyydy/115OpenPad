@@ -23,13 +23,16 @@ import java.io.File
  * 媒体库扫描引擎：手动触发、可续跑、带进度。
  * 扫描一个目录 = 列目录（响应里自带全部文件名，聚类零额外请求）→ 聚类 →
  * 逐条下载 .nfo（小文件）解析 → 入库（每条一个事务）→ 预取海报 → 更新 scan_state。
- * 中断后重启能续跑：已完成的目录 cloudUpt 未变就跳过。
+ *
+ * 中断后重启能续跑：已完成的目录**指纹一致**就跳过（见 [dirFingerprintOf]）。
+ * 早先只看"目录内 upt 的最大值"，那东西发现不了删除/改名/移入 —— 115 里目录项的 upt
+ * 就是创建时间，内容变化不顶它（实测「示例影片（系列）」从建库起就没动过）。
  *
  * 接口调用量（115 有频控，这里是媒体库最大的一处）：
  * - 列目录：**每个目录每次扫描 1 次**（目录超过一页时按 count 翻页，见 [listFiles]）。
  *   collectDirs 那次列目录的结果会传给扫描循环复用，
  *   早先是列两遍（collectDirs 找子目录一遍、循环取文件又一遍）。
- *   降不到 0 —— 判断"目录变没变"本身就得问服务器，scan_state.cloudUpt 只是记住上次的值。
+ *   降不到 0 —— 判断"目录变没变"本身就得问服务器，scan_state 只是记住上次看到的样子。
  * - .nfo：内容没变（pickCode + upt 相同）**零请求**，见 fetchNfoMeta。
  * - 海报：**首次扫描每条 1 次 downurl + 1 次下载**（[prefetchPoster]），
  *   之后命中落盘字节就零请求 —— 扫完进海报墙/详情页不必再等图。
@@ -252,10 +255,24 @@ class MediaScanner(
                     // includeSubDirs=false 时 collectDirs 没列过这个目录，这里补一次
                     val page = listing.page ?: listFiles(listing.cid, rateLimitMs)
                     val dirUpt = page.items.maxOfOrNull { it.upt } ?: 0L
+                    // 指纹覆盖**所有条目**（含子目录项）：子目录被改名/挪走同样算这个目录变了。
+                    // 条目本来就在手上，算它是纯本地开销，不多花一次请求。
+                    val dirFingerprint = dirFingerprintOf(
+                        page.items.map {
+                            FileRef(
+                                name = it.fn, pickCode = it.pc ?: "", sizeBytes = it.fs,
+                                upt = it.upt, fid = it.fid ?: "",
+                            )
+                        },
+                    )
                     if (incremental) {
-                        // 增量：目录上次扫完且列表 upt 未变 → 无新增/修改，跳过
+                        // 增量：目录上次扫完、且内容没变（指纹一致）→ 跳过。
+                        // 两个判据都留着：upt 是老的、只挡得住"新增"，指纹才挡得住删除/改名/移入；
+                        // 老数据（v9 之前）指纹是空串，这里必然不等 → 每个目录重扫一轮补上。
                         val state = dao.scanState(listing.cid)
-                        if (state != null && state.status == 2 && state.cloudUpt == dirUpt && dirUpt > 0) {
+                        if (state != null && state.status == 2 && state.cloudUpt == dirUpt && dirUpt > 0 &&
+                            state.dirFingerprint == dirFingerprint
+                        ) {
                             // 跳过不等于不管：把库里已有条目的海报补到本地。
                             // 缓存被清过 / 新装机的机器上，增量扫描是用户最常用的那条路，
                             // 不补的话海报墙仍要一张张现下。已命中的不产生任何请求。
@@ -269,6 +286,11 @@ class MediaScanner(
                             )
                             continue
                         }
+                        // ☠ 以后要是加"删除检测"（拿本轮见到的集合去差掉索引里的孤儿），
+                        //    **跳过分支里的目录必须先算作"见过"** —— 它们的条目没进本轮的产出集合，
+                        //    直接做差集会把没访问过的目录整个误删。115-strm-web 用 scan_token 标记本轮结果，
+                        //    并且专门有个 mark_cached_dir_as_seen 把被跳过目录的已知行搬进本轮，
+                        //    就是为这个；它还要求"本轮没有失败目录"才允许清理。
                     }
                     val files = page.items.filter { !it.isDir }.map {
                         FileRef(name = it.fn, pickCode = it.pc ?: "", sizeBytes = it.fs, upt = it.upt, fid = it.fid ?: "")
@@ -329,6 +351,7 @@ class MediaScanner(
                             dirPath = listing.path,
                             status = 2,
                             cloudUpt = dirUpt,
+                            dirFingerprint = dirFingerprint,
                             scannedAt = System.currentTimeMillis(),
                         ),
                     )
