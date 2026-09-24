@@ -23,6 +23,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Add
+import androidx.compose.material.icons.outlined.History
 import androidx.compose.material.icons.outlined.Delete
 import androidx.compose.material.icons.outlined.Edit
 import androidx.compose.material.icons.outlined.Movie
@@ -68,7 +69,9 @@ import com.open115.pad.data.media.MediaLibraryEntity
 import com.open115.pad.data.media.MediaScanner
 import com.open115.pad.data.media.MovieCard
 import com.open115.pad.data.media.WorksSort
+import com.open115.pad.ui.history.WatchHistoryScreen
 import com.open115.pad.ui.theme.AdaptiveBody
+import com.open115.pad.util.Format
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
@@ -157,6 +160,11 @@ fun MediaLibraryScreen(api: com.open115.pad.data.OpenApi) {
                     backdrop = null,
                     modifier = Modifier.widthIn(min = 200.dp, max = 340.dp).padding(end = 4.dp),
                 )
+                // 观影历史：入口放在媒体库页（它是"媒体库看到哪儿了"，不属于文件页 ——
+                // 文件页的播放记录在操作记录里，两处不重复）
+                IconButton(onClick = { overlays.add(MediaOverlay.History) }) {
+                    Icon(Icons.Outlined.History, contentDescription = "观影历史")
+                }
                 IconButton(onClick = { showCreate = true }) {
                     Icon(Icons.Outlined.Add, contentDescription = "新建媒体库")
                 }
@@ -262,8 +270,13 @@ fun MediaLibraryScreen(api: com.open115.pad.data.OpenApi) {
                                         .format(Date(lib.createdAt)) +
                                         // 扫描结束后要重算，否则"还没有影片"会一直挂着
                                         LibraryCount(dao, lib.rootPaths, scanProgress.finishedAt) +
-                                        if (lib.rateLimitMs > 0) " · 限速 ${lib.rateLimitMs}ms" else "" +
-                                        if (lib.minVideoSizeMb > 0) " · 过滤 <${lib.minVideoSizeMb}MB" else "",
+                                        // ☠ 每个 if 都必须带括号：`a + if (c) x else "" + if (d) y else ""`
+                                        // 会解析成 `a + if (c) x else ("" + if (d) y else "")` ——
+                                        // 条件成立时后面几段全被吞掉（早先「限速」一有值，「过滤」就再也显示不出来）
+                                        (if (lib.rateLimitMs > 0) " · 限速 ${lib.rateLimitMs}ms" else "") +
+                                        (if (lib.minVideoSizeMb > 0) " · 过滤 <${lib.minVideoSizeMb}MB" else "") +
+                                        autoScanText(lib) +
+                                        (if (lib.lastScanAt > 0) " · 上次扫描 ${Format.ago(lib.lastScanAt)}" else ""),
                                     style = MaterialTheme.typography.bodySmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 )
@@ -291,6 +304,7 @@ fun MediaLibraryScreen(api: com.open115.pad.data.OpenApi) {
                                                                 cid, path, incremental = true,
                                                                 rateLimitMs = lib.rateLimitMs,
                                                                 minVideoSizeMb = lib.minVideoSizeMb,
+                                                                libraryId = lib.id,
                                                             )
                                                         }
                                                     }
@@ -308,6 +322,7 @@ fun MediaLibraryScreen(api: com.open115.pad.data.OpenApi) {
                                                                 cid, path, incremental = false,
                                                                 rateLimitMs = lib.rateLimitMs,
                                                                 minVideoSizeMb = lib.minVideoSizeMb,
+                                                                libraryId = lib.id,
                                                             )
                                                         }
                                                     }
@@ -336,7 +351,7 @@ fun MediaLibraryScreen(api: com.open115.pad.data.OpenApi) {
             title = "新建媒体库",
             existing = null,
             onDismiss = { showCreate = false },
-            onSave = { name, cids, paths, rate, autoScan, minSize ->
+            onSave = { name, cids, paths, rate, autoScan, minSize, interval ->
                 scope.launch {
                     val (cid, path) = MediaLibraryEntity.joinRoots(cids, paths)
                     dao.insertLibrary(
@@ -344,6 +359,7 @@ fun MediaLibraryScreen(api: com.open115.pad.data.OpenApi) {
                             name = name, rootCid = cid, rootPath = path,
                             createdAt = System.currentTimeMillis(), rateLimitMs = rate,
                             autoScanOnStart = autoScan, minVideoSizeMb = minSize,
+                            autoScanIntervalHours = interval,
                         ),
                     )
                     showCreate = false
@@ -358,10 +374,10 @@ fun MediaLibraryScreen(api: com.open115.pad.data.OpenApi) {
             title = "编辑媒体库",
             existing = lib,
             onDismiss = { editTarget = null },
-            onSave = { name, cids, paths, rate, autoScan, minSize ->
+            onSave = { name, cids, paths, rate, autoScan, minSize, interval ->
                 scope.launch {
                     val (cid, path) = MediaLibraryEntity.joinRoots(cids, paths)
-                    dao.updateLibrary(lib.id, name, cid, path, rate, autoScan, minSize)
+                    dao.updateLibrary(lib.id, name, cid, path, rate, autoScan, minSize, interval)
                     editTarget = null
                 }
             },
@@ -403,6 +419,11 @@ fun MediaLibraryScreen(api: com.open115.pad.data.OpenApi) {
             onOpenMovie = { card, list, index ->
                 overlays.add(MediaOverlay.Detail(card, list, index))
             },
+        )
+
+        is MediaOverlay.History -> WatchHistoryScreen(
+            container = container,
+            onBack = { overlays.removeLastOrNull() },
         )
 
         null -> Unit
@@ -478,6 +499,17 @@ private suspend fun deleteLibraryFully(
 }
 
 /**
+ * 「自动扫描」这一段的文案：关着就空着；开着分"每次启动"与"≤每 N 小时"两种。
+ *
+ * 抽出来是因为它在字符串拼接里，而那种地方最容易踩优先级坑（见调用点的注释）。
+ */
+private fun autoScanText(lib: MediaLibraryEntity): String = when {
+    !lib.autoScanOnStart -> ""
+    lib.autoScanIntervalHours > 0 -> " · 自动扫描 ≤每 ${lib.autoScanIntervalHours}h"
+    else -> " · 自动扫描（每次启动）"
+}
+
+/**
  * 库内影片数：卡片上显示「N 部」，进库前就知道有没有内容（多根库取各根之和）。
  *
  * [refreshKey] 必须传一个"扫描结束后会变"的值（这里传 scanProgress.finishedAt）：
@@ -517,6 +549,7 @@ private fun LibraryEditDialog(
         rateLimitMs: Long,
         autoScanOnStart: Boolean,
         minVideoSizeMb: Int,
+        autoScanIntervalHours: Int,
     ) -> Unit,
 ) {
     var name by remember { mutableStateOf(existing?.name ?: "") }
@@ -533,9 +566,14 @@ private fun LibraryEditDialog(
         mutableStateOf(existing?.minVideoSizeMb?.takeIf { it > 0 }?.toString() ?: "")
     }
     var autoScan by remember { mutableStateOf(existing?.autoScanOnStart ?: false) }
+    var intervalText by remember {
+        mutableStateOf(existing?.autoScanIntervalHours?.takeIf { it > 0 }?.toString() ?: "")
+    }
     var picking by remember { mutableStateOf(false) }
     val rate = rateText.toLongOrNull()?.coerceAtLeast(0) ?: 0L
     val minSize = minSizeText.toIntOrNull()?.coerceIn(0, 100_000) ?: 0
+    // 上限 30 天：再大就等于"关了"，不如直接留空（留空 = 不限间隔）
+    val intervalHours = intervalText.toIntOrNull()?.coerceIn(1, 24 * 30) ?: 0
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -625,6 +663,26 @@ private fun LibraryEditDialog(
                     }
                     Switch(checked = autoScan, onCheckedChange = { autoScan = it })
                 }
+                // 间隔只在开关打开时才有意义（关掉了给它设间隔是自相矛盾的输入）
+                if (autoScan) {
+                    Spacer(Modifier.height(8.dp))
+                    OutlinedTextField(
+                        value = intervalText,
+                        onValueChange = { intervalText = it.filter { c -> c.isDigit() }.take(4) },
+                        label = { Text("扫描间隔（小时，留空 = 每次启动都扫）") },
+                        supportingText = {
+                            Text(
+                                if (intervalHours > 0) {
+                                    "距上次扫描不足 ${intervalHours} 小时就跳过这个库（判断是纯本地的，不花请求）"
+                                } else {
+                                    "留空 = 每次启动都扫。库很大时可以设 6~24，减少列目录请求"
+                                },
+                            )
+                        },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                }
             }
         },
         confirmButton = {
@@ -640,6 +698,7 @@ private fun LibraryEditDialog(
                             rate,
                             autoScan,
                             minSize,
+                            if (autoScan) intervalHours else 0,
                         )
                     }
                 },
@@ -749,6 +808,9 @@ private sealed interface MediaOverlay {
 
     /** 同一个演员 / 同一个标签的全部作品（**跨所有媒体库**，见 dao.byActor/byTag） */
     data class Works(val kind: WorksKind, val name: String) : MediaOverlay
+
+    /** 观影历史（媒体库这一库线自己的记录；文件页的播放不走这里，那边看操作记录） */
+    object History : MediaOverlay
 }
 
 /**

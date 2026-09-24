@@ -241,9 +241,10 @@ class SideArtTest {
 
     @Test
     fun `nfo 没演员时用 _actors 里的文件名_而不是目录名猜的脏名`() {
-        // 实测：`ABC-101-4K-C 示例演员/` 里那个没 nfo 的分集（ABC-101-U），
+        // 实测：`ABC-101-4K-C 示例演员/` 里那个没 nfo 的视频（ABC-101-U），
         // 目录名启发式会猜出 `-4K-C 示例演员`（番号正则只吃到 ABC-101），
         // 而 `.actors/示例演员.jpg` 给的是干净真名 —— 而且正是头像的键。
+        // （那个目录现在被 clusterFiles 合成了一条；nfo 里没写演员时仍走这条兜底。）
         assertEquals(
             listOf("示例演员"),
             actorsOf(

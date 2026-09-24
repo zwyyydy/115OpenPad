@@ -212,6 +212,10 @@ class MediaScanner(
      *
      * [minVideoSizeMb] 是**每库**的体积过滤（0 = 不过滤）：小于它的视频不入库。
      * 在聚类阶段就滤掉，见 [sniffDirectory]。
+     *
+     * [libraryId] 非空 = 这一轮是为某个媒体库跑的：跑完把 `libraries.lastScanAt` 写掉
+     * （定时增量扫描靠它判断"距上次扫描够久了吗"）。调用方不给就什么都不记 ——
+     * 扫描器本身不认识"库"这个概念，只认识根目录。
      */
     suspend fun runScan(
         rootCid: String,
@@ -220,6 +224,7 @@ class MediaScanner(
         incremental: Boolean = false,
         rateLimitMs: Long = 0,
         minVideoSizeMb: Int = 0,
+        libraryId: Long? = null,
     ) {
         mutex.withLock {
             if (_progress.value.running) return
@@ -235,10 +240,12 @@ class MediaScanner(
             )
         }
         var stoppedEarly = false
+        // 跑完的目录数（进度条用）。声明在 try 之外是为了收尾时判断"这轮到底跑了吗" ——
+        // 见 finally 里写 lastScanAt 那段。
+        var done = 0
         try {
             var movies = 0
             var skipped = 0
-            var done = 0
             // 递归列目录。**这一步列到的结果直接传给下面复用**，不再对同一个目录重复请求
             // （早先是 collectDirs 列一遍找子目录、下面的循环再列一遍取文件，等于每目录 2 次）
             val allDirs = collectDirs(rootCid, rootPath, includeSubDirs, rateLimitMs)
@@ -247,6 +254,10 @@ class MediaScanner(
                 stoppedEarly = true
                 Log.i(TAG, "扫描在列目录阶段被停止")
             } else {
+                // 老数据自愈：哪些目录还是"元数据与视频分成两条"的样子（`ABC-101-4K-C` + `ABC-101-U`）。
+                // 合并逻辑是后加的，而指纹一致时下面的循环会跳过这个目录 —— 不特判就永远合不起来。
+                // 判据是纯本地的，一次查完全库（见 dao.dirsNeedingOrphanMerge），之后每目录只查一次集合。
+                val orphanMergeDirs = if (incremental) dao.dirsNeedingOrphanMerge().toHashSet() else emptySet()
                 _progress.value = _progress.value.copy(
                     totalDirs = allDirs.size,
                     phase = Phase.Indexing,
@@ -286,7 +297,10 @@ class MediaScanner(
                         // 例外：分 CD 的老数据还没合并（合并逻辑是后加的）→ 不能跳过，
                         // 得重扫一遍把它们并成一条 + 分集。判据只看文件名，零请求。
                         val cdPending = cdMergePending(listing.cid, files)
-                        if (!cdPending && state != null && state.status == 2 && state.cloudUpt == dirUpt &&
+                        // 另一类老数据：元数据与视频分成两条（见 clusterFiles 的合并判据）——
+                        // 判据在上面一次性算好，这里只查集合。
+                        val orphanPending = listing.cid in orphanMergeDirs
+                        if (!cdPending && !orphanPending && state != null && state.status == 2 && state.cloudUpt == dirUpt &&
                             dirUpt > 0 && state.dirFingerprint == dirFingerprint
                         ) {
                             // 跳过不等于不管：把库里已有条目的海报补到本地。
@@ -447,6 +461,13 @@ class MediaScanner(
         } catch (e: Exception) {
             Log.w("MediaScanner", "扫描中断: ${e.message}")
         } finally {
+            // 记"这个库刚扫完"。**一个目录都没跑完就不记**（done == 0 通常是列目录阶段就抛了，
+            // 多半是网络问题）：那种情况该在下次启动时再试，而不是白白占用一个扫描间隔。
+            // 用户中途按停止 → done > 0 → 照记（他确实扫过一轮了，别每次启动都来烦他）。
+            if (libraryId != null && done > 0) {
+                runCatching { dao.markLibraryScanned(libraryId, System.currentTimeMillis()) }
+                    .onFailure { Log.w(TAG, "记录扫描时间失败 libraryId=$libraryId: ${it.message}") }
+            }
             // 收尾统一放 finally：正常结束、抛异常、被停止三条路都要把 running 落回去，
             // 否则 UI 会永远停在"扫描中"、且 requestStop 之后的等待永远等不到
             _progress.value = _progress.value.copy(
@@ -652,9 +673,10 @@ class MediaScanner(
          * 这个簇要挂的侧挂素材（剧照/头像）。**同一个目录里的每个簇都挂同一份**。
          *
          * 不搞"只挂给锚点"那套：剧照/头像是**整个目录**的素材，而一个目录里可能有多个簇
-         * （`ABC-101-4K-C 示例演员/` 里 nfo 叫 `ABC-101-4K-C.nfo`、视频却叫 `ABC-101-U.wmv`，
-         * 于是有元数据的那条和能播的那条**不是同一个簇**）—— 只挂锚点的话，用户点开
-         * 海报墙上那张有简介有评分的卡，反而一张剧照都没有。
+         * （分 CD 的各张盘、一季的各集都各有一条行）—— 只挂锚点的话，别的行点进详情页
+         * 一张剧照都没有。
+         * （`ABC-101-4K-C 示例演员/` 那种"nfo 与视频前缀对不上、分成两条"的目录早先也靠它
+         *  兜住元数据那条的剧照；那对现在由 clusterFiles 直接合成一条了。）
          * 代价只是十几条 pick_code 在同一个目录的几条行里各存一遍（每条约几百字节）。
          *
          * **null = 这次看不到**（includeSubDirs=false）→ 保留库里的原值，

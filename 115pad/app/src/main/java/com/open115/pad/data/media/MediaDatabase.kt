@@ -17,8 +17,9 @@ import androidx.sqlite.db.SupportSQLiteDatabase
         MovieTagEntity::class,
         ScanStateEntity::class,
         MediaLibraryEntity::class,
+        WatchHistoryEntity::class,
     ],
-    version = 12,
+    version = 13,
     exportSchema = false,
 )
 abstract class MediaDatabase : RoomDatabase() {
@@ -164,14 +165,39 @@ abstract class MediaDatabase : RoomDatabase() {
         }
     }
 
+    /**
+     * 定时增量扫描（`libraries` 加两列）与观影历史（新表 `watch_history`）。
+     *
+     * 两列都靠 ALTER 增量补，不动已有数据：
+     *  - `autoScanIntervalHours` 默认 0 = 不限间隔 → **老库行为完全不变**（原来的
+     *    `autoScanOnStart` 仍是开关，间隔只是给它加了个"别太频繁"的上限）
+     *  - `lastScanAt` 默认 0 = 从未扫过 → 第一次启动就会扫（与老行为一致）
+     *
+     * `watch_history` 是全新的空表，老数据无所谓。DDL 要跟实体一字不差地对上（列序无所谓，
+     * 但类型/NOT NULL/主键/索引名都要一致）—— Room 打开库时会拿实体声明对账，不一致直接抛。
+     */
+    private val MIGRATION_12_13 = object : Migration(12, 13) {
+        override fun migrate(db: SupportSQLiteDatabase) {
+            db.execSQL("ALTER TABLE libraries ADD COLUMN autoScanIntervalHours INTEGER NOT NULL DEFAULT 0")
+            db.execSQL("ALTER TABLE libraries ADD COLUMN lastScanAt INTEGER NOT NULL DEFAULT 0")
+            db.execSQL(
+                "CREATE TABLE IF NOT EXISTS watch_history (" +
+                    "itemKey TEXT NOT NULL, name TEXT NOT NULL, positionMs INTEGER NOT NULL, " +
+                    "durationMs INTEGER NOT NULL, updatedAt INTEGER NOT NULL, local INTEGER NOT NULL, " +
+                    "PRIMARY KEY(itemKey))",
+            )
+            db.execSQL("CREATE INDEX IF NOT EXISTS index_watch_history_updatedAt ON watch_history (updatedAt)")
+        }
+    }
+
     fun build(context: Context): MediaDatabase =
         Room.databaseBuilder(context, MediaDatabase::class.java, "media.db")
             .addMigrations(
                 MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5,
                 MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9,
-                MIGRATION_9_10, MIGRATION_10_11, MIGRATION_11_12,
+                MIGRATION_9_10, MIGRATION_10_11, MIGRATION_11_12, MIGRATION_12_13,
             )
             .fallbackToDestructiveMigration()
             .build()
-    }
+}
 }

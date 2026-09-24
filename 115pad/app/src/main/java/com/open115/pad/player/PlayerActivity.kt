@@ -387,11 +387,19 @@ class PlayerActivity : ComponentActivity() {
         private const val EXTRA_PLAYLIST = "playlist"
         private const val EXTRA_INDEX = "index"
         private const val EXTRA_SOURCE_URI = "source_uri"
+        private const val EXTRA_START_MS = "start_ms"
+        private const val EXTRA_RECORD_HISTORY = "record_history"
 
         /**
          * @param playlist 当前视图的播放列表（可为空：此时上一集/下一集均置灰）。
          *                 经 JSON 字符串传递；条目只含 pick_code 与标题，千集量级也只有百 KB 级。
          * @param index    当前条目在 playlist 中的下标。
+         * @param startMs  指定起播位置（毫秒），0 = 沿用该视频自己的观看记录。
+         *                 观影历史页点进来时用它 —— 那是**本机记的**进度，
+         *                 比云端观看记录新（云端 10 秒才上报一次）。
+         * @param recordHistory 是否写「观影历史」。**只有媒体库那条链路传 true**：
+         *                 文件页的播放记录在操作记录里，两处各记一份是重复；
+         *                 本机文件（传输中心/外部分享）也不记 —— 它们不在媒体库里。
          */
         fun intent(
             context: Context,
@@ -399,6 +407,8 @@ class PlayerActivity : ComponentActivity() {
             name: String,
             playlist: List<PlaylistEntry> = emptyList(),
             index: Int = 0,
+            startMs: Long = 0L,
+            recordHistory: Boolean = false,
         ): Intent {
             val json = runCatching {
                 Json.encodeToString(ListSerializer(PlaylistEntry.serializer()), playlist)
@@ -408,6 +418,8 @@ class PlayerActivity : ComponentActivity() {
                 .putExtra(EXTRA_NAME, name)
                 .putExtra(EXTRA_PLAYLIST, json)
                 .putExtra(EXTRA_INDEX, index)
+                .putExtra(EXTRA_START_MS, startMs)
+                .putExtra(EXTRA_RECORD_HISTORY, recordHistory)
         }
 
         /**
@@ -420,10 +432,11 @@ class PlayerActivity : ComponentActivity() {
          * 不传 mime：播放时让 ExoPlayer 嗅探容器，比外部声明的类型更可靠
          * （DownloadManager 常报 application/octet-stream，MimeTypeMap 又不认 mkv/m2ts）。
          */
-        fun localIntent(context: Context, uri: String, name: String): Intent =
+        fun localIntent(context: Context, uri: String, name: String, startMs: Long = 0L): Intent =
             Intent(context, PlayerActivity::class.java)
                 .putExtra(EXTRA_SOURCE_URI, uri)
                 .putExtra(EXTRA_NAME, name)
+                .putExtra(EXTRA_START_MS, startMs)
 
         /**
          * 取要播的 Uri，两条来源都要认：
@@ -463,6 +476,8 @@ class PlayerActivity : ComponentActivity() {
         } ?: emptyList()
         val index = intent.getIntExtra(EXTRA_INDEX, 0)
             .coerceIn(0, (playlist.size - 1).coerceAtLeast(0))
+        val startMs = intent.getLongExtra(EXTRA_START_MS, 0L)
+        val recordHistory = intent.getBooleanExtra(EXTRA_RECORD_HISTORY, false)
         setContent {
             Open115Theme {
                 PlayerScreen(
@@ -472,6 +487,8 @@ class PlayerActivity : ComponentActivity() {
                     initialLocalUri = sourceUri,
                     playlist = playlist,
                     initialIndex = index,
+                    initialStartMs = startMs,
+                    recordHistory = recordHistory,
                     onBack = { finish() },
                 )
             }
@@ -524,6 +541,16 @@ fun PlayerScreen(
     onBack: () -> Unit,
     /** 本地/外部源（见 [PlayerActivity.localIntent]）。非空时整条云盘链路绕开 */
     initialLocalUri: String? = null,
+    /** 指定起播位置（毫秒，0 = 用该视频自己的观看记录）。观影历史页点进来时给 */
+    initialStartMs: Long = 0L,
+    /**
+     * 是否写「观影历史」（见 [PlayerActivity.intent] 的 recordHistory）。
+     *
+     * 只对**媒体库**那条链路为 true：文件页的播放记录在操作记录里，本机文件不在媒体库里。
+     * 注意它是**不可变的入口参数**：切换软/硬解是这个 Activity 内的重建（走 pendingStartMs 那套），
+     * 切集也只是换 currentPickCode，都不会重新进 onCreate。
+     */
+    recordHistory: Boolean = false,
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
@@ -553,9 +580,11 @@ fun PlayerScreen(
      * - null → 沿用该视频自己的观看记录（首次从文件页进入时行为不变）
      * - 0L   → 切集时强制从头播（需求：切集后进度归零）
      * - 其它 → 就地重建播放器时（切换软/硬解）带回原位置，免得跳回云端观看记录
+     * 初值来自 [initialStartMs]：观影历史页点进来时带的是**本机记的**进度
+     * （比云端观看记录新 —— 那边 10 秒才上报一次，刚退出时可能还没轮到）。
      * 若希望切集也续播，把 switchEpisode 里的 `pendingStartMs = 0L` 去掉即可。
      */
-    var pendingStartMs by remember { mutableStateOf<Long?>(null) }
+    var pendingStartMs by remember { mutableStateOf(initialStartMs.takeIf { it > 0L }) }
     /**
      * 重新加载时要保留的清晰度档位（只有"切换软/硬解重建播放器"会用到）。
      * 不带的话重算 targetDef 会退回默认最高档，用户手动选的 1080P / 原盘会被悄悄改掉。
@@ -1544,6 +1573,34 @@ fun PlayerScreen(
         }
     }
 
+    /**
+     * 观影历史（本机那份）：**只给媒体库那条播放链路用**（[recordHistory]），
+     * 文件页与本机文件都不记 —— 前者在操作记录里已有一份，后者不在媒体库里。
+     *
+     * 为什么要自己记：115 只有「按 pick_code 查某一条的进度」，**没有"列出看过的片"的接口** ——
+     * 媒体库页里那份「观影历史」只能靠本机。
+     *
+     * 落在 [AppContainer.transferScope] 上，而不是 rememberCoroutineScope：退出播放器时
+     * 组合随即被销毁，挂在组合上的协程会被取消，最后一笔进度就丢了。失败只当没记过 ——
+     * 历史是附属品，绝不能影响播放。
+     */
+    fun saveWatchHistory(key: String, label: String, posMs: Long, durMs: Long) {
+        if (!recordHistory || key.isBlank()) return
+        container.transferScope.launch {
+            runCatching {
+                container.mediaDatabase.mediaDao().upsertWatchHistory(
+                    com.open115.pad.data.media.WatchHistoryEntity(
+                        itemKey = key,
+                        name = label,
+                        positionMs = posMs.coerceAtLeast(0L),
+                        durationMs = durMs.coerceAtLeast(0L),
+                        updatedAt = System.currentTimeMillis(),
+                    ),
+                )
+            }
+        }
+    }
+
     // 定期上报播放进度
     LaunchedEffect(currentPickCode, prefs) {
         while (isActive && data != null) {
@@ -1553,12 +1610,17 @@ fun PlayerScreen(
                 val ended = player.playbackState == Player.STATE_ENDED
                 runCatching { container.openApi.videoHistorySave(currentPickCode, pos, if (ended) 1 else 0) }
             }
+            // 媒体库播放才记本机观影历史（与云端上报同一个节奏）。
+            // 门槛只有"媒体准备好了"：打开看了几秒的片也该在历史里出现过（退出时还会再补一笔）
+            if (durationMs > 0L) {
+                saveWatchHistory(currentPickCode, currentName, positionMs, durationMs)
+            }
         }
     }
 
     // 本地源的续播位置：没有云端观看记录可用，只能在本机记一份。
     // 不复用上面那条上报链路 —— 它靠 `data != null` 把关（本地源恒为 null，天然跳过），
-    // key 也是 pick_code。
+    // key 也是 pick_code。观影历史不收本机源（不属于媒体库），这里只记续播点。
     LaunchedEffect(localUri) {
         val uri = localUri ?: return@LaunchedEffect
         while (isActive) {
@@ -2095,11 +2157,20 @@ fun PlayerScreen(
         }
     }
 
-    // 退到后台暂停
+    // 退到后台暂停；顺手把**最终进度**写进观影历史（只有媒体库播放会写）。
+    //
+    // 为什么还要在这里补一笔：上面那条链路是 10 秒一次，看了 8 分钟直接退出会丢掉最后那几秒，
+    // 而那正是"下次从哪儿继续"最在意的位置。用 ON_STOP 而不是 onDestroy：进程被回收时后者不一定触发。
+    // 门槛只有"媒体真的准备好了"（时长 > 0）—— 错误页退出不会记一条空记录。
     val lifecycleOwner = LocalLifecycleOwner.current
     DisposableEffect(lifecycleOwner) {
         val obs = LifecycleEventObserver { _, event ->
-            if (event == Lifecycle.Event.ON_STOP) player.pause()
+            if (event == Lifecycle.Event.ON_STOP) {
+                player.pause()
+                if (durationMs > 0L && localUri == null) {
+                    saveWatchHistory(currentPickCode, currentName, positionMs, durationMs)
+                }
+            }
         }
         lifecycleOwner.lifecycle.addObserver(obs)
         onDispose { lifecycleOwner.lifecycle.removeObserver(obs) }

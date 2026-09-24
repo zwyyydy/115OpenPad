@@ -632,6 +632,26 @@ interface MediaDao {
     suspend fun cdGroupNeedsRescan(dirKey: String, base: String): Int
 
     /**
+     * 哪些目录还是"元数据与视频分成两条"的老样子（判据在 [DirectorySniffer.clusterFiles] 里）。
+     *
+     * 与 [cdGroupNeedsRescan] 同一个理由：合并逻辑是后加的，而增量扫描会跳过没变化的目录 ——
+     * 老数据永远合不起来。区别是这里**一次把全库查完**，扫描开始时取一次、之后每个目录只做一次
+     * 集合判断：一条条按目录查的话（三个子查询都按 sourceDirKey 过滤，而这一列没有索引）
+     * 就变成每目录 3 次全表扫描。
+     *
+     * 形状正是合并前的样子：顶层恰好两条 —— 一条"有视频没 nfo"、一条"有 nfo 没视频"。
+     * 合并之后这个目录只剩一条（既带视频又带 nfo）→ 不再出现在结果里，不会反复逼着重扫；
+     * 剧集/季目录（每条都带视频）、分 CD 目录（顶层只有合成行那一条）也都不匹配。
+     */
+    @Query(
+        "SELECT sourceDirKey FROM movies WHERE seriesKey IS NULL AND sourceDirKey != '' " +
+            "GROUP BY sourceDirKey HAVING COUNT(*) = 2 " +
+            "AND SUM(videoPickCode IS NOT NULL AND nfoPickCode IS NULL) = 1 " +
+            "AND SUM(videoPickCode IS NULL AND nfoPickCode IS NOT NULL) = 1",
+    )
+    suspend fun dirsNeedingOrphanMerge(): List<String>
+
+    /**
      * 这个目录里还有多少条**没记上侧挂素材**的行（只统计这个目录真正有的那几样）。
      *
      * 用于升级补数据：v9 及更早的库里这两列全是 NULL，而"没补过"和"这个目录根本没有
@@ -722,7 +742,8 @@ interface MediaDao {
 
     @Query(
         "UPDATE libraries SET name = :name, rootCid = :rootCid, rootPath = :rootPath, " +
-            "rateLimitMs = :rateLimitMs, autoScanOnStart = :autoScanOnStart, minVideoSizeMb = :minVideoSizeMb " +
+            "rateLimitMs = :rateLimitMs, autoScanOnStart = :autoScanOnStart, minVideoSizeMb = :minVideoSizeMb, " +
+            "autoScanIntervalHours = :autoScanIntervalHours " +
             "WHERE id = :id",
     )
     suspend fun updateLibrary(
@@ -733,7 +754,17 @@ interface MediaDao {
         rateLimitMs: Long,
         autoScanOnStart: Boolean,
         minVideoSizeMb: Int,
+        autoScanIntervalHours: Int,
     )
+
+    /**
+     * 记下"这个库刚扫完一轮"。
+     *
+     * 只在 [MediaScanner.runScan] 收尾时调用，而且**一个目录都没跑完就不记**
+     * （那种情况是列目录就抛了，多半是网络问题，下次启动该再试）。
+     */
+    @Query("UPDATE libraries SET lastScanAt = :at WHERE id = :id")
+    suspend fun markLibraryScanned(id: Long, at: Long)
 
     @Query("SELECT * FROM libraries ORDER BY createdAt DESC")
     fun libraries(): Flow<List<MediaLibraryEntity>>
@@ -781,4 +812,41 @@ interface MediaDao {
         }
         tags.forEach { linkTagByName(movie.mediaKey, it) }
     }
+
+    // ---------------- 观影历史 ----------------
+
+    /**
+     * 观影历史（最近看的在最前）+ **库内元数据**。
+     *
+     * join 用 `movies.videoPickCode = watch_history.itemKey`：命中说明这条在某个媒体库里，
+     * 海报和标题现取（库里换了海报/改了名，历史页立刻跟着变，不会像存快照那样过期）。
+     * 分集的 `seriesKey` 再 join 一次系列拿系列名，列表里显示"剧名 · 第 7 集"。
+     *
+     * join 不上时（片子后来被删了、库被删了）三个字段全是 null —— 界面退回用播放时记的
+     * [WatchHistoryRow.name]（文件名），列表**不会因此空一行**。
+     */
+    @Query(
+        "SELECT h.itemKey AS itemKey, h.name AS name, h.positionMs AS positionMs, " +
+            "h.durationMs AS durationMs, h.updatedAt AS updatedAt, h.local AS local, " +
+            "COALESCE(m.posterPickCode, s.posterPickCode) AS posterPickCode, " +
+            "COALESCE(s.title, m.title) AS libraryTitle, m.title AS ownTitle " +
+            "FROM watch_history h " +
+            "LEFT JOIN movies m ON m.videoPickCode = h.itemKey " +
+            "LEFT JOIN movies s ON s.mediaKey = m.seriesKey " +
+            "ORDER BY h.updatedAt DESC LIMIT :limit",
+    )
+    fun watchHistoryRows(limit: Int = 500): Flow<List<WatchHistoryRow>>
+
+    @Query("SELECT * FROM watch_history WHERE itemKey = :key")
+    suspend fun watchHistoryOf(key: String): WatchHistoryEntity?
+
+    /** 一条只需一个 pick_code/uri：再看一次就是覆盖同一条，不堆重复行 */
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsertWatchHistory(row: WatchHistoryEntity)
+
+    @Query("DELETE FROM watch_history WHERE itemKey = :key")
+    suspend fun deleteWatchHistory(key: String)
+
+    @Query("DELETE FROM watch_history")
+    suspend fun clearWatchHistory()
 }

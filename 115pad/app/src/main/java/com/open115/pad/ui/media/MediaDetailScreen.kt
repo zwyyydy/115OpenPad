@@ -222,7 +222,12 @@ fun MediaDetailScreen(
 
     fun play(pc: String, name: String, entries: List<PlaylistEntry>, at: Int) {
         context.startActivity(
-            PlayerActivity.intent(context, pc, name, entries, at.coerceIn(0, (entries.size - 1).coerceAtLeast(0))),
+            PlayerActivity.intent(
+                context, pc, name, entries,
+                at.coerceIn(0, (entries.size - 1).coerceAtLeast(0)),
+                // 媒体库的播放要进「观影历史」（文件页的播放不记，那边看操作记录）
+                recordHistory = true,
+            ),
         )
     }
 

@@ -226,6 +226,22 @@ data class MediaLibraryEntity(
     /** 程序启动时对这个库自动跑增量扫描 */
     val autoScanOnStart: Boolean = false,
     /**
+     * 自动扫描的**最小间隔（小时）**：距上次扫描不到这么久就跳过，0 = 不限（每次启动都扫）。
+     *
+     * 只在程序启动时判断一次（见 App115 的启动块）：115 有频控，一轮增量扫描的代价是
+     * "每个目录一次列表请求"，一个几千文件的库跑起来是分钟级 —— 每次开 App 都扫并不合适，
+     * 而这个开关的用户预期就是"别太频繁"。判断本身是纯本地的（比较 [lastScanAt]），零请求。
+     */
+    val autoScanIntervalHours: Int = 0,
+    /**
+     * 上次扫描**跑完**的时间（毫秒，0 = 从未扫过）。由 [MediaScanner.runScan] 在收尾时写。
+     *
+     * 记的是"结束"而不是"开始"：开始就记的话，一轮卡在列目录阶段失败的扫描也算数，
+     * 库里就会在这之后 N 小时内不再自动扫。反过来，一轮连一个目录都没跑完（列目录就抛了）
+     * 也不记 —— 那种情况就是网络问题，下次启动应该再试。
+     */
+    val lastScanAt: Long = 0,
+    /**
      * 体积过滤：**视频小于这么多 MB 就不入库**，0 = 不过滤。
      *
      * 为什么按库配而不是全局：同一个账号下的库差异很大 —— 正片库里 100MB 以下的多半是
@@ -246,3 +262,76 @@ data class MediaLibraryEntity(
                 paths.filter { it.isNotBlank() }.joinToString("\n")
     }
 }
+
+/**
+ * 这次启动该不该自动扫这个库。判据纯本地（只比时间戳），零请求。
+ *
+ * - 间隔 0 = 不限 → 每次启动都扫（这个开关本来的行为）
+ * - 从未扫过（[MediaLibraryEntity.lastScanAt] = 0）→ 要扫
+ * - 正好等于间隔 → 要扫（`>=` 而不是 `>`：设 1 小时就是"满 1 小时可以扫"）
+ *
+ * 抽成函数而不是写在启动块里，是为了能被单测钉住 —— 时间相关的判断最容易差一个边界。
+ */
+fun MediaLibraryEntity.autoScanDue(now: Long): Boolean {
+    // 从未扫过：**必须显式判**，不能靠"now - 0 很大"—— 那依赖机器时钟是真实时间
+    // （单测里的小时钟就会翻车，设备时钟被改小也一样）
+    if (lastScanAt <= 0L) return true
+    val intervalMs = autoScanIntervalHours.coerceAtLeast(0) * 3_600_000L
+    return intervalMs <= 0L || now - lastScanAt >= intervalMs
+}
+
+/**
+ * 观影历史：一条 = 在**媒体库里**播过一次的视频（key 就是它的 pick_code）。
+ *
+ * 为什么自己记：115 那边只有「按 pick_code 查某一条的进度」（`GET open/video/history`），
+ * **没有"列出看过的片"的接口** —— 媒体库页里那份「观影历史」只能靠本机记。
+ *
+ * **只收媒体库的播放**（见 PlayerActivity.intent 的 recordHistory）：文件页的播放记录在
+ * 「操作记录」里已经有一份，两处都记是重复；本机文件（传输中心/外部分享进来的）也不在媒体库里。
+ *
+ * 主键就是播放链路自己用的那个 key，所以"再看一次"天然是更新同一条、不会重复堆。
+ * 海报/标题**不存这里**（存了会跟库不同步）：列表查询时 join movies 现取，
+ * 见 [MediaDao.watchHistoryRows]。
+ */
+@Entity(tableName = "watch_history", indices = [Index("updatedAt")])
+data class WatchHistoryEntity(
+    @PrimaryKey val itemKey: String,
+    /** 播放时看到的名字。列表里优先显示库里的标题（见 watchHistoryRows） */
+    val name: String,
+    val positionMs: Long,
+    val durationMs: Long,
+    /** 最后一次有进度的时间：列表按它倒序，"刚才看的"在最上面 */
+    val updatedAt: Long,
+    /**
+     * 本机/外部源（uri 形式）—— 播放时不能再当 pick_code 去解析直链。
+     *
+     * 现在**恒为 false**：写入链路只记媒体库（云端）播放。留着这一列有两个原因：
+     * ① 表结构已经随 v13 落盘，为了它再迁移一次不值当；
+     * ② 列表页仍然认它（历史行万一是本机源，点下去要走 localIntent 而不是解析直链）。
+     */
+    val local: Boolean = false,
+)
+
+/**
+ * 观影历史 + **媒体库里的元数据**（海报 / 更像片名的标题），列表页直接用。
+ *
+ * join 规则：历史行的 key 就是视频的 pick_code，而 `movies.videoPickCode` 正是它 ——
+ * 命中说明这部片在某个库里，于是海报、标题都能现取（库里改了名、换了海报，历史页立刻跟着变）。
+ *  - 分集（剧集包里的某一集、分 CD 的某张盘）自己那条也带海报（扫描时从系列继承的），
+ *    所以影片这层只 join 一次
+ *  - 标题取 `COALESCE(s.title, m.title)`：分集显示**系列名**（列表里"示例剧集三"比"第 7 集"好认），
+ *    集名当副标题（[ownTitle]，跟主标题不一样时才显示）
+ */
+data class WatchHistoryRow(
+    val itemKey: String,
+    val name: String,
+    val positionMs: Long,
+    val durationMs: Long,
+    val updatedAt: Long,
+    val local: Boolean,
+    val posterPickCode: String?,
+    /** 库里的标题（分集时是所属系列/影片的名字）；不在任何库里为 null */
+    val libraryTitle: String?,
+    /** 这条视频自己那行的标题（分集就是集名）；不在库里为 null */
+    val ownTitle: String?,
+)

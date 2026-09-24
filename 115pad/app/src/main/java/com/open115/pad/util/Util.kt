@@ -94,4 +94,24 @@ object Format {
 
     /** 任务进度可能是 0-100 或 0-10000，做归一化 */
     fun percent(v: Double): Float = (if (v > 100) v / 100.0 else v).toFloat().coerceIn(0f, 100f)
+
+    /**
+     * 相对时间：`刚刚 / 5 分钟前 / 3 小时前 / 2 天前 / 2026-09-25`。
+     *
+     * 「上次扫描是什么时候」「这条片多久之前看的」这类问题的答案都是"多久以前"，
+     * 直接给一个完整时间戳反而要心算。超过一周落回日期 —— 再往上"23 天前"也不比日期好读。
+     *
+     * [ms] <= 0（没记过）返回「从未」，调用方直接拼进文案即可。
+     */
+    fun ago(ms: Long, now: Long = System.currentTimeMillis()): String {
+        if (ms <= 0) return "从未"
+        val d = now - ms
+        return when {
+            d < 60_000L -> "刚刚"
+            d < 3_600_000L -> "${d / 60_000} 分钟前"
+            d < 86_400_000L -> "${d / 3_600_000} 小时前"
+            d < 7 * 86_400_000L -> "${d / 86_400_000} 天前"
+            else -> java.text.SimpleDateFormat("yyyy-MM-dd", Locale.CHINA).format(java.util.Date(ms))
+        }
+    }
 }

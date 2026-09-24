@@ -149,6 +149,120 @@ class ClusterFilesTest {
         assertTrue("一个视频组 = 影片目录", !sniffDirectory(listOf(f("A.mkv"))).isMultiVideo)
     }
 
+    // ---------------- 元数据簇与视频簇前缀对不上：合成一条 ----------------
+
+    /**
+     * 实测清单：`示例库三/示例库二/示例演员/演员目录/示例演员/ABC-101-4K-C 示例演员/`
+     * （8 项，另有 `.actors/`、`extrafanart/` 两个目录，它们不进这个列表）。
+     * 刮削器给文件夹改成了 `ABC-101-4K-C 示例演员`，视频还是下载时的原名 `ABC-101-U.mp4`。
+     */
+    private val prefixMismatchDir = listOf(
+        f("ABC-101-4K-C-fanart.jpg"),
+        f("ABC-101-4K-C-poster.jpg"),
+        f("ABC-101-4K-C-thumb.jpg"),
+        f("ABC-101-4K-C.nfo"),
+        f("ABC-101-4K-C.nfo.bak"),
+        f("ABC-101-U.mp4"),
+    )
+
+    @Test
+    fun `nfo 与视频前缀对不上时合成一条_播放键落到视频上`() {
+        // 用户报的就是这个：有海报有简介的那张卡点播放 →「没有找到可播放的视频文件」，
+        // 因为元数据和视频被聚成了两个簇、入库成两条独立的行
+        val cs = clusterFiles(prefixMismatchDir)
+        assertEquals("同一部片只该出一条", 1, cs.size)
+        val c = cs.single()
+        assertEquals("键与标题用元数据那个前缀", "ABC-101-4K-C", c.prefix)
+        assertEquals("ABC-101-4K-C.nfo", c.nfo?.name)
+        assertEquals("视频必须挂在同一条上", "ABC-101-U.mp4", c.video?.name)
+        assertEquals("ABC-101-4K-C-poster.jpg", c.poster?.name)
+        assertEquals("ABC-101-4K-C-fanart.jpg", c.fanart?.name)
+        assertEquals("ABC-101-4K-C-thumb.jpg", c.thumb?.name)
+    }
+
+    @Test
+    fun `合成之后算影片目录_不是多集`() {
+        // 判成多集的话入库时 isEpisodeLike=true，详情页会变成"播放第 1 集"而不是直接播
+        assertTrue("合成后只剩一个视频组", !sniffDirectory(prefixMismatchDir).isMultiVideo)
+    }
+
+    @Test
+    fun `合成之后目录级海报挂给合成的那条`() {
+        // 合并必须在挑锚点之前做：早先"唯一带视频的簇"是那个没元数据的半边（ABC-101-U），
+        // 目录级的 poster.jpg/fanart.jpg 会挂到它身上 —— 而它根本不出现在海报墙上。
+        // （这一条用没有自带图的目录测：自带的 `…-poster.jpg` 本来就优先于目录级的，见上面那条用例）
+        val cs = clusterFiles(
+            listOf(f("ABC-101-4K-C.nfo"), f("ABC-101-U.mp4"), f("poster.jpg"), f("fanart.jpg")),
+        )
+        assertEquals(1, cs.size)
+        val c = cs.single()
+        assertEquals("ABC-101-4K-C", c.prefix)
+        assertEquals("poster.jpg", c.poster?.name)
+        assertEquals("fanart.jpg", c.fanart?.name)
+    }
+
+    @Test
+    fun `合成的那条自带图时_目录级图不抢`() {
+        val cs = clusterFiles(prefixMismatchDir + listOf(f("poster.jpg"), f("fanart.jpg")))
+        val c = cs.single()
+        assertEquals("ABC-101-4K-C-poster.jpg", c.poster?.name)
+        assertEquals("ABC-101-4K-C-fanart.jpg", c.fanart?.name)
+    }
+
+    @Test
+    fun `视频那边有图_元数据那边没有时借过来`() {
+        val cs = clusterFiles(listOf(f("X.nfo"), f("X-U.mp4"), f("X-U-poster.jpg")))
+        assertEquals(1, cs.size)
+        assertEquals("X-U-poster.jpg", cs.single().poster?.name)
+    }
+
+    @Test
+    fun `视频自带 nfo 时不合并`() {
+        // A 自给自足（视频 + nfo），B 是另一个不相干的 nfo —— 合并会把两条毫不相干的并成一条
+        val cs = clusterFiles(listOf(f("A.mkv"), f("A.nfo"), f("B.nfo")))
+        assertEquals(2, cs.size)
+        assertEquals("A.nfo", cs.first { it.prefix == "A" }.nfo?.name)
+    }
+
+    @Test
+    fun `两个以上 nfo 簇说不清信谁_不合并`() {
+        val cs = clusterFiles(listOf(f("A.mp4"), f("B.nfo"), f("C.nfo")))
+        assertEquals(3, cs.size)
+        assertNull("B 不该凭空拿到 A 的视频", cs.first { it.prefix == "B" }.video)
+    }
+
+    @Test
+    fun `多视频目录不合并`() {
+        // 一季的集：每条都自带视频，合成一条会把整季压成一部片
+        val cs = clusterFiles(
+            listOf(f("剧 - S01E01 - 第1集.mkv"), f("剧 - S01E02 - 第2集.mkv"), f("tvshow.nfo")),
+        )
+        assertEquals(3, cs.size)
+        assertEquals("剧 - S01E01 - 第1集.mkv", cs.first { it.prefix.contains("E01") }.video?.name)
+    }
+
+    @Test
+    fun `分CD的两张盘不归这条规则管`() {
+        // 各盘都有自己的视频（还有自己的 nfo），合不合并是 cdGroupBaseOf 那套的事，别在这里先并了
+        val cs = clusterFiles(
+            listOf(
+                f("ABC-201-cd1.mp4"), f("ABC-201-cd1.nfo"),
+                f("ABC-201-cd2.mp4"), f("ABC-201-cd2.nfo"),
+            ),
+        )
+        assertEquals(2, cs.size)
+        assertEquals("ABC-201", cdGroupBaseOf(cs))
+    }
+
+    @Test
+    fun `只有元数据没有视频时保持原样`() {
+        // 实测同一个库的 `ABC-102-C 示例演员/`：目录里一个视频文件都没有（视频在库外的别的目录）
+        // —— 没有视频可借，这条卡就是播不了，别去跟别的目录的东西凑
+        val cs = clusterFiles(listOf(f("ABC-102-C.nfo"), f("ABC-102-C-poster.jpg")))
+        assertEquals(1, cs.size)
+        assertNull(cs.single().video)
+    }
+
     // ---------------- 分集继承：往上找祖先目录 ----------------
 
     @Test

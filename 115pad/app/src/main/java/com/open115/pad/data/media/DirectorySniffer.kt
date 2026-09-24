@@ -8,6 +8,9 @@ package com.open115.pad.data.media
  *
  * 聚类规则：文件名去掉 {tmdbid-…}、去掉 -poster/-fanart/-thumb/-logo 等装饰后缀和
  * 语言后缀（.zh-CN）与扩展名，剩下的公共前缀即一组；视频扩展名是主文件。
+ *
+ * 前缀聚完之后还有一步**合并**：目录里只有一个"有元数据没视频"的簇、一个"有视频没元数据"的簇时，
+ * 它们是同一部片（刮削器给文件夹改了名、视频还是下载时的原名），合成一条 —— 见 [clusterFiles] 里的判据。
  */
 
 private val VIDEO_EXTS = setOf("mkv", "mp4", "avi", "iso", "ts", "mov", "wmv", "flv", "m2ts", "webm")
@@ -177,6 +180,40 @@ fun clusterFiles(files: List<FileRef>, minVideoBytes: Long = 0L): List<Cluster> 
         // 只丢"曾经有视频且被滤掉"的组 —— 纯 nfo 组（tvshow.nfo）照旧保留，剧集条目靠它建起来。
         .filterNot { it.video == null && it.videoTooSmall }
 
+    // ---- 元数据簇与视频簇的前缀对不上：合成一条 ----
+    // 实测 2026-09-25「示例演员」库 `ABC-101-4K-C 示例演员/`：nfo 与三张图叫 `ABC-101-4K-C.*`，
+    // 唯一那个 33.6GB 的视频却叫 `ABC-101-U.mp4` —— 刮削器给**文件夹**改了名，视频还是下载时的原名。
+    // 不合并的后果（用户实测报的就是这个）：有元数据的那条 videoPickCode 是 null，
+    // 点播放弹「没有找到可播放的视频文件」；视频另出一条没海报没标题的卡、还因为没评分排在墙尾。
+    //
+    // 判据两条都要满足（宁可不合并也别乱合并）：
+    //  ① 全目录**只有一个**带视频的簇，且它**没有 nfo** —— 自己带 nfo 就自给自足，不该动它；
+    //  ② 除它之外**恰好一个**有 nfo 的簇（有元数据、没视频）。
+    // （前缀必然不同：相同的话本来就聚成一个簇了。）
+    // 一季的集、分 CD（每张盘都自带视频）、同片不同清晰度都被 ① 挡住；
+    // 两个以上 nfo 簇说不清该信谁，被 ② 挡住。
+    //
+    // 合成的那条**用元数据簇的身份**（前缀 → mediaKey、标题、nfo、海报都是它的），
+    // 视频从视频簇借过来；图只补它自己没有的。这样一张卡、点播放直接落在这个视频上，
+    // 不必再走"合成行 + 分集"那套（那是分 CD 多个视频时才需要的）。
+    fun loneMetadataPair(): Pair<MutableCluster, MutableCluster>? {
+        // ① 唯一带视频的簇且它没有 nfo
+        val v = entries.filter { it.video != null }.singleOrNull()?.takeIf { it.nfo == null } ?: return null
+        // ② 除它之外恰好一个有 nfo 的簇
+        val m = entries.filter { it !== v && it.nfo != null }.singleOrNull() ?: return null
+        return m to v
+    }
+
+    // ★ 必须在挑锚点**之前**合并：合成后的簇既带元数据又带视频，目录级的 poster.jpg/fanart.jpg
+    //   正是给"这一条"的（早先是"唯一带视频的簇"拿到，也就是那个没元数据的半边）。
+    val merged = loneMetadataPair()?.let { (meta, video) ->
+        meta.video = video.video
+        meta.poster = meta.poster ?: video.poster
+        meta.fanart = meta.fanart ?: video.fanart
+        meta.thumb = meta.thumb ?: video.thumb
+        entries.filter { it !== video }
+    } ?: entries
+
     // 目录级海报/背景挂给哪个簇（锚点）：
     //   ① 本目录**唯一**带视频的簇 —— 单影片目录（示例影片那种）
     //   ② 带 nfo 但没有视频的簇 —— 剧集根目录的 tvshow.nfo 就是"系列本身"，海报就该挂它
@@ -188,10 +225,11 @@ fun clusterFiles(files: List<FileRef>, minVideoBytes: Long = 0L): List<Cluster> 
     //    索引里两个字段却都是 null，海报墙上系列卡是空白。
     //
     // ① 在 ② 之前：电影目录里混进一个无关的 xxx.nfo 时，海报不该挂到那个 nfo 组上。
-    val anchor = entries.singleOrNull { it.video != null }
-        ?: entries.firstOrNull { it.nfo != null && it.video == null }
+    // （合并过的那种目录里，①指的就是合成的那条 —— 它才是这部片。）
+    val anchor = merged.singleOrNull { it.video != null }
+        ?: merged.firstOrNull { it.nfo != null && it.video == null }
 
-    return entries.map { c ->
+    return merged.map { c ->
         val onAnchor = c === anchor
         Cluster(
             prefix = c.prefix,

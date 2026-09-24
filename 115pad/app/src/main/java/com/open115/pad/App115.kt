@@ -2,12 +2,14 @@ package com.open115.pad
 
 import android.app.Application
 import android.content.Context
+import android.util.Log
 import com.open115.pad.data.AuthApi
 import com.open115.pad.data.AuthInterceptor
 import com.open115.pad.data.OpenApi
 import com.open115.pad.data.QrApi
 import com.open115.pad.data.Session
 import com.open115.pad.data.TokenAuthenticator
+import com.open115.pad.data.media.autoScanDue
 import kotlinx.serialization.json.Json
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -219,18 +221,32 @@ class AppContainer(context: Context) {
         // 开关打开的库：登录后自动跑一轮**增量**扫描（upt 未变的目录全部跳过，
         // 代价只有每目录一次列表请求；未登录不跑）。开关是**每库各自**的设置，
         // mediaScanner 自带互斥，多个库连扫 + 用户随后手动扫描都不会并发。
+        //
+        // 「间隔多少小时」也在这里判：**距上次扫描不足就把这个库跳过**（纯本地比较，零请求）。
+        // 间隔 0 = 不限 → 每次启动都扫，与这个开关原来的行为一致（老库升级上来不会突变）。
         scope.launch {
             session.loggedInFlow.collect { loggedIn ->
                 if (!loggedIn) return@collect
                 val dao = mediaDatabase.mediaDao()
+                val now = System.currentTimeMillis()
                 dao.libraries().first()
                     .filter { it.autoScanOnStart }
                     .forEach { lib ->
+                        // 距上次扫描不足设定间隔就跳过这个库（判据纯本地，零请求）。
+                        // 间隔 0 = 不限 → 每次启动都扫，与这个开关原来的行为一致。
+                        if (!lib.autoScanDue(now)) {
+                            Log.i(
+                                "App115",
+                                "跳过自动扫描「${lib.name}」：距上次扫描不足 ${lib.autoScanIntervalHours} 小时",
+                            )
+                            return@forEach
+                        }
                         lib.rootCids.zip(lib.rootPaths).forEach { (cid, path) ->
                             mediaScanner.runScan(
                                 cid, path, incremental = true,
                                 rateLimitMs = lib.rateLimitMs,
                                 minVideoSizeMb = lib.minVideoSizeMb,
+                                libraryId = lib.id,
                             )
                         }
                     }
