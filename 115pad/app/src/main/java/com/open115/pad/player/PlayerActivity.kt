@@ -82,7 +82,6 @@ import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
-import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Slider
 import androidx.compose.material3.Surface
@@ -310,6 +309,76 @@ private fun preloadFailReason(err: PlaybackException?): String {
         else -> "加载失败（${err.errorCodeName}）"
     }
 }
+
+/**
+ * 解码能力类错误：这台设备/这条流"解不动"——解码器初始化或查询失败、超能力、解码失败、
+ * 音轨初始化失败。换地址、重试都没意义，只能降档。
+ *
+ * 原盘是重灾区——115 的「原盘」就是原始文件本身，4K HEVC 10bit、AV1、DTS-HD 这类
+ * 规格平板上解不动是常态；而 115 的转码档（1~5）恒为 8bit AVC，设备基本都放得动。
+ * 「原画」(100) 对高规格片源也常常就是原始文件本身，所以这类错误任何档位都可能踩到。
+ */
+private fun isCodecFailure(err: PlaybackException): Boolean = when (err.errorCode) {
+    PlaybackException.ERROR_CODE_DECODING_FAILED,
+    PlaybackException.ERROR_CODE_DECODING_FORMAT_UNSUPPORTED,
+    PlaybackException.ERROR_CODE_DECODING_FORMAT_EXCEEDS_CAPABILITIES,
+    PlaybackException.ERROR_CODE_DECODER_INIT_FAILED,
+    PlaybackException.ERROR_CODE_DECODER_QUERY_FAILED,
+    PlaybackException.ERROR_CODE_AUDIO_TRACK_INIT_FAILED,
+    -> true
+
+    else -> false
+}
+
+/**
+ * 解封装（容器）不支持的错误。可能是文件本身（原盘常见的怪封装），
+ * 也可能是外挂字幕把整条媒体准备带崩了——所以只在原盘档拿它当降档依据，
+ * 转码档上先交给后面的"无字幕重试"。
+ */
+private fun isContainerFailure(err: PlaybackException): Boolean = when (err.errorCode) {
+    PlaybackException.ERROR_CODE_PARSING_CONTAINER_UNSUPPORTED,
+    PlaybackException.ERROR_CODE_PARSING_CONTAINER_MALFORMED,
+    -> true
+
+    else -> false
+}
+
+/**
+ * 原盘直链"文件级不可播"的错误：403 之外，404、以及 CDN 返回的不是媒体内容也算。
+ * 这些错误值得先换一份新直链（115 每次 downUrl 给的地址可能落到不同 CDN），
+ * 换完还是不行才降档。
+ */
+private fun isDeadOriginalLink(err: PlaybackException): Boolean = when (err.errorCode) {
+    PlaybackException.ERROR_CODE_IO_BAD_HTTP_STATUS,
+    PlaybackException.ERROR_CODE_IO_FILE_NOT_FOUND,
+    PlaybackException.ERROR_CODE_IO_INVALID_HTTP_CONTENT_TYPE,
+    -> true
+
+    else -> false
+}
+
+/**
+ * 从当前档往下找"下一档"（严格更低，所以不会来回横跳）。
+ *
+ * @param deviceSafe 只挑真·转码档（1~5）：能力类失败时用——「原画」(100) 对高规格片源
+ *                   常常就是原始文件本身，拿它当降级目标会再踩一次同样的坑
+ *                   （加载时的默认档位也是同样的取舍，见 targetDef 那段）。
+ *                   直链失效不属于能力问题，这时「原画」反而是画质最高的选择。
+ */
+private fun nextTierBelow(current: Int, available: List<Int>, deviceSafe: Boolean): Int? {
+    val lower = available.filter { it != current && it != DEF_ORIGINAL_FILE && it < current }
+    if (lower.isEmpty()) return null
+    return if (deviceSafe) lower.filter { it != 100 }.maxOrNull() ?: lower.maxOrNull()
+    else lower.maxOrNull()
+}
+
+/**
+ * 画面中央的瞬时提示（900ms 自动淡出）。
+ *
+ * compact = 小字：切清晰度这种"后台正在做事"的等待提示，一行小字就够——原来是
+ * "大黑框 + 粗进度条"，黑底画面正中被糊住一大块，用户明确嫌丑，进度条已去掉。
+ */
+private data class ScreenHint(val text: String, val compact: Boolean)
 
 class PlayerActivity : ComponentActivity() {
     companion object {
@@ -557,6 +626,14 @@ fun PlayerScreen(
     // 视频帧宽高比来源（onVideoSizeChanged）：旋转后做等比适配用
     var vsVideoSize by remember { mutableStateOf(VideoSize.UNKNOWN) }
     var dtFx by remember { mutableStateOf<DoubleTapFx?>(null) }
+    // 水波纹轮次用自增序号而不是 currentTimeMillis：同一毫秒内的两次（左右两侧同时双击）
+    // 会撞成同一个 id，而 DoubleTapFxOverlay 的 remember(fx.id) 会因此复用上一轮的动画
+    // （alpha 已归零）→ 第二下水波纹不亮。
+    var dtFxSeq by remember { mutableStateOf(0L) }
+    fun pulseDoubleTapFx(side: Int, label: String) {
+        dtFxSeq += 1L
+        dtFx = DoubleTapFx(side, label, dtFxSeq)
+    }
     var speedCapsule by remember { mutableStateOf<String?>(null) }
     var controllerHideJob by remember { mutableStateOf<kotlinx.coroutines.Job?>(null) }
 
@@ -925,11 +1002,16 @@ fun PlayerScreen(
         }
     }
 
-    // 手势指示器
-    var indicator by remember { mutableStateOf<Pair<String, Float?>?>(null) }
+    // 手势指示器 / 操作回执
+    var indicator by remember { mutableStateOf<ScreenHint?>(null) }
     var indicatorAt by remember { mutableStateOf(0L) }
-    val setIndicator: (String, Float?) -> Unit = { text, progress ->
-        indicator = text to progress
+    val setIndicator: (String) -> Unit = { text ->
+        indicator = ScreenHint(text, compact = false)
+        indicatorAt = System.currentTimeMillis()
+    }
+    /** 小字提示（无进度条）：切清晰度这类等待用，见 [ScreenHint] */
+    val setHint: (String) -> Unit = { text ->
+        indicator = ScreenHint(text, compact = true)
         indicatorAt = System.currentTimeMillis()
     }
     LaunchedEffect(indicator, indicatorAt) {
@@ -1032,10 +1114,14 @@ fun PlayerScreen(
 
             override fun onPlayerError(err: PlaybackException) {
                 val httpFail = err.errorCode == PlaybackException.ERROR_CODE_IO_BAD_HTTP_STATUS
+                // 原盘直链的"文件级不可播"错误（403/404/返回的不是媒体）同样值得先换一份新直链：
+                // 115 每次 downUrl 给的地址可能落到不同 CDN，换一次往往就好了。换完还不行才降档。
+                val linkFail = httpFail ||
+                    (currentDef == DEF_ORIGINAL_FILE && isDeadOriginalLink(err))
                 val now = System.currentTimeMillis()
                 // 距上次自愈足够久 → 视为新一轮故障，补满重试预算
                 if (now - lastAddressRefreshAt > REFRESH_NEW_ROUND_GAP_MS) refreshAttempts = 0
-                if (httpFail && refreshAttempts < REFRESH_MAX_ATTEMPTS) {
+                if (linkFail && refreshAttempts < REFRESH_MAX_ATTEMPTS) {
                     // 播放地址/分片签名过期（HTTP 403）→ 换新地址续播。
                     // 带重试预算 + 递退间隔：上游抖动常在几秒内自愈，
                     // 旧逻辑"30 秒内只换一次"会把可恢复的抖动直接变成硬报错。
@@ -1052,7 +1138,7 @@ fun PlayerScreen(
                                 val fresh = parseVideoPlayResponse(container.openApi.videoPlay(currentPickCode))
                                 data = fresh
                             } else {
-                                setIndicator("原盘地址已刷新", null)
+                                setIndicator("原盘地址已刷新")
                             }
                             val pos = resumePos(player.currentPosition)
                             val built = buildItem(currentDef)
@@ -1072,33 +1158,48 @@ fun PlayerScreen(
                     }
                     return
                 }
-                // 原盘档解码失败（典型：原文件是 HEVC Main10 / 4K 之类的高规格编码，
-                // 设备的解码器声明能力不覆盖 —— ExoPlayer 给 DECODING_FAILED 且
-                // format_supported=NO_EXCEEDS_CAPABILITIES）→ 回退到转码最高档。
-                // 这类失败换直链地址没有意义：编码参数本身就播不了；而 115 的转码档恒为
-                // 8bit AVC，设备基本都放得动。只自动回退一次，且把偏好改回非原盘，
-                // 否则连播的每一集都会重复踩同一个坑。
-                val decodeFail = err.errorCode == PlaybackException.ERROR_CODE_DECODING_FAILED ||
-                    err.errorCode == PlaybackException.ERROR_CODE_DECODING_FORMAT_UNSUPPORTED
-                if (decodeFail && currentDef == DEF_ORIGINAL_FILE) {
-                    val fallbackDef = data?.videoUrls
-                        ?.map { it.definition }
-                        ?.filter { it != DEF_ORIGINAL_FILE }
-                        ?.maxOrNull()
-                    if (fallbackDef != null) {
+                // ---- 这一档播不了 → 自动降一档 ----
+                // 两类失败换地址都没意义，退到下一档才是出路（比把用户丢在报错页强）：
+                //  ① 解码能力类（解码器/超能力/音轨初始化）：任何档都可能踩到（原盘最多见，
+                //     「原画」对高规格片源也常是原始文件本身）→ 任何档都降；
+                //  ② 解封装不支持、或原盘直链把换地址预算用完仍 403/404 → 只从原盘降
+                //     （转码档的解析失败更可能是外挂字幕带崩的，留给后面的无字幕重试先试）。
+                // 目标档取"往下最近的一个转码档"（见 nextTierBelow），且严格更低，
+                // 所以不会在档位间来回横跳。
+                val codecFail = isCodecFailure(err)
+                val containerFail = isContainerFailure(err)
+                val fromOriginal = currentDef == DEF_ORIGINAL_FILE
+                val linkDead = fromOriginal && linkFail
+                if (codecFail || ((containerFail || linkDead) && fromOriginal)) {
+                    val next = nextTierBelow(
+                        current = currentDef,
+                        available = data?.videoUrls?.map { it.definition }.orEmpty(),
+                        deviceSafe = codecFail || containerFail,
+                    )
+                    if (next != null) {
+                        val from = currentDef
+                        val capability = codecFail || containerFail
                         scope.launch {
-                            runCatching { container.playerPrefs.setPreferOriginal(false) }
+                            // 能力不够是"这台设备放不动这一档"→ 把原盘偏好改回去，否则连播的
+                            // 每一集都会重复踩同一个坑；直链失效只是这一个文件的地址问题，
+                            // 不动用户偏好（下一集该用原盘还用原盘）
+                            if (capability && from == DEF_ORIGINAL_FILE) {
+                                runCatching { container.playerPrefs.setPreferOriginal(false) }
+                            }
                             val pos = resumePos(player.currentPosition)
-                            val built = buildItem(fallbackDef)
+                            val built = buildItem(next)
                             if (built == null) {
-                                error = "播放失败（${err.errorCodeName}）：原盘与转码均不可用"
+                                error = "播放失败（${err.errorCodeName}）：${defLabel(from)}与${defLabel(next)}均不可用"
                                 return@launch
                             }
-                            currentDef = fallbackDef
+                            currentDef = next
                             player.setMediaItem(built.second, pos)
                             player.prepare()
                             player.playWhenReady = true
-                            setIndicator("设备不支持原盘编码，已切回${defLabel(fallbackDef)}", null)
+                            setIndicator(
+                                if (capability) "设备放不动${defLabel(from)}，已切到${defLabel(next)}"
+                                else "原盘地址不可用，已切到${defLabel(next)}",
+                            )
                         }
                         return
                     }
@@ -1291,13 +1392,13 @@ fun PlayerScreen(
             }
             PlayMode.SEQUENTIAL -> {
                 if (currentIndex < playQueue.lastIndex) switchEpisode(1)
-                else setIndicator("已是最后一集", null)
+                else setIndicator("已是最后一集")
             }
             PlayMode.SHUFFLE -> {
                 val candidates = playQueue.indices.filter { i ->
                     i != currentIndex && playedKeys.none { it == playQueue[i].pc }
                 }
-                if (candidates.isEmpty()) setIndicator("随机播放已播完全部", null)
+                if (candidates.isEmpty()) setIndicator("随机播放已播完全部")
                 else loadEpisodeAt(candidates.random())
             }
         }
@@ -1390,7 +1491,25 @@ fun PlayerScreen(
                     ?: d.videoUrls.maxOfOrNull { it.definition }
                     ?: 4
             }
-            val built = buildItem(targetDef)
+            var built = buildItem(targetDef)
+            // 原盘直链这一刻取不到（downUrl 频控/签名异常/无下载权限）→ 直接退到下一档。
+            // 注意 targetDef 里的预检已经成功过一次，这里是第二次 downUrl —— 连着两次调用
+            // 恰好是最容易被频控打中的姿势，所以这条不是理论上的分支。
+            // 旧行为是弹"没有可用的播放地址（部分清晰度需要会员）"——把接口问题说成会员问题，
+            // 而且明明转码档能播。
+            if (built == null && targetDef == DEF_ORIGINAL_FILE) {
+                val next = nextTierBelow(
+                    current = DEF_ORIGINAL_FILE,
+                    available = d.videoUrls.map { it.definition },
+                    deviceSafe = false,
+                )
+                if (next != null) {
+                    built = buildItem(next)
+                    // 用 Toast 而不是画面中央的指示器：此刻还在 loading 全屏遮罩里，
+                    // 指示器要等遮罩撤掉才可能显示，900ms 自动淡出早就过了
+                    if (built != null) toast("原盘地址不可用，已切到${defLabel(next)}")
+                }
+            }
             if (built == null) {
                 error = "没有可用的播放地址（部分清晰度需要会员）"
                 loading = false
@@ -1522,10 +1641,9 @@ fun PlayerScreen(
                 lastBufferedPos = pre.bufferedPosition
                 lastProgressAt = now
             }
-            setIndicator(
-                "正在切换 ${labelOf(def)}…",
-                (buffered.toFloat() / PRELOAD_BUFFER_MS).coerceIn(0f, 0.99f),
-            )
+            // 每次轮询都刷新提示：既让用户知道还在等，也靠"有更新"躲过 900ms 自动淡出
+            //（否则长等待期间界面毫无反馈，用户会以为卡死了）。小字、不出进度条。
+            setHint("正在切换 ${labelOf(def)}…")
             if (now - lastProgressAt > PRELOAD_STALL_MS) return PreloadOutcome.STALL
             if (now - startedAt > PRELOAD_MAX_WAIT_MS) return PreloadOutcome.TIMEOUT
         }
@@ -1563,7 +1681,6 @@ fun PlayerScreen(
                 // 只给个瞬时提示——切画质失败不该把正在看的画面打断。
                 setIndicator(
                     if (def == DEF_ORIGINAL_FILE) "原盘直链获取失败" else "该清晰度不可用",
-                    null,
                 )
                 return@launch
             }
@@ -1571,7 +1688,7 @@ fun PlayerScreen(
             if (d == currentDef) return@launch
             var item = firstItem
 
-            setIndicator("正在切换 ${labelOf(d)}…", 0f)
+            setHint("正在切换 ${labelOf(d)}…")
             pulseControlRow()
 
             val pre = preloadPlayer
@@ -1594,7 +1711,7 @@ fun PlayerScreen(
                 if (tries >= PRELOAD_MAX_TRIES || !worthRetryPreload(preloadError)) break
                 // 换新地址再试一轮（只有地址/链路类错误值得，见 worthRetryPreload）
                 item = refreshItemAfterPreloadFail(d) ?: break
-                setIndicator("正在切换 ${labelOf(d)}…（换新地址重试）", 0f)
+                setHint("正在切换 ${labelOf(d)}…（换新地址重试）")
             }
             if (outcome != PreloadOutcome.READY) {
                 // 失败用 Toast 而不是指示器：指示器 900ms 就淡出，这种长句子来不及看。
@@ -1639,7 +1756,7 @@ fun PlayerScreen(
                     " 缓冲=${pre.bufferedPosition - newPos}ms 位置=${newPos}ms",
             )
             pre.stop()
-            setIndicator("已切换到 ${labelOf(d)}", null)
+            setHint("已切换到 ${labelOf(d)}")
             pulseControlRow()
         }
     }
@@ -1661,7 +1778,7 @@ fun PlayerScreen(
         if (currentDef != 0) pendingKeepDef = currentDef
         pv = prefs.copy(softwareDecode = target)
         scope.launch { runCatching { container.playerPrefs.setSoftwareDecode(target) } }
-        setIndicator(if (target) "已切换软解（CPU）" else "已切换硬解", null)
+        setIndicator(if (target) "已切换软解（CPU）" else "已切换硬解")
         pulseControlRow()
     }
 
@@ -1680,7 +1797,7 @@ fun PlayerScreen(
     fun setSpeed(s: Float) {
         currentSpeed = s
         player.setPlaybackSpeed(s)
-        setIndicator("倍速 x$s", null)
+        setIndicator("倍速 x$s")
     }
 
     /** 加载在线搜索的字幕：下载到本地缓存后作为外挂字幕重建媒体，记住进度 */
@@ -1949,7 +2066,6 @@ fun PlayerScreen(
                 player.playWhenReady = true
                 setIndicator(
                     "字幕偏移 " + (if (subOffsetMs >= 0) "+" else "") + subOffsetMs / 1000.0 + "s",
-                    null,
                 )
             } catch (e: Exception) {
                 error = "字幕调整失败：${e.message}"
@@ -2187,8 +2303,8 @@ fun PlayerScreen(
                     },
                     onDoubleTap = { xRatio ->
                         applyDoubleTapZone(player, doubleTapConfig, xRatio) { side, label ->
-                            pulseControlRow()
-                            dtFx = DoubleTapFx(side, label, System.currentTimeMillis())
+                            // 双击快进/退只出水波纹，不弹控制排——与横滑快进/退保持一致
+                            pulseDoubleTapFx(side, label)
                         }
                     },
                     onHud = { vrHudText = it },
@@ -2238,8 +2354,10 @@ fun PlayerScreen(
                     speedCapsule = text
                 },
                 onDoubleTapFx = { side, label ->
-                    pulseControlRow()
-                    dtFx = DoubleTapFx(side, label, System.currentTimeMillis())
+                    // 双击快进/退只出水波纹，不弹控制排：和横滑快进/退一样，
+                    // 画面别被底部控制键和进度条挡住（弹控制排还会让进度条变可交互，
+                    // 落在底部的下一击会被它吃掉）
+                    pulseDoubleTapFx(side, label)
                 },
             )
             // ---- 屏幕防误触锁（模块 A）----
@@ -2382,10 +2500,10 @@ fun PlayerScreen(
                                             vrState.resetView()
                                             vrGyro.recenter()
                                             pushVrParams()
-                                            setIndicator("视角已复位", null)
+                                            setIndicator("视角已复位")
                                         } else {
                                             videoRotation = (videoRotation + 90) % 360
-                                            setIndicator("画面旋转 ${videoRotation}°", null)
+                                            setIndicator("画面旋转 ${videoRotation}°")
                                         }
                                         pulseControlRow()
                                     },
@@ -2596,7 +2714,7 @@ fun PlayerScreen(
                                         PlayMode.REPEAT_ONE -> PlayMode.SHUFFLE
                                         PlayMode.SHUFFLE -> PlayMode.SEQUENTIAL
                                     }
-                                    setIndicator(playMode.label, null)
+                                    setIndicator(playMode.label)
                                     pulseControlRow()
                                 }) {
                                     Icon(
@@ -2825,23 +2943,24 @@ fun PlayerScreen(
                 )
             }
 
-            indicator?.let { (text, progress) ->
+            // 瞬时提示：compact 是小字（切清晰度等待），其余是动作回执
+            indicator?.let { hint ->
+                val compact = hint.compact
                 Surface(
-                    shape = RoundedCornerShape(10.dp),
-                    color = Color.Black.copy(alpha = 0.65f),
+                    shape = RoundedCornerShape(if (compact) 8.dp else 10.dp),
+                    color = Color.Black.copy(alpha = if (compact) 0.55f else 0.65f),
                     modifier = Modifier.align(Alignment.Center),
                 ) {
-                    Column(Modifier.padding(horizontal = 18.dp, vertical = 12.dp)) {
-                        Text(text, color = Color.White, style = MaterialTheme.typography.titleMedium)
-                        if (progress != null) {
-                            LinearProgressIndicator(
-                                progress = { progress },
-                                modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
-                                color = Color.White,
-                                trackColor = Color.White.copy(alpha = 0.25f),
-                            )
-                        }
-                    }
+                    Text(
+                        hint.text,
+                        color = if (compact) Color.White.copy(alpha = 0.92f) else Color.White,
+                        style = if (compact) MaterialTheme.typography.labelMedium
+                        else MaterialTheme.typography.titleMedium,
+                        modifier = Modifier.padding(
+                            horizontal = if (compact) 12.dp else 18.dp,
+                            vertical = if (compact) 6.dp else 12.dp,
+                        ),
+                    )
                 }
             }
         }

@@ -11,6 +11,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
@@ -165,6 +166,10 @@ internal fun VrGestureLayer(
     val scope = rememberCoroutineScope()
     var lastTapAt = remember { longArrayOf(0L) }
     var pendingTap = remember { arrayOfNulls<Job>(1) }
+    // 回调取"最新引用"：pointerInput 块只在键变化时重启，闭包直接捕获旧 lambda 会把
+    // 重建播放器（切软/硬解）之前的播放器实例一直带下去 —— 双击会 seek 一个已释放的
+    // 播放器上，表现为"VR 下双击快进偶有失效"。
+    val curOnDoubleTap = rememberUpdatedState(onDoubleTap)
 
     var layer = modifier
     if (enabled) {
@@ -255,20 +260,21 @@ internal fun VrGestureLayer(
                 if (moved) {
                     onHud(null)
                 } else {
-                    // 单击 / 双击：双击要等一个窗口才能定性，所以单击延后触发
+                    // 单击 / 双击：双击要等一个窗口才能定性，所以单击延后触发。
+                    // 窗口与普通手势层共用 DOUBLE_TAP_WINDOW_MS，两种模式手感一致。
                     val now = System.currentTimeMillis()
                     val prev = pendingTap[0]
-                    if (now - lastTapAt[0] < DOUBLE_TAP_MS && prev?.isActive == true) {
+                    if (now - lastTapAt[0] < DOUBLE_TAP_WINDOW_MS && prev?.isActive == true) {
                         prev.cancel()
                         pendingTap[0] = null
                         lastTapAt[0] = 0L
                         // 用当前这一击的位置判区（与 Compose 的 onDoubleTap 语义一致：
                         // 取的是第二击），两击之间手指可能已经挪了位置
-                        onDoubleTap(down.position.x / size.width.toFloat().coerceAtLeast(1f))
+                        curOnDoubleTap.value(down.position.x / size.width.toFloat().coerceAtLeast(1f))
                     } else {
                         lastTapAt[0] = now
                         pendingTap[0] = scope.launch {
-                            delay(DOUBLE_TAP_MS)
+                            delay(DOUBLE_TAP_WINDOW_MS)
                             onToggleController()
                         }
                     }
@@ -294,5 +300,3 @@ internal fun VrHud(text: String?, modifier: Modifier) {
         )
     }
 }
-
-private const val DOUBLE_TAP_MS = 280L
