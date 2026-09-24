@@ -63,6 +63,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import coil.compose.SubcomposeAsyncImage
+import com.open115.pad.data.media.backgroundSourceOf
 import com.open115.pad.data.media.MediaDao
 import com.open115.pad.data.media.MediaLibraryEntity
 import com.open115.pad.data.media.MovieCard
@@ -324,25 +325,26 @@ fun PosterCard(card: MovieCard, onClick: () -> Unit, onLongClick: (() -> Unit)? 
                 .aspectRatio(2f / 3f)
                 .clip(RoundedCornerShape(12.dp)),
         ) {
-            if (card.posterPickCode.isNullOrBlank()) {
-                // 无海报兜底：浅灰底 + 图标，不留空白
-                Box(
-                    Modifier.fillMaxSize().background(MaterialTheme.colorScheme.surfaceVariant),
-                    contentAlignment = Alignment.Center,
-                ) {
-                    Icon(
-                        Icons.Outlined.Movie,
-                        contentDescription = null,
-                        modifier = Modifier.size(48.dp),
-                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                }
-            } else {
-                PickCodeImage(
-                    pickCode = card.posterPickCode,
-                    modifier = Modifier.fillMaxSize(),
+            // 浅灰底 + 图标：海报没加载出来时垫在下面，不留空白。
+            // 有海报的片图上来了就盖住它；没海报的片，如果详情页已经裁好兜底海报
+            // （背景图右半边）也会盖住它 —— 所以这里不再按"有没有 pick_code"分流
+            Box(
+                Modifier.fillMaxSize().background(MaterialTheme.colorScheme.surfaceVariant),
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(
+                    Icons.Outlined.Movie,
+                    contentDescription = null,
+                    modifier = Modifier.size(48.dp),
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
+            // cropIfMissing = false：墙上**只认已经裁好的兜底海报**，不在这里下载/现裁
+            PosterImage(
+                posterPickCode = card.posterPickCode,
+                backgroundPickCode = backgroundSourceOf(card.fanartPickCode, card.extraFanartPickCodes),
+                modifier = Modifier.fillMaxSize(),
+            )
             // 浮动元数据微标：右上磨砂半透明胶囊 ★ 评分（自包覆，不设固定容器）
             card.rating?.let { rating ->
                 Surface(
@@ -456,7 +458,53 @@ fun PickCodeImage(
     }
 }
 
-/** Shimmer 骨架占位：斜向高光扫过，海报/背景图加载期间显示 */
+/**
+ * 海报（竖图），**没有海报时用背景图裁一张兜底**。
+ *
+ * 兜底图 = 背景图的右半部分（16:9 取右半边 ≈ 0.89 的竖图）。裁切只在**详情页**里做
+ * （那时背景图的字节正在取/已经在本地，见 [com.open115.pad.data.ImageUrlResolver.ensureCroppedPoster]），
+ * 所以两种调用方式：
+ *  - 详情页传 [cropIfMissing] = true：进页面顺手把兜底海报裁出来（**零额外请求**，
+ *    复用背景图那一份字节）
+ *  - 海报墙用默认的 false：**只查裁好的文件在不在**（纯文件判断，零请求），
+ *    没裁过就还是占位图标 —— 墙上有几十张卡，每张都去下载/现裁一张图是不行的
+ */
+@Composable
+fun PosterImage(
+    posterPickCode: String?,
+    backgroundPickCode: String?,
+    modifier: Modifier = Modifier,
+    contentScale: ContentScale = ContentScale.Crop,
+    cropIfMissing: Boolean = false,
+) {
+    val context = LocalContext.current
+    val container = (context.applicationContext as com.open115.pad.App115).container
+    // 版本号进 key：详情页刚裁出一张兜底海报时，墙上那些**已经渲染过、判定为"没有"**的卡片
+    // 才会重查一遍（否则从详情页返回时组合不会重跑，卡片一直停在占位图标）
+    val derivedVersion by container.imageUrlResolver.derivedPosterVersion.collectAsState()
+    val model by produceState<Any?>(null, posterPickCode, backgroundPickCode, cropIfMissing, derivedVersion) {
+        val resolver = container.imageUrlResolver
+        val poster = posterPickCode?.takeIf { it.isNotBlank() }
+            ?.let { resolver.posterFor(it, container.cacheDir) }
+        value = poster ?: if (cropIfMissing) {
+            resolver.ensureCroppedPoster(backgroundPickCode, container.cacheDir)
+        } else {
+            resolver.croppedPosterIfCached(backgroundPickCode, container.cacheDir)
+        }
+    }
+    if (model != null) {
+        SubcomposeAsyncImage(
+            model = model,
+            contentDescription = null,
+            contentScale = contentScale,
+            modifier = modifier,
+            loading = { ShimmerPlaceholder(Modifier.fillMaxSize()) },
+            error = {},
+        )
+    } else {
+        Spacer(modifier)
+    }
+}
 @Composable
 fun ShimmerPlaceholder(modifier: Modifier = Modifier) {
     val transition = rememberInfiniteTransition(label = "shimmer")

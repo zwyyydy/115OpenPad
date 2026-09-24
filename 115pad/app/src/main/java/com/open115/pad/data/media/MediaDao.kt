@@ -15,6 +15,21 @@ data class MovieCard(
     val year: Int?,
     val rating: Double?,
     val posterPickCode: String?,
+    /**
+     * 背景图 pick_code。海报墙只在**没有海报**时用它：拿它裁一张兜底海报
+     * （见 [com.open115.pad.data.ImageUrlResolver.croppedPosterIfCached]）。
+     *
+     * 为什么加进这个投影（它本来有七八个查询在用）：海报墙的每张卡都得知道"兜底图在哪"，
+     * 一条条查库比多带一列贵得多；而且 Room 是**编译期**校验列的，漏改一个查询直接编译失败，
+     * 不会静默少一列。
+     */
+    val fanartPickCode: String? = null,
+    /**
+     * 剧照的 pick_code（\n 连接）。墙只在**没有 fanart.jpg** 时用它取第一张当兜底源 ——
+     * 详情页本来就是这么兜的（见 [backgroundSourceOf]），两边取到不同的图就会出现
+     * "详情页背景是 A、裁出来的海报是 B"。
+     */
+    val extraFanartPickCodes: String? = null,
     val isEpisodeLike: Boolean,
     /** 主视频 pick_code：海报墙点进去直接播，也用来拼"播完自动下一部"的播放列表 */
     val videoPickCode: String? = null,
@@ -202,7 +217,7 @@ interface MediaDao {
     // 下面这些都只出**顶层条目**（seriesKey IS NULL）：分集归到系列卡里选集，
     // 不该在海报墙或搜索结果里各占一张卡。
     @Query(
-        "SELECT mediaKey, title, year, rating, posterPickCode, isEpisodeLike, videoPickCode, genre, videoName FROM movies " +
+        "SELECT mediaKey, title, year, rating, posterPickCode, fanartPickCode, extraFanartPickCodes, isEpisodeLike, videoPickCode, genre, videoName FROM movies " +
             "WHERE title LIKE '%' || :keyword || '%' AND seriesKey IS NULL " +
             "ORDER BY rating IS NULL, rating DESC LIMIT :limit",
     )
@@ -210,14 +225,14 @@ interface MediaDao {
 
     /** 全库按评分排（当前无调用方，留着当通用入口）。同样只出顶层条目 */
     @Query(
-        "SELECT mediaKey, title, year, rating, posterPickCode, isEpisodeLike, videoPickCode, genre, videoName FROM movies " +
+        "SELECT mediaKey, title, year, rating, posterPickCode, fanartPickCode, extraFanartPickCodes, isEpisodeLike, videoPickCode, genre, videoName FROM movies " +
             "WHERE seriesKey IS NULL " +
             "ORDER BY rating IS NULL, rating DESC LIMIT :limit",
     )
     fun byRating(limit: Int = 200): Flow<List<MovieCard>>
 
     @Query(
-        "SELECT mediaKey, title, year, rating, posterPickCode, isEpisodeLike, videoPickCode, genre, videoName FROM movies " +
+        "SELECT mediaKey, title, year, rating, posterPickCode, fanartPickCode, extraFanartPickCodes, isEpisodeLike, videoPickCode, genre, videoName FROM movies " +
             // 精确等于（影片直接在库根目录）或以 库路径/ 开头：别用 LIKE 'x%'，
             // 否则库 "test" 会把库 "test001" 的影片也收进来。
             // seriesKey IS NULL：海报墙只出顶层条目（影片 / 系列本身），分集归到系列卡里选集
@@ -236,7 +251,7 @@ interface MediaDao {
      *   会把它的条目漏进根为 `test/刮削测试` 的库，18 部 = 7 + 11。
      */
     @Query(
-        "SELECT mediaKey, title, year, rating, posterPickCode, isEpisodeLike, videoPickCode, genre, videoName FROM movies " +
+        "SELECT mediaKey, title, year, rating, posterPickCode, fanartPickCode, extraFanartPickCodes, isEpisodeLike, videoPickCode, genre, videoName FROM movies " +
             "WHERE seriesKey IS NULL AND (" +
             "(:p0 <> '' AND (dirPath = :p0 OR dirPath LIKE :p0 || '/%')) " +
             "OR (:p1 <> '' AND (dirPath = :p1 OR dirPath LIKE :p1 || '/%')) " +
@@ -303,7 +318,7 @@ interface MediaDao {
     suspend fun movieCountInPaths(p0: String, p1: String, p2: String, p3: String, p4: String): Int
 
     @Query(
-        "SELECT m.mediaKey, m.title, m.year, m.rating, m.posterPickCode, m.isEpisodeLike, m.videoPickCode, m.genre, m.videoName " +
+        "SELECT m.mediaKey, m.title, m.year, m.rating, m.posterPickCode, m.fanartPickCode, m.extraFanartPickCodes, m.isEpisodeLike, m.videoPickCode, m.genre, m.videoName " +
             "FROM movies m JOIN movie_actors ma ON m.mediaKey = ma.mediaKey " +
             "JOIN actors a ON ma.actorId = a.id WHERE a.name = :name AND m.seriesKey IS NULL " +
             "ORDER BY m.rating IS NULL, m.rating DESC",
@@ -311,7 +326,7 @@ interface MediaDao {
     suspend fun byActor(name: String): List<MovieCard>
 
     @Query(
-        "SELECT m.mediaKey, m.title, m.year, m.rating, m.posterPickCode, m.isEpisodeLike, m.videoPickCode, m.genre, m.videoName " +
+        "SELECT m.mediaKey, m.title, m.year, m.rating, m.posterPickCode, m.fanartPickCode, m.extraFanartPickCodes, m.isEpisodeLike, m.videoPickCode, m.genre, m.videoName " +
             "FROM movies m JOIN movie_tags mt ON m.mediaKey = mt.mediaKey " +
             "JOIN tags t ON mt.tagId = t.id WHERE t.name = :name AND m.seriesKey IS NULL " +
             "ORDER BY m.rating IS NULL, m.rating DESC",
@@ -320,7 +335,7 @@ interface MediaDao {
 
     /** 系列下的分集（海报墙上点进系列卡后用）。排序交给调用方按集号排（见 episodeSortKey） */
     @Query(
-        "SELECT mediaKey, title, year, rating, posterPickCode, isEpisodeLike, videoPickCode, genre, videoName FROM movies " +
+        "SELECT mediaKey, title, year, rating, posterPickCode, fanartPickCode, extraFanartPickCodes, isEpisodeLike, videoPickCode, genre, videoName FROM movies " +
             "WHERE seriesKey = :seriesKey",
     )
     suspend fun episodesOfSeries(seriesKey: String): List<MovieCard>

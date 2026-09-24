@@ -98,6 +98,16 @@ fun encodePickCodes(codes: List<String>): String? =
 fun decodePickCodes(raw: String?): List<String> =
     raw?.split('\n')?.filter { it.isNotBlank() } ?: emptyList()
 
+/**
+ * 详情页那张**背景图**用哪个 pick_code —— 也是"没有海报时裁兜底海报"的源。
+ *
+ * 优先 `fanart.jpg`；没有就用**第一张剧照**（刮了 extrafanart 的目录往往没有单张背景图，
+ * 详情页本来就是这么兜的）。扫描器与海报墙必须用同一份判断：两边取到不同的图，
+ * 就会出现"详情页背景是 A、裁出来的海报是 B"。
+ */
+fun backgroundSourceOf(fanartPickCode: String?, extraFanartPickCodes: String?): String? =
+    fanartPickCode?.takeIf { it.isNotBlank() } ?: decodePickCodes(extraFanartPickCodes).firstOrNull()
+
 @Entity(tableName = "episodes", primaryKeys = ["mediaKey", "episodeKey"])
 data class EpisodeEntity(
     val mediaKey: String,

@@ -276,4 +276,18 @@ class SideArtTest {
         assertEquals(codes, decodePickCodes(encodePickCodes(codes)))
         assertEquals(emptyList<String>(), decodePickCodes(null))
     }
+
+    // ---------------- 背景图取哪一张（详情页与海报墙必须一致） ----------------
+
+    @Test
+    fun `背景源_fanart 优先_没有就用第一张剧照`() {
+        assertEquals("fanartPc", backgroundSourceOf("fanartPc", "a\nb"))
+        // 实测：ABC-101-U 没有 fanart.jpg，兜底海报的源就是它的第一张剧照 ——
+        // 海报墙原来只传 fanartPickCode（null），于是墙上永远查不到这张兜底图
+        assertEquals("a", backgroundSourceOf(null, "a\nb"))
+        // 空串也算没有（老数据里可能是空串而不是 NULL）
+        assertEquals("a", backgroundSourceOf("", "a\nb"))
+        assertNull(backgroundSourceOf(null, null))
+        assertNull(backgroundSourceOf("  ", ""))
+    }
 }

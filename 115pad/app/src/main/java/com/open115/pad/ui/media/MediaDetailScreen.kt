@@ -67,6 +67,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import com.open115.pad.data.PlaylistEntry
+import com.open115.pad.data.media.backgroundSourceOf
 import com.open115.pad.data.media.ActorCard
 import com.open115.pad.data.media.EpisodeEntity
 import com.open115.pad.data.media.MediaDao
@@ -246,8 +247,16 @@ fun MediaDetailScreen(
             //    （不是"在图上盖一层渐变" —— 那会留一块比周围略深的矩形，见 Dissolve.kt）
             //    没有 fanart.jpg 的片用**第一张剧照**兜底：刮了 extrafanart 的目录往往没有单张背景图，
             //    空着就是整屏纯色，有图总比没有强。
+            //
+            // ★ 这一张同时也是**没有海报时那张兜底海报的来源**（裁它的右半部分，见下面的海报框）：
+            //   所以先把它算出来存着，两处用同一个 pick_code，不会各取各的导致对不上。
+            //   取法与海报墙共用 backgroundSourceOf（fanart 优先，没有就用第一张剧照）。
+            val backgroundPick = backgroundSourceOf(
+                data?.movie?.fanartPickCode,
+                data?.movie?.extraFanartPickCodes,
+            )
             PickCodeImage(
-                pickCode = data?.movie?.fanartPickCode ?: data?.fanarts?.firstOrNull(),
+                pickCode = backgroundPick,
                 modifier = Modifier.fillMaxSize().dissolve(0.45f, 1.0f),
             )
             // ② 水平渐变：文字都在左半区，左侧压暗保证可读，右侧透出剧照主体
@@ -295,16 +304,20 @@ fun MediaDetailScreen(
 
                     Row(Modifier.padding(top = 8.dp)) {
                         // 海报：竖版 2:3，宽度按可用宽度的比例约束（大屏不甩成半屏宽，窄屏不挤成一指宽），
-                        // 高度由 2:3 自动推导，无硬编码宽高
+                        // 高度由 2:3 自动推导，无硬编码宽高。
+                        // 没有 poster 的片用背景图裁一张（cropIfMissing = true：进这个页面才裁，
+                        // 复用背景图那份字节，零额外请求；裁好后海报墙下次也用它）
                         BoxWithConstraints(Modifier.fillMaxWidth(0.32f).widthIn(min = 110.dp, max = 180.dp)) {
                             Surface(
                                 color = MaterialTheme.colorScheme.surfaceVariant,
                                 shape = RoundedCornerShape(10.dp),
                                 modifier = Modifier.fillMaxWidth().aspectRatio(2f / 3f),
                             ) {
-                                PickCodeImage(
-                                    pickCode = current.movie.posterPickCode,
+                                PosterImage(
+                                    posterPickCode = current.movie.posterPickCode,
+                                    backgroundPickCode = backgroundPick,
                                     modifier = Modifier.fillMaxSize(),
+                                    cropIfMissing = true,
                                 )
                             }
                         }

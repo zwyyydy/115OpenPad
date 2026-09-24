@@ -1,7 +1,10 @@
 package com.open115.pad.data
 
+import android.util.Log
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -203,6 +206,113 @@ class ImageUrlResolver(
         return cachedPoster(pickCode, cacheDir) != null
     }
 
+    // ---------------- 没海报的片：拿背景图裁一张出来 ----------------
+    //
+    // 背景图（fanart）是 16:9 横图、海报是竖图。取背景图的**右半部分**就得到一张 0.89
+    // 的竖图（详情页的排版本来就把左边压暗给文字让位，主体基本都在右半边），
+    // 直接当海报用比"空白底 + 一个图标"强得多。
+    //
+    // 时机是刻意的：**裁切只在详情页里做**（那时背景图的字节已经在手上/正在取），
+    // 扫描期一张图都不下、也不额外打接口；海报墙只查"裁好的文件在不在"（纯文件判断，
+    // 零请求），所以墙上的兜底海报会在你**看过那部片的详情页之后**才出现。
+
+    /**
+     * 兜底海报（由背景图裁出来的那种）的**版本号**：每裁出一张就 +1。
+     *
+     * 为什么要它：海报墙的卡片是"先渲染、后打开详情页"的 —— 卡片那次判断
+     * （[croppedPosterIfCached] 返回 null = 还没裁过）会被记住，从详情页返回时
+     * 组合**不会重跑**（key 没变），于是墙上的卡片永远停在占位图标。
+     * UI 把这个版本号收进 produceState 的 key，裁好一张就自动重查一遍。
+     *
+     * 代价是每次裁图会让墙上的卡片重跑一次取图逻辑，但那时都是本地文件判断（零请求）。
+     */
+    private val _derivedPosterVersion = MutableStateFlow(0)
+    val derivedPosterVersion: StateFlow<Int> = _derivedPosterVersion
+
+    /**
+     * 已经裁好的兜底海报（**只查本地，绝不下载**）。给海报墙用：没有就返回 null，
+     * 卡片照旧显示占位图标。
+     */
+    suspend fun croppedPosterIfCached(backgroundPickCode: String?, cacheDir: File): Any? {
+        if (backgroundPickCode.isNullOrBlank() || !mediaCacheEnabled()) return null
+        val file = derivedPosterFile(File(cacheDir, MEDIA_DIR), backgroundPickCode)
+        return withContext(Dispatchers.IO) {
+            if (!file.exists() || file.length() <= 0L) return@withContext null
+            // 同 cachedPoster：命中要顶 mtime，否则常看的兜底海报会被当成最旧的先淘汰
+            file.setLastModified(System.currentTimeMillis())
+            file.absolutePath
+        }
+    }
+
+    /**
+     * 确保有兜底海报：背景图字节不在本地就先按正常链路取回来（[posterFor]），
+     * 再从它裁出右半部分落盘。**已经在本地就纯文件判断**，不会重复裁、也不会重复下。
+     *
+     * 裁失败（图太大解不动、缓存关掉只能拿到直链、源图损坏）一律返回 null ——
+     * 兜底海报是锦上添花，不该让详情页因此报错。
+     */
+    suspend fun ensureCroppedPoster(backgroundPickCode: String?, cacheDir: File): Any? {
+        if (backgroundPickCode.isNullOrBlank()) return null
+        croppedPosterIfCached(backgroundPickCode, cacheDir)?.let { return it }
+        if (!mediaCacheEnabled()) return null
+        val srcPath = posterFor(backgroundPickCode, cacheDir) as? String ?: return null
+        val dir = File(cacheDir, MEDIA_DIR)
+        val target = derivedPosterFile(dir, backgroundPickCode)
+        val made = withContext(Dispatchers.IO) {
+            runCatching {
+                if (target.exists() && target.length() > 0L) return@runCatching target.absolutePath
+                cropRightHalfTo(File(srcPath), target)
+                target.absolutePath
+            }.onFailure { Log.w(TAG, "背景图裁海报失败 pickCode=$backgroundPickCode: ${it.message}") }
+                .getOrNull()
+        }
+        // 新裁出来的：告诉 UI 一声，好让海报墙那批"已经渲染过、判定为没有兜底海报"的卡片重查
+        if (made != null) _derivedPosterVersion.value += 1
+        return made
+    }
+
+    /**
+     * 裁右半部分并落盘（先写临时文件再改名，同 [fetchBytesToCache]：
+     * 中途被杀不会留下半个文件被当成有效海报）。
+     *
+     * 解码时按 inSampleSize 把宽度压到 [CROP_MAX_SRC_WIDTH] 以内：4K 背景图整张解出来是
+     * 33MB 内存，而海报显示宽度最多几百像素，没必要。
+     */
+    private fun cropRightHalfTo(src: File, target: File) {
+        val bounds = android.graphics.BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        android.graphics.BitmapFactory.decodeFile(src.absolutePath, bounds)
+        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) error("背景图解不出尺寸")
+        var sample = 1
+        while (bounds.outWidth / (sample * 2) >= CROP_MAX_SRC_WIDTH) sample *= 2
+
+        val opts = android.graphics.BitmapFactory.Options().apply { inSampleSize = sample }
+        val full = android.graphics.BitmapFactory.decodeFile(src.absolutePath, opts) ?: error("背景图解码失败")
+        val half = android.graphics.Bitmap.createBitmap(full, full.width / 2, 0, full.width / 2, full.height)
+        try {
+            // 临时名带纳秒后缀：同一个 pickCode 并发裁两次（快速进出详情页）时不会往
+            // 同一个临时文件里交错写。谁最后改名成功谁算数，内容一样。
+            val tmp = File(target.parentFile, "${target.name}.${System.nanoTime()}.tmp")
+            tmp.outputStream().use { out ->
+                @Suppress("DEPRECATION")
+                half.compress(android.graphics.Bitmap.CompressFormat.JPEG, CROP_JPEG_QUALITY, out)
+            }
+            if (!tmp.renameTo(target)) {
+                tmp.copyTo(target, overwrite = true)
+                tmp.delete()
+            }
+        } finally {
+            half.recycle()
+            full.recycle()
+        }
+    }
+
+    /**
+     * 兜底海报的落盘文件：键是**背景图的 pickCode**（不是影片的 key）。
+     * 这样背景图换了（重刮）就是另一个文件，旧的自然被 LRU 淘汰 —— 不会拿着一张过期截图当海报。
+     */
+    private fun derivedPosterFile(dir: File, backgroundPickCode: String): File =
+        targetOf(dir, "$DERIVED_PREFIX$backgroundPickCode")
+
     /**
      * 已落盘的海报文件；命中时把 mtime 顶到现在。**调用方负责判缓存开关**。
      *
@@ -240,7 +350,11 @@ class ImageUrlResolver(
      */
     suspend fun evictPosterCache(pickCodes: Collection<String>, cacheDir: File) = withContext(Dispatchers.IO) {
         val dir = File(cacheDir, MEDIA_DIR)
-        pickCodes.filter { it.isNotBlank() }.distinct().forEach { targetOf(dir, it).delete() }
+        pickCodes.filter { it.isNotBlank() }.distinct().forEach { pc ->
+            targetOf(dir, pc).delete()
+            // 由这张背景图裁出来的兜底海报也一起删（它的键是背景图 pickCode）
+            derivedPosterFile(dir, pc).delete()
+        }
     }
 
     private suspend fun fetchBytesToCache(stableKey: String, url: String, cacheDir: File, dirName: String, maxBytes: Long): File =
@@ -278,11 +392,22 @@ class ImageUrlResolver(
     private fun now(): Long = System.currentTimeMillis()
 
     companion object {
+        private const val TAG = "ImageUrlResolver"
+
         /** LRU 上限：一次浏览相册通常几十张，128 足够且内存开销可忽略（只是字符串） */
         private const val MAX_ENTRIES = 128
 
         /** 直链签名有效期按 30 分钟算，留 10 分钟余量避免拿到临期链接 */
         private const val SIGN_TTL_MS = 20L * 60 * 1000
+
+        /** 兜底海报的键前缀：和普通图共用命名规则，但要能一眼看出它是"裁出来的" */
+        private const val DERIVED_PREFIX = "poster-from-fanart|"
+
+        /** 裁兜底海报时把源图宽度压到这个值以内再解码（4K 整张解出来 33MB，海报用不上） */
+        private const val CROP_MAX_SRC_WIDTH = 1920
+
+        /** 兜底海报的 JPEG 质量：它是从压缩过的背景图上二次编码，给高一点少掉点画质 */
+        private const val CROP_JPEG_QUALITY = 90
 
         /** 大图落盘目录名 */
         private const val HUGE_DIR = "huge_img"
