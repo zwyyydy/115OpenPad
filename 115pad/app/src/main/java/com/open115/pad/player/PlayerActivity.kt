@@ -65,6 +65,7 @@ import androidx.compose.material.icons.outlined.MyLocation
 import androidx.compose.material.icons.outlined.PanoramaPhotosphere
 import androidx.compose.material.icons.outlined.Pause
 import androidx.compose.material.icons.outlined.PhotoCamera
+import androidx.compose.material.icons.outlined.PhotoFilter
 import androidx.compose.material.icons.outlined.PlayArrow
 import androidx.compose.material.icons.outlined.SkipNext
 import androidx.compose.material.icons.outlined.SkipPrevious
@@ -529,6 +530,10 @@ private data class PlayerPrefValues(
     val showBattery: Boolean,
     val showNetSpeed: Boolean,
     val showSpecBadge: Boolean,
+    /** 实验室：视频滤镜开关（设置页「实验室」） */
+    val labFilterEnabled: Boolean,
+    /** 实验室：滤镜参数串（16 个 float 逗号分隔，见 [FilterParams]） */
+    val labFilterParams: String,
 )
 
 @Composable
@@ -913,6 +918,8 @@ fun PlayerScreen(
             showBattery = container.playerPrefs.showBattery.first(),
             showNetSpeed = container.playerPrefs.showNetSpeed.first(),
             showSpecBadge = container.playerPrefs.showSpecBadge.first(),
+            labFilterEnabled = container.playerPrefs.labFilterEnabled.first(),
+            labFilterParams = container.playerPrefs.labFilterParams.first(),
         )
     }
     val prefs = pv
@@ -921,6 +928,67 @@ fun PlayerScreen(
             CircularProgressIndicator(color = Color.White)
         }
         return
+    }
+
+    // ---- 实验室：视频滤镜 ----
+    /**
+     * 当前滤镜参数。
+     *
+     * ⚠️ 每次改动都要**换新实例**（copy 后改字段）：参数是普通 data class，原地改字段
+     * 不会让读取它的 Compose 重新组合，面板上的滑块也就不会跟着动。
+     */
+    var filterParams by remember(prefs) {
+        mutableStateOf(FilterParams.fromPrefString(prefs.labFilterParams))
+    }
+    /** 面板开关。与 VR 菜单互斥：两个都挂在控制排顶部，同时开会叠在一起 */
+    var filterMenuOpen by remember { mutableStateOf(false) }
+    /** 着色器建不起来（驱动异常）时置位 → 退回原渲染路径，只退一次 */
+    var filterGlFailed by remember { mutableStateOf(false) }
+    /** 已经落盘的参数串：避免重复写（DataStore 每次写都是一次磁盘事务） */
+    var filterPersisted by remember(prefs) { mutableStateOf(prefs.labFilterParams) }
+    /** GL 视图实例：截图与"播放器重建后补挂输出面"都要用（同 [vrViewRef]） */
+    val filterViewRef = remember { java.util.concurrent.atomic.AtomicReference<FilterViewportView?>(null) }
+
+    /**
+     * 这次播放走不走滤镜渲染路径。
+     *
+     * 三个条件缺一不可：设置页开了开关、参数不是原图、当前不在 VR 里。
+     * 前两条保证"开了开关但没选风格"的用户零开销（仍走原来的 TextureView 路径）；
+     * 第三条是因为 VR 视窗自己就是一套 GL 管线（反投影），两条路径不能同时画同一块画面
+     * —— VR 优先，退出 VR 滤镜自然回来。
+     */
+    val filterActive = prefs.labFilterEnabled && !filterGlFailed &&
+        !filterParams.isNeutral() && vrMode == null
+
+    /** 把滤镜参数与画面几何推给 GL 线程：只换 uniform，不重建任何东西 */
+    fun pushFilterState() {
+        val v = filterViewRef.get() ?: return
+        v.updateParams(filterParams)
+        v.updateGeometry(vsVideoSize.width, vsVideoSize.height, videoRotation)
+    }
+
+    /** 参数落盘。拖动时每帧都写太浪费，抬手/点预设时写一次就够 */
+    fun persistFilterParams() {
+        val raw = filterParams.toPrefString()
+        if (raw == filterPersisted) return
+        filterPersisted = raw
+        scope.launch { container.playerPrefs.setLabFilterParams(raw) }
+    }
+
+    /**
+     * 旋转角 / 帧尺寸变化时补推一次几何。
+     *
+     * 不能只靠 `AndroidView` 的 update 块：那里面读状态**不订阅**（它是普通回调不是
+     * 组合作用域），漏推的表现就是"点了旋转、画面还是躺着的"。
+     */
+    LaunchedEffect(filterActive, videoRotation, vsVideoSize) {
+        pushFilterState()
+    }
+
+    // 进 VR 时收起滤镜面板：VR 里滤镜不生效（画面由 VR 视窗自己画），
+    // 面板留在屏幕上只会让人以为"点了没反应"
+    LaunchedEffect(vrMode) {
+        if (vrMode != null) filterMenuOpen = false
     }
 
     val player = remember(prefs) {
@@ -1262,10 +1330,12 @@ fun PlayerScreen(
         // 调试日志：adb logcat -s EventLogger 可看完整播放器事件
         player.addAnalyticsListener(EventLogger())
         // 视频输出面：普通路径由 VideoSurface 挂 TextureView（它随 player 一起重挂）；
-        // VR 路径要在这里补挂——GL 视图不会随播放器重建，它的 onSurfaceReady 也就不会
+        // VR / 滤镜路径要在这里补挂——GL 视图不会随播放器重建，它的 onSurfaceReady 也就不会
         // 再触发，不补这一下切完软/硬解画面会一直是黑的。
         if (vrMode != null) {
             vrViewRef.get()?.currentSurface?.let { player.setVideoSurface(it) }
+        } else if (filterActive) {
+            filterViewRef.get()?.currentSurface?.let { player.setVideoSurface(it) }
         }
         onDispose {
             player.removeListener(listener)
@@ -1313,14 +1383,20 @@ fun PlayerScreen(
     /**
      * 抓当前画面存相册。
      *
-     * 两条渲染路径要分别处理：普通模式是 TextureView（可直接读位图，旋转自己补），
-     * VR 模式是 GLSurfaceView（只能 PixelCopy，但拷出来就是反投影后的所见画面）。
+     * 三条渲染路径要分别处理：普通模式是 TextureView（可直接读位图，旋转自己补），
+     * VR 与滤镜模式是 GLSurfaceView（只能 PixelCopy，但拷出来就是所见即所得的画面：
+     * 反投影/调色与旋转都已经在着色器里做完，字幕整层叠上去即可）。
      * 字幕层单独叠上去 —— 位图里没有它，不叠的话带字幕的片子截出来是干净的原文。
      */
     fun takeScreenshot() {
         pulseControlRow()
-        val gl = if (vrMode != null) vrViewRef.get() else null
-        if (vrMode != null && gl == null) {
+        // 走 GL 的那两条路径都只能 PixelCopy；滤镜视图的 ref 只在滤镜分支存在时非空
+        val gl = when {
+            vrMode != null -> vrViewRef.get()
+            filterActive -> filterViewRef.get()
+            else -> null
+        }
+        if ((vrMode != null || filterActive) && gl == null) {
             toast("截图失败：画面未就绪")
             return
         }
@@ -2232,10 +2308,27 @@ fun PlayerScreen(
                     update = { v -> v.updateParams(vrState.snapshot()) },
                     modifier = Modifier.fillMaxSize(),
                 )
-            } else {
+            } else if (!filterActive) {
                 DisposableEffect(textureView, player) {
                     player.setVideoTextureView(textureView)
                     onDispose { player.clearVideoTextureView(textureView) }
+                }
+            }
+            // 滤镜模式**不在这里**建视图：GL 视图要摆在"画面尺寸"的那个 Box 里（见下），
+            // 由那个 Box 决定它的位置与大小，而不是铺满全屏。
+            //
+            // 退出滤镜（选回原图 / 关掉实验室开关 / 着色器不可用）：必须把输出面切回
+            // TextureView —— GL 视图销毁时它持有的 Surface 一并失效，不切回去画面直接变黑
+            // （解码照跑，只是没有输出面了）。key 用布尔而不是参数本身：换 key 时
+            // onDispose 拿的是**旧值**，用参数当 key 会让"换预设"也误判成退出滤镜。
+            DisposableEffect(filterActive) {
+                onDispose {
+                    if (filterActive) {
+                        filterViewRef.set(null)
+                        // 读 currentPlayer 而不是捕 player：播放器可能已经被重建过
+                        currentPlayer.clearVideoSurface()
+                        currentPlayer.setVideoTextureView(textureView)
+                    }
                 }
             }
             // 退出 VR：必须把输出面切回 TextureView。GL 视图销毁时它持有的 Surface
@@ -2302,32 +2395,73 @@ fun PlayerScreen(
                     if (frameRefs.subtitle === subtitleView) frameRefs.subtitle = null
                 }
             }
-            if (vrMode == null) Box(
-                Modifier
-                    .align(Alignment.Center)
-                    // 必须用 requiredSize 而非 size：旋转 90/270 时按帧比例算出的布局尺寸是
-                    // 转置的（1080×2370 的竖屏片在 2560×1600 屏上要 1167×2560），size() 会被
-                    // 父约束直接夹到 1600 高，布局比例随之从 0.46 变成 0.73，TextureView 把画面
-                    // 拉伸填满 → 旋转后画面形变。requiredSize 允许子节点超出父约束并居中。
-                    .requiredSize(with(vsDensity) { surfaceW.toDp() }, with(vsDensity) { surfaceH.toDp() })
-                    .graphicsLayer { rotationZ = videoRotation.toFloat() },
-            ) {
-                AndroidView(factory = { _ -> textureView }, modifier = Modifier.fillMaxSize())
-                AndroidView(
-                    factory = { _ -> subtitleView },
-                    update = { sv ->
-                        sv.setFixedTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, subtitleTextSize)
-                    },
-                    modifier = Modifier
-                        .align(Alignment.BottomCenter)
-                        .fillMaxSize()
-                        // 垂直位置：整幅字幕层随画面高度按百分比上移。不用 SubtitleView 的
-                        // bottomPaddingFraction——该参数只在 cue 未自带行位置（Cue.line 为
-                        // DIMEN_UNSET）时生效，115 官方字幕带行位置时会被完全忽略（实测拉滑块
-                        // 字幕纹丝不动）；整层位移与字幕格式、行位置无关。
-                        .graphicsLayer { translationY = -surfaceH * subtitleBottomPercent / 100f }
-                        .padding(bottom = 4.dp),
-                )
+            if (vrMode == null) {
+                // 滤镜模式下面板摆的是**旋转后**的尺寸：GLSurfaceView 是 SurfaceView 子类，
+                // 内容由 SurfaceFlinger 合成，外层 graphicsLayer 的旋转对它不生效，
+                // 旋转改由着色器承担（与 VR 同一条思路）。屏幕上的观感与 TextureView 那条路一致。
+                val boxW = if (filterActive && rotated) surfaceH else surfaceW
+                val boxH = if (filterActive && rotated) surfaceW else surfaceH
+                Box(
+                    Modifier
+                        .align(Alignment.Center)
+                        // 必须用 requiredSize 而非 size：旋转 90/270 时按帧比例算出的布局尺寸是
+                        // 转置的（1080×2370 的竖屏片在 2560×1600 屏上要 1167×2560），size() 会被
+                        // 父约束直接夹到 1600 高，布局比例随之从 0.46 变成 0.73，TextureView 把画面
+                        // 拉伸填满 → 旋转后画面形变。requiredSize 允许子节点超出父约束并居中。
+                        .requiredSize(
+                            with(vsDensity) { boxW.toDp() },
+                            with(vsDensity) { boxH.toDp() },
+                        )
+                        .then(
+                            if (filterActive) Modifier
+                            else Modifier.graphicsLayer { rotationZ = videoRotation.toFloat() },
+                        ),
+                ) {
+                    if (filterActive) {
+                        // ---- 滤镜模式：画面交给 GL 着色器调色 ----
+                        AndroidView(
+                            factory = { ctx ->
+                                FilterViewportView(ctx).also { v ->
+                                    filterViewRef.set(v)
+                                    // 同 VR：必须挂到**当时**那个播放器实例上（实例会被重建）
+                                    v.onSurfaceReady = { s -> currentPlayer.setVideoSurface(s) }
+                                    // 着色器建不起来（驱动异常）：置位后 filterActive 变 false，
+                                    // 这个视图连同它的输出面在下面的 DisposableEffect 里一起收掉，
+                                    // 并自动回到 TextureView 路径 —— 否则用户看到的是"开了滤镜全黑"
+                                    v.onGlFailed = {
+                                        filterGlFailed = true
+                                        toast("滤镜不可用（着色器初始化失败），已回到原画面")
+                                    }
+                                }
+                            },
+                            update = { v ->
+                                v.updateParams(filterParams)
+                                v.updateGeometry(
+                                    vsVideoSize.width, vsVideoSize.height, videoRotation,
+                                )
+                            },
+                            modifier = Modifier.fillMaxSize(),
+                        )
+                    } else {
+                        AndroidView(factory = { _ -> textureView }, modifier = Modifier.fillMaxSize())
+                    }
+                    AndroidView(
+                        factory = { _ -> subtitleView },
+                        update = { sv ->
+                            sv.setFixedTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, subtitleTextSize)
+                        },
+                        modifier = Modifier
+                            .align(Alignment.BottomCenter)
+                            .fillMaxSize()
+                            // 垂直位置：整幅字幕层随画面高度按百分比上移。不用 SubtitleView 的
+                            // bottomPaddingFraction——该参数只在 cue 未自带行位置（Cue.line 为
+                            // DIMEN_UNSET）时生效，115 官方字幕带行位置时会被完全忽略（实测拉滑块
+                            // 字幕纹丝不动）；整层位移与字幕格式、行位置无关。
+                            // 用 boxH 而不是 surfaceH：滤镜模式下盒子是旋转后的尺寸，两者不等
+                            .graphicsLayer { translationY = -boxH * subtitleBottomPercent / 100f }
+                            .padding(bottom = 4.dp),
+                    )
+                }
             } else {
                 // VR：视窗满屏，字幕直接贴底叠一层，不参与旋转也不做等比适配
                 AndroidView(
@@ -2523,6 +2657,24 @@ fun PlayerScreen(
                         horizontalAlignment = Alignment.CenterHorizontally,
                         modifier = Modifier.padding(end = 18.dp),
                     ) {
+                        // 滤镜键（实验室）：只在设置页开了「视频滤镜」时出现，VR 模式下藏起来
+                        // —— VR 视窗自己就是一套 GL 管线，滤镜在那条路上不生效，
+                        // 留一个点了没反应的按钮比藏起来更糟
+                        if (prefs.labFilterEnabled && vrMode == null) {
+                            CircleIconButton(
+                                icon = Icons.Outlined.PhotoFilter,
+                                description = "视频滤镜",
+                                color = if (filterActive) VrActiveColor
+                                else Color.Black.copy(alpha = 0.55f),
+                                onClick = {
+                                    filterMenuOpen = !filterMenuOpen
+                                    // 两个面板都挂在控制排顶部，同时开就叠在一起了
+                                    if (filterMenuOpen) vrMenuOpen = false
+                                    pulseControlRow()
+                                },
+                            )
+                            Spacer(Modifier.height(12.dp))
+                        }
                         // VR 键**常驻**（不再只在识别到 VR 素材时出现）。
                         // 自动识别必然有猜不到的情况——宽高比 2 既可能是 VR180 左右、
                         // 也可能是 360 单目，还有带黑边/非标裁剪的素材。
@@ -2540,6 +2692,8 @@ fun PlayerScreen(
                                         indication = null,
                                     ) {
                                         vrMenuOpen = !vrMenuOpen
+                                        // 与滤镜面板互斥（同挂在控制排顶部）
+                                        if (vrMenuOpen) filterMenuOpen = false
                                         pulseControlRow()
                                     },
                                 contentAlignment = Alignment.Center,
@@ -2720,6 +2874,30 @@ fun PlayerScreen(
                                 pushVrParams()
                                 pulseControlRow()
                             },
+                            modifier = Modifier.align(Alignment.CenterHorizontally),
+                        )
+                    }
+                    // 滤镜面板（实验室）：与 VR 菜单同一个位置、同一套交互 ——
+                    // 贴底挂在控制排顶部，跟进度条/按钮排同生共死，4 秒淡出一致。
+                    if (filterMenuOpen) {
+                        FilterMenu(
+                            params = filterParams,
+                            presetIndex = FilterPresets.indexOf(filterParams),
+                            onPickPreset = { i ->
+                                val p = FilterPresets.all[i].params.copy()
+                                filterParams = p
+                                pushFilterState()
+                                persistFilterParams()
+                                pulseControlRow()
+                            },
+                            onParam = { p ->
+                                filterParams = p
+                                pushFilterState()
+                                // 滑杆拖一下控制排就续命一次，否则拖到一半整排淡出
+                                pulseControlRow()
+                            },
+                            // 抬手才落盘：拖动过程中每帧写一次 DataStore 纯属浪费
+                            onParamCommit = { persistFilterParams() },
                             modifier = Modifier.align(Alignment.CenterHorizontally),
                         )
                     }
@@ -3648,6 +3826,118 @@ private fun PlayingBarsIndicator(
 
 /** VR 生效时开关按钮的高亮色（暗金，黑底画面上醒目但不刺眼） */
 private val VrActiveColor = Color(0xFF8A6A16)
+
+/**
+ * 滤镜面板（实验室）：一排预设胶囊 + 六个参数滑块（两列三行）。
+ *
+ * 为什么预设与滑块并存：预设负责"风格"（阴影色/高光色/gamma/褪色这些滑块给不出来的东西），
+ * 滑块负责在选好的风格上微调。拖过滑块后参数不再等于任何预设，胶囊就不高亮、
+ * 左上角的字样变成「自定义」—— 用户一眼能看出"已经不在预设上了"。
+ *
+ * 与 [VrModeMenu] 同一套外观与行为（贴底、跟控制排同生共死），不另起弹层：
+ * 播放器里弹层与控制排的淡出节奏对不齐时，用户会以为点空了。
+ */
+@Composable
+internal fun FilterMenu(
+    params: FilterParams,
+    /** 命中的预设下标；-1 = 参数被改过（自定义） */
+    presetIndex: Int,
+    onPickPreset: (Int) -> Unit,
+    /** 拖动中：换一组参数（调用方负责实时上屏） */
+    onParam: (FilterParams) -> Unit,
+    /** 抬手：落盘 */
+    onParamCommit: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Surface(
+        color = Color.Black.copy(alpha = 0.8f),
+        shape = RoundedCornerShape(14.dp),
+        modifier = modifier.padding(start = 12.dp, end = 12.dp, bottom = 6.dp),
+    ) {
+        Column(modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)) {
+            // 低分辨率横屏下 9 个胶囊可能超宽，允许横向滚动兜底（同 VR 菜单）
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.horizontalScroll(rememberScrollState()),
+            ) {
+                Text(
+                    if (presetIndex < 0) "自定义" else "预设",
+                    color = Color.White.copy(alpha = 0.75f),
+                    style = MaterialTheme.typography.labelMedium,
+                    maxLines = 1,
+                    modifier = Modifier.padding(end = 6.dp),
+                )
+                FilterPresets.all.forEachIndexed { i, preset ->
+                    VrChip(
+                        preset.name,
+                        selected = i == presetIndex,
+                        onClick = { onPickPreset(i) },
+                    )
+                }
+                // 重置 = 回到原图（中性参数），渲染路径也随之退回 TextureView
+                VrChip("重置", selected = false, onClick = { onPickPreset(0) })
+            }
+            Spacer(Modifier.height(4.dp))
+            // 两列三行：平板横屏下不至于挡掉大半画面，竖屏窄屏也还能用
+            FILTER_SLIDERS.chunked(2).forEach { row ->
+                Row(Modifier.fillMaxWidth()) {
+                    row.forEach { slider ->
+                        FilterSliderCell(
+                            slider = slider,
+                            params = params,
+                            onParam = onParam,
+                            onParamCommit = onParamCommit,
+                            modifier = Modifier.weight(1f).padding(horizontal = 4.dp),
+                        )
+                    }
+                    // 奇数个时补空位（当前固定 6 个；留着防以后加参数时右列被拉宽）
+                    repeat(2 - row.size) { Spacer(Modifier.weight(1f)) }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun FilterSliderCell(
+    slider: FilterSlider,
+    params: FilterParams,
+    onParam: (FilterParams) -> Unit,
+    onParamCommit: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val value = slider.get(params)
+    Column(modifier) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                slider.label,
+                color = Color.White.copy(alpha = 0.75f),
+                style = MaterialTheme.typography.labelMedium,
+                maxLines = 1,
+            )
+            Spacer(Modifier.width(6.dp))
+            Text(
+                slider.format(value),
+                color = Color.White,
+                style = MaterialTheme.typography.labelMedium,
+                maxLines = 1,
+            )
+        }
+        Slider(
+            value = value,
+            onValueChange = { v ->
+                // ⚠️ 必须 copy 出新实例：参数是普通 data class，原地改字段 Compose 不会重组，
+                //    表现是"滑块能拖、数值与画面都不动"
+                val next = params.copy()
+                slider.set(next, v)
+                onParam(next)
+            },
+            onValueChangeFinished = onParamCommit,
+            valueRange = slider.range,
+            modifier = Modifier.fillMaxWidth(),
+        )
+    }
+}
 
 /**
  * VR 模式选择条（横排胶囊）。

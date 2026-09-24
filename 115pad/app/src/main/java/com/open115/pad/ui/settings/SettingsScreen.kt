@@ -167,6 +167,7 @@ fun SettingsScreen(container: AppContainer) {
     val subtitleTextSize by container.playerPrefs.subtitleTextSize.collectAsState(initial = 18f)
     val subtitleBottomPercent by container.playerPrefs.subtitleBottomPercent.collectAsState(initial = 0)
     val softwareDecode by container.playerPrefs.softwareDecode.collectAsState(initial = false)
+    val labFilterEnabled by container.playerPrefs.labFilterEnabled.collectAsState(initial = false)
     val autoSubmitClipboard by container.downloadPrefs.autoSubmitClipboardDownload
         .collectAsState(initial = false)
     var cacheSizeMb by remember { mutableStateOf(-1L) }
@@ -306,6 +307,24 @@ fun SettingsScreen(container: AppContainer) {
                 PlayerCache.clear(context)
                 cacheSizeMb = 0
             },
+        )
+
+        SectionTitle("实验室")
+        Text(
+            "实验功能，可能不稳定；不想要随时关掉，关掉即回到原样。以后新的尝鲜功能也放这里。",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
+        )
+        SettingSwitch(
+            title = "视频滤镜",
+            subtitle = "给播放画面加风格滤镜（电影感 / 复古胶片 / 黑白 …）：开启后播放器右侧多一个「滤镜」" +
+                "按钮，可选预设、也能自己拖亮度/对比度/饱和度等参数。" +
+                "画面由 GPU 多过一道着色器，4K 高码率片源会略微增加耗电；" +
+                "选「原图」或关掉本开关时仍走原来的渲染路径，零额外开销。" +
+                "VR 视角下滤镜不生效（那条路径的画面由 VR 视窗自己画）",
+            checked = labFilterEnabled,
+            onChange = { v -> scope.launch { container.playerPrefs.setLabFilterEnabled(v) } },
         )
 
         SectionTitle("媒体库")

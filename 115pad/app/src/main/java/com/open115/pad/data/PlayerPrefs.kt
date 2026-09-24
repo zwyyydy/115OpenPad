@@ -130,6 +130,33 @@ class PlayerPrefs(private val context: Context) {
     suspend fun setVrPanniniD(v: Float) = context.playerDataStore.edit { it[KEY_VR_PANNINI] = v }
     suspend fun setVrWindow(v: String) = context.playerDataStore.edit { it[KEY_VR_WINDOW] = v }
 
+    // ---- 实验室：视频滤镜 ----
+
+    /**
+     * 滤镜总开关（设置页「实验室」）。关着的时候播放器连滤镜按钮都不出现，
+     * 渲染也完全走原来的 TextureView 路径。
+     */
+    val labFilterEnabled: Flow<Boolean> =
+        context.playerDataStore.data.map { it[KEY_LAB_FILTER_ENABLED] ?: false }
+
+    /**
+     * 滤镜参数串（16 个 float 逗号分隔，见 `FilterParams.toPrefString`）。
+     *
+     * 这里刻意只当**不透明字符串**存：编解码归播放器那边管（`FilterParams`），
+     * data 层不需要认识滤镜有几个参数 —— 以后加参数只改一处，存储层不用动。
+     *
+     * 参数是**全局**的（不分条目）：滤镜是口味，不是素材属性，
+     * 用户挑好「电影感」不该每换一集再调一次。（VR 模式按条目记是因为那跟素材本身有关。）
+     */
+    val labFilterParams: Flow<String> =
+        context.playerDataStore.data.map { it[KEY_LAB_FILTER_PARAMS] ?: "" }
+
+    suspend fun setLabFilterEnabled(v: Boolean) =
+        context.playerDataStore.edit { it[KEY_LAB_FILTER_ENABLED] = v }
+
+    suspend fun setLabFilterParams(v: String) =
+        context.playerDataStore.edit { it[KEY_LAB_FILTER_PARAMS] = v }
+
     // ---- 本地/外部源的续播位置 ----
     // 云盘片走 115 的观看记录；本地文件（已下载的、外部应用传进来的）没有那个接口，
     // 只能在本机记一份。不做的话 40 分钟的下载片每次进都从头开始，体验像半成品。
@@ -169,6 +196,8 @@ class PlayerPrefs(private val context: Context) {
         val KEY_VR_FOV = floatPreferencesKey("vr_fov")
         val KEY_VR_PANNINI = floatPreferencesKey("vr_pannini_d")
         val KEY_VR_WINDOW = stringPreferencesKey("vr_window")
+        val KEY_LAB_FILTER_ENABLED = booleanPreferencesKey("lab_filter_enabled")
+        val KEY_LAB_FILTER_PARAMS = stringPreferencesKey("lab_filter_params")
         val KEY_LOCAL_RESUME = stringPreferencesKey("local_resume")
     }
 }
