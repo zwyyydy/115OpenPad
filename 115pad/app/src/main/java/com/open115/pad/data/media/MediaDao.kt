@@ -143,14 +143,23 @@ interface MediaDao {
     )
     fun byLibraryPath(prefix: String, limit: Int = 200): Flow<List<MovieCard>>
 
-    /** 多根媒体库：任一路径匹配（精确等于或以其为前缀）即纳入 */
+    /**
+     * 多根媒体库：任一路径匹配（精确等于或以其为前缀）即纳入。
+     *
+     * ☠ 每个参数都要先判 `<> ''`：库里不足 5 根时调用方会把空位补成空串，
+     *   而 `dirPath LIKE :pN || '/%'` 在 `:pN = ''` 时等于 `LIKE '/%'` ——
+     *   **匹配所有以 `/` 开头的路径**，也就是别的库整片漏进来。
+     *   实测：根为 `/示例目录`（选目录器在根层给的就是带前导斜杠的形态）的库，
+     *   会把它的条目漏进根为 `test/刮削测试` 的库，18 部 = 7 + 11。
+     */
     @Query(
         "SELECT mediaKey, title, year, rating, posterPickCode, isEpisodeLike, videoPickCode, genre, videoName FROM movies " +
-            "WHERE seriesKey IS NULL AND (:p0 = '' OR dirPath = :p0 OR dirPath LIKE :p0 || '/%' " +
-            "OR dirPath = :p1 OR dirPath LIKE :p1 || '/%' " +
-            "OR dirPath = :p2 OR dirPath LIKE :p2 || '/%' " +
-            "OR dirPath = :p3 OR dirPath LIKE :p3 || '/%' " +
-            "OR dirPath = :p4 OR dirPath LIKE :p4 || '/%') " +
+            "WHERE seriesKey IS NULL AND (" +
+            "(:p0 <> '' AND (dirPath = :p0 OR dirPath LIKE :p0 || '/%')) " +
+            "OR (:p1 <> '' AND (dirPath = :p1 OR dirPath LIKE :p1 || '/%')) " +
+            "OR (:p2 <> '' AND (dirPath = :p2 OR dirPath LIKE :p2 || '/%')) " +
+            "OR (:p3 <> '' AND (dirPath = :p3 OR dirPath LIKE :p3 || '/%')) " +
+            "OR (:p4 <> '' AND (dirPath = :p4 OR dirPath LIKE :p4 || '/%'))) " +
             "ORDER BY rating IS NULL, rating DESC LIMIT :limit",
     )
     fun byLibraryPaths(p0: String, p1: String, p2: String, p3: String, p4: String, limit: Int = 200): Flow<List<MovieCard>>
@@ -163,15 +172,17 @@ interface MediaDao {
      *
      * 只取 `seriesKey IS NULL`：分集的图是从系列继承来的，同一张会重复出现几十次，
      * 轮播时看着就是"卡住不动"。
+     *
+     * ☠ 空串判断同上（见 [byLibraryPaths]）：漏了它，背景轮播会把别的库的 fanart 也轮进来。
      */
     @Query(
         "SELECT fanartPickCode FROM movies " +
-            "WHERE seriesKey IS NULL AND fanartPickCode IS NOT NULL AND fanartPickCode != '' " +
-            "AND (:p0 = '' OR dirPath = :p0 OR dirPath LIKE :p0 || '/%' " +
-            "OR dirPath = :p1 OR dirPath LIKE :p1 || '/%' " +
-            "OR dirPath = :p2 OR dirPath LIKE :p2 || '/%' " +
-            "OR dirPath = :p3 OR dirPath LIKE :p3 || '/%' " +
-            "OR dirPath = :p4 OR dirPath LIKE :p4 || '/%')",
+            "WHERE seriesKey IS NULL AND fanartPickCode IS NOT NULL AND fanartPickCode != '' AND (" +
+            "(:p0 <> '' AND (dirPath = :p0 OR dirPath LIKE :p0 || '/%')) " +
+            "OR (:p1 <> '' AND (dirPath = :p1 OR dirPath LIKE :p1 || '/%')) " +
+            "OR (:p2 <> '' AND (dirPath = :p2 OR dirPath LIKE :p2 || '/%')) " +
+            "OR (:p3 <> '' AND (dirPath = :p3 OR dirPath LIKE :p3 || '/%')) " +
+            "OR (:p4 <> '' AND (dirPath = :p4 OR dirPath LIKE :p4 || '/%')))",
     )
     suspend fun backdropsInPaths(p0: String, p1: String, p2: String, p3: String, p4: String): List<String>
 
@@ -199,11 +210,12 @@ interface MediaDao {
     /** 多根媒体库的影片数（超过 5 根时前 5 根之外的用 byLibraryPath 逐个补）。同样只数顶层条目，和墙上看到的张数一致 */
     @Query(
         "SELECT COUNT(*) FROM movies " +
-            "WHERE seriesKey IS NULL AND (:p0 = '' OR dirPath = :p0 OR dirPath LIKE :p0 || '/%' " +
-            "OR dirPath = :p1 OR dirPath LIKE :p1 || '/%' " +
-            "OR dirPath = :p2 OR dirPath LIKE :p2 || '/%' " +
-            "OR dirPath = :p3 OR dirPath LIKE :p3 || '/%' " +
-            "OR dirPath = :p4 OR dirPath LIKE :p4 || '/%')",
+            "WHERE seriesKey IS NULL AND (" +
+            "(:p0 <> '' AND (dirPath = :p0 OR dirPath LIKE :p0 || '/%')) " +
+            "OR (:p1 <> '' AND (dirPath = :p1 OR dirPath LIKE :p1 || '/%')) " +
+            "OR (:p2 <> '' AND (dirPath = :p2 OR dirPath LIKE :p2 || '/%')) " +
+            "OR (:p3 <> '' AND (dirPath = :p3 OR dirPath LIKE :p3 || '/%')) " +
+            "OR (:p4 <> '' AND (dirPath = :p4 OR dirPath LIKE :p4 || '/%')))",
     )
     suspend fun movieCountInPaths(p0: String, p1: String, p2: String, p3: String, p4: String): Int
 
