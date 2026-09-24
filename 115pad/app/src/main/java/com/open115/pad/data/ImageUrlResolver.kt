@@ -192,6 +192,18 @@ class ImageUrlResolver(
     }
 
     /**
+     * 这张图是不是已经落在本地了。
+     *
+     * 给扫描期"预取海报"用：命中就不必去解析直链，也就**不必占一次限速等待** ——
+     * 分集继承系列海报时，一季 36 集查的是同一张图，每集白等 500ms 就是 18 秒。
+     * 顺带把 mtime 顶一下（同 [cachedPoster]）。
+     */
+    suspend fun hasCachedPoster(pickCode: String?, cacheDir: File): Boolean {
+        if (pickCode.isNullOrBlank() || !mediaCacheEnabled()) return false
+        return cachedPoster(pickCode, cacheDir) != null
+    }
+
+    /**
      * 已落盘的海报文件；命中时把 mtime 顶到现在。**调用方负责判缓存开关**。
      *
      * 顶 mtime 不能省：pruneCache 的"最久未用"就是靠它判断的，而走了本方法的调用方

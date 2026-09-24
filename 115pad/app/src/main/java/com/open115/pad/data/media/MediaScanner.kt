@@ -2,6 +2,7 @@ package com.open115.pad.data.media
 
 import android.util.Log
 import com.open115.pad.data.FilesPage
+import com.open115.pad.data.ImageUrlResolver
 import com.open115.pad.data.OpenApi
 import com.open115.pad.data.envData
 import com.open115.pad.data.parseFilesResponse
@@ -16,18 +17,22 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import java.io.File
 
 /**
  * 媒体库扫描引擎：手动触发、可续跑、带进度。
  * 扫描一个目录 = 列目录（响应里自带全部文件名，聚类零额外请求）→ 聚类 →
- * 逐条下载 .nfo（小文件）解析 → 入库（每条一个事务）→ 更新 scan_state。
+ * 逐条下载 .nfo（小文件）解析 → 入库（每条一个事务）→ 预取海报 → 更新 scan_state。
  * 中断后重启能续跑：已完成的目录 cloudUpt 未变就跳过。
  *
  * 接口调用量（115 有频控，这里是媒体库最大的一处）：
- * - 列目录：**每个目录每次扫描 1 次**。collectDirs 那次列目录的结果会传给扫描循环复用，
+ * - 列目录：**每个目录每次扫描 1 次**（目录超过一页时按 count 翻页，见 [listFiles]）。
+ *   collectDirs 那次列目录的结果会传给扫描循环复用，
  *   早先是列两遍（collectDirs 找子目录一遍、循环取文件又一遍）。
  *   降不到 0 —— 判断"目录变没变"本身就得问服务器，scan_state.cloudUpt 只是记住上次的值。
  * - .nfo：内容没变（pickCode + upt 相同）**零请求**，见 fetchNfoMeta。
+ * - 海报：**首次扫描每条 1 次 downurl + 1 次下载**（[prefetchPoster]），
+ *   之后命中落盘字节就零请求 —— 扫完进海报墙/详情页不必再等图。
  */
 class MediaScanner(
     private val openApi: OpenApi,
@@ -35,7 +40,13 @@ class MediaScanner(
     private val dao: MediaDao,
     /** 媒体库落盘缓存。为 null = 不缓存（测试 / 没接容器时） */
     private val cache: MediaCache? = null,
+    /** 海报字节的落盘与直链解析（扫描期预取用）。为 null = 不预取海报 */
+    private val imageUrlResolver: ImageUrlResolver? = null,
+    private val imageCacheDir: File? = null,
 ) {
+    /** 扫描阶段：进度条据此决定是"不确定"还是按目录数走 */
+    enum class Phase { Idle, Listing, Indexing }
+
     data class Progress(
         val running: Boolean = false,
         /** 已请求停止、正在当前目录收尾（UI 据此把按钮置灰显示"停止中…"） */
@@ -48,10 +59,20 @@ class MediaScanner(
          * 否则扫描会在删除之后把条目又写回来（见 MediaLibraryScreen 的删除确认）。
          */
         val rootCid: String = "",
+        val phase: Phase = Phase.Idle,
         val doneDirs: Int = 0,
         val totalDirs: Int = 0,
+        /**
+         * 列目录阶段**已发现**的目录数。
+         *
+         * 这个阶段没有分母（目录数正是它要算的东西），大库又可能占掉整轮的大半时间 ——
+         * 早先这里只能显示 0/0，看着像卡死。有了它至少能看出在往前走。
+         */
+        val discoveredDirs: Int = 0,
         val currentDir: String = "",
         val moviesIndexed: Int = 0,
+        /** 本次扫描**新下载**的海报张数（命中落盘的不算） */
+        val postersFetched: Int = 0,
         val finishedAt: Long = 0,
     )
 
@@ -91,6 +112,12 @@ class MediaScanner(
     /** 限速：相邻两次 115 API 请求的最小间隔（毫秒），0 = 不限 */
     private var lastRequestAt = 0L
 
+    /**
+     * 本次扫描新下载的海报张数。扫描由 mutex 串行化，用普通字段就够。
+     * 进度每次 copy 都把它带上（它是**计数器**不是快照，漏带就会回退成 0）。
+     */
+    private var postersFetched = 0
+
     private suspend fun throttle(rateLimitMs: Long) {
         if (rateLimitMs <= 0) return
         val now = System.currentTimeMillis()
@@ -99,9 +126,76 @@ class MediaScanner(
         lastRequestAt = System.currentTimeMillis()
     }
 
-    /** 列目录（带限速）：响应里自带文件名，聚类零额外请求 */
-    private suspend fun listFiles(cid: String, rateLimitMs: Long) =
-        parseFilesResponse(run { throttle(rateLimitMs); openApi.files(cid = cid, limit = 200) })
+    /**
+     * 列目录（带限速）：响应里自带文件名，聚类零额外请求。
+     *
+     * ★ **按 count 翻页取全**。115 一页最多给 [PAGE_SIZE] 项，早先只取第一页 ——
+     * 目录里超过一页的文件会被**静默丢掉**：一季带多语言字幕、或者一个目录几百个文件的库，
+     * 只有前 200 个能入库，界面上看不出任何异常。现在按响应里的 count 一页页取到齐。
+     *
+     * 兜底两道：`page.items` 为空就停（服务端 count 不准时不至于死循环）、
+     * 总页数封顶 [MAX_PAGES]（真遇到病态目录宁可少扫也不能把频控额度耗光）。
+     */
+    private suspend fun listFiles(cid: String, rateLimitMs: Long): FilesPage {
+        val first = parseFilesResponse(
+            run { throttle(rateLimitMs); openApi.files(cid = cid, limit = PAGE_SIZE) },
+        )
+        if (first.count <= first.items.size) return first
+
+        val all = first.items.toMutableList()
+        while (all.size < first.count && all.size < MAX_PAGES * PAGE_SIZE) {
+            val page = parseFilesResponse(
+                run {
+                    throttle(rateLimitMs)
+                    openApi.files(cid = cid, limit = PAGE_SIZE, offset = all.size)
+                },
+            )
+            if (page.items.isEmpty()) break
+            all += page.items
+        }
+        if (all.size < first.count) {
+            Log.w(TAG, "目录 $cid 只取到 ${all.size}/${first.count} 项（分页上限 $MAX_PAGES 页）")
+        }
+        return first.copy(items = all)
+    }
+
+    /**
+     * 把一个目录里已入库条目的海报都补到本地（增量扫描跳过该目录时用）。
+     *
+     * 只查库里已有的 pick_code，不重新列目录 —— 跳过目录本来就是"不打扰云端"，
+     * 这里多花的请求只跟**缺多少张图**成正比：全都在本地时是 0 次。
+     */
+    private suspend fun prefetchDirPosters(dirKey: String, rateLimitMs: Long) {
+        if (imageUrlResolver == null || imageCacheDir == null) return
+        for (pc in dao.posterPickCodesInDir(dirKey)) {
+            // 停止检查：这个循环是"跳过目录"里的，不受簇边界那次检查保护 ——
+            // 一个上千条的目录会按限速一张张下完（几十分钟），把「停止」的响应承诺废掉
+            if (stopRequested.get()) return
+            if (prefetchPoster(pc, rateLimitMs)) postersFetched++
+        }
+    }
+
+    /**
+     * 预取一条海报的字节（扫描期顺手做掉，扫完进海报墙就不必再等图）。
+     *
+     * - 已在本地：纯文件判断，**不占限速等待**（分集继承系列海报时，一季几十集查的是同一张图）
+     * - 没在本地：1 次 downurl + 1 次下载，走同一条限速
+     * - 缓存关掉 / 没有图 / 解析失败：什么都不做（海报是锦上添花，不该让一条索引失败）
+     *
+     * 返回 true = **这次真的把它落盘了**（进度里"已缓存海报"只数这个）。
+     * 判定方式是落盘后再查一次本地文件，而不是看 [ImageUrlResolver.posterFor] 的返回值 ——
+     * 缓存关掉时它返回的是直链、并没落盘，按返回值算就会虚报。
+     */
+    private suspend fun prefetchPoster(pickCode: String?, rateLimitMs: Long): Boolean {
+        val resolver = imageUrlResolver ?: return false
+        val dir = imageCacheDir ?: return false
+        if (pickCode.isNullOrBlank()) return false
+        if (resolver.hasCachedPoster(pickCode, dir)) return false
+        throttle(rateLimitMs)
+        runCatching { resolver.posterFor(pickCode, dir) }
+            .onFailure { Log.w(TAG, "海报预取异常 pickCode=$pickCode: ${it.message}") }
+        return resolver.hasCachedPoster(pickCode, dir)
+    }
 
     /**
      * 实际执行（调用方在自己的 scope 里 launch）：手动触发、可续跑、带进度。
@@ -124,7 +218,13 @@ class MediaScanner(
             // 清掉上一轮遗留的停止请求。**必须在 running 判断之后**——
             // 放前面的话，一次被拒绝的并发调用会把正在跑的那轮扫描的停止标志擦掉。
             stopRequested.set(false)
-            _progress.value = Progress(running = true, rootCid = rootCid, currentDir = rootPath)
+            postersFetched = 0
+            _progress.value = Progress(
+                running = true,
+                rootCid = rootCid,
+                currentDir = rootPath,
+                phase = Phase.Listing,
+            )
         }
         var stoppedEarly = false
         try {
@@ -139,7 +239,10 @@ class MediaScanner(
                 stoppedEarly = true
                 Log.i(TAG, "扫描在列目录阶段被停止")
             } else {
-                _progress.value = _progress.value.copy(totalDirs = allDirs.size)
+                _progress.value = _progress.value.copy(
+                    totalDirs = allDirs.size,
+                    phase = Phase.Indexing,
+                )
                 for (listing in allDirs) {
                     if (stopRequested.get()) {
                         stoppedEarly = true
@@ -153,9 +256,17 @@ class MediaScanner(
                         // 增量：目录上次扫完且列表 upt 未变 → 无新增/修改，跳过
                         val state = dao.scanState(listing.cid)
                         if (state != null && state.status == 2 && state.cloudUpt == dirUpt && dirUpt > 0) {
+                            // 跳过不等于不管：把库里已有条目的海报补到本地。
+                            // 缓存被清过 / 新装机的机器上，增量扫描是用户最常用的那条路，
+                            // 不补的话海报墙仍要一张张现下。已命中的不产生任何请求。
+                            prefetchDirPosters(listing.cid, rateLimitMs)
                             skipped++
                             done++
-                            _progress.value = _progress.value.copy(doneDirs = done, moviesIndexed = movies)
+                            _progress.value = _progress.value.copy(
+                                doneDirs = done,
+                                moviesIndexed = movies,
+                                postersFetched = postersFetched,
+                            )
                             continue
                         }
                     }
@@ -183,6 +294,11 @@ class MediaScanner(
                                 ancestor = ancestor,
                             )
                             movies++
+                            // 大目录（一季几十集）里让"已入库/已缓存图"跟着动，不然进度条整段不动
+                            _progress.value = _progress.value.copy(
+                                moviesIndexed = movies,
+                                postersFetched = postersFetched,
+                            )
                         } catch (e: Exception) {
                             failed = true
                             Log.w("MediaScanner", "索引失败 ${cluster.prefix}: ${e.message}")
@@ -217,7 +333,11 @@ class MediaScanner(
                         ),
                     )
                     done++
-                    _progress.value = _progress.value.copy(doneDirs = done, moviesIndexed = movies)
+                    _progress.value = _progress.value.copy(
+                                doneDirs = done,
+                                moviesIndexed = movies,
+                                postersFetched = postersFetched,
+                            )
                 }
                 if (skipped > 0) Log.i(TAG, "增量扫描完成：跳过 $skipped/${allDirs.size} 个未变化目录")
             }
@@ -272,6 +392,12 @@ class MediaScanner(
             val (cid, path) = queue.removeFirst()
             val page = listFiles(cid, rateLimitMs)
             result.add(DirListing(cid, path, page))
+            // 这一阶段没有分母（目录数正是它要算的东西），至少让"已发现 N 个目录"在动
+            _progress.value = _progress.value.copy(
+                phase = Phase.Listing,
+                discoveredDirs = result.size,
+                currentDir = path,
+            )
             page.items.filter { it.isDir }.forEach { dir ->
                 dir.fid?.let { queue.add(it to "$path/${dir.fn}") }
             }
@@ -397,6 +523,9 @@ class MediaScanner(
                 ),
             ),
         )
+        // 顺手把海报字节取到本地：扫完进海报墙/详情页就不必再等图。
+        // 放在入库**之后** —— 预取失败或被打断都不影响这条已经进库。
+        if (prefetchPoster(movie.posterPickCode, rateLimitMs)) postersFetched++
         return key
     }
 
@@ -481,6 +610,12 @@ class MediaScanner(
 
     companion object {
         private const val TAG = "MediaScanner"
+
+        /** 列目录每页取多少项（115 的上限就是这个量级） */
+        private const val PAGE_SIZE = 200
+
+        /** 一个目录最多翻几页：病态目录（count 虚高 / 服务端不认 offset）不至于把频控额度耗光 */
+        private const val MAX_PAGES = 25
 
         /** nfo 解析结果的序列化器（缓存里存的是 NfoMeta 的 JSON） */
         private val nfoJson = Json { ignoreUnknownKeys = true; encodeDefaults = true }

@@ -183,6 +183,19 @@ interface MediaDao {
     )
     suspend fun backdropsInPath(prefix: String): List<String>
 
+    /**
+     * 这个目录里各条目用到的海报 pick_code（去重）。
+     *
+     * 增量扫描**跳过**的目录靠它补海报：跳过 = 不重新索引，也就没有"顺手预取"那一步，
+     * 于是清过缓存 / 新装机的机器跑增量扫描时，海报墙还得一张张现下。
+     * 命中的不会产生请求（见 MediaScanner.prefetchPoster），所以代价只跟缺多少张成正比。
+     */
+    @Query(
+        "SELECT DISTINCT posterPickCode FROM movies " +
+            "WHERE sourceDirKey = :dirKey AND posterPickCode IS NOT NULL AND posterPickCode != ''",
+    )
+    suspend fun posterPickCodesInDir(dirKey: String): List<String>
+
     /** 多根媒体库的影片数（超过 5 根时前 5 根之外的用 byLibraryPath 逐个补）。同样只数顶层条目，和墙上看到的张数一致 */
     @Query(
         "SELECT COUNT(*) FROM movies " +

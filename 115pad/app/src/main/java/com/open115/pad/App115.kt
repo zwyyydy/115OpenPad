@@ -156,6 +156,10 @@ class AppContainer(context: Context) {
 
     val mediaScanner = com.open115.pad.data.media.MediaScanner(
         openApi, okHttpClient, mediaDatabase.mediaDao(), mediaCache,
+        // 扫描期顺手把海报字节取到本地：扫完进海报墙/详情页不必再等图
+        // （缓存命中时是纯文件判断，不占限速等待；缓存关掉时什么都不做）
+        imageUrlResolver = imageUrlResolver,
+        imageCacheDir = cacheDir,
     )
 
     /** 云下载提交（含持久化的保存位置），手动添加/剪贴板/外部唤起共用 */

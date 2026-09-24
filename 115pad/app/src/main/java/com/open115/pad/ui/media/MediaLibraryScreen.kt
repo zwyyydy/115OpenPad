@@ -13,6 +13,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Add
 import androidx.compose.material.icons.outlined.Delete
@@ -29,6 +30,7 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -42,11 +44,15 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.open115.pad.appContainer
 import com.open115.pad.data.FileItem
 import com.open115.pad.data.media.MediaLibraryEntity
+import com.open115.pad.data.media.MediaScanner
 import com.open115.pad.data.media.MovieCard
 import com.open115.pad.ui.theme.AdaptiveBody
 import kotlinx.coroutines.flow.first
@@ -108,36 +114,10 @@ fun MediaLibraryScreen(api: com.open115.pad.data.OpenApi) {
             // 全局扫描进度 + 停止。停止**在目录/簇边界生效**（不会打断正在进行的那个请求），
             // 所以按钮点下去会先变成"停止中…"，等当前这一小步跑完才真的停。
             if (scanProgress.running) {
-                LinearProgressIndicator(
-                    progress = {
-                        if (scanProgress.totalDirs > 0) scanProgress.doneDirs.toFloat() / scanProgress.totalDirs else 0f
-                    },
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 16.dp),
+                ScanProgressCard(
+                    progress = scanProgress,
+                    onStop = { container.mediaScanner.requestStop() },
                 )
-                Row(
-                    Modifier.fillMaxWidth().padding(start = 16.dp, end = 4.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Text(
-                        // totalDirs 为 0 时还在列目录阶段 —— 大库这一阶段本身可能占掉整轮的大半时间，
-                        // 显示成"0/0 目录"会让人以为卡住了
-                        if (scanProgress.totalDirs > 0) {
-                            "正在扫描 ${scanProgress.currentDir}（${scanProgress.doneDirs}/${scanProgress.totalDirs} 目录，已索引 ${scanProgress.moviesIndexed} 部）"
-                        } else {
-                            "正在列目录 ${scanProgress.currentDir}…"
-                        },
-                        style = MaterialTheme.typography.bodySmall,
-                        modifier = Modifier.weight(1f).padding(vertical = 4.dp),
-                    )
-                    TextButton(
-                        onClick = { container.mediaScanner.requestStop() },
-                        enabled = !scanProgress.stopping,
-                    ) {
-                        Text(if (scanProgress.stopping) "停止中…" else "停止")
-                    }
-                }
             } else if (scanProgress.stopped) {
                 // 停止后说清两件事：进度没丢、怎么继续（续扫走增量，它按 scan_state 跳过已扫完的目录）
                 Text(
@@ -570,5 +550,80 @@ private fun LibraryEditDialog(
                 picking = false
             },
         )
+    }
+}
+
+/**
+ * 扫描进度卡片。
+ *
+ * 三层信息，各解决一个"看不出在干嘛"的问题：
+ *  ① **进度条**：列目录阶段是**不确定态**（这一阶段没有分母 —— 目录数正是它要算的东西，
+ *     而大库的列目录可能占掉整轮的大半时间）。早先这里恒显示 0/0，看着像卡死。
+ *  ② 阶段 + 当前目录：路径只显示**最后两段**（全路径会被截断成开头那几段，
+ *     而"现在扫到哪儿"恰恰在末尾）。
+ *  ③ 计数：目录进度 / 已入库 / 已缓存海报。计数是**计数器不是快照**，
+ *     大目录里逐条更新，不然一季几十集整段不动。
+ */
+@Composable
+private fun ScanProgressCard(
+    progress: MediaScanner.Progress,
+    onStop: () -> Unit,
+) {
+    val listing = progress.phase == MediaScanner.Phase.Listing
+    Surface(
+        color = MaterialTheme.colorScheme.surface,
+        shape = RoundedCornerShape(12.dp),
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
+    ) {
+        Column(Modifier.padding(12.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    if (listing) "正在列目录" else "正在索引",
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.SemiBold,
+                )
+                Spacer(Modifier.width(8.dp))
+                Text(
+                    progress.currentDir.split('/').takeLast(2).joinToString("/"),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f),
+                )
+                TextButton(onClick = onStop, enabled = !progress.stopping) {
+                    Text(if (progress.stopping) "停止中…" else "停止")
+                }
+            }
+            val barModifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(50))
+            if (listing) {
+                LinearProgressIndicator(modifier = barModifier)
+            } else {
+                LinearProgressIndicator(
+                    progress = {
+                        if (progress.totalDirs > 0) {
+                            progress.doneDirs.toFloat() / progress.totalDirs
+                        } else {
+                            0f
+                        }
+                    },
+                    modifier = barModifier,
+                )
+            }
+            Spacer(Modifier.height(6.dp))
+            Text(
+                buildString {
+                    if (listing) {
+                        append("已发现 ${progress.discoveredDirs} 个目录")
+                    } else {
+                        append("目录 ${progress.doneDirs}/${progress.totalDirs}")
+                        append(" · 已入库 ${progress.moviesIndexed} 部")
+                    }
+                    if (progress.postersFetched > 0) append(" · 已缓存海报 ${progress.postersFetched} 张")
+                },
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
     }
 }
