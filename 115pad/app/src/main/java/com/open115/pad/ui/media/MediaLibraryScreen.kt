@@ -37,6 +37,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
@@ -84,7 +85,16 @@ fun MediaLibraryScreen(api: com.open115.pad.data.OpenApi) {
     var scanMenuFor by remember { mutableStateOf<MediaLibraryEntity?>(null) }
     // 点库卡片进海报墙，再点海报进详情（两级都盖在本页之上，返回逐层退）
     var openedLib by remember { mutableStateOf<MediaLibraryEntity?>(null) }
-    var detail by remember { mutableStateOf<Triple<MovieCard, List<MovieCard>, Int>?>(null) }
+    /**
+     * 详情页之上的浮层**栈**：详情 → 同演员/同标签的作品 → 详情 → …
+     *
+     * 早先只有一个 `detail` 变量（详情页之上叠不了东西），点演员要跳转就放不下了。
+     * 用栈也是**导航语义**：返回键逐层退，跟用户点进来的顺序一致。
+     *
+     * 只渲染栈顶那一层（下面几层不保持组合）：回到上一层时它的数据重查一次 ——
+     * 都是本地 Room 查询（毫秒级），换来的是内存不随层数增长。
+     */
+    val overlays = remember { mutableStateListOf<MediaOverlay>() }
     /**
      * 海报墙的刷新信号，**墙和详情页共用**。
      *
@@ -284,19 +294,37 @@ fun MediaLibraryScreen(api: com.open115.pad.data.OpenApi) {
             refreshKey = wallTick,
             onChanged = { wallTick++ },
             onBack = { openedLib = null },
-            onOpenMovie = { card, list, index -> detail = Triple(card, list, index) },
+            onOpenMovie = { card, list, index ->
+                overlays.add(MediaOverlay.Detail(card, list, index))
+            },
         )
     }
 
-    detail?.let { (card, list, index) ->
-        MediaDetailScreen(
-            card = card,
-            playlist = list,
-            index = index,
+    // 浮层栈：只渲染栈顶。返回 = 出栈，进详情/进"同演员作品" = 入栈
+    when (val top = overlays.lastOrNull()) {
+        is MediaOverlay.Detail -> MediaDetailScreen(
+            card = top.card,
+            playlist = top.list,
+            index = top.index,
             dao = dao,
             onDeleted = { wallTick++ },
-            onBack = { detail = null },
+            onOpenWorks = { kind, name -> overlays.add(MediaOverlay.Works(kind, name)) },
+            onBack = { overlays.removeLastOrNull() },
         )
+
+        is MediaOverlay.Works -> MediaWorksScreen(
+            kind = top.kind,
+            name = top.name,
+            dao = dao,
+            refreshKey = wallTick,
+            onChanged = { wallTick++ },
+            onBack = { overlays.removeLastOrNull() },
+            onOpenMovie = { card, list, index ->
+                overlays.add(MediaOverlay.Detail(card, list, index))
+            },
+        )
+
+        null -> Unit
     }
 
     deleteTarget?.let { lib ->
@@ -626,4 +654,17 @@ private fun ScanProgressCard(
             )
         }
     }
+}
+
+/**
+ * 媒体库里可以叠起来的浮层（栈顶那个才是当前显示的）。
+ *
+ * 详情页之上还能再叠"同演员/同标签的作品"页，所以这里不是单个变量而是一个栈。
+ */
+private sealed interface MediaOverlay {
+    /** 影片/系列详情（[list] 是它所在的列表，播完自动接下一部就是按它排的） */
+    data class Detail(val card: MovieCard, val list: List<MovieCard>, val index: Int) : MediaOverlay
+
+    /** 同一个演员 / 同一个标签的全部作品（**跨所有媒体库**，见 dao.byActor/byTag） */
+    data class Works(val kind: WorksKind, val name: String) : MediaOverlay
 }

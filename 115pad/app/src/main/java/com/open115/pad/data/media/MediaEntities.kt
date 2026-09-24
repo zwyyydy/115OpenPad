@@ -64,6 +64,18 @@ data class MovieEntity(
     val nfoPickCode: String? = null,
     val nfoUpt: Long = 0,
     /**
+     * **nfo 的完整解析结果**（[NfoMeta] 的 JSON）。
+     *
+     * 为什么整份存 JSON 而不是每个字段一列：nfo 里能刮出来的字段有四十多个（原名/标语/时长/
+     * 国家/语言/编剧/合集/技术参数/音轨字幕…），逐列建的话每加一个字段就要一次建表迁移；
+     * 而这里面**只有标题/年份/评分/简介/分类/演员**这几样要参与查询与排序（它们已经是独立的列、
+     * 也是海报墙与检索在用的），其余都是"详情页展示用"的长尾 —— 一列 JSON 就够。
+     *
+     * 取用见 MediaDetailScreen（`Json.decodeFromString<NfoMeta>`），写入见 MediaScanner。
+     * 老库升级后这一列是空的：详情页那时只显示原有的字段，重扫一次就补上。
+     */
+    val nfoJson: String? = null,
+    /**
      * 主视频 / nfo / 海报 / 背景 / 缩略图的 **file_id**（115 的 `ufile/delete` 只认 file_ids，
      * pick_code 不认）。
      *

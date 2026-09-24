@@ -45,6 +45,11 @@ android {
     lint {
         checkReleaseBuilds = false // 个人分发：跳过 fatal lint
     }
+    testOptions {
+        // 单测里 android.jar 是空壳：NfoParser 出错时会 android.util.Log.w，
+        // 不开这个开关就是 "Method w in android.util.Log not mocked" 把用例打挂
+        unitTests.isReturnDefaultValues = true
+    }
 }
 
 dependencies {
@@ -54,6 +59,9 @@ dependencies {
 
     // 纯逻辑单测（批量重命名的算名规则：中文数字、Excel 式字母、扩展名边界）
     testImplementation("junit:junit:4.13.2")
+    // nfo 解析器单测：平台自带的 XmlPullParser 在 JVM 单测里是 android.jar 的空壳（调用即抛），
+    // 用 kxml2 —— 同一个 org.xmlpull.v1 API 的纯 Java 实现（Android 上也带着它）
+    testImplementation("net.sf.kxml:kxml2:2.3.0")
 
     implementation("androidx.core:core-ktx:1.13.1")
     implementation("androidx.activity:activity-compose:1.9.3")

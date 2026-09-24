@@ -213,15 +213,37 @@ interface MediaDao {
         linkTag(MovieTagEntity(mediaKey, id))
     }
 
-    // ---- 查询：标题搜索 / 评分排序 / 按演员 / 按标签 ----
+    // ---- 查询：搜索 / 评分排序 / 按演员 / 按标签 ----
     // 下面这些都只出**顶层条目**（seriesKey IS NULL）：分集归到系列卡里选集，
-    // 不该在海报墙或搜索结果里各占一张卡。
+    // 不该在海报墙或搜索结果里各出一次。
+
+    /**
+     * **全局搜索**：片名 / 演员 / 标签，一网打尽，**不按媒体库过滤**（跨所有库）。
+     *
+     * 三个来源合并成"命中集合"再取顶层条目：
+     *  - 片名 `LIKE`（片名不分词，子串匹配就够；用户搜的是"示例影片"这种短词）
+     *  - 演员名 `LIKE` → 命中分集时用 `COALESCE(seriesKey, mediaKey)` 归到它所属的系列卡
+     *    （演员挂在分集行上，直接拿 mediaKey 去比会一张卡都出不来）
+     *  - 标签名 `LIKE` → 同上
+     *
+     * 用 UNION（去重）而不是三个 OR 子查询：一部片同时命中片名和演员时只出一张卡。
+     */
     @Query(
-        "SELECT mediaKey, title, year, rating, posterPickCode, fanartPickCode, extraFanartPickCodes, isEpisodeLike, videoPickCode, genre, videoName FROM movies " +
-            "WHERE title LIKE '%' || :keyword || '%' AND seriesKey IS NULL " +
+        "SELECT mediaKey, title, year, rating, posterPickCode, fanartPickCode, extraFanartPickCodes, " +
+            "isEpisodeLike, videoPickCode, genre, videoName FROM movies " +
+            "WHERE seriesKey IS NULL AND mediaKey IN (" +
+            "SELECT mediaKey FROM movies WHERE title LIKE '%' || :keyword || '%' " +
+            "UNION " +
+            "SELECT COALESCE(x.seriesKey, x.mediaKey) FROM movies x " +
+            "JOIN movie_actors ma ON x.mediaKey = ma.mediaKey " +
+            "JOIN actors a ON ma.actorId = a.id WHERE a.name LIKE '%' || :keyword || '%' " +
+            "UNION " +
+            "SELECT COALESCE(x.seriesKey, x.mediaKey) FROM movies x " +
+            "JOIN movie_tags mt ON x.mediaKey = mt.mediaKey " +
+            "JOIN tags t ON mt.tagId = t.id WHERE t.name LIKE '%' || :keyword || '%') " +
             "ORDER BY rating IS NULL, rating DESC LIMIT :limit",
     )
-    suspend fun searchByTitle(keyword: String, limit: Int = 100): List<MovieCard>
+    suspend fun searchAll(keyword: String, limit: Int = 200): List<MovieCard>
 
     /** 全库按评分排（当前无调用方，留着当通用入口）。同样只出顶层条目 */
     @Query(
@@ -317,19 +339,36 @@ interface MediaDao {
     )
     suspend fun movieCountInPaths(p0: String, p1: String, p2: String, p3: String, p4: String): Int
 
+    /**
+     * 某个演员的全部作品。
+     *
+     * ★ **不按媒体库过滤**：演员不属于某一个库，A 库和 B 库里同一个演员的作品要一起列出来
+     *   （需求原话："生效范围包括所有媒体库"）。
+     *
+     * ★ 剧集包要绕一道：演员挂在**分集**行上（整季 nfo 在系列根，演员在每一集的 nfo 里），
+     *   而这里只出顶层条目（海报墙的口径）—— 所以除了直接命中的顶层条目，还要把
+     *   "命中的分集所属的系列"一起列出来，否则点一部剧里的演员会得到 0 结果。
+     */
     @Query(
-        "SELECT m.mediaKey, m.title, m.year, m.rating, m.posterPickCode, m.fanartPickCode, m.extraFanartPickCodes, m.isEpisodeLike, m.videoPickCode, m.genre, m.videoName " +
-            "FROM movies m JOIN movie_actors ma ON m.mediaKey = ma.mediaKey " +
-            "JOIN actors a ON ma.actorId = a.id WHERE a.name = :name AND m.seriesKey IS NULL " +
-            "ORDER BY m.rating IS NULL, m.rating DESC",
+        "SELECT m.mediaKey, m.title, m.year, m.rating, m.posterPickCode, m.fanartPickCode, " +
+            "m.extraFanartPickCodes, m.isEpisodeLike, m.videoPickCode, m.genre, m.videoName FROM movies m " +
+            "WHERE m.seriesKey IS NULL AND (" +
+            "m.mediaKey IN (SELECT ma.mediaKey FROM movie_actors ma JOIN actors a ON ma.actorId = a.id WHERE a.name = :name) " +
+            "OR m.mediaKey IN (SELECT s.seriesKey FROM movies s JOIN movie_actors ma2 ON s.mediaKey = ma2.mediaKey " +
+            "JOIN actors a2 ON ma2.actorId = a2.id WHERE a2.name = :name AND s.seriesKey IS NOT NULL)) " +
+            "ORDER BY m.rating IS NULL, m.rating DESC LIMIT 1000",
     )
     suspend fun byActor(name: String): List<MovieCard>
 
+    /** 某个标签的全部作品。口径与 [byActor] 一致：跨库、只出顶层条目、剧集归到系列卡 */
     @Query(
-        "SELECT m.mediaKey, m.title, m.year, m.rating, m.posterPickCode, m.fanartPickCode, m.extraFanartPickCodes, m.isEpisodeLike, m.videoPickCode, m.genre, m.videoName " +
-            "FROM movies m JOIN movie_tags mt ON m.mediaKey = mt.mediaKey " +
-            "JOIN tags t ON mt.tagId = t.id WHERE t.name = :name AND m.seriesKey IS NULL " +
-            "ORDER BY m.rating IS NULL, m.rating DESC",
+        "SELECT m.mediaKey, m.title, m.year, m.rating, m.posterPickCode, m.fanartPickCode, " +
+            "m.extraFanartPickCodes, m.isEpisodeLike, m.videoPickCode, m.genre, m.videoName FROM movies m " +
+            "WHERE m.seriesKey IS NULL AND (" +
+            "m.mediaKey IN (SELECT mt.mediaKey FROM movie_tags mt JOIN tags t ON mt.tagId = t.id WHERE t.name = :name) " +
+            "OR m.mediaKey IN (SELECT s.seriesKey FROM movies s JOIN movie_tags mt2 ON s.mediaKey = mt2.mediaKey " +
+            "JOIN tags t2 ON mt2.tagId = t2.id WHERE t2.name = :name AND s.seriesKey IS NOT NULL)) " +
+            "ORDER BY m.rating IS NULL, m.rating DESC LIMIT 1000",
     )
     suspend fun byTag(name: String): List<MovieCard>
 

@@ -732,13 +732,15 @@ class MediaScanner(
             extraFanartDirCid = if (sideArt != null) sideArt.fanartDirCid else prev?.extraFanartDirCid,
             actorsDirCid = if (sideArt != null) sideArt.actorsDirCid else prev?.actorsDirCid,
             nfoUpt = cluster.nfo?.upt ?: 0,
+            // nfo 的**完整解析结果**整份存 JSON（长尾字段不进表，见 MovieEntity.nfoJson）
+            nfoJson = meta.takeIf { it.hasContent }?.let { nfoJson.encodeToString(it) },
             sourceDirKey = dirCid,
             scannedAt = System.currentTimeMillis(),
         )
         dao.upsertMovieWithPeople(
             movie = movie,
             actors = actors,
-            tags = meta.genres,
+            tags = meta.genres + meta.tags,
             episodes = if (!isEpisodeLike) emptyList() else listOf(
                 EpisodeEntity(
                     mediaKey = key,
@@ -815,6 +817,8 @@ class MediaScanner(
             thumbPickCode = first.thumb?.pickCode,
             nfoPickCode = first.nfo?.pickCode,
             nfoUpt = first.nfo?.upt ?: 0,
+            // 合成行也存整份解析结果（长尾字段详情页要用，见 MovieEntity.nfoJson）
+            nfoJson = meta.takeIf { it.hasContent }?.let { nfoJson.encodeToString(it) },
             extraFanartPickCodes = if (sideArt != null) {
                 encodePickCodes(sideArt.fanart.map { it.pickCode })
             } else {
@@ -828,7 +832,7 @@ class MediaScanner(
         dao.upsertMovieWithPeople(
             movie = movie,
             actors = actors,
-            tags = meta.genres,
+            tags = meta.genres + meta.tags,
             episodes = emptyList(),
             actorAvatars = sideArt?.actorAvatars?.mapValues { it.value.pickCode }.orEmpty(),
             actorsDirCid = sideArt?.actorsDirCid,
@@ -852,7 +856,7 @@ class MediaScanner(
      * 而"真失败"也长得一样，所以给个短 TTL，过一会儿还会重试。
      */
     private suspend fun fetchNfoMeta(pickCode: String, upt: Long, rateLimitMs: Long = 0): NfoMeta {
-        val cacheKey = "nfo|$pickCode|$upt"
+        val cacheKey = nfoCacheKey(pickCode, upt)
         val store = cache
         if (store != null) {
             store.getText(cacheKey)?.let { entry ->
@@ -929,6 +933,14 @@ class MediaScanner(
         /** nfo 解析结果的序列化器（缓存里存的是 NfoMeta 的 JSON） */
         private val nfoJson = Json { ignoreUnknownKeys = true; encodeDefaults = true }
 
+        /** nfo 缓存的 key：`nfo|v<解析器版本>|<pickCode>|<upt>`（key 带 upt，文件没变就永久命中） */
+        fun nfoCacheKey(pickCode: String, upt: Long): String =
+            "nfo|v${NfoParser.PARSER_VERSION}|$pickCode|$upt"
+
+        /** nfo 缓存的**失效前缀**（删影片/删库时按它清） */
+        fun nfoCachePrefix(pickCode: String): String =
+            "nfo|v${NfoParser.PARSER_VERSION}|$pickCode|"
+
         /** 有内容的 nfo：7 天。key 里带 upt，内容变了 key 就变，所以 TTL 只是兜底 */
         private const val NFO_TTL_MS = 7L * 24 * 60 * 60 * 1000
 
@@ -948,6 +960,24 @@ class MediaScanner(
          * 有缓存时这里通常是**零请求**：nfo 本来就没内容的片会命中那条空结果缓存，
          * 不再每次进详情页都打一次 downurl（downurl 最容易触发频控）。
          */
+        /**
+         * 详情页要不要为这条**重拉一次 nfo**：
+         *  - 扫描期没拉到元数据（简介与评分都空）
+         *  - **或者还没存过完整解析结果**（`nfoJson` 为空）—— 解析器补全字段后老数据靠这条补上，
+         *    不必逼用户跑全量扫描。拉到就写回，写回后这个判断为假，不会再重复拉。
+         *
+         * 调用点（详情页）与 [refetchNfo] 共用同一个判据：各写一份迟早会走岔。
+         */
+        fun needsNfoRefetch(movie: MovieEntity): Boolean {
+            if (movie.nfoPickCode?.isNotEmpty() != true) return false
+            if (movie.plot.isNullOrBlank() && movie.rating == null) return true
+            val raw = movie.nfoJson ?: return true
+            // 存量数据的版本比当前解析器旧 → 也要重拉（不然补的新字段永远是空的）
+            val version = runCatching { nfoJson.decodeFromString<NfoMeta>(raw).parserVersion }
+                .getOrDefault(0)
+            return version < NfoParser.PARSER_VERSION
+        }
+
         suspend fun refetchNfo(
             openApi: OpenApi,
             okHttpClient: OkHttpClient,
@@ -956,9 +986,8 @@ class MediaScanner(
             mediaKey: String,
         ) {
             val movie = dao.movie(mediaKey) ?: return
+            if (!needsNfoRefetch(movie)) return
             val nfoPc = movie.nfoPickCode?.takeIf { it.isNotEmpty() } ?: return
-            // 已有简介/评分就不浪费一次 downurl（它最容易触发频控）
-            if (!movie.plot.isNullOrBlank() || movie.rating != null) return
             val scanner = MediaScanner(openApi, okHttpClient, dao, cache)
             val meta = try {
                 // nfo 下载是同步网络请求：调用方（详情页 produceState）在主线程，
@@ -978,6 +1007,8 @@ class MediaScanner(
                     rating = movie.rating ?: meta.rating,
                     plot = movie.plot ?: meta.plot,
                     genre = movie.genre ?: meta.genres.joinToString(" / ").ifEmpty { null },
+                    // 完整解析结果（详情页的长尾字段）：这次拉到就一起补上
+                    nfoJson = nfoJson.encodeToString(meta),
                 ),
             )
         }

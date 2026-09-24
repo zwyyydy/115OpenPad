@@ -128,7 +128,9 @@ suspend fun deleteMovie(
     // 本地：索引 + 落盘缓存（图按 pickCode 精确删；nfo 按 nfo|<pickCode>| 前缀失效）
     dao.deleteMovies(files.map { it.mediaKey })
     dirKeys.forEach { dao.invalidateScanState(it) }
-    mediaCache?.invalidateAll(files.mapNotNull { it.nfoPickCode }.distinct().map { "nfo|$it|" })
+    mediaCache?.invalidateAll(
+        files.mapNotNull { it.nfoPickCode }.distinct().map { MediaScanner.nfoCachePrefix(it) },
+    )
     imageUrlResolver.evictPosterCache(
         files.flatMap { listOfNotNull(it.posterPickCode, it.fanartPickCode, it.thumbPickCode) + decodePickCodes(it.extraFanartPickCodes) },
         cacheDir,

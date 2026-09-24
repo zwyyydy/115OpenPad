@@ -8,6 +8,7 @@ import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
@@ -20,15 +21,20 @@ import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
+import androidx.compose.foundation.shape.GenericShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.ArrowBack
+import androidx.compose.material.icons.outlined.Close
 import androidx.compose.material.icons.outlined.Movie
 import androidx.compose.material.icons.outlined.Search
 import androidx.compose.material3.CircularProgressIndicator
@@ -52,6 +58,17 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.BlurredEdgeTreatment
+import androidx.compose.ui.draw.blur
+import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.geometry.Rect
+import androidx.compose.ui.geometry.RoundRect
+import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.layout.boundsInRoot
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.positionInRoot
+import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
@@ -60,6 +77,8 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.IntOffset
+import kotlin.math.roundToInt
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import coil.compose.SubcomposeAsyncImage
@@ -143,15 +162,16 @@ fun PosterWallScreen(
     }
 
     var query by remember { mutableStateOf("") }
-    // 标题搜索是全表查询，结果再按本库的 mediaKey 收敛，避免搜出别的库的影片
+    /**
+     * 搜索结果 = **全局**：片名 / 演员 / 标签，跨所有媒体库（见 dao.searchAll）。
+     *
+     * 早先是"在本库内搜片名"（结果再按本库的 mediaKey 收敛）—— 演员和标签搜不到，
+     * 别的库里的同演员作品也搜不到。现在搜出来的就是全库的，卡片、海报、点进去都一样。
+     */
     val hits by produceState<List<MovieCard>?>(initialValue = null, query, all) {
-        value = if (query.isBlank()) {
-            null
-        } else {
-            val keys = all.mapTo(HashSet()) { it.mediaKey }
-            dao.searchByTitle(query, 100).filter { it.mediaKey in keys }
-        }
+        value = if (query.isBlank()) null else dao.searchAll(query, 200)
     }
+    val searching = !hits.isNullOrEmpty() || query.isNotBlank()
     val list = hits ?: all
 
     // 系统返回键 = 逐层退：有搜索词先清搜索，否则退回媒体库列表
@@ -198,32 +218,31 @@ fun PosterWallScreen(
                         Icon(Icons.Outlined.ArrowBack, contentDescription = "返回")
                     }
                     Column(Modifier.weight(1f)) {
-                        Text(library.name, style = MaterialTheme.typography.titleLarge)
                         Text(
-                            "${library.rootPath} · ${list.size} 部",
+                            if (query.isBlank()) library.name else "全局搜索「$query」",
+                            style = MaterialTheme.typography.titleLarge,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                        Text(
+                            if (query.isBlank()) {
+                                "${library.rootPath} · ${list.size} 部"
+                            } else {
+                                // 明说跨库：搜出来的结果不限于当前这个库
+                                "片名 / 演员 / 标签 · ${list.size} 部 · 全部媒体库"
+                            },
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                     }
-                    OutlinedTextField(
+                    // 毛玻璃搜索框：背后是背景轮播那张图（模糊副本 + 半透明白边）
+                    FrostedSearchField(
                         value = query,
                         onValueChange = { query = it },
-                        placeholder = { Text("在系列内搜索…") },
-                        leadingIcon = { Icon(Icons.Outlined.Search, contentDescription = null) },
-                        singleLine = true,
-                        shape = RoundedCornerShape(50),
-                        colors = TextFieldDefaults.colors(
-                            focusedIndicatorColor = MaterialTheme.colorScheme.primary,
-                            unfocusedIndicatorColor = Color.Transparent,
-                            disabledIndicatorColor = Color.Transparent,
-                            focusedContainerColor = MaterialTheme.colorScheme.surfaceVariant,
-                            unfocusedContainerColor = MaterialTheme.colorScheme.surfaceVariant,
-                        ),
-                        // 轻量搜索框：宽屏下收拢在右上，不横拉整行
+                        backdrop = rotation.getOrNull(backdropIndex),
                         modifier = Modifier
-                            .widthIn(min = 180.dp, max = 320.dp)
-                            .padding(end = 8.dp)
-                            .height(52.dp),
+                            .widthIn(min = 200.dp, max = 360.dp)
+                            .padding(end = 8.dp),
                     )
                 }
 
@@ -234,7 +253,11 @@ fun PosterWallScreen(
                         verticalArrangement = Arrangement.Center,
                     ) {
                         Text(
-                            if (query.isBlank()) "这个库还没有影片，回列表点扫描" else "没有匹配「$query」的影片",
+                            if (query.isBlank()) {
+                                "这个库还没有影片，回列表点扫描"
+                            } else {
+                                "全部媒体库里都没有匹配「$query」的片名 / 演员 / 标签"
+                            },
                             style = MaterialTheme.typography.bodyLarge,
                         )
                     }
@@ -530,5 +553,99 @@ fun ShimmerPlaceholder(modifier: Modifier = Modifier) {
                 ),
             ),
         )
+    }
+}
+
+/**
+ * 毛玻璃搜索框：半透明胶囊 + 细白边 + **真正的高斯模糊底**。
+ *
+ * 模糊底的做法：把**背景图整屏再画一份**放进这个胶囊里，按自己相对屏幕的位置反向偏移，
+ * 于是它显示出来的那块正好是"身后那张图"，糊掉之后就是毛玻璃。
+ * （Compose 没有"模糊身后内容"的 backdrop 滤镜，`Modifier.blur` 模糊的是**自己**，
+ *   所以只能把背景复制一份再裁。）
+ *
+ * 偏移用 `Modifier.offset { }` 的 lambda 版本：位置变化只在布局/绘制阶段生效，不触发重组。
+ * API < 31 时 `Modifier.blur` 是空操作 → 退化成"半透明深色胶囊"，依然能用。
+ *
+ * 用 BasicTextField 而不是 OutlinedTextField：后者的容器/描边颜色是主题给的，
+ * 要盖成玻璃得把一整套 colors 都改掉，反而更绕。
+ */
+@Composable
+private fun FrostedSearchField(
+    value: String,
+    onValueChange: (String) -> Unit,
+    /** 背后那张图（与墙上轮播用同一张，位置才对得上） */
+    backdrop: String?,
+    modifier: Modifier = Modifier,
+) {
+    val shape = RoundedCornerShape(50)
+    val screen = LocalConfiguration.current
+    var origin by remember { mutableStateOf(Offset.Zero) }
+    Box(
+        modifier
+            .height(46.dp)
+            .clip(shape)
+            // 玻璃边缘的一圈高光：没有它，深色背景上的胶囊边界会糊在一起
+            .border(1.dp, Color.White.copy(alpha = 0.22f), shape)
+            .onGloballyPositioned { origin = it.positionInRoot() },
+        contentAlignment = Alignment.Center,
+    ) {
+        // ① 模糊的背景副本（整屏尺寸，反向偏移到与真背景对齐；超出胶囊的部分被裁掉）
+        if (backdrop != null) {
+            PickCodeImage(
+                pickCode = backdrop,
+                modifier = Modifier
+                    .size(screen.screenWidthDp.dp, screen.screenHeightDp.dp)
+                    .offset { IntOffset(-origin.x.roundToInt(), -origin.y.roundToInt()) }
+                    .blur(28.dp, edgeTreatment = BlurredEdgeTreatment.Unbounded),
+            )
+        }
+        // ② 压暗 + 提亮：模糊图比周围亮，压一层黑再垫一点白，跟整体色调对得上
+        Box(Modifier.matchParentSize().background(Color.Black.copy(alpha = 0.36f)))
+        Box(Modifier.matchParentSize().background(Color.White.copy(alpha = 0.06f)))
+
+        // ③ 内容
+        Row(
+            Modifier.fillMaxSize().padding(horizontal = 14.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Icon(
+                Icons.Outlined.Search,
+                contentDescription = null,
+                tint = Color.White.copy(alpha = 0.75f),
+                modifier = Modifier.size(18.dp),
+            )
+            Spacer(Modifier.width(8.dp))
+            BasicTextField(
+                value = value,
+                onValueChange = onValueChange,
+                singleLine = true,
+                textStyle = MaterialTheme.typography.bodyMedium.copy(color = Color.White),
+                cursorBrush = SolidColor(Color.White),
+                modifier = Modifier.weight(1f),
+                decorationBox = { inner ->
+                    if (value.isEmpty()) {
+                        Text(
+                            "搜索片名 / 演员 / 标签…",
+                            color = Color.White.copy(alpha = 0.6f),
+                            style = MaterialTheme.typography.bodyMedium,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+                    inner()
+                },
+            )
+            if (value.isNotEmpty()) {
+                Icon(
+                    Icons.Outlined.Close,
+                    contentDescription = "清空搜索",
+                    tint = Color.White.copy(alpha = 0.75f),
+                    modifier = Modifier
+                        .size(18.dp)
+                        .clickable { onValueChange("") },
+                )
+            }
+        }
     }
 }

@@ -18,7 +18,7 @@ import androidx.sqlite.db.SupportSQLiteDatabase
         ScanStateEntity::class,
         MediaLibraryEntity::class,
     ],
-    version = 10,
+    version = 11,
     exportSchema = false,
 )
 abstract class MediaDatabase : RoomDatabase() {
@@ -133,12 +133,27 @@ abstract class MediaDatabase : RoomDatabase() {
         }
     }
 
+    /**
+     * nfo 解析结果整份存一列（`movies.nfoJson`）：把解析补全到四十多个字段
+     * （原名/标语/时长/国家/语言/编剧/合集/技术参数/音轨字幕/角色名…）之后，
+     * 逐列建表要一次几十条 ALTER，且以后每加一个字段还要再来一次 —— 长尾字段一律进 JSON。
+     *
+     * 老库这一列是 NULL：详情页只显示原有字段，**重扫一次**（或详情页的按需自愈）补上。
+     * 顺便把 nfo 的落盘缓存 key 升了一版（见 MediaScanner.NFO_CACHE_VERSION）——
+     * 不升的话缓存里那些"只解析了 13 个字段"的旧结果会被继续命中，新字段永远是空的。
+     */
+    private val MIGRATION_10_11 = object : Migration(10, 11) {
+        override fun migrate(db: SupportSQLiteDatabase) {
+            db.execSQL("ALTER TABLE movies ADD COLUMN nfoJson TEXT")
+        }
+    }
+
     fun build(context: Context): MediaDatabase =
         Room.databaseBuilder(context, MediaDatabase::class.java, "media.db")
             .addMigrations(
                 MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5,
                 MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9,
-                MIGRATION_9_10,
+                MIGRATION_9_10, MIGRATION_10_11,
             )
             .fallbackToDestructiveMigration()
             .build()

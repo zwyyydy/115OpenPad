@@ -73,6 +73,7 @@ import com.open115.pad.data.media.EpisodeEntity
 import com.open115.pad.data.media.MediaDao
 import com.open115.pad.data.media.MovieCard
 import com.open115.pad.data.media.MovieEntity
+import com.open115.pad.data.media.NfoMeta
 import com.open115.pad.data.media.MovieDeleteResult
 import com.open115.pad.data.media.deleteMovie
 import com.open115.pad.data.media.episodeSortKey
@@ -81,6 +82,7 @@ import com.open115.pad.ui.components.dissolve
 import com.open115.pad.ui.theme.AdaptiveBody
 import com.open115.pad.ui.theme.rememberTone
 import kotlinx.coroutines.launch
+import kotlinx.serialization.json.Json
 
 private data class MediaDetailData(
     val movie: MovieEntity,
@@ -100,6 +102,12 @@ private data class MediaDetailData(
      * 只在扫描时记了 pick_code，**字节是进这个页面才开始缓存的**（见下面的 LaunchedEffect）。
      */
     val fanarts: List<String> = emptyList(),
+    /**
+     * nfo 的**完整解析结果**（`movies.nfoJson`）：时长/国家/语言/编剧/合集/技术参数/角色名…
+     * 这些长尾字段不参与查询，所以整份存 JSON（见 MovieEntity.nfoJson），这里解出来展示。
+     * 老库升级上来时是 null（只显示原有字段），重扫一次补上。
+     */
+    val nfo: NfoMeta? = null,
 )
 
 /**
@@ -117,6 +125,11 @@ fun MediaDetailScreen(
     dao: MediaDao,
     /** 删成功时通知外面刷新海报墙（墙在详情浮层下面没被销毁，不会自己发现数据变了） */
     onDeleted: () -> Unit = {},
+    /**
+     * 点演员 / 点标签：外面开一页"这个演员（标签）的全部作品"。
+     * **跨所有媒体库** —— 演员本来就不属于某一个库。
+     */
+    onOpenWorks: (WorksKind, String) -> Unit = { _, _ -> },
     onBack: () -> Unit,
 ) {
     val context = LocalContext.current
@@ -127,8 +140,9 @@ fun MediaDetailScreen(
 
     val data by produceState<MediaDetailData?>(initialValue = null, card.mediaKey) {
         val movie = dao.movie(card.mediaKey)
-        if (movie != null && movie.plot.isNullOrBlank() && movie.rating == null) {
-            // 扫描期 nfo 拉取失败的影片：进详情页按需重拉一次（自愈），然后再查库
+        if (movie != null && com.open115.pad.data.media.MediaScanner.needsNfoRefetch(movie)) {
+            // 扫描期 nfo 拉取失败的影片、以及**还没存完整解析结果的老数据**（nfoJson 为空）：
+            // 进详情页按需重拉一次（自愈），然后再查库。判据与 refetchNfo 共用一份。
             com.open115.pad.data.media.MediaScanner.refetchNfo(
                 container.openApi, container.okHttpClient, dao, container.mediaCache, card.mediaKey,
             )
@@ -144,6 +158,9 @@ fun MediaDetailScreen(
                 episodes = dao.episodesOf(card.mediaKey),
                 seriesEpisodes = dao.episodesOfSeries(card.mediaKey),
                 fanarts = updated.extraFanartList,
+                nfo = updated.nfoJson?.let {
+                    runCatching { nfoJson.decodeFromString<NfoMeta>(it) }.getOrNull()
+                },
             )
         }
     }
@@ -348,6 +365,37 @@ fun MediaDetailScreen(
                                 Spacer(Modifier.height(6.dp))
                                 Text(it, color = Color.White.copy(alpha = 0.75f), style = MaterialTheme.typography.bodySmall)
                             }
+                            // nfo 里的关键元信息（时长/首播/国家/语言/分级/合集），一行放不下就省略
+                            val facts = listOfNotNull(
+                                current.nfo?.runtimeText,
+                                current.nfo?.premiered,
+                                current.nfo?.countries?.takeIf { it.isNotEmpty() }?.joinToString(" / "),
+                                current.nfo?.languages?.takeIf { it.isNotEmpty() }?.joinToString(" / "),
+                                current.nfo?.contentRating,
+                                current.nfo?.set?.takeIf { it.isNotBlank() }?.let { "合集：$it" },
+                            )
+                            if (facts.isNotEmpty()) {
+                                Spacer(Modifier.height(6.dp))
+                                Text(
+                                    facts.joinToString(" · "),
+                                    color = Color.White.copy(alpha = 0.8f),
+                                    style = MaterialTheme.typography.bodySmall,
+                                    maxLines = 2,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                            }
+                            // 标语（tagline）：单独一行、斜一点，它是"宣传语"不是元数据
+                            current.nfo?.tagline?.takeIf { it.isNotBlank() }?.let {
+                                Spacer(Modifier.height(6.dp))
+                                Text(
+                                    it,
+                                    color = Color.White.copy(alpha = 0.7f),
+                                    style = MaterialTheme.typography.bodySmall,
+                                    fontStyle = androidx.compose.ui.text.font.FontStyle.Italic,
+                                    maxLines = 2,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                            }
                             Spacer(Modifier.height(14.dp))
                             val mainPc = current.movie.videoPickCode
                             // 系列卡自己没有视频文件，播放按钮落到第一集
@@ -376,16 +424,29 @@ fun MediaDetailScreen(
                         Text(it, style = MaterialTheme.typography.bodyMedium, color = Color.White.copy(alpha = 0.9f))
                     }
 
+                    // nfo 里的长尾字段（时长/首播/国家/导演/编剧/合集/技术参数…）：有值的才列
+                    current.nfo?.let { NfoFactsSection(it) }
+
                     if (current.actors.isNotEmpty()) {
                         Spacer(Modifier.height(16.dp))
                         Text("演员", style = MaterialTheme.typography.titleSmall, color = Color.White)
                         Spacer(Modifier.height(6.dp))
                         // 刮到过头像（`.actors/` 目录，同名演员在别的影片里刮到过也算）就铺头像卡；
-                        // 一个都没有时保持原来的药丸列表 —— 一排首字母圆底并不比药丸好读
+                        // 一个都没有时保持原来的药丸列表 —— 一排首字母圆底并不比药丸好读。
+                        // 两种形态都**可点**：点开这个演员在**全部媒体库**里的作品
+                        // nfo 里的角色名（`<actor><role>`）：名字对得上就显示"饰 XXX"
+                        val roles = remember(current.nfo) { current.nfo?.actorPairs?.toMap().orEmpty() }
                         if (current.actors.any { !it.avatarPickCode.isNullOrBlank() }) {
-                            ActorAvatarRow(current.actors)
+                            ActorAvatarRow(current.actors, roles) { onOpenWorks(WorksKind.Actor, it) }
                         } else {
-                            LabelFlow(current.actors.map { it.name })
+                            LabelFlow(
+                                current.actors.map { a ->
+                                    roles[a.name]?.takeIf { it.isNotBlank() }?.let { "${a.name} · $it" } ?: a.name
+                                },
+                            ) { label ->
+                                // 药丸文案带了角色名，点出去查的是**演员名**（取 · 之前那段）
+                                onOpenWorks(WorksKind.Actor, label.substringBefore(" · "))
+                            }
                         }
                     }
 
@@ -418,7 +479,7 @@ fun MediaDetailScreen(
                         Spacer(Modifier.height(16.dp))
                         Text("标签", style = MaterialTheme.typography.titleSmall, color = Color.White)
                         Spacer(Modifier.height(6.dp))
-                        LabelFlow(current.tags)
+                        LabelFlow(current.tags) { onOpenWorks(WorksKind.Tag, it) }
                     }
 
                     // 分集：系列卡列它名下的分集；番号式/多视频影片列它自己的 episodes
@@ -514,11 +575,20 @@ private const val FANART_PREFETCH_BATCH = 20
  * 不占位空白，也不假装有图。
  */
 @Composable
-private fun ActorAvatarRow(actors: List<ActorCard>) {
+private fun ActorAvatarRow(
+    actors: List<ActorCard>,
+    /** 演员 → 角色名（来自 nfo 的 `<actor><role>`），没有就不显示第二行 */
+    roles: Map<String, String> = emptyMap(),
+    onClick: (String) -> Unit,
+) {
     LazyRow(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
         items(actors, key = { it.name }) { actor ->
             Column(
-                Modifier.width(72.dp),
+                Modifier
+                    .width(72.dp)
+                    .clip(RoundedCornerShape(10.dp))
+                    .clickable { onClick(actor.name) }
+                    .padding(vertical = 4.dp),
                 horizontalAlignment = Alignment.CenterHorizontally,
             ) {
                 Box(
@@ -547,6 +617,16 @@ private fun ActorAvatarRow(actors: List<ActorCard>) {
                     overflow = TextOverflow.Ellipsis,
                     textAlign = TextAlign.Center,
                 )
+                roles[actor.name]?.takeIf { it.isNotBlank() }?.let { role ->
+                    Text(
+                        role,
+                        color = Color.White.copy(alpha = 0.55f),
+                        style = MaterialTheme.typography.labelSmall,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        textAlign = TextAlign.Center,
+                    )
+                }
             }
         }
     }
@@ -613,10 +693,10 @@ private fun FanartViewer(pickCodes: List<String>, initial: Int, onDismiss: () ->
     }
 }
 
-/** 演员/标签小药丸：自动换行 */
+/** 演员/标签小药丸：自动换行；[onClick] 点开"这个演员/标签的全部作品"（跨所有媒体库） */
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
-private fun LabelFlow(labels: List<String>) {
+private fun LabelFlow(labels: List<String>, onClick: (String) -> Unit) {
     FlowRow(
         horizontalArrangement = Arrangement.spacedBy(8.dp),
         verticalArrangement = Arrangement.spacedBy(6.dp),
@@ -625,12 +705,89 @@ private fun LabelFlow(labels: List<String>) {
             Surface(
                 color = Color.White.copy(alpha = 0.16f),
                 shape = RoundedCornerShape(16.dp),
+                modifier = Modifier.clickable { onClick(label) },
             ) {
                 Text(
                     label,
                     color = Color.White,
                     style = MaterialTheme.typography.labelLarge,
                     modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
+                )
+            }
+        }
+    }
+}
+
+/**
+ * nfo 长尾字段的解码器（容错：库里存的可能是老版本解析器写的 JSON，多出来的键忽略）。
+ * 只是展示用，解不出来就当没有 —— 不该让详情页崩。
+ */
+private val nfoJson = Json { ignoreUnknownKeys = true }
+
+/**
+ * 影片信息：nfo 里那些**不参与查询、只在详情页看**的字段（时长/首播/国家/导演/编剧/合集/
+ * 技术参数/外部编号…）。一条都没有就整节不出现 —— 老库升级上来时 nfoJson 是空的，
+ * 表现跟以前完全一样（重扫一次就补上）。
+ */
+@Composable
+private fun NfoFactsSection(nfo: NfoMeta) {
+    val rows = buildList {
+        nfo.runtimeText?.let { add("时长" to it) }
+        nfo.premiered?.takeIf { it.isNotBlank() }?.let { add("首播" to it) }
+        nfo.countries.takeIf { it.isNotEmpty() }?.let { add("国家/地区" to it.joinToString(" / ")) }
+        nfo.languages.takeIf { it.isNotEmpty() }?.let { add("语言" to it.joinToString(" / ")) }
+        nfo.contentRating?.takeIf { it.isNotBlank() }?.let { add("分级" to it) }
+        nfo.directors.takeIf { it.isNotEmpty() }?.let { add("导演" to it.joinToString(" / ")) }
+        nfo.writers.takeIf { it.isNotEmpty() }?.let { add("编剧" to it.joinToString(" / ")) }
+        nfo.studios.takeIf { it.isNotEmpty() }?.let { add("片商" to it.joinToString(" / ")) }
+        nfo.network?.takeIf { it.isNotBlank() }?.let { add("电视台" to it) }
+        nfo.set?.takeIf { it.isNotBlank() }?.let { add("合集" to it) }
+        nfo.status?.takeIf { it.isNotBlank() }?.let { add("状态" to it) }
+        nfo.source?.takeIf { it.isNotBlank() }?.let { add("来源" to it) }
+        // 评分：主评分（带人数）/ 媒体评分 / 榜单
+        nfo.rating?.let { r ->
+            val votes = nfo.votes?.let { v -> "（${if (v >= 10000) "%.1f 万".format(v / 10000.0) else "$v"} 人）" } ?: ""
+            add("评分" to "%.1f%s".format(r, votes))
+        }
+        nfo.criticRating?.let { add("媒体评分" to "%.1f".format(it)) }
+        nfo.top250?.let { add("榜单" to "TOP $it") }
+        // 技术参数（nfo 的 <fileinfo><streamdetails>）
+        listOfNotNull(nfo.resolutionText, nfo.videoCodec, nfo.videoAspect).takeIf { it.isNotEmpty() }
+            ?.let { add("画面" to it.joinToString(" · ")) }
+        listOfNotNull(
+            nfo.audioCodec,
+            nfo.audioChannels?.let { "$it 声道" },
+            nfo.audioLanguages.takeIf { it.isNotEmpty() }?.joinToString("/"),
+        ).takeIf { it.isNotEmpty() }?.let { add("音轨" to it.joinToString(" · ")) }
+        nfo.subtitleLanguages.takeIf { it.isNotEmpty() }?.let { add("字幕" to it.joinToString(" / ")) }
+        nfo.videoDurationSeconds?.takeIf { it > 0 }?.let { add("片长" to "${it / 60} 分 ${it % 60} 秒") }
+        // 外部编号（刮削器写的 id，排查"为什么没刮到"时有用）
+        listOfNotNull(
+            nfo.uniqueTmdbid?.let { "TMDB $it" },
+            nfo.imdbId,
+            nfo.tvdbId?.let { "TVDB $it" },
+        ).takeIf { it.isNotEmpty() }?.let { add("编号" to it.joinToString(" · ")) }
+        nfo.dateAdded?.takeIf { it.isNotBlank() }?.let { add("入库" to it.take(10)) }
+    }
+    if (rows.isEmpty()) return
+
+    Spacer(Modifier.height(16.dp))
+    Text("影片信息", style = MaterialTheme.typography.titleSmall, color = Color.White)
+    Spacer(Modifier.height(6.dp))
+    Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
+        rows.forEach { (label, value) ->
+            Row {
+                Text(
+                    label,
+                    color = Color.White.copy(alpha = 0.55f),
+                    style = MaterialTheme.typography.bodySmall,
+                    modifier = Modifier.width(66.dp),
+                )
+                Text(
+                    value,
+                    color = Color.White.copy(alpha = 0.88f),
+                    style = MaterialTheme.typography.bodySmall,
+                    modifier = Modifier.weight(1f),
                 )
             }
         }
