@@ -281,8 +281,7 @@ fun MediaLibraryEntity.autoScanDue(now: Long): Boolean {
 }
 
 /**
- * 观影历史：一条 = 在**媒体库里**播过一次的视频（key 就是它的 pick_code）。
- *
+ * 观影历史：一条 = 在**媒体库里**播过一次的视频（key 就是它的 pick_code）。 *
  * 为什么自己记：115 那边只有「按 pick_code 查某一条的进度」（`GET open/video/history`），
  * **没有"列出看过的片"的接口** —— 媒体库页里那份「观影历史」只能靠本机记。
  *
@@ -335,3 +334,49 @@ data class WatchHistoryRow(
     /** 这条视频自己那行的标题（分集就是集名）；不在库里为 null */
     val ownTitle: String?,
 )
+
+/**
+ * 一条扫描记录：**什么时候、扫的哪个库、结果如何、新增了哪些片**。
+ *
+ * 为什么单独一张表而不是塞进「操作记录」（OpLog）：那是**文件操作**的流水（复制/移动/上传…），
+ * 混在一起既冲淡它、又受它 1000 条上限的牵连；而扫描记录要能带**海报图**展示新增影片，
+ * 它需要 join `movies` —— 那是媒体库自己的事，就该待在媒体库这一侧。
+ *
+ * [libraryName] 冗余存一份：库被删了记录也还看得懂"这条是哪个库的"。
+ * [newKeys] 存的是**影片键**不是标题 —— 标题与海报在界面里 join `movies` 现取，
+ * 库里改了名、换了海报，旧记录里也跟着变（存快照的话记录一多就会跟库不一致）。
+ */
+@Entity(tableName = "scan_log", indices = [Index("at")])
+data class ScanLogEntity(
+    @PrimaryKey(autoGenerate = true) val id: Long = 0,
+    /** 库 id（0 = 没有对应库，例如手工指定根目录扫的） */
+    val libraryId: Long = 0,
+    val libraryName: String,
+    /** 完成时间（毫秒）—— 记录列表按它倒序 */
+    val at: Long,
+    val elapsedMs: Long = 0,
+    val totalDirs: Int = 0,
+    val doneDirs: Int = 0,
+    val skippedDirs: Int = 0,
+    val indexed: Int = 0,
+    val postersFetched: Int = 0,
+    val stopped: Boolean = false,
+    /** 新增影片的 mediaKey，`\n` 分隔（路径里不会出现换行，键同理） */
+    val newKeys: String = "",
+) {
+    val newKeyList: List<String> get() = newKeys.split('\n').filter { it.isNotBlank() }
+
+    /** 交给界面拼摘要（文案统一在 [ScanReport] 里，见它的注释） */
+    fun toReport(): ScanReport = ScanReport(
+        libraryName = libraryName,
+        startedAt = at - elapsedMs,
+        finishedAt = at,
+        totalDirs = totalDirs,
+        doneDirs = doneDirs,
+        skippedDirs = skippedDirs,
+        indexed = indexed,
+        postersFetched = postersFetched,
+        newCount = newKeyList.size,
+        stopped = stopped,
+    )
+}

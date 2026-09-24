@@ -240,15 +240,20 @@ class MediaScanner(
             )
         }
         var stoppedEarly = false
-        // 跑完的目录数（进度条用）。声明在 try 之外是为了收尾时判断"这轮到底跑了吗" ——
-        // 见 finally 里写 lastScanAt 那段。
+        // 这几个计数器声明在 try 之外，是为了收尾时能拼出"这次扫描干了什么"（扫描记录 + lastScanAt）。
+        // 进度条用的 done 还要判断"这轮到底跑了吗"。
         var done = 0
+        var movies = 0
+        var skipped = 0
+        var totalDirsSeen = 0
+        /** 本次**新增**的顶层影片键（分集不单列）—— 存进扫描记录，界面拿它 join 出海报与标题 */
+        val newKeys = mutableListOf<String>()
+        val startedAt = System.currentTimeMillis()
         try {
-            var movies = 0
-            var skipped = 0
             // 递归列目录。**这一步列到的结果直接传给下面复用**，不再对同一个目录重复请求
             // （早先是 collectDirs 列一遍找子目录、下面的循环再列一遍取文件，等于每目录 2 次）
             val allDirs = collectDirs(rootCid, rootPath, includeSubDirs, rateLimitMs)
+            totalDirsSeen = allDirs.size
             if (stopRequested.get()) {
                 // 列目录阶段没有写入，停在这里没有任何损失（续扫会重新列）
                 stoppedEarly = true
@@ -372,6 +377,9 @@ class MediaScanner(
                         scan.isMultiVideo -> ancestorInfoOf(listing.path, files, rootPath)
                         else -> null
                     }
+                    // 索引前先拿这个目录**已有的键**：跑完之后既用它清陈旧条目，
+                    // 也用它判"哪些是本次新增的片"（原本只在清陈旧时查，提前到这里复用，不多花查询）
+                    val keysBefore = dao.mediaKeysInDir(listing.cid).toSet()
                     val produced = mutableSetOf<String>()
                     var failed = false
                     var aborted = false
@@ -433,10 +441,18 @@ class MediaScanner(
                     // 有簇索引失败时**一条都不清** —— 那可能只是这次网络不好，删掉就把已索引的
                     // 元数据弄丢了，而重扫本来就是为了补数据。
                     if (!failed) {
-                        val stale = dao.mediaKeysInDir(listing.cid).filterNot { it in produced }
+                        val stale = keysBefore.filterNot { it in produced }
                         if (stale.isNotEmpty()) {
                             dao.deleteMovies(stale)
                             Log.i(TAG, "清理 ${listing.path} 下 ${stale.size} 条陈旧条目")
+                        }
+                        // 新增影片 = 本次产出的键里、索引前不存在的那些。
+                        // **只收顶层条目**（seriesKey == null）—— 那正是海报墙上会多出来的卡：
+                        // 一季几十集的分集不单列（系列卡已经代表它了），分 CD 的合成行是顶层 ✓、
+                        // 各张盘带 seriesKey ✗。存的是**键**：界面 join movies 现取标题与海报。
+                        for (key in produced - keysBefore) {
+                            val row = dao.movie(key) ?: continue
+                            if (row.seriesKey == null) newKeys += key
                         }
                     }
                     dao.upsertScanState(
@@ -461,13 +477,46 @@ class MediaScanner(
         } catch (e: Exception) {
             Log.w("MediaScanner", "扫描中断: ${e.message}")
         } finally {
+            val finishedAt = System.currentTimeMillis()
             // 记"这个库刚扫完"。**一个目录都没跑完就不记**（done == 0 通常是列目录阶段就抛了，
             // 多半是网络问题）：那种情况该在下次启动时再试，而不是白白占用一个扫描间隔。
             // 用户中途按停止 → done > 0 → 照记（他确实扫过一轮了，别每次启动都来烦他）。
             if (libraryId != null && done > 0) {
-                runCatching { dao.markLibraryScanned(libraryId, System.currentTimeMillis()) }
+                runCatching { dao.markLibraryScanned(libraryId, finishedAt) }
                     .onFailure { Log.w(TAG, "记录扫描时间失败 libraryId=$libraryId: ${it.message}") }
             }
+            // 媒体库自己的记录里留一条：**何时扫的、扫的哪个库、结果、新增了哪些片**
+            // （表 scan_log → 媒体库页的「扫描记录」，那里用海报图展示新增影片）。
+            // **跑没跑完都记** —— 用户就是靠它回答"上次扫到哪儿了"。翻车了也只当没记，不影响扫描本身。
+            runCatching {
+                val report = ScanReport(
+                    libraryName = libraryLabel(libraryId, rootPath),
+                    startedAt = startedAt,
+                    finishedAt = finishedAt,
+                    totalDirs = totalDirsSeen,
+                    doneDirs = done,
+                    skippedDirs = skipped,
+                    indexed = movies,
+                    postersFetched = postersFetched,
+                    newCount = newKeys.size,
+                    stopped = stoppedEarly,
+                )
+                dao.addScanLog(
+                    ScanLogEntity(
+                        libraryId = libraryId ?: 0L,
+                        libraryName = report.libraryName,
+                        at = finishedAt,
+                        elapsedMs = report.elapsedMs,
+                        totalDirs = report.totalDirs,
+                        doneDirs = report.doneDirs,
+                        skippedDirs = report.skippedDirs,
+                        indexed = report.indexed,
+                        postersFetched = report.postersFetched,
+                        stopped = report.stopped,
+                        newKeys = newKeys.joinToString("\n"),
+                    ),
+                )
+            }.onFailure { Log.w(TAG, "写扫描记录失败: ${it.message}") }
             // 收尾统一放 finally：正常结束、抛异常、被停止三条路都要把 running 落回去，
             // 否则 UI 会永远停在"扫描中"、且 requestStop 之后的等待永远等不到
             _progress.value = _progress.value.copy(
@@ -620,8 +669,17 @@ class MediaScanner(
         }
     }
 
-    /** 列表项 → FileRef（扫描期反复用，抽出来免得三处各写一遍字段映射） */
-    private fun fileRefsOf(page: FilesPage?, includeDirs: Boolean = false): List<FileRef> =
+    /**
+     * 扫描记录里这条扫描属于谁：库里那条的名字优先（用户在列表里认得的是它），
+     * 取不到（没 libraryId / 库被删了）就退回根目录最后一段。
+     */
+    private suspend fun libraryLabel(libraryId: Long?, rootPath: String): String {
+        val name = libraryId?.let { runCatching { dao.library(it) }.getOrNull()?.name }
+        return name?.takeIf { it.isNotBlank() }
+            ?: rootPath.trimEnd('/').substringAfterLast('/').ifBlank { rootPath }
+    }
+
+    /** 列表项 → FileRef（扫描期反复用，抽出来免得三处各写一遍字段映射） */    private fun fileRefsOf(page: FilesPage?, includeDirs: Boolean = false): List<FileRef> =
         page?.items.orEmpty().filter { includeDirs || !it.isDir }.map {
             FileRef(
                 name = it.fn, pickCode = it.pc ?: "", sizeBytes = it.fs,

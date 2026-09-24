@@ -849,4 +849,56 @@ interface MediaDao {
 
     @Query("DELETE FROM watch_history")
     suspend fun clearWatchHistory()
+
+    // ---------------- 扫描记录（媒体库自己的流水） ----------------
+
+    /**
+     * 记录一次扫描。**顺手裁掉多余的**：只留最近 [SCAN_LOG_KEEP] 条 ——
+     * 每次启动都可能自动扫一轮，不裁的话这张表会一直长（而且它每行都带一串新增键）。
+     */
+    @Transaction
+    suspend fun addScanLog(row: ScanLogEntity) {
+        insertScanLog(row)
+        trimScanLogs(SCAN_LOG_KEEP)
+    }
+
+    @Insert
+    suspend fun insertScanLog(row: ScanLogEntity): Long
+
+    /** 只保留最新 [keep] 条（扫一次插一条，按完成时间倒序数） */
+    @Query(
+        "DELETE FROM scan_log WHERE id NOT IN (" +
+            "SELECT id FROM scan_log ORDER BY at DESC LIMIT :keep)",
+    )
+    suspend fun trimScanLogs(keep: Int)
+
+    @Query("SELECT * FROM scan_log ORDER BY at DESC LIMIT :limit")
+    fun scanLogs(limit: Int = 200): Flow<List<ScanLogEntity>>
+
+    @Query("DELETE FROM scan_log")
+    suspend fun clearScanLogs()
+
+    /**
+     * 一批 mediaKey → 海报墙同款卡片（[MovieCard]）。扫描记录里"新增的影片"就用它渲染成图。
+     *
+     * 分块查：一次扫描可能新增几百部，`IN (…)` 的变量数是 SQLite 有上限的（老版本 999），
+     * 撞上就是一句难懂的 SQL 错误 —— 这里按 300 一批拼起来，调用方不用管。
+     * 查不到的键（片子后来被删了）自然不在结果里。
+     */
+    @Transaction
+    suspend fun movieCardsByKeys(keys: List<String>): List<MovieCard> {
+        if (keys.isEmpty()) return emptyList()
+        return keys.chunked(300).flatMap { movieCardsByKeysChunk(it) }
+    }
+
+    @Query(
+        "SELECT mediaKey, title, year, rating, posterPickCode, fanartPickCode, extraFanartPickCodes, " +
+            "isEpisodeLike, videoPickCode, genre, videoName FROM movies WHERE mediaKey IN (:keys)",
+    )
+    suspend fun movieCardsByKeysChunk(keys: List<String>): List<MovieCard>
+
+    private companion object {
+        /** 扫描记录最多留这么多条（每次启动的自动扫描也算一次，不裁会一直涨） */
+        const val SCAN_LOG_KEEP = 200
+    }
 }

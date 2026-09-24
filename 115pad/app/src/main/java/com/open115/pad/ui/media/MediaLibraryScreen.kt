@@ -24,6 +24,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Add
 import androidx.compose.material.icons.outlined.History
+import androidx.compose.material.icons.outlined.Update
 import androidx.compose.material.icons.outlined.Delete
 import androidx.compose.material.icons.outlined.Edit
 import androidx.compose.material.icons.outlined.Movie
@@ -160,6 +161,11 @@ fun MediaLibraryScreen(api: com.open115.pad.data.OpenApi) {
                     backdrop = null,
                     modifier = Modifier.widthIn(min = 200.dp, max = 340.dp).padding(end = 4.dp),
                 )
+                // 扫描记录：媒体库自己的流水（何时扫的哪个库、结果、新增影片带图）——
+                // 不放文件页那份「操作记录」（那是文件操作的流水），也不占导航栏
+                IconButton(onClick = { overlays.add(MediaOverlay.ScanLog) }) {
+                    Icon(Icons.Outlined.Update, contentDescription = "扫描记录")
+                }
                 // 观影历史：入口放在媒体库页（它是"媒体库看到哪儿了"，不属于文件页 ——
                 // 文件页的播放记录在操作记录里，两处不重复）
                 IconButton(onClick = { overlays.add(MediaOverlay.History) }) {
@@ -423,6 +429,12 @@ fun MediaLibraryScreen(api: com.open115.pad.data.OpenApi) {
 
         is MediaOverlay.History -> WatchHistoryScreen(
             container = container,
+            onBack = { overlays.removeLastOrNull() },
+        )
+
+        is MediaOverlay.ScanLog -> MediaScanLogScreen(
+            dao = dao,
+            onOpenMovie = { card, list, index -> overlays.add(MediaOverlay.Detail(card, list, index)) },
             onBack = { overlays.removeLastOrNull() },
         )
 
@@ -811,6 +823,9 @@ private sealed interface MediaOverlay {
 
     /** 观影历史（媒体库这一库线自己的记录；文件页的播放不走这里，那边看操作记录） */
     object History : MediaOverlay
+
+    /** 扫描记录（何时扫的哪个库、结果、新增了哪些片——带海报图） */
+    object ScanLog : MediaOverlay
 }
 
 /**

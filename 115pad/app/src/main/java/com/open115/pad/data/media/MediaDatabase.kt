@@ -18,8 +18,9 @@ import androidx.sqlite.db.SupportSQLiteDatabase
         ScanStateEntity::class,
         MediaLibraryEntity::class,
         WatchHistoryEntity::class,
+        ScanLogEntity::class,
     ],
-    version = 13,
+    version = 14,
     exportSchema = false,
 )
 abstract class MediaDatabase : RoomDatabase() {
@@ -190,12 +191,33 @@ abstract class MediaDatabase : RoomDatabase() {
         }
     }
 
+    /**
+     * 扫描记录表 `scan_log`（媒体库自己的记录：何时扫的哪个库、结果、新增了哪些片）。
+     *
+     * 纯新增的空表，老数据无关。DDL 要跟 [ScanLogEntity] 一字不差地对上（类型/NOT NULL/主键/索引名）——
+     * Room 打开库时拿实体声明对账，不一致直接抛。
+     */
+    private val MIGRATION_13_14 = object : Migration(13, 14) {
+        override fun migrate(db: SupportSQLiteDatabase) {
+            db.execSQL(
+                "CREATE TABLE IF NOT EXISTS scan_log (" +
+                    "id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, libraryId INTEGER NOT NULL, " +
+                    "libraryName TEXT NOT NULL, at INTEGER NOT NULL, elapsedMs INTEGER NOT NULL, " +
+                    "totalDirs INTEGER NOT NULL, doneDirs INTEGER NOT NULL, skippedDirs INTEGER NOT NULL, " +
+                    "indexed INTEGER NOT NULL, postersFetched INTEGER NOT NULL, stopped INTEGER NOT NULL, " +
+                    "newKeys TEXT NOT NULL)",
+            )
+            db.execSQL("CREATE INDEX IF NOT EXISTS index_scan_log_at ON scan_log (at)")
+        }
+    }
+
     fun build(context: Context): MediaDatabase =
         Room.databaseBuilder(context, MediaDatabase::class.java, "media.db")
             .addMigrations(
                 MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5,
                 MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9,
                 MIGRATION_9_10, MIGRATION_10_11, MIGRATION_11_12, MIGRATION_12_13,
+                MIGRATION_13_14,
             )
             .fallbackToDestructiveMigration()
             .build()
