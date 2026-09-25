@@ -50,6 +50,9 @@ class AppContainer(context: Context) {
     val filesPrefs = com.open115.pad.data.FilesPrefs(context)
     val downloadPrefs = com.open115.pad.data.DownloadPrefs(context)
 
+    /** 应用级偏好（目前只有「启动首页」，设置 → 界面显示） */
+    val appPrefs = com.open115.pad.data.AppPrefs(context)
+
     /** 文件夹置顶（本机生效，115 开放平台无对应接口） */
     val pinnedPrefs = com.open115.pad.data.PinnedPrefs(context)
 

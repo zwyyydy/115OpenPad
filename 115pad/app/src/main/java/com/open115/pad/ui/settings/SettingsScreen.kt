@@ -21,6 +21,7 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
@@ -49,6 +50,7 @@ import coil.compose.SubcomposeAsyncImage
 import com.open115.pad.AppContainer
 import com.open115.pad.data.ImageUrlResolver
 import com.open115.pad.data.OpenApi
+import com.open115.pad.data.StartPage
 import com.open115.pad.data.UserInfo
 import com.open115.pad.player.PlayerCache
 import com.open115.pad.ui.components.ConfirmDialog
@@ -178,6 +180,8 @@ fun SettingsScreen(container: AppContainer) {
     val mediaCacheEnabled by container.mediaPrefs.cacheEnabled.collectAsState(initial = true)
     val mediaCacheMaxMb by container.mediaPrefs.cacheMaxMb
         .collectAsState(initial = com.open115.pad.data.media.MediaPrefs.DEFAULT_MAX_MB)
+    // 启动首页（界面显示 →「启动首页」）：存的是枚举名，见 data/AppPrefs.kt
+    val startPage by container.appPrefs.startPage.collectAsState(initial = StartPage.FILES)
     /** 媒体库缓存占用（字节）：简介文本池 / 海报，-1 = 还在算 */
     var mediaTextBytes by remember { mutableStateOf(-1L) }
     var mediaPosterBytes by remember { mutableStateOf(-1L) }
@@ -392,6 +396,13 @@ fun SettingsScreen(container: AppContainer) {
         )
 
         SectionTitle("界面显示")
+        ChoiceRow(
+            title = "启动首页",
+            subtitle = "程序启动后默认显示哪一页；下次启动应用生效（媒体库页会收起左侧导航栏）",
+            options = listOf("文件" to StartPage.FILES, "媒体库" to StartPage.MEDIA),
+            selected = startPage,
+            onSelect = { scope.launch { container.appPrefs.setStartPage(it) } },
+        )
         Text(
             "全屏播放时右上角状态栏的显示内容（四项可独立开关）",
             style = MaterialTheme.typography.bodySmall,
@@ -496,6 +507,45 @@ private fun fmtBytes(bytes: Long): String {
         kb < 1024 -> "%.0f KB".format(kb)
         kb < 10 * 1024 -> "%.1f MB".format(kb / 1024)
         else -> "%.0f MB".format(kb / 1024)
+    }
+}
+
+/**
+ * 二选一的设置行：标题 + 说明在左，右侧一排胶囊（选中态高亮）。
+ *
+ * 用 [FilterChip] 而不是 Switch ——「文件 / 媒体库」是两个平级选项，没有开/关语义，
+ * 开关形状会让人以为是在启用/停用某个功能。
+ */
+@Composable
+private fun <T> ChoiceRow(
+    title: String,
+    subtitle: String,
+    options: List<Pair<String, T>>,
+    selected: T,
+    onSelect: (T) -> Unit,
+) {
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp, vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(Modifier.weight(1f)) {
+            Text(title, style = MaterialTheme.typography.bodyLarge)
+            Text(
+                subtitle,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        options.forEach { (label, value) ->
+            FilterChip(
+                selected = value == selected,
+                onClick = { onSelect(value) },
+                label = { Text(label) },
+                modifier = Modifier.padding(start = 8.dp),
+            )
+        }
     }
 }
 

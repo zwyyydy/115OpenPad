@@ -53,6 +53,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.navigation.compose.NavHost
@@ -121,14 +122,25 @@ fun AppRoot(container: AppContainer, widthClass: WindowWidthSizeClass) {
                         com.open115.pad.data.parseUserInfo(container.openApi.userInfo())
                     }.onSuccess { com.open115.pad.ui.settings.UserInfoCache.put(it) }
                 }
-                MainScaffold(container, widthClass)
+                // 启动首页（设置 →「启动首页」）必须**在 NavHost 首次组合前**读出来：
+                // 读出来才建 MainScaffold，否则会先按默认落页、再跳，肉眼就是"闪一下文件页"。
+                // DataStore 首次读取是毫秒级，这段空窗复用上面登录态检查的同一个转圈。
+                val startPagePref by container.appPrefs.startPage.collectAsState(initial = null)
+                val startRoute = startPagePref?.route
+                if (startRoute == null) {
+                    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                        CircularProgressIndicator()
+                    }
+                } else {
+                    MainScaffold(container, widthClass, initialPage = startRoute)
+                }
             }
         }
     }
 }
 
 @Composable
-private fun MainScaffold(container: AppContainer, widthClass: WindowWidthSizeClass) {
+private fun MainScaffold(container: AppContainer, widthClass: WindowWidthSizeClass, initialPage: String) {
     val navController = rememberNavController()
     val snackbarHostState = remember { SnackbarHostState() }
     val scope = rememberCoroutineScope()
@@ -151,6 +163,26 @@ private fun MainScaffold(container: AppContainer, widthClass: WindowWidthSizeCla
             launchSingleTop = true
             restoreState = true
         }
+    }
+
+    /**
+     * 启动首页：导航图起点**恒为文件页**，登录后只往偏好页跳一次。
+     *
+     * 为什么不直接把偏好页设成 startDestination：媒体库页是"盖在文件页之上"的沉浸页
+     * （收起导航栏、返回键回文件页 —— 用户熟悉的就是这个语义）。把它当图起点，BACK 会直接
+     * 退出应用，人在媒体库页又没有导航栏可点，等于进得去出不来。
+     *
+     * [landed] 是给第一次绘制遮一下的：跳转发生在首帧之后，不遮的话会看到一帧文件页
+     * （"闪一下"）。跳完/不需要跳（本来就是文件页）才显示内容。
+     */
+    var landed by remember { mutableStateOf(initialPage == "files") }
+    LaunchedEffect(Unit) {
+        if (initialPage != "files") {
+            // 不用 navigate(dest)：它是给"点标签"用的（会 popUpTo 起点 + 存/恢复状态），
+            // 这里就是普通的压栈，语义与手动点一下「媒体库」完全一致
+            navController.navigate(initialPage) { launchSingleTop = true }
+        }
+        landed = true
     }
 
     val onPlayVideo: (FileItem, List<PlaylistEntry>, Int) -> Unit = { item, playlist, index ->
@@ -282,8 +314,10 @@ private fun MainScaffold(container: AppContainer, widthClass: WindowWidthSizeCla
             Box(Modifier.weight(1f)) {
                 NavHost(
                     navController = navController,
+                    // 起点恒为文件页；启动首页由上面那次 navigate 跳过去（返回语义见那里的注释）
                     startDestination = "files",
-                    modifier = Modifier.fillMaxSize(),
+                    // 首帧遮一下：跳转还没发生前别把文件页露出来（见 landed 的注释）
+                    modifier = Modifier.fillMaxSize().alpha(if (landed) 1f else 0f),
                 ) {
                     composable("files") {
                         val vm: FilesViewModel = viewModel(initializer = {
