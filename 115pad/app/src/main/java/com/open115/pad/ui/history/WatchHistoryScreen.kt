@@ -86,6 +86,9 @@ fun WatchHistoryScreen(
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
+    // 作为浮层嵌在媒体库页时，系统返回键 = 出栈（没有这一句 BACK 会穿透到应用级
+    // 导航、直接跳到「文件」页）。独立使用时 onBack 为 null，不注册、保持系统默认行为。
+    androidx.activity.compose.BackHandler(enabled = onBack != null) { onBack?.invoke() }
     // 自己起一个 host：这个页现在只作为媒体库的浮层出现（见 MediaLibraryScreen 的 overlays），
     // 外面的 Scaffold 在浮层之上，不该借它的 host
     val snackbarHostState = remember { SnackbarHostState() }
@@ -237,20 +240,22 @@ fun WatchHistoryScreen(
  *  - `name` 可能为空 —— 从文件管理器/别的应用直接用 ACTION_VIEW 打开视频时，
  *    播放器那边没有文件名可传（见 PlayerActivity.sourceUriOrNull），历史行就只剩一个 uri
  *  - 本机条目退回 uri 的最后一段（就是文件名），至少认得出是哪部片
+ *
+ * 非私有：媒体库首页的「继续观看」横排渲染同一批行，口径必须与这一页完全一致。
  */
-private fun displayTitle(row: WatchHistoryRow): String =
+fun displayTitle(row: WatchHistoryRow): String =
     row.libraryTitle?.takeIf { it.isNotBlank() }
         ?: row.name.takeIf { it.isNotBlank() }
         ?: row.itemKey.substringAfterLast('/').ifBlank { row.itemKey }
 
-/** 副标题：分集/分盘的集名（与主标题不同才有意义），否则空 */
-private fun displaySubtitle(row: WatchHistoryRow): String {
+/** 副标题：分集/分盘的集名（与主标题不同才有意义），否则空。非私有理由同 [displayTitle] */
+fun displaySubtitle(row: WatchHistoryRow): String {
     val own = row.ownTitle?.takeIf { it.isNotBlank() } ?: return ""
     return if (own == displayTitle(row)) "" else own
 }
 
-/** 位置到片尾不足 [NEAR_END_MS] 就算看完（没有时长信息时不算，宁可显示进度） */
-private fun isFinished(row: WatchHistoryRow): Boolean =
+/** 位置到片尾不足 [NEAR_END_MS] 就算看完（没有时长信息时不算，宁可显示进度）。非私有理由同 [displayTitle] */
+fun isFinished(row: WatchHistoryRow): Boolean =
     row.durationMs > 0L && row.positionMs >= row.durationMs - NEAR_END_MS
 
 @OptIn(ExperimentalFoundationApi::class)

@@ -14,6 +14,8 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
@@ -24,14 +26,11 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Add
 import androidx.compose.material.icons.outlined.History
+import androidx.compose.material.icons.outlined.MoreVert
 import androidx.compose.material.icons.outlined.Update
 import androidx.compose.material.icons.outlined.Delete
-import androidx.compose.material.icons.outlined.Edit
 import androidx.compose.material.icons.outlined.Movie
-import androidx.compose.material.icons.outlined.Refresh
-import androidx.compose.material.icons.outlined.Settings
 import androidx.compose.material3.AlertDialog
-import androidx.compose.material3.Card
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
@@ -60,25 +59,29 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import coil.compose.AsyncImage
 import com.open115.pad.appContainer
 import com.open115.pad.data.FileItem
 import com.open115.pad.data.media.MediaLibraryEntity
 import com.open115.pad.data.media.MediaScanner
 import com.open115.pad.data.media.MovieCard
+import com.open115.pad.data.media.WatchHistoryRow
 import com.open115.pad.data.media.WorksSort
+import com.open115.pad.player.PlayerActivity
 import com.open115.pad.ui.history.WatchHistoryScreen
+import com.open115.pad.ui.history.displaySubtitle
+import com.open115.pad.ui.history.displayTitle
+import com.open115.pad.ui.history.isFinished
 import com.open115.pad.ui.theme.AdaptiveBody
 import com.open115.pad.util.Format
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
 
 /**
  * 媒体库页（类 Yamby）：左侧独立入口。
@@ -98,8 +101,6 @@ fun MediaLibraryScreen(api: com.open115.pad.data.OpenApi) {
     var showCreate by remember { mutableStateOf(false) }
     var deleteTarget by remember { mutableStateOf<MediaLibraryEntity?>(null) }
     var editTarget by remember { mutableStateOf<MediaLibraryEntity?>(null) }
-    // 扫描菜单的展开状态（每个库卡片一个）
-    var scanMenuFor by remember { mutableStateOf<MediaLibraryEntity?>(null) }
     // 点库卡片进海报墙，再点海报进详情（两级都盖在本页之上，返回逐层退）
     var openedLib by remember { mutableStateOf<MediaLibraryEntity?>(null) }
     /**
@@ -133,6 +134,66 @@ fun MediaLibraryScreen(api: com.open115.pad.data.OpenApi) {
     }
     // 返回键：正在搜索就先清搜索（与海报墙一致）
     androidx.activity.compose.BackHandler(enabled = query.isNotBlank()) { query = "" }
+
+    // ---- 首页化的两个横排（只在非搜索态出现） ----
+
+    /** 继续观看：观影历史里"开了头还没看完"的前 12 条（判据与观影历史页同一个 isFinished） */
+    val historyRows by dao.watchHistoryRows(60).collectAsState(initial = emptyList())
+    val continueRows = remember(historyRows) {
+        historyRows.filter { !isFinished(it) && it.positionMs > 0 }.take(12)
+    }
+
+    /**
+     * 最近新增：扫描记录里的 newKeys 跨库摊平、同一部片取最新一次、按时间倒序取前 24。
+     *
+     * 为什么走 scan_log 而不是 movies.dateAdded：dateAdded 是 nfo 里刮削器写的"入库时间"，
+     * 老资源可能是几年前的时间戳；scan_log 的 newKeys 是"这一轮扫描**真的**发现了它"，
+     * 语义就是「最近新增」，和扫描记录浮层看到的完全一致。
+     */
+    val scanLogRows by dao.scanLogs(40).collectAsState(initial = emptyList())
+    val recentPairs = remember(scanLogRows) {
+        scanLogRows
+            .flatMap { log -> log.newKeyList.map { it to log.at } }
+            .groupBy(keySelector = { it.first }, valueTransform = { it.second })
+            .map { (key, ats) -> key to (ats.maxOrNull() ?: 0L) }
+            .sortedByDescending { it.second }
+            .take(24)
+    }
+    val recentCards by produceState<List<MovieCard>>(emptyList(), recentPairs) {
+        val byKey = dao.movieCardsByKeys(recentPairs.map { it.first }).associateBy { it.mediaKey }
+        value = recentPairs.mapNotNull { byKey[it.first] }
+    }
+
+    /** 发起一个库的扫描（增量/全量共用，按钮收进了库卡片的「⋯」菜单） */
+    fun startScan(lib: MediaLibraryEntity, incremental: Boolean) {
+        scope.launch {
+            container.transferScope.launch {
+                lib.rootCids.zip(lib.rootPaths).forEach { (cid, path) ->
+                    container.mediaScanner.runScan(
+                        cid, path, incremental = incremental,
+                        rateLimitMs = lib.rateLimitMs,
+                        minVideoSizeMb = lib.minVideoSizeMb,
+                        libraryId = lib.id,
+                    )
+                }
+            }
+        }
+    }
+
+    /** 「继续观看」的卡片点了直接续播（与观影历史页同一套意图：本机源走 localIntent） */
+    fun playRow(row: WatchHistoryRow) {
+        val start = if (isFinished(row)) 0L else row.positionMs
+        val title = displayTitle(row)
+        val sub = displaySubtitle(row)
+        val label = if (sub.isBlank()) title else "$title · $sub"
+        context.startActivity(
+            if (row.local) {
+                PlayerActivity.localIntent(context, row.itemKey, label, start)
+            } else {
+                PlayerActivity.intent(context, row.itemKey, label, startMs = start, recordHistory = true)
+            },
+        )
+    }
 
     // 极光底：几团很淡的径向渐变，给毛玻璃卡片一点"透出来的东西"（纯绘制、零请求）
     Box(Modifier.fillMaxSize().auroraBackdrop()) {
@@ -247,101 +308,64 @@ fun MediaLibraryScreen(api: com.open115.pad.data.OpenApi) {
                     Text("点右上角「新建」，选择云盘里的 Emby 资源目录", style = MaterialTheme.typography.bodyMedium)
                 }
             } else {
-                LazyColumn(Modifier.weight(1f)) {
+                LazyColumn(
+                    Modifier.weight(1f),
+                    contentPadding = PaddingValues(bottom = 16.dp),
+                ) {
                     items(libraries, key = { it.id }) { lib ->
-                        GlassCard(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(horizontal = 16.dp, vertical = 8.dp),
-                            onClick = { openedLib = lib },
-                        ) {
-                        Row(
-                            Modifier
-                                .fillMaxWidth()
-                                .padding(16.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                        ) {
-                            Column(Modifier.weight(1f)) {
-                                Text(lib.name, style = MaterialTheme.typography.titleMedium)
-                                // 多根库逐行列出；单根只有一行，视觉上和原来一致
-                                lib.rootPaths.forEach { path ->
-                                    Text(
-                                        path,
-                                        style = MaterialTheme.typography.bodySmall,
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        LibraryCard(
+                            lib = lib,
+                            dao = dao,
+                            container = container,
+                            refreshTick = wallTick,
+                            scanFinishedAt = scanProgress.finishedAt,
+                            scanRunning = scanProgress.running,
+                            onOpen = { openedLib = lib },
+                            onScan = { incremental -> startScan(lib, incremental) },
+                            onEdit = { editTarget = lib },
+                            onDelete = { deleteTarget = lib },
+                            modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+                        )
+                    }
+
+                    // 最近新增：扫描发现的跨库新片，海报横滑，点开详情（「查看全部」进扫描记录）
+                    if (recentCards.isNotEmpty()) {
+                        item(key = "recent-header") {
+                            SectionHeaderRow(
+                                "最近新增",
+                                actionText = "查看全部",
+                                onAction = { overlays.add(MediaOverlay.ScanLog) },
+                            )
+                        }
+                        item(key = "recent-row") {
+                            LazyRow(
+                                contentPadding = PaddingValues(horizontal = 16.dp),
+                                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                            ) {
+                                items(recentCards, key = { it.mediaKey }) { card ->
+                                    PosterTile(
+                                        card = card,
+                                        onClick = {
+                                            overlays.add(
+                                                MediaOverlay.Detail(card, recentCards, recentCards.indexOf(card)),
+                                            )
+                                        },
                                     )
                                 }
-                                Text(
-                                    "建于 " + SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.getDefault())
-                                        .format(Date(lib.createdAt)) +
-                                        // 扫描结束后要重算，否则"还没有影片"会一直挂着
-                                        LibraryCount(dao, lib.rootPaths, scanProgress.finishedAt) +
-                                        // ☠ 每个 if 都必须带括号：`a + if (c) x else "" + if (d) y else ""`
-                                        // 会解析成 `a + if (c) x else ("" + if (d) y else "")` ——
-                                        // 条件成立时后面几段全被吞掉（早先「限速」一有值，「过滤」就再也显示不出来）
-                                        (if (lib.rateLimitMs > 0) " · 限速 ${lib.rateLimitMs}ms" else "") +
-                                        (if (lib.minVideoSizeMb > 0) " · 过滤 <${lib.minVideoSizeMb}MB" else "") +
-                                        autoScanText(lib) +
-                                        (if (lib.lastScanAt > 0) " · 上次扫描 ${Format.ago(lib.lastScanAt)}" else ""),
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                )
                             }
-                                // 扫描菜单：增量（按 upt 跳过未变化目录）/ 全量（不跳过）
-                                Box {
-                                    IconButton(
-                                        onClick = { scanMenuFor = lib },
-                                        enabled = !scanProgress.running,
-                                    ) {
-                                        Icon(Icons.Outlined.Refresh, contentDescription = "扫描")
-                                    }
-                                    DropdownMenu(
-                                        expanded = scanMenuFor == lib,
-                                        onDismissRequest = { scanMenuFor = null },
-                                    ) {
-                                        DropdownMenuItem(
-                                            text = { Text("增量扫描（只扫新增；上次停止后也用它继续）") },
-                                            onClick = {
-                                                scanMenuFor = null
-                                                scope.launch {
-                                                    container.transferScope.launch {
-                                                        lib.rootCids.zip(lib.rootPaths).forEach { (cid, path) ->
-                                                            container.mediaScanner.runScan(
-                                                                cid, path, incremental = true,
-                                                                rateLimitMs = lib.rateLimitMs,
-                                                                minVideoSizeMb = lib.minVideoSizeMb,
-                                                                libraryId = lib.id,
-                                                            )
-                                                        }
-                                                    }
-                                                }
-                                            },
-                                        )
-                                        DropdownMenuItem(
-                                            text = { Text("全量扫描（重新索引全部）") },
-                                            onClick = {
-                                                scanMenuFor = null
-                                                scope.launch {
-                                                    container.transferScope.launch {
-                                                        lib.rootCids.zip(lib.rootPaths).forEach { (cid, path) ->
-                                                            container.mediaScanner.runScan(
-                                                                cid, path, incremental = false,
-                                                                rateLimitMs = lib.rateLimitMs,
-                                                                minVideoSizeMb = lib.minVideoSizeMb,
-                                                                libraryId = lib.id,
-                                                            )
-                                                        }
-                                                    }
-                                                }
-                                            },
-                                        )
-                                    }
-                                }
-                                IconButton(onClick = { editTarget = lib }) {
-                                    Icon(Icons.Outlined.Edit, contentDescription = "编辑")
-                                }
-                                IconButton(onClick = { deleteTarget = lib }) {
-                                    Icon(Icons.Outlined.Delete, contentDescription = "删除")
+                        }
+                    }
+
+                    // 继续观看：开了头还没看完的，点了接着上次的位置播
+                    if (continueRows.isNotEmpty()) {
+                        item(key = "continue-header") { SectionHeaderRow("继续观看") }
+                        item(key = "continue-row") {
+                            LazyRow(
+                                contentPadding = PaddingValues(horizontal = 16.dp),
+                                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                            ) {
+                                items(continueRows, key = { it.itemKey }) { row ->
+                                    ContinueTile(row = row, onClick = { playRow(row) })
                                 }
                             }
                         }
@@ -513,34 +537,311 @@ private suspend fun deleteLibraryFully(
 /**
  * 「自动扫描」这一段的文案：关着就空着；开着分"每次启动"与"≤每 N 小时"两种。
  *
- * 抽出来是因为它在字符串拼接里，而那种地方最容易踩优先级坑（见调用点的注释）。
+ * 只返回这一段本身（不带「 · 」分隔符，拼接交给调用方的 joinToString）。
+ * 早先这段藏在一个大字符串拼接里 —— `a + if (c) x else "" + if (d) y else ""`
+ * 会解析成 `a + if (c) x else ("" + if (d) y else "")`，条件成立时后面几段全被吞掉
+ * （「限速」一有值，「过滤」就再也显示不出来）；现在整行走 listOfNotNull + joinToString，
+ * 这类坑没有存身之处。
  */
 private fun autoScanText(lib: MediaLibraryEntity): String = when {
     !lib.autoScanOnStart -> ""
-    lib.autoScanIntervalHours > 0 -> " · 自动扫描 ≤每 ${lib.autoScanIntervalHours}h"
-    else -> " · 自动扫描（每次启动）"
+    lib.autoScanIntervalHours > 0 -> "自动扫描 ≤每 ${lib.autoScanIntervalHours}h"
+    else -> "自动扫描（每次启动）"
 }
 
 /**
- * 库内影片数：卡片上显示「N 部」，进库前就知道有没有内容（多根库取各根之和）。
+ * 库内影片数：卡片上的「N 部」徽标，进库前就知道有没有内容（多根库取各根之和）。
+ * 还没算出来返回 null（首帧不显示徽标，别闪一个"0 部"出来）。
  *
  * [refreshKey] 必须传一个"扫描结束后会变"的值（这里传 scanProgress.finishedAt）：
  * produceState 只在 key 变化时重算，而 rootPaths 在扫描前后是不变的 ——
  * 只以它为 key 的话，刚扫完的库会一直显示扫描前的数字（"还没有影片"）。
  */
 @Composable
-private fun LibraryCount(
+private fun LibraryCountState(
     dao: com.open115.pad.data.media.MediaDao,
     rootPaths: List<String>,
     refreshKey: Long,
-): String {
+): Int? {
     val count by produceState(initialValue = -1, rootPaths, refreshKey) {
         value = rootPaths.sumOf { dao.movieCountIn(it) }
     }
-    return when {
-        count < 0 -> ""
-        count == 0 -> " · 还没有影片"
-        else -> " · $count 部"
+    return if (count < 0) null else count
+}
+
+/**
+ * 库卡片（首页化的拼贴版）：左边文字（标题 + 部数徽标 + 路径 + 摘要），右边一条该库的海报。
+ *
+ * 海报**只取本地已缓存的**（[com.open115.pad.data.ImageUrlResolver.cachedPosterIfPresent]，
+ * 纯文件判断、零请求）：这一页是入口页，一进来就要画几个库的图，不能背着
+ * "未命中 = 一次直链解析 + 一次下载"的开销，更不该为铺卡片去打 115 接口。
+ * 所以宁缺毋滥 —— 缓存里没有的库不画海报条，退回纯文字卡；海报会在扫描预取 /
+ * 逛海报墙时自然落盘，下次进来就有了。
+ *
+ * 操作（增量/全量扫描、编辑、删除）收进右上角「⋯」菜单：原先三个图标按钮常驻，
+ * 删除（破坏性）和扫描并列，平板上误触的代价太高。
+ */
+@Composable
+private fun LibraryCard(
+    lib: MediaLibraryEntity,
+    dao: com.open115.pad.data.media.MediaDao,
+    container: com.open115.pad.AppContainer,
+    /** 内容变了要重查的信号（删片、扫描落了新海报都算），见 PosterStrip / libraryCountState */
+    refreshTick: Int,
+    scanFinishedAt: Long,
+    scanRunning: Boolean,
+    onOpen: () -> Unit,
+    onScan: (incremental: Boolean) -> Unit,
+    onEdit: () -> Unit,
+    onDelete: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    var menuOpen by remember { mutableStateOf(false) }
+    val count = LibraryCountState(dao, lib.rootPaths, scanFinishedAt)
+    GlassCard(modifier = modifier.fillMaxWidth(), onClick = onOpen) {
+        Row(
+            Modifier.fillMaxWidth().padding(16.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Column(Modifier.weight(1f)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(lib.name, style = MaterialTheme.typography.titleMedium)
+                    if (count != null) {
+                        Spacer(Modifier.width(8.dp))
+                        CountPill(count)
+                    }
+                }
+                Spacer(Modifier.height(2.dp))
+                // 多根库逐行列出；单根只有一行，视觉上和原来一致
+                lib.rootPaths.forEach { path ->
+                    Text(
+                        path,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+                // 元信息用 listOfNotNull + joinToString 拼：字符串拼接里的 if 优先级
+                // 是踩过的坑（条件成立时后面几段全被吞掉），这种写法没有存身之处
+                val meta = listOfNotNull(
+                    if (lib.lastScanAt > 0) "上次扫描 ${Format.ago(lib.lastScanAt)}" else null,
+                    if (lib.rateLimitMs > 0) "限速 ${lib.rateLimitMs}ms" else null,
+                    if (lib.minVideoSizeMb > 0) "过滤 <${lib.minVideoSizeMb}MB" else null,
+                    autoScanText(lib).ifEmpty { null },
+                ).joinToString(" · ")
+                if (meta.isNotEmpty()) {
+                    Text(
+                        meta,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+            }
+            Spacer(Modifier.width(12.dp))
+            PosterStrip(lib, dao, container, refreshTick, scanFinishedAt)
+            Box {
+                IconButton(onClick = { menuOpen = true }) {
+                    Icon(Icons.Outlined.MoreVert, contentDescription = "更多操作")
+                }
+                DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
+                    DropdownMenuItem(
+                        text = { Text("增量扫描（只扫新增；上次停止后也用它继续）") },
+                        enabled = !scanRunning,
+                        onClick = {
+                            menuOpen = false
+                            onScan(true)
+                        },
+                    )
+                    DropdownMenuItem(
+                        text = { Text("全量扫描（重新索引全部）") },
+                        enabled = !scanRunning,
+                        onClick = {
+                            menuOpen = false
+                            onScan(false)
+                        },
+                    )
+                    DropdownMenuItem(
+                        text = { Text("编辑") },
+                        onClick = {
+                            menuOpen = false
+                            onEdit()
+                        },
+                    )
+                    DropdownMenuItem(
+                        text = { Text("删除", color = MaterialTheme.colorScheme.error) },
+                        onClick = {
+                            menuOpen = false
+                            onDelete()
+                        },
+                    )
+                }
+            }
+        }
+    }
+}
+
+/**
+ * 库卡片右侧的海报条：从该库随机采样一批候选，逐个查"在不在本地缓存"，凑满 3 张就收手。
+ * 一张都没有就整条不画（卡片退回纯文字，别立几个空占位块）。
+ */
+@Composable
+private fun PosterStrip(
+    lib: MediaLibraryEntity,
+    dao: com.open115.pad.data.media.MediaDao,
+    container: com.open115.pad.AppContainer,
+    refreshTick: Int,
+    scanFinishedAt: Long,
+) {
+    val models by produceState<List<Any?>>(
+        initialValue = emptyList(), lib.rootPaths, refreshTick, scanFinishedAt,
+    ) {
+        val candidates = lib.rootPaths.flatMap { dao.posterSamplesInPath(it) }.distinct()
+        val hits = mutableListOf<Any?>()
+        for (code in candidates) {
+            container.imageUrlResolver.cachedPosterIfPresent(code, container.cacheDir)?.let { hits.add(it) }
+            if (hits.size >= 3) break
+        }
+        value = hits
+    }
+    if (models.isEmpty()) return
+    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+        models.forEach { model ->
+            Box(
+                Modifier
+                    .width(88.dp)
+                    .height(126.dp)
+                    .clip(RoundedCornerShape(10.dp))
+                    .background(MaterialTheme.colorScheme.surfaceVariant),
+            ) {
+                AsyncImage(
+                    model = model,
+                    contentDescription = null,
+                    contentScale = ContentScale.Crop,
+                    modifier = Modifier.fillMaxSize(),
+                )
+            }
+        }
+    }
+}
+
+/** 「N 部」徽标：部数是这张卡上最该一眼看到的数字（原先埋在元信息行中间） */
+@Composable
+private fun CountPill(count: Int) {
+    Text(
+        if (count == 0) "还没有影片" else "$count 部",
+        style = MaterialTheme.typography.labelMedium,
+        color = MaterialTheme.colorScheme.primary,
+        modifier = Modifier
+            .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.14f), RoundedCornerShape(50))
+            .padding(horizontal = 8.dp, vertical = 2.dp),
+    )
+}
+
+/** 横排区块的标题行；actionText 非空时右侧给个文字按钮（「查看全部」进扫描记录） */
+@Composable
+private fun SectionHeaderRow(title: String, actionText: String? = null, onAction: (() -> Unit)? = null) {
+    Row(
+        Modifier.fillMaxWidth().padding(horizontal = 16.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(title, style = MaterialTheme.typography.titleMedium, modifier = Modifier.weight(1f))
+        if (actionText != null && onAction != null) {
+            TextButton(onClick = onAction) { Text(actionText) }
+        }
+    }
+}
+
+/**
+ * 「最近新增」的海报小卡：取图与海报墙同款（PosterImage，命中缓存零请求），
+ * 下面一行片名。点了开详情浮层而不是直接播 —— 与海报墙的手感一致。
+ */
+@Composable
+private fun PosterTile(card: MovieCard, onClick: () -> Unit) {
+    Column(Modifier.width(108.dp).clickable(onClick = onClick)) {
+        Box(
+            Modifier
+                .fillMaxWidth()
+                .height(158.dp)
+                .clip(RoundedCornerShape(10.dp))
+                .background(MaterialTheme.colorScheme.surfaceVariant),
+        ) {
+            // 兜底图标在下层：海报没加载出来/本来就没有时不剩空白
+            Icon(
+                Icons.Outlined.Movie,
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.align(Alignment.Center).size(26.dp),
+            )
+            PosterImage(
+                posterPickCode = card.posterPickCode,
+                backgroundPickCode = card.fanartPickCode,
+                modifier = Modifier.fillMaxSize(),
+            )
+        }
+        Spacer(Modifier.height(4.dp))
+        Text(
+            card.title,
+            style = MaterialTheme.typography.bodySmall,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
+    }
+}
+
+/**
+ * 「继续观看」的卡：海报 + 底部进度条 + 还剩多久。点了直接续播
+ * （判据与意图都和观影历史页一致，见 [com.open115.pad.ui.history.isFinished]）。
+ */
+@Composable
+private fun ContinueTile(row: WatchHistoryRow, onClick: () -> Unit) {
+    val fraction = if (row.durationMs > 0L) {
+        (row.positionMs.toFloat() / row.durationMs).coerceIn(0f, 1f)
+    } else {
+        0f
+    }
+    Column(Modifier.width(108.dp).clickable(onClick = onClick)) {
+        Box(
+            Modifier
+                .fillMaxWidth()
+                .height(158.dp)
+                .clip(RoundedCornerShape(10.dp))
+                .background(MaterialTheme.colorScheme.surfaceVariant),
+        ) {
+            Icon(
+                Icons.Outlined.Movie,
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.align(Alignment.Center).size(26.dp),
+            )
+            PickCodeImage(row.posterPickCode, Modifier.fillMaxSize())
+            if (fraction > 0f) {
+                LinearProgressIndicator(
+                    progress = { fraction },
+                    modifier = Modifier.align(Alignment.BottomCenter).fillMaxWidth().height(3.dp),
+                )
+            }
+        }
+        Spacer(Modifier.height(4.dp))
+        Text(
+            displayTitle(row),
+            style = MaterialTheme.typography.bodySmall,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
+        Text(
+            if (row.durationMs > 0L) {
+                "剩 " + Format.duration(((row.durationMs - row.positionMs) / 1000).coerceAtLeast(0L))
+            } else {
+                Format.ago(row.updatedAt)
+            },
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.primary,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
     }
 }
 

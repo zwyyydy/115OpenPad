@@ -74,6 +74,10 @@ fun MediaScanLogScreen(
     val logs by dao.scanLogs().collectAsState(initial = emptyList())
     var confirmClear by remember { mutableStateOf(false) }
 
+    // 系统返回键 = 出栈回媒体库页（与详情/作品页一致）。没有这一句时 BACK 会穿透到
+    // 应用级导航、直接跳到「文件」页 —— 实测从「查看全部」进来一按返回就莫名其妙离开了媒体库。
+    androidx.activity.compose.BackHandler { onBack() }
+
     // 所有记录里出现过的键 → 卡片，一次批量查完（几百条记录也就几百个键，见 dao.movieCardsByKeys 的分块）
     val cardsByKey by produceState<Map<String, MovieCard>>(emptyMap(), logs) {
         val keys = logs.flatMap { it.newKeyList }.distinct()

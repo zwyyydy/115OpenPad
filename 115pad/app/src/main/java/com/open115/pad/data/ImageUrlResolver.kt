@@ -206,6 +206,19 @@ class ImageUrlResolver(
         return cachedPoster(pickCode, cacheDir) != null
     }
 
+    /**
+     * 只查本地缓存的海报（**绝不解析直链、绝不下载**），命中给文件路径、没命中给 null。
+     *
+     * 给"零请求"的界面用 —— 媒体库列表页的拼贴卡：它一页要同时铺几个库的几十张图，
+     * 每张都走 [posterFor] 的话，未命中的那些就是一次直链解析（115 API）+ 一次下载；
+     * 列表页不该背这个开销。所以这里宁缺毋滥：没缓存的槽位显示占位块，
+     * 海报会在扫描预取 / 海报墙浏览时自然落盘，下次进来就有了。
+     */
+    suspend fun cachedPosterIfPresent(pickCode: String?, cacheDir: File): Any? {
+        if (pickCode.isNullOrBlank() || !mediaCacheEnabled()) return null
+        return cachedPoster(pickCode, cacheDir)?.absolutePath
+    }
+
     // ---------------- 没海报的片：拿背景图裁一张出来 ----------------
     //
     // 背景图（fanart）是 16:9 横图、海报是竖图。取背景图的**右半部分**就得到一张 0.89

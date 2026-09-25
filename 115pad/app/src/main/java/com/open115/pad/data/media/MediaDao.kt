@@ -346,6 +346,25 @@ interface MediaDao {
     suspend fun backdropsInPath(prefix: String): List<String>
 
     /**
+     * 这个库（按路径前缀）里可以用作**拼贴卡**的海报 pick_code，取最近入库的若干条。
+     *
+     * 为什么是"最近入库"而不是随机：库卡片上的海报条相当于这个库的"封面"，
+     * 实测随机排（ORDER BY RANDOM()）会让它**每次重进页面都换一批**，看着像在闪；
+     * 按入库时间倒序则稳定，而且新条目大概率刚被扫描预取过海报（命中本地缓存的比例最高）。
+     *
+     * 只挑候选、不管在不在本地缓存 —— 在不在由调用方逐个查文件（见
+     * ImageUrlResolver.cachedPosterIfPresent），所以这里给大一点 limit（比如 24 张），
+     * 调用方滤出真的在本地的前几张。库列表页必须零请求，宁缺毋滥。
+     */
+    @Query(
+        "SELECT DISTINCT posterPickCode FROM movies " +
+            "WHERE seriesKey IS NULL AND posterPickCode IS NOT NULL AND posterPickCode != '' " +
+            "AND (dirPath = :prefix OR dirPath LIKE :prefix || '/%') " +
+            "ORDER BY COALESCE(dateAdded, scannedAt) DESC, mediaKey LIMIT :limit",
+    )
+    suspend fun posterSamplesInPath(prefix: String, limit: Int = 24): List<String>
+
+    /**
      * 这个目录里各条目用到的海报 pick_code（去重）。
      *
      * 增量扫描**跳过**的目录靠它补海报：跳过 = 不重新索引，也就没有"顺手预取"那一步，
