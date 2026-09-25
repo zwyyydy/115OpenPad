@@ -21,6 +21,7 @@ import androidx.compose.material.icons.outlined.FilterList
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LocalContentColor
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Tab
 import androidx.compose.material3.TabRow
@@ -44,15 +45,21 @@ import com.open115.pad.data.media.WorksFilter
  * 列表的筛选按钮（表头用）：勾了几项就在图标上显示数字。
  *
  * 只画按钮，弹窗由外面按 [onOpen] 打开 —— 表头那一行不该由这里决定弹窗挂在哪。
+ *
+ * [tint] 给深色表头用（如作品页整行图标都是白色）：不传就用主题的 [LocalContentColor]，
+ * 与旁边没指定 tint 的图标（随机播放/排序/返回）**严格同色**。之前默认态写的是
+ * `Color.Unspecified`，那会把矢量图标自带的黑色原样画出来，深色背景上几乎看不见。
  */
 @Composable
-internal fun FilterButton(filter: WorksFilter, onOpen: () -> Unit) {
+internal fun FilterButton(filter: WorksFilter, tint: Color? = null, onOpen: () -> Unit) {
     Row(verticalAlignment = Alignment.CenterVertically) {
         IconButton(onClick = onOpen) {
             Icon(
                 Icons.Outlined.FilterList,
                 contentDescription = if (filter.isEmpty) "筛选" else "筛选（已选 ${filter.selectedCount} 项）",
-                tint = if (filter.isEmpty) Color.Unspecified else MaterialTheme.colorScheme.primary,
+                // 勾了选项仍用 primary 高亮（配合旁边的数字），那是状态提示、不是配色问题
+                tint = if (!filter.isEmpty) MaterialTheme.colorScheme.primary
+                else tint ?: LocalContentColor.current,
             )
         }
         if (!filter.isEmpty) {

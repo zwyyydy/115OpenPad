@@ -246,11 +246,20 @@ interface MediaDao {
             "JOIN tags t ON mt.tagId = t.id WHERE t.name LIKE '%' || :keyword || '%') " +
             "ORDER BY " +
                 // 排序按序号分派（见 WorksSort）：一条查询管全部，不写六条几乎一样的 SQL。
-                // NULL 在 SQLite 的 DESC 里自然沉底，所以"没评分/没日期"的行不会顶到最前。
+                // DESC 的分支里 NULL 在 SQLite 自然沉底；ASC 的分支里 NULL 会顶到最前，
+                // 所以每个 ASC 都配一个 `(x IS NULL)` 前置项（0/1）把没值的行压到最后 ——
+                // 不用 NULLS LAST：老设备自带的 SQLite（3.30 之前）没有这个语法。
                 "CASE WHEN :sort = 0 THEN rating END DESC, " +
+                "CASE WHEN :sort = 5 THEN (rating IS NULL) END ASC, " +
+                "CASE WHEN :sort = 5 THEN rating END ASC, " +
                 "CASE WHEN :sort = 1 THEN premiered END DESC, " +
+                "CASE WHEN :sort = 6 THEN (premiered IS NULL) END ASC, " +
+                "CASE WHEN :sort = 6 THEN premiered END ASC, " +
                 "CASE WHEN :sort = 2 THEN COALESCE(dateAdded, scannedAt) END DESC, " +
+                "CASE WHEN :sort = 7 THEN (COALESCE(dateAdded, scannedAt) IS NULL) END ASC, " +
+                "CASE WHEN :sort = 7 THEN COALESCE(dateAdded, scannedAt) END ASC, " +
                 "CASE WHEN :sort = 3 THEN title END ASC, " +
+                "CASE WHEN :sort = 8 THEN title END DESC, " +
                 "CASE WHEN :sort = 4 THEN RANDOM() END, " +
                 "title ASC LIMIT :limit",
     )
@@ -272,11 +281,20 @@ interface MediaDao {
             "WHERE (dirPath = :prefix OR dirPath LIKE :prefix || '/%') AND seriesKey IS NULL " +
             "ORDER BY " +
                 // 排序按序号分派（见 WorksSort）：一条查询管全部，不写六条几乎一样的 SQL。
-                // NULL 在 SQLite 的 DESC 里自然沉底，所以"没评分/没日期"的行不会顶到最前。
+                // DESC 的分支里 NULL 在 SQLite 自然沉底；ASC 的分支里 NULL 会顶到最前，
+                // 所以每个 ASC 都配一个 `(x IS NULL)` 前置项（0/1）把没值的行压到最后 ——
+                // 不用 NULLS LAST：老设备自带的 SQLite（3.30 之前）没有这个语法。
                 "CASE WHEN :sort = 0 THEN rating END DESC, " +
+                "CASE WHEN :sort = 5 THEN (rating IS NULL) END ASC, " +
+                "CASE WHEN :sort = 5 THEN rating END ASC, " +
                 "CASE WHEN :sort = 1 THEN premiered END DESC, " +
+                "CASE WHEN :sort = 6 THEN (premiered IS NULL) END ASC, " +
+                "CASE WHEN :sort = 6 THEN premiered END ASC, " +
                 "CASE WHEN :sort = 2 THEN COALESCE(dateAdded, scannedAt) END DESC, " +
+                "CASE WHEN :sort = 7 THEN (COALESCE(dateAdded, scannedAt) IS NULL) END ASC, " +
+                "CASE WHEN :sort = 7 THEN COALESCE(dateAdded, scannedAt) END ASC, " +
                 "CASE WHEN :sort = 3 THEN title END ASC, " +
+                "CASE WHEN :sort = 8 THEN title END DESC, " +
                 "CASE WHEN :sort = 4 THEN RANDOM() END, " +
                 "title ASC LIMIT :limit",
     )
@@ -301,11 +319,20 @@ interface MediaDao {
             "OR (:p4 <> '' AND (dirPath = :p4 OR dirPath LIKE :p4 || '/%'))) " +
             "ORDER BY " +
                 // 排序按序号分派（见 WorksSort）：一条查询管全部，不写六条几乎一样的 SQL。
-                // NULL 在 SQLite 的 DESC 里自然沉底，所以"没评分/没日期"的行不会顶到最前。
+                // DESC 的分支里 NULL 在 SQLite 自然沉底；ASC 的分支里 NULL 会顶到最前，
+                // 所以每个 ASC 都配一个 `(x IS NULL)` 前置项（0/1）把没值的行压到最后 ——
+                // 不用 NULLS LAST：老设备自带的 SQLite（3.30 之前）没有这个语法。
                 "CASE WHEN :sort = 0 THEN rating END DESC, " +
+                "CASE WHEN :sort = 5 THEN (rating IS NULL) END ASC, " +
+                "CASE WHEN :sort = 5 THEN rating END ASC, " +
                 "CASE WHEN :sort = 1 THEN premiered END DESC, " +
+                "CASE WHEN :sort = 6 THEN (premiered IS NULL) END ASC, " +
+                "CASE WHEN :sort = 6 THEN premiered END ASC, " +
                 "CASE WHEN :sort = 2 THEN COALESCE(dateAdded, scannedAt) END DESC, " +
+                "CASE WHEN :sort = 7 THEN (COALESCE(dateAdded, scannedAt) IS NULL) END ASC, " +
+                "CASE WHEN :sort = 7 THEN COALESCE(dateAdded, scannedAt) END ASC, " +
                 "CASE WHEN :sort = 3 THEN title END ASC, " +
+                "CASE WHEN :sort = 8 THEN title END DESC, " +
                 "CASE WHEN :sort = 4 THEN RANDOM() END, " +
                 "title ASC LIMIT :limit",
     )
@@ -408,11 +435,20 @@ interface MediaDao {
             "JOIN actors a2 ON ma2.actorId = a2.id WHERE a2.name = :name AND s.seriesKey IS NOT NULL)) " +
             "ORDER BY " +
                 // 排序按序号分派（见 WorksSort）：一条查询管全部，不写六条几乎一样的 SQL。
-                // NULL 在 SQLite 的 DESC 里自然沉底，所以"没评分/没日期"的行不会顶到最前。
+                // DESC 的分支里 NULL 在 SQLite 自然沉底；ASC 的分支里 NULL 会顶到最前，
+                // 所以每个 ASC 都配一个 `(x IS NULL)` 前置项（0/1）把没值的行压到最后 ——
+                // 不用 NULLS LAST：老设备自带的 SQLite（3.30 之前）没有这个语法。
                 "CASE WHEN :sort = 0 THEN rating END DESC, " +
+                "CASE WHEN :sort = 5 THEN (rating IS NULL) END ASC, " +
+                "CASE WHEN :sort = 5 THEN rating END ASC, " +
                 "CASE WHEN :sort = 1 THEN premiered END DESC, " +
+                "CASE WHEN :sort = 6 THEN (premiered IS NULL) END ASC, " +
+                "CASE WHEN :sort = 6 THEN premiered END ASC, " +
                 "CASE WHEN :sort = 2 THEN COALESCE(dateAdded, scannedAt) END DESC, " +
+                "CASE WHEN :sort = 7 THEN (COALESCE(dateAdded, scannedAt) IS NULL) END ASC, " +
+                "CASE WHEN :sort = 7 THEN COALESCE(dateAdded, scannedAt) END ASC, " +
                 "CASE WHEN :sort = 3 THEN title END ASC, " +
+                "CASE WHEN :sort = 8 THEN title END DESC, " +
                 "CASE WHEN :sort = 4 THEN RANDOM() END, " +
                 "title ASC LIMIT 1000",
     )
@@ -428,11 +464,20 @@ interface MediaDao {
             "JOIN tags t2 ON mt2.tagId = t2.id WHERE t2.name = :name AND s.seriesKey IS NOT NULL)) " +
             "ORDER BY " +
                 // 排序按序号分派（见 WorksSort）：一条查询管全部，不写六条几乎一样的 SQL。
-                // NULL 在 SQLite 的 DESC 里自然沉底，所以"没评分/没日期"的行不会顶到最前。
+                // DESC 的分支里 NULL 在 SQLite 自然沉底；ASC 的分支里 NULL 会顶到最前，
+                // 所以每个 ASC 都配一个 `(x IS NULL)` 前置项（0/1）把没值的行压到最后 ——
+                // 不用 NULLS LAST：老设备自带的 SQLite（3.30 之前）没有这个语法。
                 "CASE WHEN :sort = 0 THEN rating END DESC, " +
+                "CASE WHEN :sort = 5 THEN (rating IS NULL) END ASC, " +
+                "CASE WHEN :sort = 5 THEN rating END ASC, " +
                 "CASE WHEN :sort = 1 THEN premiered END DESC, " +
+                "CASE WHEN :sort = 6 THEN (premiered IS NULL) END ASC, " +
+                "CASE WHEN :sort = 6 THEN premiered END ASC, " +
                 "CASE WHEN :sort = 2 THEN COALESCE(dateAdded, scannedAt) END DESC, " +
+                "CASE WHEN :sort = 7 THEN (COALESCE(dateAdded, scannedAt) IS NULL) END ASC, " +
+                "CASE WHEN :sort = 7 THEN COALESCE(dateAdded, scannedAt) END ASC, " +
                 "CASE WHEN :sort = 3 THEN title END ASC, " +
+                "CASE WHEN :sort = 8 THEN title END DESC, " +
                 "CASE WHEN :sort = 4 THEN RANDOM() END, " +
                 "title ASC LIMIT 1000",
     )

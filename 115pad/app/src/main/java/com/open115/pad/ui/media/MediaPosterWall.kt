@@ -34,6 +34,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.ArrowBack
+import androidx.compose.material.icons.outlined.Shuffle
 import androidx.compose.material.icons.outlined.Check
 import androidx.compose.material.icons.outlined.Sort
 import androidx.compose.material.icons.outlined.Close
@@ -264,6 +265,12 @@ fun PosterWallScreen(
                         )
                     }
                     FilterButton(filter) { filterDialog = true }
+                    // 随机播放：从当前可见的卡片（已套搜索与筛选）里随机挑一部直接开播
+                    IconButton(onClick = {
+                        scope.launch { playRandomMovie(context, dao, list, snackbarHostState) }
+                    }) {
+                        Icon(Icons.Outlined.Shuffle, contentDescription = "随机播放")
+                    }
                     // 排序菜单：与作品页同一个设置，选完立刻重排（sort 进了 produceState 的 key）
                     Box {
                         IconButton(onClick = { sortMenu = true }) {
@@ -718,7 +725,10 @@ internal fun FrostedSearchField(
  */
 private fun sortListInMemory(list: List<MovieCard>, sort: WorksSort): List<MovieCard> = when (sort) {
     WorksSort.Rating -> list.sortedWith(compareBy(nullsLast(reverseOrder())) { it.rating })
-    WorksSort.Premiered, WorksSort.DateAdded -> list   // 没有对应字段可排：保持库内顺序（各根内部已按 SQL 排好）
+    WorksSort.RatingAsc -> list.sortedWith(compareBy(nullsLast()) { it.rating })
+    // 首映/入库没有对应字段可排：保持库内顺序（各根内部已按 SQL 排好，升序降序都一样降级）
+    WorksSort.Premiered, WorksSort.PremieredAsc, WorksSort.DateAdded, WorksSort.DateAddedAsc -> list
     WorksSort.Title -> list.sortedBy { it.title }
+    WorksSort.TitleDesc -> list.sortedByDescending { it.title }
     WorksSort.Random -> list.shuffled()
 }

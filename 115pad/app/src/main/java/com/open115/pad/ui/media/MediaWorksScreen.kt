@@ -14,6 +14,7 @@ import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Check
+import androidx.compose.material.icons.outlined.Shuffle
 import androidx.compose.material.icons.outlined.Sort
 import androidx.compose.material.icons.outlined.ArrowBack
 import androidx.compose.material3.DropdownMenu
@@ -161,7 +162,18 @@ fun MediaWorksScreen(
                                 color = Color.White.copy(alpha = 0.7f),
                             )
                         }
-                        FilterButton(filter) { filterDialog = true }
+                        // 表头整行图标都是白色，筛选键传同色（不传会拿到主题默认色，深底上看不清）
+                        FilterButton(filter, tint = Color.White) { filterDialog = true }
+                        // 随机播放：从当前可见的作品（已套筛选）里随机挑一部直接开播
+                        IconButton(onClick = {
+                            scope.launch { playRandomMovie(context, dao, visible, snackbarHostState) }
+                        }) {
+                            Icon(
+                                Icons.Outlined.Shuffle,
+                                contentDescription = "随机播放",
+                                tint = Color.White,
+                            )
+                        }
                         // 排序菜单：选完立刻重查（sort 进了 produceState 的 key）
                         Box {
                             IconButton(onClick = { sortMenu = true }) {
