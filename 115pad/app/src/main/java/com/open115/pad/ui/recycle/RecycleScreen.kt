@@ -188,13 +188,7 @@ fun RecycleScreen(
     snackbarHostState: SnackbarHostState,
 ) {
     val ui by vm.ui.collectAsState()
-    val scope = rememberCoroutineScope()
     var showClearAll by remember { mutableStateOf(false) }
-    var showDeleteConfirm by remember { mutableStateOf(false) }
-
-    fun notify(msg: String?) {
-        if (msg != null) scope.launch { snackbarHostState.showSnackbar(msg) }
-    }
 
     // 外层 Box：让底部浮动操作栏（BottomCenter 对齐）悬浮在列表上方
     Box(Modifier.fillMaxSize()) {
@@ -210,6 +204,72 @@ fun RecycleScreen(
                 }
             },
         )
+        RecycleContent(
+            vm, snackbarHostState, Modifier.weight(1f), embedded = false,
+            showClearAll = showClearAll, onClearRequest = { showClearAll = true },
+            onDismissClearAll = { showClearAll = false },
+        )
+    }
+    }
+}
+
+/**
+ * 手机模式「传输中心」的内嵌形态：没有自己的顶栏，计数/刷新/清空收成
+ * 列表上方的一行紧凑工具行（其余与独立页完全一致）。
+ */
+@Composable
+fun RecycleEmbedded(
+    vm: RecycleViewModel,
+    snackbarHostState: SnackbarHostState,
+) {
+    var showClearAll by remember { mutableStateOf(false) }
+    RecycleContent(
+        vm, snackbarHostState, Modifier.fillMaxSize(), embedded = true,
+        showClearAll = showClearAll, onClearRequest = { showClearAll = true },
+        onDismissClearAll = { showClearAll = false },
+    )
+}
+
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
+@Composable
+private fun RecycleContent(
+    vm: RecycleViewModel,
+    snackbarHostState: SnackbarHostState,
+    modifier: Modifier = Modifier,
+    embedded: Boolean,
+    showClearAll: Boolean,
+    onClearRequest: () -> Unit,
+    onDismissClearAll: () -> Unit,
+) {
+    val ui by vm.ui.collectAsState()
+    val scope = rememberCoroutineScope()
+    var showDeleteConfirm by remember { mutableStateOf(false) }
+
+    fun notify(msg: String?) {
+        if (msg != null) scope.launch { snackbarHostState.showSnackbar(msg) }
+    }
+
+    Box(modifier) {
+    Column(Modifier.fillMaxSize()) {
+        if (embedded) {
+            Row(
+                Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 2.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    "共 ${ui.items.size} 项",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = com.open115.pad.ui.theme.AppColors.TextTertiary,
+                )
+                Spacer(Modifier.weight(1f))
+                IconButton(onClick = { vm.refresh() }) {
+                    Icon(Icons.Outlined.Refresh, contentDescription = "刷新")
+                }
+                TextButton(onClick = onClearRequest, enabled = ui.items.isNotEmpty()) {
+                    Text("清空")
+                }
+            }
+        }
         Box(Modifier.weight(1f)) {
             // 宽屏防拉伸：回收站列表收进 960dp 居中容器
             com.open115.pad.ui.theme.AdaptiveBody(Modifier.fillMaxSize()) {
@@ -399,16 +459,16 @@ fun RecycleScreen(
 
     if (showClearAll) {
         AlertDialog(
-            onDismissRequest = { showClearAll = false },
+            onDismissRequest = onDismissClearAll,
             title = { Text("清空回收站") },
             text = { Text("回收站内所有文件将被彻底删除且无法恢复，确定继续？") },
             confirmButton = {
                 Button(onClick = {
-                    showClearAll = false
+                    onDismissClearAll()
                     scope.launch { notify(vm.clearAll()) }
                 }) { Text("清空") }
             },
-            dismissButton = { TextButton(onClick = { showClearAll = false }) { Text("取消") } },
+            dismissButton = { TextButton(onClick = onDismissClearAll) { Text("取消") } },
         )
     }
     if (showDeleteConfirm) {

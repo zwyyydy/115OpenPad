@@ -244,22 +244,7 @@ fun OfflineScreen(
     expanded: Boolean,
     snackbarHostState: SnackbarHostState,
 ) {
-    val ui by vm.ui.collectAsState()
-    val saveLocation by vm.saveLocation.collectAsState()
-    val scope = rememberCoroutineScope()
     var showAdd by remember { mutableStateOf(false) }
-    var deleteTarget by remember { mutableStateOf<OfflineTask?>(null) }
-
-    // 每次进入本页拉一次第一页：外部唤起/剪贴板刚提交的任务要能立刻看到，
-    // 否则已存在的 ViewModel 只有在"有进行中任务"时才会轮询合并。
-    LaunchedEffect(Unit) { vm.refresh(silent = true) }
-
-    val shown = if (ui.filter == null) ui.tasks else ui.tasks.filter { it.status == ui.filter }
-
-    fun notify(msg: String?) {
-        if (msg != null) scope.launch { snackbarHostState.showSnackbar(msg) }
-    }
-
     Scaffold(
         topBar = {
             TopAppBar(
@@ -279,7 +264,68 @@ fun OfflineScreen(
             )
         },
     ) { padding ->
-        Column(Modifier.fillMaxSize().padding(padding)) {
+        OfflineBody(
+            vm, snackbarHostState, Modifier.padding(padding), embedded = false,
+            showAdd = showAdd, onAddDismiss = { showAdd = false },
+        )
+    }
+}
+
+/**
+ * 手机模式「传输中心」的内嵌形态：没有自己的顶栏（标题/刷新由宿主页面提供），
+ * 「添加任务」FAB 悬浮在右下角。列表底部留出 FAB 高度，避免盖住"已加载 x/y"。
+ */
+@Composable
+fun OfflineEmbedded(
+    vm: OfflineViewModel,
+    snackbarHostState: SnackbarHostState,
+) {
+    var showAdd by remember { mutableStateOf(false) }
+    Box(Modifier.fillMaxSize()) {
+        OfflineBody(
+            vm, snackbarHostState, Modifier.fillMaxSize(), embedded = true,
+            showAdd = showAdd, onAddDismiss = { showAdd = false },
+        )
+        ExtendedFloatingActionButton(
+            onClick = { showAdd = true },
+            icon = { Icon(Icons.Outlined.Add, contentDescription = null) },
+            text = { Text("添加任务") },
+            modifier = Modifier.align(Alignment.BottomEnd).padding(16.dp),
+        )
+    }
+}
+
+@Composable
+private fun OfflineBody(
+    vm: OfflineViewModel,
+    snackbarHostState: SnackbarHostState,
+    modifier: Modifier = Modifier,
+    embedded: Boolean,
+    showAdd: Boolean,
+    onAddDismiss: () -> Unit,
+) {
+    val ui by vm.ui.collectAsState()
+    val saveLocation by vm.saveLocation.collectAsState()
+    val scope = rememberCoroutineScope()
+    var deleteTarget by remember { mutableStateOf<OfflineTask?>(null) }
+
+    // 每次进入本页拉一次第一页：外部唤起/剪贴板刚提交的任务要能立刻看到，
+    // 否则已存在的 ViewModel 只有在"有进行中任务"时才会轮询合并。
+    LaunchedEffect(Unit) { vm.refresh(silent = true) }
+
+    val shown = if (ui.filter == null) ui.tasks else ui.tasks.filter { it.status == ui.filter }
+
+    fun notify(msg: String?) {
+        if (msg != null) scope.launch { snackbarHostState.showSnackbar(msg) }
+    }
+
+    Box(modifier) {
+        Column(
+            Modifier.fillMaxSize().then(
+                // 内嵌时给右下角 FAB 让位
+                if (embedded) Modifier.padding(bottom = 72.dp) else Modifier
+            ),
+        ) {
             if (ui.quotaTotal != null) {
                 // 配额微胶囊：横向进度指示（已用/总量）替代纯文字
                 val total = ui.quotaTotal ?: 0
@@ -400,11 +446,11 @@ fun OfflineScreen(
         AddTaskDialog(
             api = vm.api,
             initial = saveLocation,
-            onDismiss = { showAdd = false },
+            onDismiss = onAddDismiss,
             // 选择目录即落盘：这里就写回持久化，不必等任务真的提交过
             onPickLocation = { cid, name -> vm.rememberSaveLocation(cid, name) },
             onConfirm = { urls, cid, name ->
-                showAdd = false
+                onAddDismiss()
                 // 兜底再写一次：用户没动过"选择"时保存的仍是同一个值，重复写无副作用
                 vm.rememberSaveLocation(cid, name)
                 scope.launch { notify(vm.addUrls(urls, cid)) }

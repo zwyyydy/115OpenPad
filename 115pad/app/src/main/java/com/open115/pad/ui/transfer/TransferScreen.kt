@@ -17,8 +17,10 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Close
 import androidx.compose.material.icons.outlined.CloudUpload
@@ -62,6 +64,10 @@ import com.open115.pad.data.UploadRecord
 import com.open115.pad.data.resumeUploadRecord
 import com.open115.pad.player.PlayerActivity
 import com.open115.pad.ui.components.isLocalPlayable
+import com.open115.pad.ui.offline.OfflineEmbedded
+import com.open115.pad.ui.offline.OfflineViewModel
+import com.open115.pad.ui.recycle.RecycleEmbedded
+import com.open115.pad.ui.recycle.RecycleViewModel
 import com.open115.pad.ui.theme.AppCard
 import com.open115.pad.ui.theme.AppChip
 import com.open115.pad.ui.theme.AppColors
@@ -69,6 +75,7 @@ import com.open115.pad.ui.theme.AdaptiveBody
 import com.open115.pad.ui.theme.KindBadge
 import com.open115.pad.ui.theme.StatusBadge
 import com.open115.pad.util.Format
+import androidx.lifecycle.viewmodel.compose.viewModel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
@@ -238,12 +245,24 @@ private fun timeText(ms: Long): String =
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun TransferScreen(snackbarHostState: SnackbarHostState) {
+fun TransferScreen(
+    snackbarHostState: SnackbarHostState,
+    /** 手机模式：把「云下载 / 回收站」收进来作为内嵌分页（平板仍是左侧导航独立入口） */
+    showCloudTabs: Boolean = false,
+    /** 外部唤起提交成功后直达某个分页（"offline"），普通进页为空 */
+    requestedTab: String = "",
+) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val log = remember { context.appContainer.transferLog }
 
-    var tab by remember { mutableStateOf(0) } // 0 = 下载，1 = 上传
+    var tab by remember { mutableStateOf(0) } // 0 = 下载，1 = 上传，2 = 云下载（仅手机），3 = 回收站（仅手机）
+    LaunchedEffect(requestedTab) {
+        when (requestedTab) {
+            "offline" -> tab = 2
+            "recycle" -> tab = 3
+        }
+    }
 
     // ---- 下载侧状态 ----
     var tasks by remember { mutableStateOf<List<DlTask>>(emptyList()) }
@@ -338,21 +357,30 @@ fun TransferScreen(snackbarHostState: SnackbarHostState) {
         TopAppBar(
             title = { Text("传输中心") },
             actions = {
-                IconButton(onClick = {
-                    tasks = queryDownloads(context)
-                    notify("已刷新")
-                }) {
-                    Icon(Icons.Outlined.Refresh, contentDescription = "刷新")
+                // 云下载/回收站分页有自己的刷新入口，顶栏刷新只管本机下载列表
+                if (tab <= 1) {
+                    IconButton(onClick = {
+                        tasks = queryDownloads(context)
+                        notify("已刷新")
+                    }) {
+                        Icon(Icons.Outlined.Refresh, contentDescription = "刷新")
+                    }
                 }
             },
         )
-        // 分段切换：下载 / 上传（数量直接标在标签上）
+        // 分段切换：下载 / 上传（数量直接标在标签上）；手机模式追加云下载/回收站
         Row(
-            Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 2.dp),
+            Modifier.fillMaxWidth()
+                .then(if (showCloudTabs) Modifier.horizontalScroll(rememberScrollState()) else Modifier)
+                .padding(horizontal = 16.dp, vertical = 2.dp),
             horizontalArrangement = Arrangement.spacedBy(8.dp),
         ) {
             AppChip("下载 ${tasks.size}", selected = tab == 0, onClick = { tab = 0 })
             AppChip("上传 ${uploads.size}", selected = tab == 1, onClick = { tab = 1 })
+            if (showCloudTabs) {
+                AppChip("云下载", selected = tab == 2, onClick = { tab = 2 })
+                AppChip("回收站", selected = tab == 3, onClick = { tab = 3 })
+            }
         }
         if (tab == 0) {
             // 明确告诉用户文件到底存哪儿：公共下载目录，系统「文件」App 里也能看到
@@ -389,7 +417,7 @@ fun TransferScreen(snackbarHostState: SnackbarHostState) {
                         onDelete = { t -> pendingDelete = t },
                     )
 
-                    else -> UploadList(
+                    tab == 1 -> UploadList(
                         uploads = uploads,
                         queuedIds = queuedIds,
                         onPause = { pauseUpload(it) },
@@ -403,6 +431,22 @@ fun TransferScreen(snackbarHostState: SnackbarHostState) {
                             else pendingUploadDelete = r
                         },
                     )
+
+                    // 手机模式内嵌的云下载/回收站：复用独立页的内容区（无顶栏形态）。
+                    // ViewModel 懒建——切到对应分页才创建，与原独立路由的进入即拉取一致。
+                    tab == 2 -> {
+                        val vm: OfflineViewModel = viewModel(initializer = {
+                            context.appContainer.let { OfflineViewModel(it.openApi, it.downloadPrefs) }
+                        })
+                        OfflineEmbedded(vm, snackbarHostState)
+                    }
+
+                    tab == 3 -> {
+                        val vm: RecycleViewModel = viewModel(initializer = {
+                            RecycleViewModel(context.appContainer.openApi)
+                        })
+                        RecycleEmbedded(vm, snackbarHostState)
+                    }
                 }
             }
         }

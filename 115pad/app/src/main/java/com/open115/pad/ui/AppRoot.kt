@@ -25,6 +25,7 @@ import androidx.compose.material.icons.outlined.Movie
 import androidx.compose.material.icons.outlined.Download
 import androidx.compose.material.icons.outlined.DriveFileRenameOutline
 import androidx.compose.material.icons.outlined.Folder
+import androidx.compose.material.icons.outlined.MoreHoriz
 import androidx.compose.material.icons.outlined.RestoreFromTrash
 import androidx.compose.material.icons.outlined.Settings
 import androidx.compose.material.icons.outlined.Tune
@@ -61,6 +62,8 @@ import androidx.navigation.compose.composable
 import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import androidx.navigation.NavGraph.Companion.findStartDestination
+import androidx.navigation.NavType
+import androidx.navigation.navArgument
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.open115.pad.AppContainer
 import com.open115.pad.data.DownloadRequest
@@ -102,6 +105,34 @@ private val destinations = listOf(
     Dest("recycle", "回收站", Icons.Outlined.RestoreFromTrash),
     Dest("settings", "设置", Icons.Outlined.Settings),
 )
+
+/**
+ * 手机底部导航栏只放 5 个高频入口：8 个全平铺会把窄屏挤满。
+ * 「云下载 / 回收站」收进传输中心（手机模式下是传输中心的内嵌分页），
+ * 「过滤规则 / 重命名」收进「更多」，以后手机模式新增的低频功能也进「更多」。
+ * 平板左侧导航栏保持 [destinations] 全量不变。
+ */
+private val phoneTabs = listOf(
+    Dest("files", "文件", Icons.Outlined.Folder),
+    Dest("media", "媒体库", Icons.Outlined.Movie),
+    Dest("transfer", "传输中心", Icons.Outlined.Download),
+    Dest("more", "更多", Icons.Outlined.MoreHoriz),
+    Dest("settings", "设置", Icons.Outlined.Settings),
+)
+
+/** 手机模式下当前路由应高亮的底部 tab（子页面归属到收纳它的 tab） */
+private fun phoneSelectedTab(route: String?): String? = when {
+    route == null -> null
+    route == "filter" || route == "rename" -> "more"       // 「更多」里的子页
+    route == "offline" || route == "recycle" -> "transfer" // 传输中心里的子页（含宽窄切换瞬间落在旧路由上）
+    // 注意：currentBackStackEntryAsState 给的是路由模式（"transfer?tab={tab}"），
+    // 不是导航时的实际字符串，所以传输中心要用前缀匹配
+    route.startsWith("transfer") -> "transfer"
+    else -> route
+}
+
+/** 「更多」收纳页的入口清单（按序展示）。以后手机模式新增低频功能，把 route 追加到这里即可 */
+private val moreRoutes = listOf("filter", "rename")
 
 @Composable
 fun AppRoot(container: AppContainer, widthClass: WindowWidthSizeClass) {
@@ -152,8 +183,8 @@ private fun MainScaffold(container: AppContainer, widthClass: WindowWidthSizeCla
     // 媒体库页自己的海报墙/详情浮层盖在它上面，返回也逐层退，不依赖导航栏
     val immersiveMedia = currentRoute == "media"
 
-    fun navigate(dest: Dest) {
-        navController.navigate(dest.route) {
+    fun navigateRoute(route: String) {
+        navController.navigate(route) {
             // 关键：弹回起始目的地并保存各标签自己的状态。
             // 之前 popUpTo(dest.route) 会把目标自身压栈/恢复整个旧栈，导致
             // 切换几个标签后点击失效、必须按返回键才能出来。
@@ -164,6 +195,8 @@ private fun MainScaffold(container: AppContainer, widthClass: WindowWidthSizeCla
             restoreState = true
         }
     }
+
+    fun navigate(dest: Dest) = navigateRoute(dest.route)
 
     /**
      * 启动首页：导航图起点**恒为文件页**，登录后只往偏好页跳一次。
@@ -239,7 +272,12 @@ private fun MainScaffold(container: AppContainer, widthClass: WindowWidthSizeCla
             scope.launch {
                 snackbarHostState.showSnackbar(if (auto) "已自动提交云下载任务" else "任务已加入云端离线队列")
             }
-            if (gotoOffline) destinations.firstOrNull { it.route == "offline" }?.let { navigate(it) }
+            if (gotoOffline) {
+                // 手机模式下云下载页收进了传输中心（内嵌分页），带 tab 参数直达云下载分页；
+                // 平板仍是独立路由
+                if (expanded) destinations.firstOrNull { it.route == "offline" }?.let { navigate(it) }
+                else navigateRoute("transfer?tab=offline")
+            }
         } else {
             snackbarHostState.showSnackbar("提交失败：$err")
         }
@@ -280,9 +318,10 @@ private fun MainScaffold(container: AppContainer, widthClass: WindowWidthSizeCla
                 exit = fadeOut(tween(200)) + slideOutVertically(tween(300)) { it / 2 } + shrinkVertically(tween(300)),
             ) {
                 NavigationBar {
-                    destinations.forEach { dest ->
+                    val selected = phoneSelectedTab(currentRoute)
+                    phoneTabs.forEach { dest ->
                         NavigationBarItem(
-                            selected = currentRoute == dest.route,
+                            selected = selected == dest.route,
                             onClick = { navigate(dest) },
                             icon = { Icon(dest.icon, contentDescription = dest.label) },
                             label = { Text(dest.label) },
@@ -380,8 +419,20 @@ private fun MainScaffold(container: AppContainer, widthClass: WindowWidthSizeCla
                         val vm: RecycleViewModel = viewModel(initializer = { RecycleViewModel(container.openApi) })
                         RecycleScreen(vm, expanded, snackbarHostState)
                     }
-                    composable("transfer") {
-                        com.open115.pad.ui.transfer.TransferScreen(snackbarHostState)
+                    composable(
+                        // 手机模式下「云下载/回收站」是传输中心的内嵌分页，外部唤起提交后
+                        // 用 transfer?tab=offline 直达云下载分页；不带参数=普通进页
+                        route = "transfer?tab={tab}",
+                        arguments = listOf(navArgument("tab") {
+                            type = NavType.StringType
+                            defaultValue = ""
+                        }),
+                    ) { entry ->
+                        com.open115.pad.ui.transfer.TransferScreen(
+                            snackbarHostState,
+                            showCloudTabs = !expanded,
+                            requestedTab = entry.arguments?.getString("tab").orEmpty(),
+                        )
                     }
                 composable("rename") {
                     com.open115.pad.ui.rename.RenameTasksScreen(
@@ -393,6 +444,16 @@ private fun MainScaffold(container: AppContainer, widthClass: WindowWidthSizeCla
                 }
                 composable("settings") {
                     SettingsScreen(container)
+                }
+                // 手机模式的「更多」收纳页：低频功能入口（过滤规则/重命名，以后新增也进这里）。
+                // 从这里点进去是普通压栈（不 popUpTo），返回键回到「更多」而不是文件页
+                composable("more") {
+                    com.open115.pad.ui.more.MoreScreen(
+                        entries = destinations.filter { it.route in moreRoutes }.map {
+                            com.open115.pad.ui.more.MoreEntry(it.route, it.label, it.icon)
+                        },
+                        onOpen = { route -> navController.navigate(route) { launchSingleTop = true } },
+                    )
                 }
                 }
 
