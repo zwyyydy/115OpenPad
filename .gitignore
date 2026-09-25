@@ -41,6 +41,7 @@ ref/
 test_upload_*.bin
 test_video_*.mp4
 test_*.bin
+test_*.py
 
 # 临时令牌/文件
 .tmp_*
