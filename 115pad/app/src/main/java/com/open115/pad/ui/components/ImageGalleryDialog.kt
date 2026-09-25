@@ -1,6 +1,7 @@
 package com.open115.pad.ui.components
 
 import android.app.Activity
+import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.BitmapRegionDecoder
@@ -84,6 +85,10 @@ import kotlin.math.roundToInt
  *   第二层：原图直链解析（uo → downurl → thumb 三级链）完成后淡入替换
  *
  * 预加载：浏览第 N 张时，后台解析并预热 N-1 / N+1 的直链与位图缓存。
+ *
+ * 缓存：两层都按 pick_code 挂 Coil 的磁盘缓存键（见 [diskKeyOf]）—— 关掉画廊再进来、
+ * 甚至冷启动重进都能命中本地字节。跨会话省不掉的是直链解析那一步（签名 20 分钟 TTL，
+ * 见 ImageUrlResolver），但省掉的是几 MB 的整张重下。
  *
  * 鸟瞰位置图：放大后右下角浮出半透明小图 + 当前视口框（见 [MiniMap]）。
  * 长图/巨图放大到 5x 时最容易"我在图的哪一块"迷失，这个框就是为它做的。
@@ -207,13 +212,56 @@ fun ImageGalleryDialog(
                 neighbours.filter { it.originUrl.isNullOrBlank() }.mapNotNull { it.pickCode },
             )
             for (n in neighbours) {
+                // 超大图不在这里预热：它根本不走 Coil（HugeImage 自己拉字节落盘做分块解码），
+                // 给它 enqueue 等于把几十 MB 原图白下一遍到 Coil 缓存里，随后还会被重下一份
+                if (n.isHugeBySize) continue
                 val url = resolver.resolveOrigin(n) ?: continue
-                context.imageLoader.enqueue(
-                    ImageRequest.Builder(context).data(url).build(),
-                )
+                // 键要和正式加载时一致，否则预热下来的字节正式加载时命中不到
+                context.imageLoader.enqueue(originRequest(context, n, url))
             }
         }
     }
+}
+
+/**
+ * 磁盘缓存的**稳定键**：与直链签名无关，用 pick_code（没有就退 fid）。
+ *
+ * 为什么必须换键：Coil 默认拿 URL 当磁盘缓存键，而 115 的直链每次解析都会换签名
+ * （`uo` 每次列目录变、downurl 每次请求变）—— 于是关掉画廊再进来、或者杀掉进程重进，
+ * 键就变了，Coil 必然 miss，几 MB 的原图整张重新下一遍。换成 pick_code 之后签名怎么变
+ * 都命中同一份缓存，与超大图的 huge_img、媒体库的 media_img 是同一套"稳定 key"思路。
+ *
+ * [kind] 必须区分缩略图与原图：两者是**不同的字节**（缩略图是方形裁剪的小图），
+ * 共用一个键会让原图位置渲染出缩略图，而且永远刷不掉（缓存一直命中）。
+ */
+private fun diskKeyOf(item: ImageMediaItem, kind: String): String? =
+    (item.pickCode ?: item.fileId)?.let { "$it|$kind" }
+
+/**
+ * 原图请求。**只覆盖 diskCacheKey，不碰 memoryCacheKey**：
+ *
+ * 内存缓存故意沿用 Coil 默认键（里面含请求尺寸）—— 全屏原图与右下角鸟瞰图是两个尺寸，
+ * 共用一个内存键会让先解码的那张小图污染另一处（鸟瞰图会把全屏画面顶成糊的）。
+ * 而内存缓存只在进程内有效、且进程内 URL 本来就不变，不覆盖也照样命中；
+ * 需要跨会话复用的只有磁盘那一层。
+ */
+private fun originRequest(context: Context, item: ImageMediaItem, url: String): ImageRequest {
+    val builder = ImageRequest.Builder(context).data(url)
+    diskKeyOf(item, "origin")?.let { builder.diskCacheKey(it) }
+    return builder.build()
+}
+
+/**
+ * 大图首帧的缩略图请求。
+ * `preview` 可能是 thumb、也可能（该文件没有 thumb 时）退回原图，键要跟着走 ——
+ * 否则会把整张原图当成缩略图存进 "|thumb" 键下，正式加载原图时又下一份。
+ */
+private fun previewRequest(context: Context, item: ImageMediaItem): ImageRequest? {
+    val url = item.preview ?: return null
+    val kind = if (!item.thumbnailUrl.isNullOrBlank()) "thumb" else "origin"
+    val builder = ImageRequest.Builder(context).data(url)
+    diskKeyOf(item, kind)?.let { builder.diskCacheKey(it) }
+    return builder.build()
 }
 
 @Composable
@@ -225,6 +273,7 @@ private fun GalleryPage(
     onDismissRequest: () -> Unit,
     onDismissProgress: (Float) -> Unit,
 ) {
+    val context = LocalContext.current
     val zoomState = remember(item) { ZoomState() }
     var originUrl by remember(item) { mutableStateOf<String?>(null) }
     var originReady by remember(item) { mutableStateOf(false) }
@@ -234,6 +283,14 @@ private fun GalleryPage(
     // 只有成为当前页才解析，避免 Pager 预组合相邻页时抢跑打满频控
     LaunchedEffect(item, active) {
         if (active && originUrl == null) originUrl = resolver.resolveOrigin(item)
+    }
+
+    // 两个请求都挂上稳定磁盘键（见 [diskKeyOf]）：关掉画廊再进来 / 冷启动重进，
+    // 直链签名变了也命中同一份磁盘缓存。鸟瞰图与原图共用同一个 model，
+    // 顺带省掉鸟瞰图那次独立的网络请求。
+    val previewModel = remember(item) { previewRequest(context, item) }
+    val originModel = remember(item, originUrl) {
+        originUrl?.takeIf { !item.isHugeBySize }?.let { originRequest(context, item, it) }
     }
 
     Box(Modifier.fillMaxSize()) {
@@ -246,7 +303,7 @@ private fun GalleryPage(
         ) {
             // 第一层：缩略图。列表页已经加载过它，大图首帧必然有内容
             AsyncImage(
-                model = item.preview,
+                model = previewModel,
                 contentDescription = item.fileName,
                 contentScale = ContentScale.Fit,
                 onSuccess = { s ->
@@ -280,7 +337,7 @@ private fun GalleryPage(
                     )
                 } else {
                     AsyncImage(
-                        model = origin,
+                        model = originModel,
                         contentDescription = null,
                         contentScale = ContentScale.Fit,
                         onSuccess = { s ->
@@ -309,10 +366,10 @@ private fun GalleryPage(
                 // 下拉关闭时整屏都在渐隐，鸟瞰图也得跟着淡出，否则会孤零零悬在暗下去的图上
                 .graphicsLayer { alpha = 1f - zoomState.dismissProgress },
         ) {
-            MiniMap(
-                zoomState = zoomState,
-                model = if (item.isHugeBySize) cachedFile else originUrl,
-            )
+                    MiniMap(
+                        zoomState = zoomState,
+                        model = if (item.isHugeBySize) cachedFile else originModel,
+                    )
         }
 
         // 原图解析中（缩略图已经显示，所以只给一个轻量指示）

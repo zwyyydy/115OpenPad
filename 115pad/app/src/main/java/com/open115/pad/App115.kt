@@ -5,6 +5,7 @@ import android.content.Context
 import android.util.Log
 import com.open115.pad.data.AuthApi
 import com.open115.pad.data.AuthInterceptor
+import com.open115.pad.data.ImageUrlResolver
 import com.open115.pad.data.OpenApi
 import com.open115.pad.data.QrApi
 import com.open115.pad.data.Session
@@ -16,6 +17,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.File
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -190,11 +192,24 @@ class AppContainer(context: Context) {
         )
         // 登出（含因终态授权码被强制登出）后，本机缓存必须作废：
         // 不清的话，换个账号登录会直接看到上一个账号的目录内容 / 海报 / 简介
+        //
+        // 图片那几层也要清：画廊的原图/缩略图磁盘缓存、超大图的 huge_img 现在都按
+        // **pick_code** 命名（见 ImageGalleryDialog.diskKeyOf），不再随直链签名变化自动失效，
+        // 留着就可能被下一个账号的同名文件命中。
         scope.launch {
             session.loggedInFlow.collect {
                 if (!it) {
                     dirCache.clear()
                     mediaCache.clear()
+                    withContext(Dispatchers.IO) {
+                        coil.Coil.imageLoader(context).diskCache?.clear()
+                        ImageUrlResolver.clearHugeCache(cacheDir)
+                    }
+                    // 已解码的位图按 Coil 的约定在主线程清（内存缓存只在进程内有效，
+                    // 但换账号后不该让上一账号的图继续从内存里命中）
+                    withContext(Dispatchers.Main) {
+                        coil.Coil.imageLoader(context).memoryCache?.clear()
+                    }
                 }
             }
         }
