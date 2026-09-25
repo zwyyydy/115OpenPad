@@ -144,7 +144,7 @@ class AppContainer(context: Context) {
 
     @Volatile
     var mediaCacheMaxBytes: Long = com.open115.pad.data.media.MediaPrefs.DEFAULT_MAX_MB * 1024 * 1024
-        private set
+        private set  // 0 = 不限制（不能存 Long.MAX_VALUE：textPoolBytes 里再乘会溢出）
 
     /**
      * 媒体库落盘缓存：nfo 的解析结果（文本）。
@@ -200,8 +200,14 @@ class AppContainer(context: Context) {
         }
         scope.launch {
             mediaPrefs.cacheMaxMb.collect { mb ->
-                val shrunk = mb < mediaCacheMaxBytes / (1024 * 1024)
-                mediaCacheMaxBytes = mb * 1024 * 1024
+                val oldBytes = mediaCacheMaxBytes
+                // 0 = 不限制，镜像里保持 0（MediaCache.sweep 与海报 pruneCache 都把 ≤0 视为不限）
+                val newBytes = if (mb == com.open115.pad.data.media.MediaPrefs.UNLIMITED_MB) 0L
+                    else mb * 1024 * 1024
+                mediaCacheMaxBytes = newBytes
+                // 上限调小要**立刻**淘汰，不能等下次写入才生效（海报的 pruneCache
+                // 平时只在下载后跑，这里得显式补一次）；从"不限制"切回具体值同理。
+                val shrunk = newBytes != 0L && (oldBytes == 0L || newBytes < oldBytes)
                 if (shrunk) {
                     mediaCache.sweep()
                     imageUrlResolver.sweepPosterCache(cacheDir)

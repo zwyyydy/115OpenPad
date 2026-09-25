@@ -23,7 +23,7 @@ class MediaPrefs(private val context: Context) {
     /** 媒体库落盘缓存总开关（默认开）。关掉 = 不读写磁盘缓存，已存的不动 */
     val cacheEnabled: Flow<Boolean> = context.mediaDataStore.data.map { it[KEY_CACHE_ENABLED] ?: true }
 
-    /** 缓存上限（MB），默认 2 GB。主要限制海报字节，nfo 是 KB 级的 */
+    /** 缓存上限（MB），默认 2 GB；[UNLIMITED_MB] = 不限制。主要限制海报字节，nfo 是 KB 级的 */
     val cacheMaxMb: Flow<Long> = context.mediaDataStore.data.map { it[KEY_CACHE_MAX_MB] ?: DEFAULT_MAX_MB }
 
     /** 作品列表的排序方式（作品页表头那个菜单选的），存名字不存序号 —— 序号改了不至于串味 */
@@ -36,13 +36,17 @@ class MediaPrefs(private val context: Context) {
     suspend fun setCacheEnabled(enabled: Boolean) =
         context.mediaDataStore.edit { it[KEY_CACHE_ENABLED] = enabled }
 
-    suspend fun setCacheMaxMb(mb: Long) =
-        context.mediaDataStore.edit { it[KEY_CACHE_MAX_MB] = mb.coerceIn(MIN_MAX_MB, MAX_MAX_MB) }
+    suspend fun setCacheMaxMb(mb: Long) = context.mediaDataStore.edit {
+        it[KEY_CACHE_MAX_MB] = if (mb <= 0L) UNLIMITED_MB else mb.coerceIn(MIN_MAX_MB, MAX_MAX_MB)
+    }
 
     companion object {
         const val DEFAULT_MAX_MB = 2048L
         const val MIN_MAX_MB = 512L
         const val MAX_MAX_MB = 8192L
+
+        /** "不限制"挡位的存储值。0 的语义（上限 ≤ 0 视为不限）消费端各有判，见 textPoolBytes / pruneCache / sweep */
+        const val UNLIMITED_MB = 0L
 
         /** 滑块步进 */
         const val STEP_MB = 256L
@@ -52,13 +56,13 @@ class MediaPrefs(private val context: Context) {
         private val KEY_WORKS_SORT = stringPreferencesKey("works_sort")
 
         /**
-         * nfo 文本池从总上限里分到的份额。
+         * nfo 文本池从总上限里分到的份额（5%）。
          *
          * 单独切一小块而不是共用一个池：海报是 MB 级、nfo 是 KB 级，量级差三个数量级，
          * 混在一起淘汰时 nfo 会被海报挤光（而且几乎不影响总量，挤掉也不释放空间）。
-         * 上限取总量的 1/8 且不超过 64MB —— nfo 实际永远到不了这个数（几千部片才几 MB）。
+         * 份额取总上限的 5% —— nfo 实际远用不满（几千部片才几 MB），这个数只是天花板；
+         * 上限为 0（不限制）时算出来也是 0，MediaCache.sweep 把 ≤ 0 一并视为不限。
          */
-        fun textPoolBytes(totalMb: Long): Long =
-            (totalMb * 1024 * 1024 / 8).coerceAtMost(64L * 1024 * 1024)
+        fun textPoolBytes(totalMb: Long): Long = totalMb * 1024 * 1024 / 20
     }
 }

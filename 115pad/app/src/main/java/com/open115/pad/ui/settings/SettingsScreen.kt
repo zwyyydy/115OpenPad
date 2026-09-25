@@ -336,28 +336,30 @@ fun SettingsScreen(container: AppContainer) {
             checked = mediaCacheEnabled,
             onChange = { v -> scope.launch { container.mediaPrefs.setCacheEnabled(v) } },
         )
+        // 缓存上限滑块：最右端点是「不限制」挡（内部存 0），行程比 MAX_MAX_MB 多一步
+        val mp = com.open115.pad.data.media.MediaPrefs
+        val unlimitedPos = mp.MAX_MAX_MB + mp.STEP_MB
         SliderRow(
             title = "缓存上限",
-            valueText = "$mediaCacheMaxMb MB",
-            value = mediaCacheMaxMb.toFloat(),
-            range = com.open115.pad.data.media.MediaPrefs.MIN_MAX_MB.toFloat()..
-                com.open115.pad.data.media.MediaPrefs.MAX_MAX_MB.toFloat(),
+            valueText = if (mediaCacheMaxMb == mp.UNLIMITED_MB) "不限制" else "$mediaCacheMaxMb MB",
+            value = (if (mediaCacheMaxMb == mp.UNLIMITED_MB) unlimitedPos else mediaCacheMaxMb).toFloat(),
+            range = mp.MIN_MAX_MB.toFloat()..unlimitedPos.toFloat(),
             // Slider 的 steps 是"两端点之间的刻度数"，所以要减 1
             steps = mediaCacheSliderSteps(),
         ) { v ->
             scope.launch {
-                container.mediaPrefs.setCacheMaxMb(
-                    (v / com.open115.pad.data.media.MediaPrefs.STEP_MB).toInt()
-                        .toLong() * com.open115.pad.data.media.MediaPrefs.STEP_MB,
-                )
+                val mb = (v / mp.STEP_MB).toInt().toLong() * mp.STEP_MB
+                container.mediaPrefs.setCacheMaxMb(if (mb >= unlimitedPos) mp.UNLIMITED_MB else mb)
             }
         }
         SettingRow(
             title = "缓存占用",
             subtitle = when {
                 mediaTextBytes < 0 || mediaPosterBytes < 0 -> "计算中…"
+                mediaCacheMaxMb == mp.UNLIMITED_MB ->
+                    "海报 ${fmtBytes(mediaPosterBytes)} · 简介 ${fmtBytes(mediaTextBytes)}（上限不限制）"
                 else -> "海报 ${fmtBytes(mediaPosterBytes)} · 简介 ${fmtBytes(mediaTextBytes)}" +
-                    "（上限主要限制海报，简介按上限的 1/8 另算）"
+                    "（上限主要限制海报，简介按上限的 5% 另算）"
             },
             onClick = null,
         )
@@ -476,10 +478,10 @@ private fun SectionTitle(text: String) {
     com.open115.pad.ui.theme.SectionHeader(text, Modifier.padding(top = 14.dp))
 }
 
-/** 媒体库缓存上限滑块的刻度数：Slider 的 steps 是"两端点之间的刻度数"，所以要减 1 */
+/** 媒体库缓存上限滑块的刻度数：Slider 的 steps 是"两端点之间的刻度数"，所以要减 1；最右端点是「不限制」挡 */
 private fun mediaCacheSliderSteps(): Int {
     val mp = com.open115.pad.data.media.MediaPrefs
-    return ((mp.MAX_MAX_MB - mp.MIN_MAX_MB) / mp.STEP_MB).toInt() - 1
+    return ((mp.MAX_MAX_MB + mp.STEP_MB - mp.MIN_MAX_MB) / mp.STEP_MB).toInt() - 1
 }
 
 /**

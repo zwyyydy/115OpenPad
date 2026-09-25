@@ -452,6 +452,8 @@ class ImageUrlResolver(
 
         /** 按"最久未用"把目录压回上限以内（mtime 兼作最近使用时间，由 fetchBytesToCache 维护） */
         private fun pruneCache(dir: File, maxBytes: Long) {
+            // ≤0 = 不限制（设置里的"不限制"挡镜像成 0 传到这里），不判的话第一张海报就会被删光
+            if (maxBytes <= 0) return
             runCatching {
                 val files = dir.listFiles()?.filter { it.isFile } ?: return
                 var total = files.sumOf { it.length() }
