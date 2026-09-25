@@ -60,6 +60,7 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -94,6 +95,10 @@ fun MediaLibraryScreen(api: com.open115.pad.data.OpenApi) {
     val scope = rememberCoroutineScope()
     val container = context.appContainer
     val dao = container.mediaDatabase.mediaDao()
+    // 手机（窄屏）排版开关：这一页的顶栏与库卡片在 411dp 宽下会互相挤压
+    // （搜索框 + 3 个图标总宽溢出、卡片右侧海报条把文字列压成一个字宽），
+    // 都按这个标志切紧凑形态；平板（>=600dp）完全保持原样
+    val compact = LocalConfiguration.current.screenWidthDp < 600
 
     val libraries by dao.libraries().collectAsState(initial = emptyList())
     val scanProgress by container.mediaScanner.progress.collectAsState()
@@ -208,19 +213,27 @@ fun MediaLibraryScreen(api: com.open115.pad.data.OpenApi) {
             ) {
                 Icon(Icons.Outlined.Movie, contentDescription = null)
                 Spacer(Modifier.width(8.dp))
-                Text(
-                    if (query.isBlank()) "媒体库" else "全局搜索「$query」",
-                    style = MaterialTheme.typography.titleLarge,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.weight(1f),
-                )
-                // 毛玻璃搜索框（这一页没有背景图可透，退化成半透明胶囊）
+                // 窄屏不给标题留位置：搜索框 + 3 个图标才是这一行必须完整的部分，
+                // 硬塞标题会把最后两个图标挤出屏幕（旧版在手机上就是这样）
+                if (!compact) {
+                    Text(
+                        if (query.isBlank()) "媒体库" else "全局搜索「$query」",
+                        style = MaterialTheme.typography.titleLarge,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f),
+                    )
+                }
+                // 毛玻璃搜索框（这一页没有背景图可透，退化成半透明胶囊）。
+                // 窄屏弹性占满剩余宽度（固定 200~340dp 会和图标抢地方）
                 FrostedSearchField(
                     value = query,
                     onValueChange = { query = it },
                     backdrop = null,
-                    modifier = Modifier.widthIn(min = 200.dp, max = 340.dp).padding(end = 4.dp),
+                    modifier = (
+                        if (compact) Modifier.weight(1f)
+                        else Modifier.widthIn(min = 200.dp, max = 340.dp)
+                        ).padding(end = 4.dp),
                 )
                 // 扫描记录：媒体库自己的流水（何时扫的哪个库、结果、新增影片带图）——
                 // 不放文件页那份「操作记录」（那是文件操作的流水），也不占导航栏
@@ -277,7 +290,8 @@ fun MediaLibraryScreen(api: com.open115.pad.data.OpenApi) {
                     }
                 } else {
                     LazyVerticalGrid(
-                        columns = GridCells.Adaptive(minSize = 130.dp),
+                        // 窄屏用更小的列宽 → 手机上排 3 列（130dp 在 411dp 宽下只排得下 2 列，卡片偏大）
+                        columns = GridCells.Adaptive(minSize = if (compact) 110.dp else 130.dp),
                         contentPadding = PaddingValues(16.dp),
                         horizontalArrangement = Arrangement.spacedBy(16.dp),
                         verticalArrangement = Arrangement.spacedBy(16.dp),
@@ -320,6 +334,7 @@ fun MediaLibraryScreen(api: com.open115.pad.data.OpenApi) {
                             refreshTick = wallTick,
                             scanFinishedAt = scanProgress.finishedAt,
                             scanRunning = scanProgress.running,
+                            compact = compact,
                             onOpen = { openedLib = lib },
                             onScan = { incremental -> startScan(lib, incremental) },
                             onEdit = { editTarget = lib },
@@ -590,6 +605,8 @@ private fun LibraryCard(
     refreshTick: Int,
     scanFinishedAt: Long,
     scanRunning: Boolean,
+    /** 手机窄屏：海报条从 3 张缩到 2 张并整体变小（见 PosterStrip 的说明） */
+    compact: Boolean,
     onOpen: () -> Unit,
     onScan: (incremental: Boolean) -> Unit,
     onEdit: () -> Unit,
@@ -641,7 +658,7 @@ private fun LibraryCard(
                 }
             }
             Spacer(Modifier.width(12.dp))
-            PosterStrip(lib, dao, container, refreshTick, scanFinishedAt)
+            PosterStrip(lib, dao, container, refreshTick, scanFinishedAt, compact)
             Box {
                 IconButton(onClick = { menuOpen = true }) {
                     Icon(Icons.Outlined.MoreVert, contentDescription = "更多操作")
@@ -684,8 +701,12 @@ private fun LibraryCard(
 }
 
 /**
- * 库卡片右侧的海报条：从该库随机采样一批候选，逐个查"在不在本地缓存"，凑满 3 张就收手。
+ * 库卡片右侧的海报条：从该库随机采样一批候选，逐个查"在不在本地缓存"，凑满就收手。
  * 一张都没有就整条不画（卡片退回纯文字，别立几个空占位块）。
+ *
+ * [compact]（手机）下条子整体缩水：3 张 88dp → 2 张 64dp。
+ * 旧布局的固定宽度（3 张 88dp + 间距 + 菜单键 ≈ 356dp）在 411dp 宽的屏上
+ * 只剩 ~38dp 给左边文字列 —— 库名被挤成一字一行，必须让位。
  */
 @Composable
 private fun PosterStrip(
@@ -694,7 +715,11 @@ private fun PosterStrip(
     container: com.open115.pad.AppContainer,
     refreshTick: Int,
     scanFinishedAt: Long,
+    compact: Boolean,
 ) {
+    val want = if (compact) 2 else 3
+    val tileW = if (compact) 64.dp else 88.dp
+    val tileH = if (compact) 92.dp else 126.dp
     val models by produceState<List<Any?>>(
         initialValue = emptyList(), lib.rootPaths, refreshTick, scanFinishedAt,
     ) {
@@ -702,17 +727,17 @@ private fun PosterStrip(
         val hits = mutableListOf<Any?>()
         for (code in candidates) {
             container.imageUrlResolver.cachedPosterIfPresent(code, container.cacheDir)?.let { hits.add(it) }
-            if (hits.size >= 3) break
+            if (hits.size >= want) break
         }
         value = hits
     }
     if (models.isEmpty()) return
-    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+    Row(horizontalArrangement = Arrangement.spacedBy(if (compact) 4.dp else 6.dp)) {
         models.forEach { model ->
             Box(
                 Modifier
-                    .width(88.dp)
-                    .height(126.dp)
+                    .width(tileW)
+                    .height(tileH)
                     .clip(RoundedCornerShape(10.dp))
                     .background(MaterialTheme.colorScheme.surfaceVariant),
             ) {

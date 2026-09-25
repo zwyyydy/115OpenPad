@@ -139,6 +139,9 @@ fun PosterWallScreen(
     val container = (context.applicationContext as com.open115.pad.App115).container
     val snackbarHostState = remember { SnackbarHostState() }
     var deleteTarget by remember { mutableStateOf<MovieCard?>(null) }
+    // 手机（窄屏）排版：顶栏一行放不下「标题列 + 3 个图标 + 搜索框」，把搜索框换到第二行；
+    // 海报网格从 2 列调到 3 列。平板（>=600dp）保持原样
+    val compact = LocalConfiguration.current.screenWidthDp < 600
 
     // 多根库：任一路径匹配即纳入（byLibraryPaths 支持 5 根，更多时逐根查询合并去重）
     // 排序方式（表头那个菜单选的）：与作品页共用同一个设置（存 MediaPrefs）
@@ -262,6 +265,11 @@ fun PosterWallScreen(
                             },
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            // ☠ 必须限一行：窄屏下标题列只剩 ~200dp，这行副标题（二十来字）
+                            // 不限行就会逐字换行撑成几十行，整个顶栏被顶到屏幕中部、
+                            // 网格跟着掉下去（手机上实测到的排版事故）
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
                         )
                     }
                     FilterButton(filter) { filterDialog = true }
@@ -293,14 +301,28 @@ fun PosterWallScreen(
                             }
                         }
                     }
-                    // 毛玻璃搜索框：背后是背景轮播那张图（模糊副本 + 半透明白边）
+                    // 毛玻璃搜索框：背后是背景轮播那张图（模糊副本 + 半透明白边）。
+                    // 窄屏放这一行的末尾会把图标挤出去，改到下面独立一行（见 compact 分支）
+                    if (!compact) {
+                        FrostedSearchField(
+                            value = query,
+                            onValueChange = { query = it },
+                            backdrop = rotation.getOrNull(backdropIndex),
+                            modifier = Modifier
+                                .widthIn(min = 200.dp, max = 360.dp)
+                                .padding(end = 8.dp),
+                        )
+                    }
+                }
+                // 手机：搜索框独占第二行（整行宽度，输入时也比一行里的半截胶囊好用）
+                if (compact) {
                     FrostedSearchField(
                         value = query,
                         onValueChange = { query = it },
                         backdrop = rotation.getOrNull(backdropIndex),
                         modifier = Modifier
-                            .widthIn(min = 200.dp, max = 360.dp)
-                            .padding(end = 8.dp),
+                            .fillMaxWidth()
+                            .padding(horizontal = 16.dp, vertical = 2.dp),
                     )
                 }
 
@@ -320,10 +342,10 @@ fun PosterWallScreen(
                         )
                     }
                 } else {
-                    // 全屏自适应网格：手机 2~3 列 / 平板 4~5 列 / 2K/4K 大屏 6~8 列，
+                    // 全屏自适应网格：手机 3 列（minSize 调小）/ 平板 4~5 列 / 2K/4K 大屏 6~8 列，
                     // 列宽由系统按 minSize 均分铺满，横向拉伸只等比放大或增列，不留死白
                     LazyVerticalGrid(
-                        columns = GridCells.Adaptive(minSize = 130.dp),
+                        columns = GridCells.Adaptive(minSize = if (compact) 110.dp else 130.dp),
                         contentPadding = PaddingValues(16.dp),
                         horizontalArrangement = Arrangement.spacedBy(16.dp),
                         verticalArrangement = Arrangement.spacedBy(16.dp),

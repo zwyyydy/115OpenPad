@@ -38,6 +38,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -84,6 +85,8 @@ fun MediaWorksScreen(
     val scope = rememberCoroutineScope()
     val container = (context.applicationContext as com.open115.pad.App115).container
     val snackbarHostState = remember { SnackbarHostState() }
+    // 手机（窄屏）：顶栏副标题限一行、海报网格 3 列；平板保持原样
+    val compact = LocalConfiguration.current.screenWidthDp < 600
     // 排序方式（表头那个菜单选的）：存设置里，跨页面/重启都记得
     val sort by container.mediaPrefs.worksSort.collectAsState(initial = WorksSort.DEFAULT)
     val cards by produceState<List<MovieCard>>(emptyList(), kind, name, refreshKey, sort) {
@@ -160,6 +163,9 @@ fun MediaWorksScreen(
                                     if (filter.isEmpty) "" else " · 已筛选 ${filter.selectedCount} 项",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = Color.White.copy(alpha = 0.7f),
+                                // 同海报墙：不限行会在窄屏逐字换行，把顶栏撑成几十行高
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
                             )
                         }
                         // 表头整行图标都是白色，筛选键传同色（不传会拿到主题默认色，深底上看不清）
@@ -220,7 +226,7 @@ fun MediaWorksScreen(
                         }
                     } else {
                         LazyVerticalGrid(
-                            columns = GridCells.Adaptive(minSize = 130.dp),
+                            columns = GridCells.Adaptive(minSize = if (compact) 110.dp else 130.dp),
                             contentPadding = PaddingValues(16.dp),
                             horizontalArrangement = Arrangement.spacedBy(16.dp),
                             verticalArrangement = Arrangement.spacedBy(16.dp),
