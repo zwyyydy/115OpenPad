@@ -1,9 +1,13 @@
 package com.open115.pad.ui.files
 
+import android.widget.Toast
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.expandHorizontally
 import androidx.compose.animation.shrinkHorizontally
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.clickable
@@ -16,6 +20,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -25,26 +30,32 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.DriveFileMove
+import androidx.compose.material.icons.outlined.Add
 import androidx.compose.material.icons.outlined.ChevronLeft
 import androidx.compose.material.icons.outlined.ChevronRight
+import androidx.compose.material.icons.outlined.Close
 import androidx.compose.material.icons.outlined.CloudDownload
 import androidx.compose.material.icons.outlined.Delete
 import androidx.compose.material.icons.outlined.DriveFileRenameOutline
 import androidx.compose.material.icons.outlined.Description
 import androidx.compose.material.icons.outlined.Download
 import androidx.compose.material.icons.outlined.FileCopy
+import androidx.compose.material.icons.outlined.Folder
 import androidx.compose.material.icons.outlined.History
 import androidx.compose.material.icons.outlined.Image
 import androidx.compose.material.icons.outlined.PlayCircle
 import androidx.compose.material.icons.outlined.Upload
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.VerticalDivider
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -55,10 +66,21 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.scale
+import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.layout.boundsInRoot
+import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.window.Popup
+import androidx.compose.ui.window.PopupProperties
+import kotlin.math.roundToInt
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.open115.pad.appContainer
@@ -704,7 +726,6 @@ fun FilesScreen(
 
     var showCreate by remember { mutableStateOf(false) }
     var renameTarget by remember { mutableStateOf<FileItem?>(null) }
-    var starTarget by remember { mutableStateOf<FileItem?>(null) }
     var showDeleteConfirm by remember { mutableStateOf(false) }
     var moveMode by remember { mutableStateOf<String?>(null) }
     var downloadTarget by remember { mutableStateOf<FileItem?>(null) }
@@ -717,6 +738,17 @@ fun FilesScreen(
 
     fun notify(msg: String?) {
         if (msg != null) scope.launch { snackbarHostState.showSnackbar(msg) }
+    }
+
+    // 拖动多选 → 快捷目录：host 由文件行（手势源）与侧栏条目（落点）共享
+    val quickDirDrag = remember { QuickDirDragHost() }
+    fun onQuickDirDrop(cid: String, name: String) {
+        // 目标就是当前目录：接口会"成功"但其实什么都没动，直接拦下
+        if (cid == vm.currentCid()) {
+            notify("文件已经在这个目录里了")
+            return
+        }
+        scope.launch { notify(vm.moveSelected(cid, name)) }
     }
 
     // 重命名任务结束后刷新列表。
@@ -961,7 +993,7 @@ fun FilesScreen(
                 Column(Modifier.width(SidePaneWidth).fillMaxSize()) {
                     UserInfoCard(Modifier.padding(16.dp))
                     HorizontalDivider()
-                    FilesSidePane(vm, ui, Modifier.weight(1f))
+                    FilesSidePane(vm, ui, Modifier.weight(1f), quickDirDrag)
                 }
             }
             SidePaneHandle(
@@ -997,7 +1029,8 @@ fun FilesScreen(
                     }
                 },
                 onSelectAll = { vm.toggleSelectAll() },
-                onStar = { starTarget = it },
+                // 直接在点击时启动：星标没有"目标要先记下来"的理由，走状态中转反而会自取消
+                onStar = { scope.launch { notify(vm.toggleStarItem(it)) } },
                 onPin = { scope.launch { notify(vm.togglePins(it)) } },
                 onDownload = {
                     val files = ui.items.filter { it.fid in ui.selection && !it.isDir }
@@ -1018,6 +1051,8 @@ fun FilesScreen(
                 onUploadFolder = { folderPicker.launch(null) },
                 onOpenFilterRules = onOpenFilterRules,
                 onCreateFolder = { showCreate = true },
+                quickDirDrag = quickDirDrag,
+                onQuickDirDrop = ::onQuickDirDrop,
             )
         } else {
             FilesBrowserPane(
@@ -1049,7 +1084,8 @@ fun FilesScreen(
                     }
                 },
                 onSelectAll = { vm.toggleSelectAll() },
-                onStar = { starTarget = it },
+                // 直接在点击时启动：星标没有"目标要先记下来"的理由，走状态中转反而会自取消
+                onStar = { scope.launch { notify(vm.toggleStarItem(it)) } },
                 onPin = { scope.launch { notify(vm.togglePins(it)) } },
                 onDownload = {
                     val files = ui.items.filter { it.fid in ui.selection && !it.isDir }
@@ -1070,7 +1106,67 @@ fun FilesScreen(
                 onUploadFolder = { folderPicker.launch(null) },
                 onOpenFilterRules = onOpenFilterRules,
                 onCreateFolder = { showCreate = true },
+                quickDirDrag = quickDirDrag,
+                onQuickDirDrop = ::onQuickDirDrop,
             )
+        }
+    }
+
+    // 拖动幻影：Windows 式的文件堆叠 —— 最多画 3 张选中项的缩略卡错位叠着，
+    // 右下角数量角标；悬停到快捷目录上时整体放大一档并亮主色边框
+    if (quickDirDrag.active) {
+        val dragItems = remember(ui.selection, ui.items) {
+            ui.items.filter { it.fid in ui.selection }
+        }
+        val hoverScale by androidx.compose.animation.core.animateFloatAsState(
+            targetValue = if (quickDirDrag.hoverCid != null) 1.12f else 1f,
+            label = "dragGhostScale",
+        )
+        Popup(
+            alignment = Alignment.TopStart,
+            offset = IntOffset(
+                quickDirDrag.position.x.roundToInt() - 30,
+                (quickDirDrag.position.y.roundToInt() - 150).coerceAtLeast(0),
+            ),
+            properties = PopupProperties(clippingEnabled = false),
+        ) {
+            Box(Modifier.scale(hoverScale)) {
+                val stack = dragItems.take(3)
+                // 从最底层画起：第一张选中项最后画、落在最上层（Windows 的堆叠手观感）
+                stack.reversed().forEachIndexed { idx, item ->
+                    val depth = stack.size - 1 - idx
+                    Box(
+                        Modifier
+                            .offset(x = (depth * 8).dp, y = (depth * 8).dp)
+                            .size(52.dp)
+                            .shadow(6.dp, RoundedCornerShape(12.dp))
+                            .clip(RoundedCornerShape(12.dp))
+                            .background(MaterialTheme.colorScheme.surface, RoundedCornerShape(12.dp))
+                            .border(
+                                if (quickDirDrag.hoverCid != null) 2.dp else 1.dp,
+                                if (quickDirDrag.hoverCid != null) MaterialTheme.colorScheme.primary
+                                else MaterialTheme.colorScheme.outline,
+                                RoundedCornerShape(12.dp),
+                            )
+                            .alpha(if (depth == 0) 0.96f else 0.7f),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        com.open115.pad.ui.components.Thumb(item, Modifier.size(38.dp))
+                    }
+                }
+                if (ui.selection.size > 1) {
+                    Text(
+                        "${ui.selection.size}",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onPrimary,
+                        modifier = Modifier
+                            .align(Alignment.BottomEnd)
+                            .offset(x = 8.dp, y = 8.dp)
+                            .background(MaterialTheme.colorScheme.primary, CircleShape)
+                            .padding(horizontal = 7.dp, vertical = 2.dp),
+                    )
+                }
+            }
         }
     }
 
@@ -1087,12 +1183,6 @@ fun FilesScreen(
             renameTarget = null
             scope.launch { notify(vm.rename(target, it)) }
         }, onDismiss = { renameTarget = null })
-    }
-    starTarget?.let { target ->
-        LaunchedEffect(target.fid) {
-            notify(vm.toggleStarItem(target))
-        }
-        starTarget = null
     }
     if (showDeleteConfirm) {
         ConfirmDialog(
@@ -1168,13 +1258,113 @@ private fun SidePaneHandle(collapsed: Boolean, onToggle: () -> Unit) {
 /** 侧栏操作记录最多展示条数（存储层保留 100 条，这里只渲染最近的） */
 private const val SIDE_PANE_OP_COUNT = 30
 
-/** 平板宽屏下的左侧栏：用户操作记录 */
+/** 平板宽屏下的左侧栏：快捷目录 + 用户操作记录 */
 @Composable
-private fun FilesSidePane(vm: FilesViewModel, ui: FilesViewModel.UiState, modifier: Modifier = Modifier) {
+private fun FilesSidePane(
+    vm: FilesViewModel,
+    ui: FilesViewModel.UiState,
+    modifier: Modifier = Modifier,
+    /** 拖动多选的会话：条目在这里注册落点边界，悬停高亮也由它驱动 */
+    quickDirDrag: QuickDirDragHost,
+) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val ops by context.appContainer.opLog.entries.collectAsState(initial = emptyList())
+    val quickDirs by context.appContainer.quickDirs.entries.collectAsState(initial = emptyList())
+    /** 点了尾部 ×、等确认移除的快捷目录；非空 = 弹确认框 */
+    var removeTarget by remember { mutableStateOf<com.open115.pad.data.QuickDir?>(null) }
     Column(modifier.verticalScroll(rememberScrollState()).padding(12.dp)) {
+        // ── 快捷目录：收藏常用目录，点击直达（跳转与操作记录同款 openByCid）──
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            Text("快捷目录", style = MaterialTheme.typography.labelLarge, modifier = Modifier.weight(1f))
+            Icon(
+                Icons.Outlined.Add,
+                contentDescription = "收藏当前目录",
+                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier
+                    .size(20.dp)
+                    .clickable {
+                        val cur = ui.stack.last()
+                        scope.launch {
+                            if (ui.stack.size <= 1) {
+                                Toast.makeText(context, "先进入要收藏的目录，再点 + 收藏", Toast.LENGTH_SHORT).show()
+                            } else {
+                                val path = ui.stack.drop(1).joinToString("/") { it.name }
+                                val ok = context.appContainer.quickDirs.add(cur.cid, cur.name, path)
+                                Toast.makeText(
+                                    context,
+                                    if (ok) "已收藏「${cur.name}」" else "「${cur.name}」已在快捷目录里",
+                                    Toast.LENGTH_SHORT,
+                                ).show()
+                            }
+                        }
+                    }
+                    .padding(2.dp),
+            )
+        }
+        Spacer(Modifier.height(4.dp))
+        if (quickDirs.isEmpty()) {
+            Text(
+                "还没有快捷目录\n进入某个目录后点右上角 + 收藏，之后点击直达",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        } else {
+            quickDirs.forEach { d ->
+                // 拖动落点：边界随布局变化重注册（滚动/展开收起都会触发），条目离场时注销
+                DisposableEffect(d.cid) {
+                    onDispose { quickDirDrag.unregisterTarget(d.cid) }
+                }
+                val hovered = quickDirDrag.hoverCid == d.cid
+                Row(
+                    Modifier
+                        .onGloballyPositioned { quickDirDrag.registerTarget(d.cid, d.name, it.boundsInRoot()) }
+                        .fillMaxWidth()
+                        .background(if (hovered) MaterialTheme.colorScheme.secondaryContainer else Color.Transparent)
+                        .clickable { vm.openByCid(d.cid, d.name) }
+                        .padding(vertical = 6.dp, horizontal = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Icon(
+                        Icons.Outlined.Folder,
+                        contentDescription = "快捷目录",
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.size(18.dp),
+                    )
+                    Column(Modifier.weight(1f).padding(start = 8.dp)) {
+                        Text(
+                            d.name,
+                            style = MaterialTheme.typography.bodyMedium,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                        // 收藏时的完整路径：同名目录光看名字认不出是哪一个
+                        if (!d.path.isNullOrBlank()) {
+                            Text(
+                                d.path,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                        }
+                    }
+                    Icon(
+                        Icons.Outlined.Close,
+                        contentDescription = "移除快捷目录",
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f),
+                        modifier = Modifier
+                            .size(16.dp)
+                            .clickable { removeTarget = d }
+                            .padding(2.dp),
+                    )
+                }
+            }
+        }
+        Spacer(Modifier.height(12.dp))
+        HorizontalDivider()
+        Spacer(Modifier.height(12.dp))
+        // ── 操作记录（原有区块）──
         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
             Text("操作记录", style = MaterialTheme.typography.labelLarge, modifier = Modifier.weight(1f))
             if (ops.isNotEmpty()) {
@@ -1241,6 +1431,23 @@ private fun FilesSidePane(vm: FilesViewModel, ui: FilesViewModel.UiState, modifi
                 Text("搜索「${ui.searchQuery}」结果", style = MaterialTheme.typography.bodyMedium)
             }
         }
+    }
+    // 移除快捷目录要过一次确认：× 挨着点击跳转的行，误触代价不该是"书签没了"
+    removeTarget?.let { target ->
+        AlertDialog(
+            onDismissRequest = { removeTarget = null },
+            title = { Text("移除快捷目录") },
+            text = { Text("移除「${target.name}」？只删这条书签，云端目录不受影响。") },
+            confirmButton = {
+                TextButton(onClick = {
+                    removeTarget = null
+                    scope.launch { context.appContainer.quickDirs.remove(target.cid) }
+                }) { Text("移除") }
+            },
+            dismissButton = {
+                TextButton(onClick = { removeTarget = null }) { Text("取消") }
+            },
+        )
     }
 }
 

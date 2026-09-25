@@ -78,6 +78,9 @@ class AppContainer(context: Context) {
     /** 用户操作记录（复制/移动/删除/上传/下载/云离线/预览/播放），侧栏展示 */
     val opLog = com.open115.pad.data.OpLog(context)
 
+    /** 快捷目录收藏（文件页侧栏，点击直达对应目录） */
+    val quickDirs = com.open115.pad.data.QuickDirs(context)
+
     /** 剪贴板 / 外部唤起的下载链接汇聚点，由 MainActivity 投递、AppRoot 消费 */
     val downloadLinks = com.open115.pad.data.DownloadLinkBus(context, downloadPrefs)
 

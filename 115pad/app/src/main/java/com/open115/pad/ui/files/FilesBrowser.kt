@@ -80,7 +80,16 @@ import androidx.compose.ui.unit.dp
 import com.open115.pad.data.FileItem
 import com.open115.pad.ui.components.FileGridCard
 import com.open115.pad.ui.components.FileListRow
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.layout.size
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Rect
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.input.pointer.positionChange
+import androidx.compose.ui.layout.LayoutCoordinates
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.runtime.rememberUpdatedState
 
 private val sortOptions = listOf(
     "file_name" to "按名称",
@@ -113,6 +122,10 @@ fun FilesBrowserPane(
     onUploadFolder: () -> Unit,
     onCreateFolder: () -> Unit,
     onOpenFilterRules: () -> Unit,
+    /** 拖动到快捷目录的会话；null（窄屏没有侧栏）时拖动整体不启用 */
+    quickDirDrag: QuickDirDragHost? = null,
+    /** 拖到快捷目录条目上松手：把当前多选移过去 */
+    onQuickDirDrop: (cid: String, name: String) -> Unit = { _, _ -> },
 ) {
     var sortMenuOpen by remember { mutableStateOf(false) }
 
@@ -424,14 +437,20 @@ fun FilesBrowserPane(
                         horizontalArrangement = Arrangement.spacedBy(8.dp),
                     ) {
                         items(ui.display, key = { (it.fid ?: "") + "#" + it.fn }) { item ->
-                            FileGridCard(
-                                item = item,
-                                pinned = item.fid in pinnedIds,
-                                selectMode = ui.selectMode,
-                                selected = item.fid in ui.selection,
-                                onClick = { onActivate(item) },
-                                onLongClick = { vm.toggleSelect(item.fid) },
-                            )
+                            QuickDirDragSource(
+                                enabled = ui.selectMode,
+                                host = quickDirDrag,
+                                onDrop = onQuickDirDrop,
+                            ) {
+                                FileGridCard(
+                                    item = item,
+                                    pinned = item.fid in pinnedIds,
+                                    selectMode = ui.selectMode,
+                                    selected = item.fid in ui.selection,
+                                    onClick = { onActivate(item) },
+                                    onLongClick = if (ui.selectMode) null else ({ vm.toggleSelect(item.fid) }),
+                                )
+                            }
                         }
                     }
                 }
@@ -445,14 +464,21 @@ fun FilesBrowserPane(
                     }
                     LazyColumn(state = listState, modifier = Modifier.fillMaxSize()) {
                         listItems(ui.display, key = { (it.fid ?: "") + "#" + it.fn }) { item ->
-                            FileListRow(
-                                item = item,
-                                pinned = item.fid in pinnedIds,
-                                selectMode = ui.selectMode,
-                                selected = item.fid in ui.selection,
-                                onClick = { onActivate(item) },
-                                onLongClick = { vm.toggleSelect(item.fid) },
-                            )
+                            QuickDirDragSource(
+                                enabled = ui.selectMode,
+                                host = quickDirDrag,
+                                onDrop = onQuickDirDrop,
+                            ) {
+                                FileListRow(
+                                    item = item,
+                                    pinned = item.fid in pinnedIds,
+                                    selectMode = ui.selectMode,
+                                    selected = item.fid in ui.selection,
+                                    onClick = { onActivate(item) },
+                                    // 多选态长按让位给"拖动"（见 QuickDirDragSource 注释），增删选择走勾选框/点按
+                                    onLongClick = if (ui.selectMode) null else ({ vm.toggleSelect(item.fid) }),
+                                )
+                            }
                         }
                         if (ui.loadingMore) {
                             item {
@@ -552,4 +578,127 @@ private fun SearchBarInline(initial: String, onSearch: (String) -> Unit, onClose
         },
         modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
     )
+}
+
+/**
+ * 「长按拖动多选 → 松手移到快捷目录」的会话状态。
+ *
+ * 手势侧（文件行，见 [QuickDirDragSource]）写入手指位置；侧栏的快捷目录条目把
+ * 自己的窗口边界注册进来做命中判定；拖动徽标浮层读 [position] 画跟随。
+ *
+ * 只在应用窗口内自绘判定，不走系统拖放协议 —— 高亮、落点、命中的口径全部自己说了算，
+ * 也省掉 ClipData 的来回打包。
+ */
+class QuickDirDragHost {
+    /** 拖动进行中（浮层与侧栏高亮都看它） */
+    var active by mutableStateOf(false)
+        private set
+
+    /** 手指在窗口内的位置（root 坐标） */
+    var position by mutableStateOf(Offset.Zero)
+        private set
+
+    /** 当前悬停的快捷目录 cid；null = 不在任何条目上 */
+    var hoverCid by mutableStateOf<String?>(null)
+        private set
+
+    // cid -> (目录名, 条目边界)。条目布局一变就重注册（onGloballyPositioned）
+    private val targets = mutableStateMapOf<String, Pair<String, Rect>>()
+
+    fun registerTarget(cid: String, name: String, bounds: Rect) {
+        targets[cid] = name to bounds
+    }
+
+    fun unregisterTarget(cid: String) {
+        targets.remove(cid)
+    }
+
+    fun begin(at: Offset) {
+        active = true
+        position = at
+        hoverCid = null
+    }
+
+    fun dragTo(at: Offset) {
+        position = at
+        hoverCid = targetAt(at)?.first
+    }
+
+    /** 结束拖动：落在快捷目录上返回 (cid, 目录名) 并复位；没命中返回 null */
+    fun finish(): Pair<String, String>? {
+        val hit = targetAt(position)
+        reset()
+        return hit
+    }
+
+    fun cancel() = reset()
+
+    private fun targetAt(p: Offset): Pair<String, String>? =
+        targets.entries.firstOrNull { it.value.second.contains(p) }?.let { it.key to it.value.first }
+
+    private fun reset() {
+        active = false
+        hoverCid = null
+    }
+}
+
+/**
+ * 给文件行 / 网格卡包一层拖动手势。仅多选态（[enabled] = true）启用：
+ * **横向为主的滑动**进入拖动会话（纵向让给列表滚动），松手落在快捷目录条目上
+ * 就把当前多选移过去。非多选态原样放行事件，长按选择行为不变。
+ *
+ * ★ 多选态下调用方必须把行的 onLongClick 传 null：combinedClickable 的长按
+ *   触发后会 consumeUntilUp 把后续事件全部消费，拖动手势会立刻收到
+ *   "事件已被消费"而取消。
+ */
+@Composable
+fun QuickDirDragSource(
+    enabled: Boolean,
+    host: QuickDirDragHost?,
+    onDrop: (cid: String, name: String) -> Unit,
+    content: @Composable () -> Unit,
+) {
+    var coords by remember { mutableStateOf<LayoutCoordinates?>(null) }
+    val currentOnDrop by rememberUpdatedState(onDrop)
+    Box(
+        Modifier
+            .onGloballyPositioned { coords = it }
+            .pointerInput(enabled, host) {
+                if (!enabled || host == null) return@pointerInput
+                val slop = viewConfiguration.touchSlop
+                awaitEachGesture {
+                    val down = awaitFirstDown(requireUnconsumed = false)
+                    var dragging = false
+                    var total = Offset.Zero
+                    var cancelled = false
+                    while (true) {
+                        val event = awaitPointerEvent()
+                        val change = event.changes.firstOrNull { it.id == down.id }
+                        if (change == null || !change.pressed) break
+                        total += change.positionChange()
+                        if (!dragging) {
+                            // 还没定方向：累计位移超过触摸斜距后，横主纵从 → 开始拖动；纵向 → 放弃（列表滚动）
+                            if (total.getDistance() > slop) {
+                                if (kotlin.math.abs(total.x) > kotlin.math.abs(total.y)) {
+                                    dragging = true
+                                    coords?.let { host.begin(it.localToRoot(down.position + total)) }
+                                } else {
+                                    cancelled = true
+                                    break
+                                }
+                            }
+                            if (!dragging) continue
+                        }
+                        change.consume()
+                        coords?.let { host.dragTo(it.localToRoot(down.position + total)) }
+                    }
+                    if (dragging) {
+                        val hit = host.finish()
+                        if (hit != null) currentOnDrop(hit.first, hit.second)
+                    } else if (cancelled) {
+                        host.cancel()
+                    }
+                }
+            },
+    ) { content() }
 }

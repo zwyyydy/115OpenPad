@@ -87,8 +87,9 @@ fun thumbUrlFor(item: FileItem): String? = when {
     else -> null
 }
 
+/** 文件缩略卡：类型彩色底 + 缩略图（图/视频封面/文件夹封面）兜底。拖动幻影也用它 */
 @Composable
-private fun Thumb(item: FileItem, modifier: Modifier = Modifier, iconSize: Int = 24) {
+internal fun Thumb(item: FileItem, modifier: Modifier = Modifier, iconSize: Int = 24) {
     val url = thumbUrlFor(item)
     Box(modifier, contentAlignment = Alignment.Center) {
         // 彩色类型视觉做底层常驻：缩略图加载失败/无缩略图时兜底，避免出现空白图标
@@ -113,7 +114,8 @@ fun FileListRow(
     selectMode: Boolean,
     selected: Boolean,
     onClick: () -> Unit,
-    onLongClick: () -> Unit,
+    /** null = 不做长按检测（多选态长按让位给拖动，且它的事件消费会杀掉外层拖拽手势） */
+    onLongClick: (() -> Unit)?,
     /** 已置顶的文件夹：整行铺一层淡蓝底 + 图钉标记，让置顶区一眼可分 */
     pinned: Boolean = false,
 ) {
@@ -190,7 +192,8 @@ fun FileGridCard(
     selectMode: Boolean,
     selected: Boolean,
     onClick: () -> Unit,
-    onLongClick: () -> Unit,
+    /** null = 不做长按检测（同 FileListRow） */
+    onLongClick: (() -> Unit)?,
     /** 已置顶的文件夹：卡片淡蓝底 + 左上角图钉角标 */
     pinned: Boolean = false,
 ) {
