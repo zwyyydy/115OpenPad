@@ -573,6 +573,17 @@ fun PlayerScreen(
      * 手动覆盖状态（VR 模式被一部片改过，下一部也被当成改过）。
      */
     val itemKey = localUri ?: currentPickCode
+
+    // 退出播放器时清掉视频缓存。缓存 key 是完整播放地址（带签名），每次进播放器都重新
+    // 解析地址，上一会话的缓存不可能再命中，留着只占空间（见 PlayerCache 注释）。
+    // 必须注册在两个播放器的 DisposableEffect 之前：Compose 的 onDispose 逆序执行，
+    // 这样这里（最后执行）跑的时候两个播放器已经 release，删缓存才安全。
+    // 不能挂在播放器自己的 DisposableEffect(player) 上：切软/硬解会重建播放器并触发它，
+    // 会把正用着的缓存中途清掉。
+    DisposableEffect(Unit) {
+        onDispose { PlayerCache.clearAsync(context.applicationContext) }
+    }
+
     var currentIndex by remember { mutableStateOf(initialIndex) }
     var currentName by remember { mutableStateOf(initialName) }
     /**
@@ -1002,7 +1013,9 @@ fun PlayerScreen(
             .setConnectTimeoutMs(15000)
             .setReadTimeoutMs(30000)
         val upstream = DefaultDataSource.Factory(context, httpFactory)
-        val mediaFactory = if (prefs.cacheEnabled) {
+        // 本机播放连缓存工厂都不建：不挂缓存之外，SimpleCache 也不实例化
+        // （get() 会创建 video_cache 目录和 .uid 文件），本机会话零痕迹。
+        val mediaFactory = if (prefs.cacheEnabled && localUri == null) {
             DefaultMediaSourceFactory(
                 CacheDataSource.Factory()
                     .setCache(PlayerCache.get(context, prefs.cacheMaxMb.toLong() * 1024L * 1024L))
@@ -1049,7 +1062,9 @@ fun PlayerScreen(
             .setConnectTimeoutMs(15000)
             .setReadTimeoutMs(30000)
         val upstream = DefaultDataSource.Factory(context, httpFactory)
-        val mediaFactory = if (prefs.cacheEnabled) {
+        // 与主播放器同条件：本机播放不建缓存（预载只在云端切档时用到，本地会话本就走不到，
+        // 但 get() 建目录的副作用要保持一致）。
+        val mediaFactory = if (prefs.cacheEnabled && localUri == null) {
             DefaultMediaSourceFactory(
                 CacheDataSource.Factory()
                     .setCache(PlayerCache.get(context, prefs.cacheMaxMb.toLong() * 1024L * 1024L))
@@ -1512,6 +1527,17 @@ fun PlayerScreen(
     // 首次进入与切集共用同一条加载链路：itemKey 一变就整套重载。
     // key 用 player 而不是 prefs：播放器实例一换（切换软/硬解）新实例上还没有媒体，
     // 必须重挂一遍，等价于原来的 prefs key。
+    // 本机文件专用的媒体源工厂：与主播放器同一套上游参数但不挂缓存——文件本来就在
+    // 本地，往 video_cache 拷一份纯属浪费 IO（回退进度直接读原文件不比读缓存慢）。
+    // 上游参数与 prefs 无关，独立 remember 即可，不随软/硬解重建。
+    val noCacheMediaFactory = remember {
+        val httpFactory = DefaultHttpDataSource.Factory()
+            .setUserAgent(APP_USER_AGENT)
+            .setAllowCrossProtocolRedirects(true)
+            .setConnectTimeoutMs(15000)
+            .setReadTimeoutMs(30000)
+        DefaultMediaSourceFactory(DefaultDataSource.Factory(context, httpFactory))
+    }
     LaunchedEffect(itemKey, player) {
         // ---- 本地/外部源：整条绕开 115 接口 ----
         // 播放地址、字幕列表、观看记录全都要 pick_code，本地文件一个都拿不到，
@@ -1525,12 +1551,14 @@ fun PlayerScreen(
             val resumeMs = forcedStart
                 ?: runCatching { container.playerPrefs.localResumeOf(localUri) }.getOrDefault(0L)
             runCatching {
-                player.setMediaItem(
-                    // mime 交给 mimeOfFileName：认得出的给准确值，认不出的给 null 让
-                    // ExoPlayer 嗅探容器（和「原盘」直链同一条路，mkv/m2ts 都能吃）
+                // mime 交给 mimeOfFileName：认得出的给准确值，认不出的给 null 让
+                // ExoPlayer 嗅探容器（和「原盘」直链同一条路，mkv/m2ts 都能吃）。
+                // 用 setMediaSource 而不是 setMediaItem：后者落到播放器自带的带缓存
+                // 工厂上，前者走上面那个不挂缓存的工厂（mime/容器推断规则两者一致）。
+                val source = noCacheMediaFactory.createMediaSource(
                     buildMediaItem(localUri, mimeOfFileName(currentName)),
-                    resumePos(resumeMs),
                 )
+                player.setMediaSource(source, resumePos(resumeMs))
                 player.prepare()
                 player.playWhenReady = true
             }.onFailure { e ->

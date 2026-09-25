@@ -55,7 +55,9 @@ import com.open115.pad.data.UserInfo
 import com.open115.pad.player.PlayerCache
 import com.open115.pad.ui.components.ConfirmDialog
 import com.open115.pad.ui.components.TextEntryDialog
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlin.math.roundToInt
 
 // 探活（AppRoot 启动）也会写入，故放开为 internal
@@ -188,7 +190,9 @@ fun SettingsScreen(container: AppContainer) {
 
     LaunchedEffect(Unit) {
         clientId = container.session.currentClientId()
-        cacheSizeMb = PlayerCache.sizeBytes(context) / (1024 * 1024)
+        cacheSizeMb = withContext(Dispatchers.IO) {
+            PlayerCache.sizeBytes(context) / (1024 * 1024)
+        }
         hugeCacheMb = ImageUrlResolver.hugeCacheSizeBytes(context.cacheDir) / (1024 * 1024)
         mediaTextBytes = container.mediaCache.sizeBytes()
         // 海报在 container.cacheDir（= <cache>/images/media_img），和 huge_img **不是同一个根**
@@ -238,7 +242,8 @@ fun SettingsScreen(container: AppContainer) {
         SectionTitle("播放器")
         SettingSwitch(
             title = "播放缓存",
-            subtitle = "已播内容缓存到本机，回退进度零等待；达到上限自动清理最旧缓存",
+            subtitle = "已播内容缓存到本机，本次播放内回退进度零等待；达到上限自动清理最旧缓存。" +
+                "播放地址每次进入都会更换签名，上次播放的缓存对新地址无效，退出播放器时自动清空",
             checked = cacheEnabled,
             onChange = { v -> scope.launch { container.playerPrefs.setCacheEnabled(v) } },
         )
@@ -308,8 +313,10 @@ fun SettingsScreen(container: AppContainer) {
             title = "清除视频缓存",
             subtitle = if (cacheSizeMb >= 0) "当前占用 ${cacheSizeMb} MB，点击清除" else "计算中…",
             onClick = {
-                PlayerCache.clear(context)
-                cacheSizeMb = 0
+                scope.launch {
+                    withContext(Dispatchers.IO) { PlayerCache.clear(context) }
+                    cacheSizeMb = 0
+                }
             },
         )
 
