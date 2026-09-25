@@ -970,6 +970,7 @@ private data class CacheUsage(
 }
 
 /** Coil 自己的图片磁盘缓存（画廊原图/缩略图落在这里，见 ImageGalleryDialog 的 diskKeyOf） */
+@OptIn(coil.annotation.ExperimentalCoilApi::class)
 private fun coilCacheBytes(context: Context): Long =
     coil.Coil.imageLoader(context).diskCache?.size ?: 0L
 
@@ -977,6 +978,7 @@ private fun coilCacheBytes(context: Context): Long =
  * 清空 Coil 的图片缓存。磁盘清理是阻塞 IO；内存缓存里是已解码位图，按 Coil 的约定放主线程清。
  * 与登出时走的是同一套（见 App115）。
  */
+@OptIn(coil.annotation.ExperimentalCoilApi::class)
 private suspend fun clearCoilCache(context: Context) {
     withContext(Dispatchers.IO) { coil.Coil.imageLoader(context).diskCache?.clear() }
     withContext(Dispatchers.Main) { coil.Coil.imageLoader(context).memoryCache?.clear() }

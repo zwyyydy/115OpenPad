@@ -70,6 +70,8 @@ Kotlin + Jetpack Compose (Material 3) + material3-window-size-class（平板自�
 
 本项目代码采用 [PolyForm Noncommercial 1.0.0](./LICENSE) 许可证——**个人学习、研究、娱乐等非商业用途可自由使用、修改与分发；未经作者授权不得用于商业目的**。
 
+第三方组件的来源与许可见 [THIRD_PARTY_NOTICES.md](./THIRD_PARTY_NOTICES.md)。
+
 ## 免责声明
 
 - 本项目是基于 115 官方开放平台 API 的**个人学习项目**，仅供学习交流使用，请遵守《115生活开放平台开发者协议》及当地法律法规

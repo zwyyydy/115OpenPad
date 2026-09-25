@@ -67,7 +67,7 @@ class SideArtTest {
     @Test
     fun `头像名归一化_大小写与空格都能配上`() {
         // nfo 里写 "John Doe"、目录里是 "john doe.png" 这种也要配上
-        assertEquals(normalizeActorName("John Doe"), normalizeActorName("tom  hanks"))
+        assertEquals(normalizeActorName("John Doe"), normalizeActorName("john  doe"))
         val avatars = actorAvatarFilesOf(listOf(f("John  Doe.png")))
         assertEquals("pc:John  Doe.png", avatars[normalizeActorName("John Doe")]?.pickCode)
     }
