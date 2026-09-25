@@ -67,7 +67,4 @@ object PlayerCache {
             runCatching { clear(app) }
         }
     }
-
-    fun sizeBytes(context: Context): Long =
-        dir(context).walkBottomUp().filter { it.isFile }.sumOf { it.length() }
 }
