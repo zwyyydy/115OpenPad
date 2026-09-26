@@ -2,6 +2,12 @@ package com.open115.pad.ui.files
 
 import android.widget.Toast
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.EaseOutBack
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.spring
+import androidx.compose.animation.core.tween
 import androidx.compose.animation.expandHorizontally
 import androidx.compose.animation.shrinkHorizontally
 import androidx.compose.foundation.background
@@ -64,22 +70,28 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.draw.scale
 import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.layout.boundsInRoot
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Popup
 import androidx.compose.ui.window.PopupProperties
+import kotlin.math.exp
 import kotlin.math.roundToInt
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
@@ -167,7 +179,8 @@ class FilesViewModel(
         val loadingMore: Boolean = false,
         val error: String? = null,
         val selection: Set<String> = emptySet(),
-        val gridMode: Boolean = true,
+        /** 视图模式：0=列表 1=小图标 2=大图标 */
+        val viewMode: Int = 1,
         val order: String = "file_name",
         val asc: Int = 1,
         val typeFilter: Int? = null,
@@ -211,6 +224,23 @@ class FilesViewModel(
         _schemes.map { list -> list.any { it.enabled } }
             .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), false)
 
+    /**
+     * 条目最近浏览时间（key = "cid/文件名"）：只统计播放 / 看图 / 读文本三类操作。
+     * 列表模式里给看过的条目补一行"最近浏览"。操作记录按条数裁剪，旧条目掉了
+     * 只是时间行消失，无副作用。
+     */
+    val viewTimes: kotlinx.coroutines.flow.StateFlow<Map<String, Long>> =
+        (opLog?.entries ?: MutableStateFlow(emptyList()))
+            .map { list ->
+                list.filter {
+                    it.type == OpType.VIDEO_PLAY.name ||
+                        it.type == OpType.IMAGE_VIEW.name ||
+                        it.type == OpType.TEXT_PREVIEW.name
+                }.groupBy { "${it.cid}/${it.name}" }
+                    .mapValues { (_, v) -> v.maxOf { it.at } }
+            }
+            .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyMap())
+
     init {
         // 先恢复持久化的排序/视图/筛选状态，再加载列表
         viewModelScope.launch {
@@ -219,7 +249,7 @@ class FilesViewModel(
                     s.copy(
                         order = p.order.first(),
                         asc = p.asc.first(),
-                        gridMode = p.gridMode.first(),
+                        viewMode = p.viewMode.first(),
                         typeFilter = p.typeFilter.first().takeIf { t -> t >= 0 },
                         starOnly = p.starOnly.first(),
                     )
@@ -467,8 +497,8 @@ class FilesViewModel(
         loadCurrent()
     }
 
-    fun setGrid(grid: Boolean) {
-        _ui.update { it.copy(gridMode = grid) }
+    fun setViewMode(mode: Int) {
+        _ui.update { it.copy(viewMode = mode.coerceIn(0, 2)) }
         persistState()
     }
 
@@ -478,7 +508,7 @@ class FilesViewModel(
         val s = _ui.value
         viewModelScope.launch {
             p.setSort(s.order, s.asc)
-            p.setGrid(s.gridMode)
+            p.setViewMode(s.viewMode)
             p.setTypeFilter(s.typeFilter)
             p.setStarOnly(s.starOnly)
         }
@@ -719,10 +749,21 @@ fun FilesScreen(
     /** 多选时进批量重命名面板；入参里带上了整个目录的列表，面板可一键扩到全目录 */
     onBatchRename: (BatchRenameRequest) -> Unit,
     onOpenFilterRules: () -> Unit,
+    /** 云下载页点任务跳过来的待打开目录 (cid, name)：进页即 openByCid，然后回调置空 */
+    pendingJump: Pair<String, String>? = null,
+    onJumpConsumed: () -> Unit = {},
 ) {
     val ui by vm.ui.collectAsState()
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
+
+    // 跨页跳转（云下载 → 文件）：进页即打开目标目录，消费掉待处理槽位
+    LaunchedEffect(pendingJump) {
+        pendingJump?.let { (cid, name) ->
+            vm.openByCid(cid, name)
+            onJumpConsumed()
+        }
+    }
 
     var showCreate by remember { mutableStateOf(false) }
     var renameTarget by remember { mutableStateOf<FileItem?>(null) }
@@ -1112,62 +1153,10 @@ fun FilesScreen(
         }
     }
 
-    // 拖动幻影：Windows 式的文件堆叠 —— 最多画 3 张选中项的缩略卡错位叠着，
-    // 右下角数量角标；悬停到快捷目录上时整体放大一档并亮主色边框
-    if (quickDirDrag.active) {
-        val dragItems = remember(ui.selection, ui.items) {
-            ui.items.filter { it.fid in ui.selection }
-        }
-        val hoverScale by androidx.compose.animation.core.animateFloatAsState(
-            targetValue = if (quickDirDrag.hoverCid != null) 1.12f else 1f,
-            label = "dragGhostScale",
-        )
-        Popup(
-            alignment = Alignment.TopStart,
-            offset = IntOffset(
-                quickDirDrag.position.x.roundToInt() - 30,
-                (quickDirDrag.position.y.roundToInt() - 150).coerceAtLeast(0),
-            ),
-            properties = PopupProperties(clippingEnabled = false),
-        ) {
-            Box(Modifier.scale(hoverScale)) {
-                val stack = dragItems.take(3)
-                // 从最底层画起：第一张选中项最后画、落在最上层（Windows 的堆叠手观感）
-                stack.reversed().forEachIndexed { idx, item ->
-                    val depth = stack.size - 1 - idx
-                    Box(
-                        Modifier
-                            .offset(x = (depth * 8).dp, y = (depth * 8).dp)
-                            .size(52.dp)
-                            .shadow(6.dp, RoundedCornerShape(12.dp))
-                            .clip(RoundedCornerShape(12.dp))
-                            .background(MaterialTheme.colorScheme.surface, RoundedCornerShape(12.dp))
-                            .border(
-                                if (quickDirDrag.hoverCid != null) 2.dp else 1.dp,
-                                if (quickDirDrag.hoverCid != null) MaterialTheme.colorScheme.primary
-                                else MaterialTheme.colorScheme.outline,
-                                RoundedCornerShape(12.dp),
-                            )
-                            .alpha(if (depth == 0) 0.96f else 0.7f),
-                        contentAlignment = Alignment.Center,
-                    ) {
-                        com.open115.pad.ui.components.Thumb(item, Modifier.size(38.dp))
-                    }
-                }
-                if (ui.selection.size > 1) {
-                    Text(
-                        "${ui.selection.size}",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.onPrimary,
-                        modifier = Modifier
-                            .align(Alignment.BottomEnd)
-                            .offset(x = 8.dp, y = 8.dp)
-                            .background(MaterialTheme.colorScheme.primary, CircleShape)
-                            .padding(horizontal = 7.dp, vertical = 2.dp),
-                    )
-                }
-            }
-        }
+    // 拖动幻影：拾起→跟随→离场的动画编排都收在 QuickDirDragGhost 里，
+    // 这里只在"拖动中或离场动画未播完"时把它挂上来
+    if (quickDirDrag.active || quickDirDrag.exit != null) {
+        QuickDirDragGhost(quickDirDrag)
     }
 
     // ---------- 对话框 ----------
@@ -1258,6 +1247,152 @@ private fun SidePaneHandle(collapsed: Boolean, onToggle: () -> Unit) {
 /** 侧栏操作记录最多展示条数（存储层保留 100 条，这里只渲染最近的） */
 private const val SIDE_PANE_OP_COUNT = 30
 
+/**
+ * 拖动幻影：Windows 式的缩略卡堆叠（最多 3 张 + 数量角标），动画编排全在这里——
+ *
+ * - 拾起：从被抓住那行的中心长出来（scale 0.6→1 回弹 + 淡入），不是凭空弹在指尖旁；
+ * - 跟随：逐帧指数趋近手指（每帧必走一步），快扫也基本贴住指尖；中心悬在指尖上方
+ *   一段免得被手指压住，悬停到目标上再弹大一档。**故意不用** Animatable+collectLatest
+ *   按事件重启 spring：指针事件频率常高于帧率，动画帧被反复打断，拖快了幻影会大幅
+ *   滞后、停下手指才追上来（"不跟手"的真因）；
+ * - 离场：命中 → 飞向目标行中心收缩淡出（"收进去"），落空/取消 → 原地淡出；
+ * - 丝滑的另一半在开销：位置/缩放/透明度全走 offset{} / graphicsLayer{} 的延迟读取，
+ *   拖动全程只有这一层重布局重绘制，不惊动 FilesScreen 的重组。
+ */
+@Composable
+private fun QuickDirDragGhost(host: QuickDirDragHost) {
+    val half = with(LocalDensity.current) { 34.dp.toPx() } // 堆叠的视觉半径：52dp 卡 + 16dp 错位
+    val lift = with(LocalDensity.current) { 52.dp.toPx() } // 幻影中心相对指尖的上浮距离
+    val haptics = LocalHapticFeedback.current
+
+    // 三个动画量全部手动逐帧驱动（两个 LaunchedEffect 循环），不经过 Animatable：
+    // 位置必须每帧都动，跟手程度只由时间常数决定，与指针事件频率彻底解耦
+    val posState = remember { mutableStateOf(Offset.Zero) }
+    val scaleState = remember { mutableStateOf(0.6f) }
+    val alphaState = remember { mutableStateOf(0f) }
+    val hoverScale by animateFloatAsState(
+        targetValue = if (host.hoverCid != null) 1.12f else 1f,
+        animationSpec = spring(dampingRatio = 0.55f, stiffness = 550f),
+        label = "dragGhostHover",
+    )
+    val borderColor by animateColorAsState(
+        targetValue = if (host.hoverCid != null) MaterialTheme.colorScheme.primary
+        else MaterialTheme.colorScheme.outline,
+        animationSpec = tween(120),
+        label = "dragGhostBorder",
+    )
+
+    // 拖动中：入场（淡入 + 回弹放大）+ 指数趋近手指。active 一翻 false 整个循环停手，
+    // 位置交给离场循环接管
+    LaunchedEffect(host.active) {
+        if (!host.active) return@LaunchedEffect
+        posState.value = host.beginAnchor
+        scaleState.value = 0.6f
+        alphaState.value = 0f
+        var lastNanos = 0L
+        var startNanos = 0L
+        while (true) {
+            val now = withFrameNanos { it }
+            if (lastNanos == 0L) {
+                lastNanos = now
+                startNanos = now
+                continue
+            }
+            val dtMs = ((now - lastNanos) / 1e6f).coerceIn(1f, 100f)
+            lastNanos = now
+            val sinceStartMs = (now - startNanos) / 1e6f
+            alphaState.value = (sinceStartMs / 110f).coerceIn(0f, 1f)
+            scaleState.value = 0.6f + 0.4f * EaseOutBack.transform((sinceStartMs / 220f).coerceIn(0f, 1f))
+            // τ=10ms：一帧内补掉八成差距，肉眼上就是"钉在手指上"
+            val target = Offset(host.position.x, host.position.y - lift)
+            val p = posState.value
+            val f = 1f - exp(-dtMs / 10f)
+            posState.value = Offset(p.x + (target.x - p.x) * f, p.y + (target.y - p.y) * f)
+        }
+    }
+    // 离场：命中 → 减速飞进目标行中心并收缩淡出；落空/取消 → 原地缩小淡散。
+    // 播完才 clearExit，浮层（FilesScreen 的 if）随之退出组合
+    LaunchedEffect(host.exit) {
+        val exit = host.exit ?: return@LaunchedEffect
+        val hit = exit.drop && exit.to != null
+        val fromPos = posState.value
+        val fromScale = scaleState.value
+        val targetPos = if (hit) exit.to!! else fromPos
+        val targetScale = if (hit) 0.35f else 0.85f
+        val durationMs = if (hit) 180f else 140f
+        val t0 = withFrameNanos { it }
+        while (true) {
+            var elapsedMs = 0f
+            withFrameNanos { now -> elapsedMs = (now - t0) / 1e6f }
+            val t = (elapsedMs / durationMs).coerceIn(0f, 1f)
+            val e = FastOutSlowInEasing.transform(t)
+            posState.value = Offset(
+                fromPos.x + (targetPos.x - fromPos.x) * e,
+                fromPos.y + (targetPos.y - fromPos.y) * e,
+            )
+            scaleState.value = fromScale + (targetScale - fromScale) * e
+            alphaState.value = 1f - t
+            if (t >= 1f) break
+        }
+        host.clearExit()
+    }
+    // 悬停进新目标时轻点一下：落不落得下，指尖有数
+    LaunchedEffect(host.hoverCid) {
+        if (host.hoverCid != null) haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+    }
+
+    Popup(alignment = Alignment.TopStart, properties = PopupProperties(clippingEnabled = false)) {
+        // 内容铺满整个窗口、幻影在其中定位：Popup 的可绘制表面只有窗口框那么大，
+        // 之前"52dp 小窗 + 内容远远挪出去"会把幻影整个画在表面外裁没
+        // （拖得动、落点高亮都正常，就是不见随指的图标）。铺满后手指在哪都能画，
+        // offset{} 仍是布局期读取，每帧只重排幻影这一层。
+        Box(Modifier.fillMaxSize()) {
+            Box(
+                Modifier
+                    .offset {
+                        IntOffset((posState.value.x - half).roundToInt(), (posState.value.y - half).roundToInt())
+                    }
+                    .graphicsLayer {
+                        this.alpha = alphaState.value
+                        scaleX = scaleState.value * hoverScale
+                        scaleY = scaleState.value * hoverScale
+                    },
+            ) {
+                val stack = host.items.take(3)
+                // 从最底层画起：第一张选中项最后画、落在最上层（Windows 的堆叠手观感）
+                stack.reversed().forEachIndexed { idx, item ->
+                    val depth = stack.size - 1 - idx
+                    Box(
+                        Modifier
+                            .offset(x = (depth * 8).dp, y = (depth * 8).dp)
+                            .size(52.dp)
+                            .shadow(6.dp, RoundedCornerShape(12.dp))
+                            .clip(RoundedCornerShape(12.dp))
+                            .background(MaterialTheme.colorScheme.surface, RoundedCornerShape(12.dp))
+                            .border(2.dp, borderColor, RoundedCornerShape(12.dp))
+                            .alpha(if (depth == 0) 0.96f else 0.7f),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        com.open115.pad.ui.components.Thumb(item, Modifier.size(38.dp))
+                    }
+                }
+                if (host.count > 1) {
+                    Text(
+                        "${host.count}",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onPrimary,
+                        modifier = Modifier
+                            .align(Alignment.BottomEnd)
+                            .offset(x = 8.dp, y = 8.dp)
+                            .background(MaterialTheme.colorScheme.primary, CircleShape)
+                            .padding(horizontal = 7.dp, vertical = 2.dp),
+                    )
+                }
+            }
+        }
+    }
+}
+
 /** 平板宽屏下的左侧栏：快捷目录 + 用户操作记录 */
 @Composable
 private fun FilesSidePane(
@@ -1316,11 +1451,22 @@ private fun FilesSidePane(
                     onDispose { quickDirDrag.unregisterTarget(d.cid) }
                 }
                 val hovered = quickDirDrag.hoverCid == d.cid
+                // 高亮渐变而非瞬时开关：拖动扫过一排条目时是"划过"而不是"跳格"
+                val hoverBg by animateColorAsState(
+                    if (hovered) MaterialTheme.colorScheme.secondaryContainer else Color.Transparent,
+                    animationSpec = tween(150),
+                    label = "quickDirHoverBg",
+                )
+                val hoverTint by animateColorAsState(
+                    if (hovered) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+                    animationSpec = tween(150),
+                    label = "quickDirHoverTint",
+                )
                 Row(
                     Modifier
                         .onGloballyPositioned { quickDirDrag.registerTarget(d.cid, d.name, it.boundsInRoot()) }
                         .fillMaxWidth()
-                        .background(if (hovered) MaterialTheme.colorScheme.secondaryContainer else Color.Transparent)
+                        .background(hoverBg, RoundedCornerShape(10.dp))
                         .clickable { vm.openByCid(d.cid, d.name) }
                         .padding(vertical = 6.dp, horizontal = 4.dp),
                     verticalAlignment = Alignment.CenterVertically,
@@ -1328,7 +1474,7 @@ private fun FilesSidePane(
                     Icon(
                         Icons.Outlined.Folder,
                         contentDescription = "快捷目录",
-                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                        tint = hoverTint,
                         modifier = Modifier.size(18.dp),
                     )
                     Column(Modifier.weight(1f).padding(start = 8.dp)) {
@@ -1349,10 +1495,11 @@ private fun FilesSidePane(
                             )
                         }
                     }
+                    // 悬停期间尾部 × 让位给"移入"图标：这一行此刻是落点不是删除键
                     Icon(
-                        Icons.Outlined.Close,
-                        contentDescription = "移除快捷目录",
-                        tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f),
+                        if (hovered) Icons.AutoMirrored.Outlined.DriveFileMove else Icons.Outlined.Close,
+                        contentDescription = if (hovered) "松开移动到此目录" else "移除快捷目录",
+                        tint = if (hovered) hoverTint else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f),
                         modifier = Modifier
                             .size(16.dp)
                             .clickable { removeTarget = d }

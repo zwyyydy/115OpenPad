@@ -251,6 +251,8 @@ fun TransferScreen(
     showCloudTabs: Boolean = false,
     /** 外部唤起提交成功后直达某个分页（"offline"），普通进页为空 */
     requestedTab: String = "",
+    /** 云下载页点任务 → 跳到产物/保存位置目录（进文件页并打开）；未接线时为 null */
+    onCloudJump: ((cid: String, name: String) -> Unit)? = null,
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
@@ -438,7 +440,7 @@ fun TransferScreen(
                         val vm: OfflineViewModel = viewModel(initializer = {
                             context.appContainer.let { OfflineViewModel(it.openApi, it.downloadPrefs) }
                         })
-                        OfflineEmbedded(vm, snackbarHostState)
+                        OfflineEmbedded(vm, snackbarHostState, onJump = onCloudJump)
                     }
 
                     tab == 3 -> {

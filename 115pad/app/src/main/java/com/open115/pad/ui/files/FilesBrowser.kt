@@ -29,6 +29,7 @@ import androidx.compose.material.icons.outlined.ChevronRight
 import androidx.compose.material.icons.outlined.CloudDownload
 import androidx.compose.material.icons.outlined.ContentCopy
 import androidx.compose.material.icons.outlined.CreateNewFolder
+import androidx.compose.material.icons.outlined.Dashboard
 import androidx.compose.material.icons.outlined.Delete
 import androidx.compose.material.icons.outlined.Deselect
 import androidx.compose.material.icons.outlined.DriveFileMove
@@ -85,11 +86,15 @@ import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.layout.size
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Rect
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.positionChange
 import androidx.compose.ui.layout.LayoutCoordinates
 import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.runtime.rememberUpdatedState
+import kotlinx.coroutines.withTimeoutOrNull
 
 private val sortOptions = listOf(
     "file_name" to "按名称",
@@ -131,6 +136,12 @@ fun FilesBrowserPane(
 
     // 置顶条目的 fid 集合。搜索模式下不标（那时不重排，标了反而误导）
     val pinnedIds: Set<String> = if (ui.searching) emptySet() else ui.pinnedIds.toSet()
+
+    // 拖到快捷目录时要拿着走的多选快照：每个拖动源共用一份，begin 时交给 host 存档
+    val dragSnapshot = ui.items.filter { it.fid in ui.selection }
+
+    // 条目最近浏览时间（播放/看图/读文本三类操作记录）：列表模式给看过的条目补一行
+    val viewTimes by vm.viewTimes.collectAsState()
 
     Column(modifier) {
         if (searchMode) {
@@ -216,10 +227,15 @@ fun FilesBrowserPane(
                             )
                         }
                     }
-                    IconButton(onClick = { vm.setGrid(!ui.gridMode) }) {
+                    // 视图三态循环：列表 → 小图标 → 大图标。图标显示当前模式
+                    IconButton(onClick = { vm.setViewMode((ui.viewMode + 1) % 3) }) {
                         Icon(
-                            if (ui.gridMode) Icons.Outlined.ViewList else Icons.Outlined.GridView,
-                            contentDescription = "切换视图",
+                            when (ui.viewMode) {
+                                0 -> Icons.Outlined.ViewList
+                                1 -> Icons.Outlined.GridView
+                                else -> Icons.Outlined.Dashboard
+                            },
+                            contentDescription = "切换视图（列表 / 小图标 / 大图标）",
                         )
                     }
                     IconButton(onClick = onCreateFolder) {
@@ -372,7 +388,7 @@ fun FilesBrowserPane(
             pendingRestore = null
             // 只恢复当前显示模式那一个（另一个没在组合里，别去碰它）；没有记录就从顶部开始
             runCatching {
-                if (ui.gridMode) {
+                if (ui.viewMode != 0) {
                     val (i, o) = gridScroll[curCid] ?: (0 to 0)
                     gridState.scrollToItem(i, o)
                 } else {
@@ -421,15 +437,16 @@ fun FilesBrowserPane(
                     )
                 }
 
-                ui.gridMode -> {
+                ui.viewMode != 0 -> {
                     LaunchedEffect(gridState, ui.display.size, ui.searchQuery) {
                         snapshotFlow { gridState.layoutInfo.visibleItemsInfo.lastOrNull()?.index }
                             .collect { last ->
                                 if (last != null && last >= ui.display.size - 8) vm.loadMore()
                             }
                     }
+                    // 大图标模式：格子下限 110 → 170dp，宽屏列数明显变少、图更大
                     LazyVerticalGrid(
-                        columns = GridCells.Adaptive(minSize = 110.dp),
+                        columns = GridCells.Adaptive(minSize = if (ui.viewMode == 2) 170.dp else 110.dp),
                         state = gridState,
                         modifier = Modifier.fillMaxSize(),
                         contentPadding = PaddingValues(12.dp),
@@ -441,12 +458,14 @@ fun FilesBrowserPane(
                                 enabled = ui.selectMode,
                                 host = quickDirDrag,
                                 onDrop = onQuickDirDrop,
+                                snapshot = dragSnapshot,
                             ) {
                                 FileGridCard(
                                     item = item,
                                     pinned = item.fid in pinnedIds,
                                     selectMode = ui.selectMode,
                                     selected = item.fid in ui.selection,
+                                    large = ui.viewMode == 2,
                                     onClick = { onActivate(item) },
                                     onLongClick = if (ui.selectMode) null else ({ vm.toggleSelect(item.fid) }),
                                 )
@@ -468,12 +487,14 @@ fun FilesBrowserPane(
                                 enabled = ui.selectMode,
                                 host = quickDirDrag,
                                 onDrop = onQuickDirDrop,
+                                snapshot = dragSnapshot,
                             ) {
                                 FileListRow(
                                     item = item,
                                     pinned = item.fid in pinnedIds,
                                     selectMode = ui.selectMode,
                                     selected = item.fid in ui.selection,
+                                    lastViewed = viewTimes["${ui.stack.last().cid}/${item.fn}"] ?: 0L,
                                     onClick = { onActivate(item) },
                                     // 多选态长按让位给"拖动"（见 QuickDirDragSource 注释），增删选择走勾选框/点按
                                     onLongClick = if (ui.selectMode) null else ({ vm.toggleSelect(item.fid) }),
@@ -588,6 +609,12 @@ private fun SearchBarInline(initial: String, onSearch: (String) -> Unit, onClose
  *
  * 只在应用窗口内自绘判定，不走系统拖放协议 —— 高亮、落点、命中的口径全部自己说了算，
  * 也省掉 ClipData 的来回打包。
+ *
+ * 丝滑的两处口径也在这里定：
+ * - [position] 只被 snapshotFlow / 命中判定消费，不进任何重组作用域 —— 手指每动一下
+ *   不会再把整个 FilesScreen 拖着重组一遍；
+ * - [finish]/[cancel] 不直接散场，留下 [exit] 让幻影播完离场动画（飞进目标行 /
+ *   原地淡出）再退出组合。
  */
 class QuickDirDragHost {
     /** 拖动进行中（浮层与侧栏高亮都看它） */
@@ -598,8 +625,24 @@ class QuickDirDragHost {
     var position by mutableStateOf(Offset.Zero)
         private set
 
+    /** 拾起那刻被抓住的行中心（root 坐标）：幻影从行长出来，而不是凭空弹在指尖旁 */
+    var beginAnchor by mutableStateOf(Offset.Zero)
+        private set
+
     /** 当前悬停的快捷目录 cid；null = 不在任何条目上 */
     var hoverCid by mutableStateOf<String?>(null)
+        private set
+
+    /** begin 时收下的多选快照：离场动画期间列表可能已经清了选择，幻影画快照不动真数据 */
+    var items by mutableStateOf<List<FileItem>>(emptyList())
+        private set
+    var count by mutableStateOf(0)
+        private set
+
+    /** 松手后的离场：drop=true 飞向目标行中心收进去，false 原地淡出；播完由浮层回调 [clearExit] */
+    class Exit(val to: Offset?, val drop: Boolean)
+
+    var exit by mutableStateOf<Exit?>(null)
         private set
 
     // cid -> (目录名, 条目边界)。条目布局一变就重注册（onGloballyPositioned）
@@ -613,25 +656,44 @@ class QuickDirDragHost {
         targets.remove(cid)
     }
 
-    fun begin(at: Offset) {
+    fun begin(at: Offset, anchor: Offset, snapshot: List<FileItem>) {
         active = true
         position = at
+        beginAnchor = anchor
+        items = snapshot
+        count = snapshot.size
         hoverCid = null
+        exit = null
     }
 
     fun dragTo(at: Offset) {
         position = at
-        hoverCid = targetAt(at)?.first
+        // 迟滞：已悬停的条目外扩一圈才算离开，边缘来回蹭时不至于高亮闪烁
+        hoverCid = hoverCid
+            ?.takeIf { id -> targets[id]?.second?.inflate(12f)?.contains(at) == true }
+            ?: targetAt(at)?.first
     }
 
-    /** 结束拖动：落在快捷目录上返回 (cid, 目录名) 并复位；没命中返回 null */
+    /** 结束拖动：落在快捷目录上返回 (cid, 目录名) 并留下降落动画；没命中留散场动画 */
     fun finish(): Pair<String, String>? {
-        val hit = targetAt(position)
+        // 迟滞期间高亮的就是用户眼里的落点，命中以它为准（精确边界反而会"看着亮着却没接住"）
+        val hit = hoverCid?.let { id -> targets[id]?.let { id to it.first } } ?: targetAt(position)
+        exit = hit?.let { Exit(targets[it.first]?.second?.center, drop = true) } ?: Exit(null, drop = false)
         reset()
         return hit
     }
 
-    fun cancel() = reset()
+    fun cancel() {
+        // 只有真拖起来过才有幻影要散场；纵向让位给滚动的"未遂拖动"没有浮层
+        if (active) {
+            exit = Exit(null, drop = false)
+            reset()
+        }
+    }
+
+    fun clearExit() {
+        exit = null
+    }
 
     private fun targetAt(p: Offset): Pair<String, String>? =
         targets.entries.firstOrNull { it.value.second.contains(p) }?.let { it.key to it.value.first }
@@ -643,58 +705,104 @@ class QuickDirDragHost {
 }
 
 /**
- * 给文件行 / 网格卡包一层拖动手势。仅多选态（[enabled] = true）启用：
- * **横向为主的滑动**进入拖动会话（纵向让给列表滚动），松手落在快捷目录条目上
- * 就把当前多选移过去。非多选态原样放行事件，长按选择行为不变。
+ * 给文件行 / 网格卡包一层拖动手势。仅多选态（[enabled] = true）启用，两种拎起方式：
+ * **长按**（静置到系统长按时长即拎起，之后任意方向跟随）或**横向快扫**（斜距超过
+ * 触摸斜距且横向为主，不等长按）；纵向先动的滑动让给列表滚动。拎起后列表不滚，
+ * 松手落在快捷目录条目上就把当前多选移过去。非多选态原样放行事件，长按选择不变。
  *
  * ★ 多选态下调用方必须把行的 onLongClick 传 null：combinedClickable 的长按
  *   触发后会 consumeUntilUp 把后续事件全部消费，拖动手势会立刻收到
  *   "事件已被消费"而取消。
+ * ★ 全程在 Initial 遍处理：父节点先于子节点的 clickable 看到事件（Main 遍是
+ *   子先父后），拎起后连 UP 一起消费，松手才不会误触行的点按。
  */
 @Composable
 fun QuickDirDragSource(
     enabled: Boolean,
     host: QuickDirDragHost?,
     onDrop: (cid: String, name: String) -> Unit,
+    /** 拖起来要拿着走的多选快照：begin 时交给 host 存一份，松手后列表怎么变都不影响幻影 */
+    snapshot: List<FileItem> = emptyList(),
     content: @Composable () -> Unit,
 ) {
     var coords by remember { mutableStateOf<LayoutCoordinates?>(null) }
     val currentOnDrop by rememberUpdatedState(onDrop)
+    val currentSnapshot by rememberUpdatedState(snapshot)
+    val haptics by rememberUpdatedState(LocalHapticFeedback.current)
     Box(
         Modifier
             .onGloballyPositioned { coords = it }
             .pointerInput(enabled, host) {
                 if (!enabled || host == null) return@pointerInput
                 val slop = viewConfiguration.touchSlop
+                val longPressTimeout = viewConfiguration.longPressTimeoutMillis
                 awaitEachGesture {
-                    val down = awaitFirstDown(requireUnconsumed = false)
-                    var dragging = false
+                    val down = awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
                     var total = Offset.Zero
+                    var dragging = false
                     var cancelled = false
-                    while (true) {
-                        val event = awaitPointerEvent()
-                        val change = event.changes.firstOrNull { it.id == down.id }
-                        if (change == null || !change.pressed) break
-                        total += change.positionChange()
-                        if (!dragging) {
-                            // 还没定方向：累计位移超过触摸斜距后，横主纵从 → 开始拖动；纵向 → 放弃（列表滚动）
-                            if (total.getDistance() > slop) {
-                                if (kotlin.math.abs(total.x) > kotlin.math.abs(total.y)) {
-                                    dragging = true
-                                    coords?.let { host.begin(it.localToRoot(down.position + total)) }
-                                } else {
-                                    cancelled = true
-                                    break
+
+                    // 阶段一（只旁观不消费）：横向先超斜距 → 立即拎起；纵向先超 → 让位滚动；
+                    // 两样都没发生、静置到长按时长 → 拎起（标准"长按拖动"手感）
+                    var verdict = withTimeoutOrNull(longPressTimeout) {
+                        var v = Pickup.None
+                        while (v == Pickup.None) {
+                            val event = awaitPointerEvent(PointerEventPass.Initial)
+                            val change = event.changes.firstOrNull { it.id == down.id }
+                            if (change == null || !change.pressed) {
+                                v = Pickup.Lifted
+                            } else {
+                                total += change.positionChange()
+                                if (total.getDistance() > slop) {
+                                    v = if (kotlin.math.abs(total.x) > kotlin.math.abs(total.y)) {
+                                        Pickup.Drag
+                                    } else {
+                                        Pickup.Scroll
+                                    }
                                 }
                             }
-                            if (!dragging) continue
                         }
+                        v
+                    } ?: Pickup.Timeout
+                    if (verdict == Pickup.Timeout) {
+                        // 超时瞬间手指可能刚好抬起（up 落在取消窗口里被错过）：看最新事件再定
+                        val change = currentEvent.changes.firstOrNull { it.id == down.id }
+                        if (change == null || !change.pressed) verdict = Pickup.Lifted
+                    }
+                    when (verdict) {
+                        Pickup.Drag, Pickup.Timeout -> dragging = true
+                        Pickup.Scroll -> cancelled = true
+                        else -> {}
+                    }
+
+                    if (dragging) {
+                        haptics.performHapticFeedback(HapticFeedbackType.LongPress)
+                        coords?.let { c ->
+                            host.begin(
+                                c.localToRoot(down.position + total),
+                                // 锚点 = 被抓住那行的中心：幻影从行长出来才有"拎起来"的连续感
+                                c.localToRoot(Offset(c.size.width / 2f, c.size.height / 2f)),
+                                currentSnapshot,
+                            )
+                        }
+                    }
+
+                    // 阶段二（已拎起）：任意方向跟随，Initial 遍连 UP 一起消费
+                    while (dragging) {
+                        val event = awaitPointerEvent(PointerEventPass.Initial)
+                        val change = event.changes.firstOrNull { it.id == down.id } ?: break
+                        total += change.positionChange()
                         change.consume()
+                        if (!change.pressed) break
                         coords?.let { host.dragTo(it.localToRoot(down.position + total)) }
                     }
+
                     if (dragging) {
                         val hit = host.finish()
-                        if (hit != null) currentOnDrop(hit.first, hit.second)
+                        if (hit != null) {
+                            haptics.performHapticFeedback(HapticFeedbackType.LongPress)
+                            currentOnDrop(hit.first, hit.second)
+                        }
                     } else if (cancelled) {
                         host.cancel()
                     }
@@ -702,3 +810,6 @@ fun QuickDirDragSource(
             },
     ) { content() }
 }
+
+/** 手势第一阶段的归宿：横向超斜距=拎起、纵向=让位滚动、半路抬手=普通点按、静置到点=长按拎起 */
+private enum class Pickup { Drag, Scroll, Lifted, Timeout, None }

@@ -4,17 +4,16 @@ import android.app.Activity
 import android.content.Context
 import android.content.ContextWrapper
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.EnterTransition
+import androidx.compose.animation.ExitTransition
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.expandHorizontally
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
-import androidx.compose.animation.scaleIn
-import androidx.compose.animation.shrinkHorizontally
-import androidx.compose.animation.shrinkVertically
 import androidx.compose.animation.slideInHorizontally
 import androidx.compose.animation.slideInVertically
-import androidx.compose.animation.slideOutHorizontally
-import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
@@ -52,11 +51,20 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.draw.drawWithContent
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.layout.boundsInRoot
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.unit.IntSize
+import kotlin.math.hypot
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.currentBackStackEntryAsState
@@ -196,7 +204,47 @@ private fun MainScaffold(container: AppContainer, widthClass: WindowWidthSizeCla
         }
     }
 
-    fun navigate(dest: Dest) = navigateRoute(dest.route)
+    // ---------------- 媒体库入场：暗色水波 ----------------
+    // 点「媒体库」**不立刻切路由**：暗色圆从按键中心扩散铺满全屏，盖严的那一瞬间才
+    // navigate —— 媒体库首帧的重活（DB 查询 + 海报墙组装 + 图片解码）整体藏在纯暗
+    // 背后，随后暗色淡出、溶进媒体库自己的深色底里。原先"淡入+上浮"过渡期间跟页面
+    // 组装抢主线程造成的卡顿生硬，就这么绕开了。
+    var mediaWave by remember { mutableStateOf<Offset?>(null) }
+    val waveRadius = remember { Animatable(0f) }
+    val waveAlpha = remember { Animatable(1f) }
+    var waveAreaSize by remember { mutableStateOf(IntSize.Zero) }
+
+    /** 各导航按键的中心（root 坐标）：水波从被点的那个按键扩散出来 */
+    val navCenters = remember { mutableMapOf<String, Offset>() }
+
+    fun navigate(dest: Dest) {
+        // 波面进行中不响应切页：路由在暗面底下跳变会穿帮
+        if (mediaWave != null) return
+        val center = navCenters[dest.route]
+        if (dest.route == "media" && center != null) {
+            mediaWave = center
+        } else {
+            navigateRoute(dest.route)
+        }
+    }
+
+    LaunchedEffect(mediaWave) {
+        val center = mediaWave ?: return@LaunchedEffect
+        waveRadius.snapTo(0f)
+        waveAlpha.snapTo(1f)
+        // 等一帧：波面 Box 的实际尺寸（onSizeChanged）先落下来
+        withFrameNanos { }
+        val w = waveAreaSize.width.coerceAtLeast(1).toFloat()
+        val h = waveAreaSize.height.coerceAtLeast(1).toFloat()
+        val maxR = hypot(maxOf(center.x, w - center.x), maxOf(center.y, h - center.y))
+        // 扩散：暗色铺满全屏
+        waveRadius.animateTo(maxR, tween(420, easing = FastOutSlowInEasing))
+        // 盖严的瞬间才切路由（导航栏的滑出也发生在纯暗背后，不可见）
+        navigateRoute("media")
+        // 淡出：波色就是媒体库深色方案的 background，淡出即溶进页面底色
+        waveAlpha.animateTo(0f, tween(320))
+        mediaWave = null
+    }
 
     /**
      * 启动首页：导航图起点**恒为文件页**，登录后只往偏好页跳一次。
@@ -234,6 +282,12 @@ private fun MainScaffold(container: AppContainer, widthClass: WindowWidthSizeCla
     var textPreview by remember { mutableStateOf<FileItem?>(null) }
     /** 批量重命名：面板渲染在内容区之内（左侧导航栏保持可见），状态由文件页触发 */
     var batchRename by remember { mutableStateOf<BatchRenameRequest?>(null) }
+    /** 云下载页点任务跳转：待打开的目录 (cid, name)，文件页进页时消费（openByCid） */
+    var pendingCloudJump by remember { mutableStateOf<Pair<String, String>?>(null) }
+    val jumpToCloudDir: (String, String) -> Unit = { cid, name ->
+        pendingCloudJump = cid to name
+        navigateRoute("files")
+    }
 
     // ---------------- 剪贴板识别 / 外部 App 唤起的下载链接 ----------------
 
@@ -309,13 +363,29 @@ private fun MainScaffold(container: AppContainer, widthClass: WindowWidthSizeCla
     }
 
     Scaffold(
+        // 暗色水波画在 Scaffold 全部内容（含导航栏/底栏）之上：drawWithContent 先画
+        // 原内容再补一个圆，波面状态变化只触发重绘、不触发重组；尺寸顺手量给波循环
+        modifier = Modifier
+            .fillMaxSize()
+            .onSizeChanged { waveAreaSize = it }
+            .drawWithContent {
+                drawContent()
+                val center = mediaWave ?: return@drawWithContent
+                drawCircle(
+                    color = MediaWaveDark.copy(alpha = waveAlpha.value),
+                    radius = waveRadius.value,
+                    center = center,
+                )
+            },
         snackbarHost = { SnackbarHost(snackbarHostState) },
         bottomBar = {
-            // 手机底部导航栏：媒体库页下滑收起（滑出+收合高度），回到其他页滑回来
+            // 手机底部导航栏：媒体库页收起。进媒体库时波面已盖严全屏，收起必须**瞬时**
+            // （ExitTransition.None）——任何滑出/淡出都会在暗色淡出时从波面下"闪"出来；
+            // 回到其他页的滑入动画保留
             AnimatedVisibility(
                 visible = !expanded && !immersiveMedia,
                 enter = fadeIn(tween(250)) + slideInVertically(tween(300)) { it / 2 },
-                exit = fadeOut(tween(200)) + slideOutVertically(tween(300)) { it / 2 } + shrinkVertically(tween(300)),
+                exit = ExitTransition.None,
             ) {
                 NavigationBar {
                     val selected = phoneSelectedTab(currentRoute)
@@ -323,6 +393,9 @@ private fun MainScaffold(container: AppContainer, widthClass: WindowWidthSizeCla
                         NavigationBarItem(
                             selected = selected == dest.route,
                             onClick = { navigate(dest) },
+                            modifier = Modifier.onGloballyPositioned {
+                                navCenters[dest.route] = it.boundsInRoot().center
+                            },
                             icon = { Icon(dest.icon, contentDescription = dest.label) },
                             label = { Text(dest.label) },
                         )
@@ -332,17 +405,22 @@ private fun MainScaffold(container: AppContainer, widthClass: WindowWidthSizeCla
         },
     ) { padding ->
         Row(Modifier.fillMaxSize().padding(padding)) {
-            // 平板左侧导航栏：进媒体库向左滑出 + 淡出，同时宽度收合让内容区丝滑扩满
+            // 平板左侧导航栏：同底栏——进媒体库时收起必须瞬时。原来"滑出+收合宽度"的
+            // 退场会让内容区在暗色淡出窗口里被挤着扩宽，波面一透明就看见导航栏闪现、
+            // 页面变形；从媒体库回其他页的滑入+展开保留
             AnimatedVisibility(
                 visible = expanded && !immersiveMedia,
                 enter = fadeIn(tween(250)) + slideInHorizontally(tween(300)) { -it / 2 } + expandHorizontally(tween(300)),
-                exit = fadeOut(tween(200)) + slideOutHorizontally(tween(300)) { -it / 2 } + shrinkHorizontally(tween(300)),
+                exit = ExitTransition.None,
             ) {
                 NavigationRail {
                     destinations.forEach { dest ->
                         NavigationRailItem(
                             selected = currentRoute == dest.route,
                             onClick = { navigate(dest) },
+                            modifier = Modifier.onGloballyPositioned {
+                                navCenters[dest.route] = it.boundsInRoot().center
+                            },
                             icon = { Icon(dest.icon, contentDescription = dest.label) },
                             label = { Text(dest.label) },
                         )
@@ -381,15 +459,15 @@ private fun MainScaffold(container: AppContainer, widthClass: WindowWidthSizeCla
                             onOpenFilterRules = {
                                 destinations.firstOrNull { it.route == "filter" }?.let { navigate(it) }
                             },
+                            pendingJump = pendingCloudJump,
+                            onJumpConsumed = { pendingCloudJump = null },
                         )
                     }
-                    // 媒体库页：淡入 + 轻微上浮缩放，配导航栏滑出，丝滑进全屏
+                    // 媒体库页：入场交给「暗色水波」编排（见 MainScaffold 的 mediaWave）——
+                    // 路由在波面盖严全屏的瞬间才切，这里直接就位即可；退出仍是快速淡出
                     composable(
                         "media",
-                        enterTransition = {
-                            fadeIn(tween(350)) + slideInVertically(tween(350)) { it / 24 } +
-                                scaleIn(initialScale = 0.96f, animationSpec = tween(350))
-                        },
+                        enterTransition = { EnterTransition.None },
                         exitTransition = { fadeOut(tween(200)) },
                     ) {
                         // 媒体库整条线走深色：列表 / 海报墙 / 详情页三屏连成一体，
@@ -413,7 +491,7 @@ private fun MainScaffold(container: AppContainer, widthClass: WindowWidthSizeCla
                         val vm: OfflineViewModel = viewModel(initializer = {
                             OfflineViewModel(container.openApi, container.downloadPrefs)
                         })
-                        OfflineScreen(vm, expanded, snackbarHostState)
+                        OfflineScreen(vm, expanded, snackbarHostState, onJump = jumpToCloudDir)
                     }
                     composable("recycle") {
                         val vm: RecycleViewModel = viewModel(initializer = { RecycleViewModel(container.openApi) })
@@ -432,6 +510,7 @@ private fun MainScaffold(container: AppContainer, widthClass: WindowWidthSizeCla
                             snackbarHostState,
                             showCloudTabs = !expanded,
                             requestedTab = entry.arguments?.getString("tab").orEmpty(),
+                            onCloudJump = jumpToCloudDir,
                         )
                     }
                 composable("rename") {
@@ -558,6 +637,12 @@ private fun MainScaffold(container: AppContainer, widthClass: WindowWidthSizeCla
 
 /** 外部联动处理结果：error 为 null 表示已成功提交 */
 private data class ReturnAsk(val error: String?)
+
+/**
+ * 暗色水波的波面颜色 = Open115DarkTheme 的 background（Theme.kt 的 DarkColors）。
+ * 波色与媒体库页面底色相同，淡出阶段就溶进页面里，看不出切换接缝。
+ */
+private val MediaWaveDark = Color(0xFF1C1C23)
 
 /** 从 Compose 的 context 一路解到宿主 Activity（moveTaskToBack 需要） */
 private fun Context.findHostActivity(): Activity? {

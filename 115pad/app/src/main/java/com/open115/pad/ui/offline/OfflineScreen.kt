@@ -1,7 +1,9 @@
 package com.open115.pad.ui.offline
 
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.border
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -11,6 +13,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
@@ -20,8 +23,11 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Add
 import androidx.compose.material.icons.outlined.CloudDownload
+import androidx.compose.material.icons.outlined.Close
 import androidx.compose.material.icons.outlined.Delete
+import androidx.compose.material.icons.outlined.Folder
 import androidx.compose.material.icons.outlined.Refresh
+import androidx.compose.material.icons.outlined.Search
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Checkbox
@@ -46,6 +52,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -79,6 +86,8 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.size
@@ -104,6 +113,7 @@ class OfflineViewModel(
         val pageCount: Int = 1,
         val total: Long = 0,
         val filter: Int? = null, // null 全部；0 分配中 1 下载中 2 已完成 -1 失败
+        val query: String = "", // 本地搜索：任务名 / 链接 / info_hash
     )
 
     private val _ui = MutableStateFlow(UiState())
@@ -155,32 +165,52 @@ class OfflineViewModel(
         }
     }
 
-    private fun loadPage(page: Int, replace: Boolean) {
+    private fun loadPage(page: Int, replace: Boolean) = viewModelScope.launch { loadPageSync(page, replace) }
+
+    private suspend fun loadPageSync(page: Int, replace: Boolean) {
+        _ui.update { if (replace) it.copy(loading = true, error = null) else it.copy(loadingMore = true) }
+        try {
+            val p = parseOfflineTasks(api.offlineTasks(page = page))
+            val quota = if (replace) {
+                runCatching { parseOfflineQuota(api.offlineQuota()) }.getOrNull()
+            } else null
+            _ui.update {
+                it.copy(
+                    tasks = if (replace) p.tasks else it.tasks + p.tasks,
+                    page = page,
+                    pageCount = p.pageCount ?: 1,
+                    total = p.count?.toLong() ?: 0L,
+                    quotaTotal = quota?.count ?: it.quotaTotal,
+                    quotaSurplus = quota?.surplus ?: it.quotaSurplus,
+                    error = null,
+                )
+            }
+        } catch (e: Exception) {
+            _ui.update { it.copy(error = e.message ?: e.toString()) }
+        } finally {
+            _ui.update { it.copy(loading = false, loadingMore = false) }
+        }
+    }
+
+    /**
+     * 本地搜索（任务名 / 链接 / info_hash）。离线任务没有服务端搜索接口，而列表是分页的，
+     * 只搜"已加载部分"会漏掉没翻到的任务 —— 所以搜索时把剩余分页拉全：任务总量受配额
+     * 限制（几百级），翻完代价可控；Mutex 防连续输入触发并发拉页，guard 防异常接口无限翻。
+     */
+    fun setSearch(q: String) {
+        _ui.update { it.copy(query = q) }
+        if (q.isBlank()) return
         viewModelScope.launch {
-            _ui.update { if (replace) it.copy(loading = true, error = null) else it.copy(loadingMore = true) }
-            try {
-                val p = parseOfflineTasks(api.offlineTasks(page = page))
-                val quota = if (replace) {
-                    runCatching { parseOfflineQuota(api.offlineQuota()) }.getOrNull()
-                } else null
-                _ui.update {
-                    it.copy(
-                        tasks = if (replace) p.tasks else it.tasks + p.tasks,
-                        page = page,
-                        pageCount = p.pageCount ?: 1,
-                        total = p.count?.toLong() ?: 0L,
-                        quotaTotal = quota?.count ?: it.quotaTotal,
-                        quotaSurplus = quota?.surplus ?: it.quotaSurplus,
-                        error = null,
-                    )
+            searchLoadMutex.withLock {
+                var guard = 0
+                while (guard++ < 100 && _ui.value.page < _ui.value.pageCount) {
+                    loadPageSync(_ui.value.page + 1, replace = false)
                 }
-            } catch (e: Exception) {
-                _ui.update { it.copy(error = e.message ?: e.toString()) }
-            } finally {
-                _ui.update { it.copy(loading = false, loadingMore = false) }
             }
         }
     }
+
+    private val searchLoadMutex = Mutex()
 
     // ---- 保存位置持久化：设置一次，后续提交都落到这里 ----
     val saveLocation: kotlinx.coroutines.flow.StateFlow<DownloadPrefs.SaveLocation> =
@@ -223,6 +253,48 @@ class OfflineViewModel(
     } catch (e: Exception) {
         "网络错误：${e.message}"
     }
+
+    /**
+     * 批量删除：逐个调 del_task（轻接口，条间 150ms 防频控），返回 (成功, 失败) 条数。
+     * 收尾做**全量**刷新（replace）而不是静默合并 —— 合并只对第一页生效，
+     * 跨页已删的任务清不掉。
+     */
+    suspend fun deleteBatch(infoHashes: List<String>, delSourceFile: Boolean): Pair<Int, Int> {
+        var ok = 0
+        var failed = 0
+        for (h in infoHashes) {
+            try {
+                val resp = api.offlineDelete(h, if (delSourceFile) 1 else 0)
+                if (resp.envOk()) ok++ else failed++
+            } catch (_: Exception) {
+                failed++
+            }
+            delay(150)
+        }
+        refresh()
+        return ok to failed
+    }
+
+    /**
+     * 跳转目标探测（只有已完成任务有产物可跳）：
+     * 先把 file_id 当目录试列一次 —— BT/多文件任务的产物本身就是个目录，直接进去；
+     * 列不出（单文件任务，file_id 是文件 id，open 接口没有按 id 查文件详情的能力）
+     * 就退到 wp_path_id（保存位置目录），文件就在那里。两个都拿不到才返回 null。
+     */
+    suspend fun resolveJumpTarget(task: OfflineTask): Pair<String, String>? {
+        if (task.status != 2) return null
+        val fid = task.fileId?.takeIf { it.isNotBlank() && it != "0" }
+        if (fid != null) {
+            try {
+                val resp = api.files(cid = fid, limit = 1)
+                if (resp.envOk()) return fid to (task.name ?: "云下载目录")
+            } catch (_: Exception) {
+                // file_id 是文件 id → 走保存位置兜底
+            }
+        }
+        val save = task.wpPathId?.takeIf { it.isNotBlank() }
+        return save?.let { it to "云下载保存位置" }
+    }
 }
 
 private fun statusLabel(status: Int): String = when (status) {
@@ -243,6 +315,8 @@ fun OfflineScreen(
     vm: OfflineViewModel,
     expanded: Boolean,
     snackbarHostState: SnackbarHostState,
+    /** 点击已完成任务 → 跳到产物/保存位置目录；未接线（无法跳转）时为 null */
+    onJump: ((cid: String, name: String) -> Unit)? = null,
 ) {
     var showAdd by remember { mutableStateOf(false) }
     Scaffold(
@@ -266,7 +340,7 @@ fun OfflineScreen(
     ) { padding ->
         OfflineBody(
             vm, snackbarHostState, Modifier.padding(padding), embedded = false,
-            showAdd = showAdd, onAddDismiss = { showAdd = false },
+            showAdd = showAdd, onAddDismiss = { showAdd = false }, onJump = onJump,
         )
     }
 }
@@ -279,12 +353,13 @@ fun OfflineScreen(
 fun OfflineEmbedded(
     vm: OfflineViewModel,
     snackbarHostState: SnackbarHostState,
+    onJump: ((cid: String, name: String) -> Unit)? = null,
 ) {
     var showAdd by remember { mutableStateOf(false) }
     Box(Modifier.fillMaxSize()) {
         OfflineBody(
             vm, snackbarHostState, Modifier.fillMaxSize(), embedded = true,
-            showAdd = showAdd, onAddDismiss = { showAdd = false },
+            showAdd = showAdd, onAddDismiss = { showAdd = false }, onJump = onJump,
         )
         ExtendedFloatingActionButton(
             onClick = { showAdd = true },
@@ -303,17 +378,33 @@ private fun OfflineBody(
     embedded: Boolean,
     showAdd: Boolean,
     onAddDismiss: () -> Unit,
+    onJump: ((cid: String, name: String) -> Unit)? = null,
 ) {
     val ui by vm.ui.collectAsState()
     val saveLocation by vm.saveLocation.collectAsState()
     val scope = rememberCoroutineScope()
     var deleteTarget by remember { mutableStateOf<OfflineTask?>(null) }
 
+    // ---- 多选批量删除：长按卡片进入选择态，全选只作用于当前筛选出的列表 ----
+    val selected = remember { mutableStateListOf<String>() } // infoHash
+    val selectMode = selected.isNotEmpty()
+    var batchDelete by remember { mutableStateOf(false) }
+    BackHandler(enabled = selectMode) { selected.clear() }
+
     // 每次进入本页拉一次第一页：外部唤起/剪贴板刚提交的任务要能立刻看到，
     // 否则已存在的 ViewModel 只有在"有进行中任务"时才会轮询合并。
     LaunchedEffect(Unit) { vm.refresh(silent = true) }
 
-    val shown = if (ui.filter == null) ui.tasks else ui.tasks.filter { it.status == ui.filter }
+    val shown = ui.tasks
+        .filter { ui.filter == null || it.status == ui.filter }
+        .filter {
+            val q = ui.query.trim()
+            q.isBlank() ||
+                it.name?.contains(q, ignoreCase = true) == true ||
+                it.url?.contains(q, ignoreCase = true) == true ||
+                it.infoHash.contains(q, ignoreCase = true)
+        }
+    val allShownSelected = shown.isNotEmpty() && shown.all { it.infoHash in selected }
 
     fun notify(msg: String?) {
         if (msg != null) scope.launch { snackbarHostState.showSnackbar(msg) }
@@ -361,6 +452,52 @@ private fun OfflineBody(
                 }
             }
 
+            // 多选操作栏：全选作用于当前筛选出的列表（含跨页已加载部分）
+            if (selectMode) {
+                Row(
+                    Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 2.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        "已选 ${selected.size} 项",
+                        style = MaterialTheme.typography.labelLarge,
+                        modifier = Modifier.weight(1f),
+                    )
+                    TextButton(onClick = {
+                        if (allShownSelected) selected.clear()
+                        else shown.forEach { if (it.infoHash !in selected) selected.add(it.infoHash) }
+                    }) { Text(if (allShownSelected) "全不选" else "全选") }
+                    TextButton(onClick = { selected.clear() }) { Text("取消") }
+                    Button(onClick = { batchDelete = true }, enabled = selected.isNotEmpty()) {
+                        Icon(Icons.Outlined.Delete, contentDescription = null, modifier = Modifier.size(16.dp))
+                        Spacer(Modifier.width(4.dp))
+                        Text("删除")
+                    }
+                }
+            }
+
+            // 搜索：本地过滤（任务名/链接/hash），输入时 VM 自动把剩余分页拉全
+            OutlinedTextField(
+                value = ui.query,
+                onValueChange = { vm.setSearch(it) },
+                placeholder = { Text("搜索任务名 / 链接 / hash") },
+                leadingIcon = { Icon(Icons.Outlined.Search, contentDescription = null) },
+                trailingIcon = {
+                    if (ui.query.isNotEmpty()) {
+                        IconButton(onClick = { vm.setSearch("") }) {
+                            Icon(Icons.Outlined.Close, contentDescription = "清空搜索")
+                        }
+                    }
+                },
+                singleLine = true,
+                shape = RoundedCornerShape(24.dp),
+                textStyle = MaterialTheme.typography.bodyMedium,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 12.dp, vertical = 4.dp)
+                    .heightIn(min = 48.dp),
+            )
+
             // 状态筛选：轻量分段胶囊
             Row(
                 Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 12.dp),
@@ -401,7 +538,11 @@ private fun OfflineBody(
                             )
                             Spacer(Modifier.height(8.dp))
                             Text(
-                                if (ui.filter == null) "暂无云下载任务" else "该状态下暂无任务",
+                                when {
+                                    ui.query.isNotBlank() -> "没有匹配「${ui.query.trim()}」的任务"
+                                    ui.filter == null -> "暂无云下载任务"
+                                    else -> "该状态下暂无任务"
+                                },
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                             )
                         }
@@ -418,6 +559,22 @@ private fun OfflineBody(
                             ) { task ->
                                 TaskCard(
                                     task = task,
+                                    selectMode = selectMode,
+                                    selected = task.infoHash in selected,
+                                    onToggleSelect = {
+                                        if (task.infoHash in selected) selected.remove(task.infoHash)
+                                        else selected.add(task.infoHash)
+                                    },
+                                    onEnterSelect = {
+                                        if (task.infoHash !in selected) selected.add(task.infoHash)
+                                    },
+                                    onJump = {
+                                        scope.launch {
+                                            val target = vm.resolveJumpTarget(task)
+                                            if (target != null) onJump?.invoke(target.first, target.second)
+                                            else notify("该任务没有可跳转的目录")
+                                        }
+                                    },
                                     onDelete = { deleteTarget = task },
                                 )
                             }
@@ -481,10 +638,50 @@ private fun OfflineBody(
             dismissButton = { TextButton(onClick = { deleteTarget = null }) { Text("取消") } },
         )
     }
+    if (batchDelete) {
+        var deleteSource by remember { mutableStateOf(false) }
+        AlertDialog(
+            onDismissRequest = { batchDelete = false },
+            title = { Text("删除 ${selected.size} 个任务") },
+            text = {
+                Column {
+                    Text("确定删除选中的 ${selected.size} 个云下载任务？")
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Checkbox(checked = deleteSource, onCheckedChange = { deleteSource = it })
+                        Text("同时删除已下载的文件", style = MaterialTheme.typography.bodyMedium)
+                    }
+                }
+            },
+            confirmButton = {
+                Button(onClick = {
+                    val hashes = selected.toList()
+                    val del = deleteSource
+                    batchDelete = false
+                    selected.clear()
+                    scope.launch {
+                        val (ok, failed) = vm.deleteBatch(hashes, del)
+                        notify(
+                            if (failed == 0) "已删除 $ok 个任务"
+                            else "已删除 $ok 个任务，$failed 个失败",
+                        )
+                    }
+                }) { Text("删除") }
+            },
+            dismissButton = { TextButton(onClick = { batchDelete = false }) { Text("取消") } },
+        )
+    }
 }
 
 @Composable
-private fun TaskCard(task: OfflineTask, onDelete: () -> Unit) {
+private fun TaskCard(
+    task: OfflineTask,
+    selectMode: Boolean,
+    selected: Boolean,
+    onToggleSelect: () -> Unit,
+    onEnterSelect: () -> Unit,
+    onJump: () -> Unit,
+    onDelete: () -> Unit,
+) {
     val C = com.open115.pad.ui.theme.AppColors
     val title = task.name ?: task.url ?: task.infoHash
     // 类型识别：磁力链 / 压缩包 / 视频 / 普通（按名称后缀或 url 协议）
@@ -496,39 +693,72 @@ private fun TaskCard(task: OfflineTask, onDelete: () -> Unit) {
         title.substringAfterLast('.', "").lowercase() == it
     }
 
-    com.open115.pad.ui.theme.AppCard(modifier = Modifier.fillMaxWidth()) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            when {
-                isMagnet -> com.open115.pad.ui.theme.KindBadge(title, false, Modifier.size(36.dp))
-                isArchive -> com.open115.pad.ui.theme.KindBadge(
-                    if (title.contains('.')) title else "x.zip", false, Modifier.size(36.dp),
+    // 选中描边画在卡片外圈（Box 层），盖住卡片自带的灰边，选中/取消不糊边
+    Box(
+        Modifier.then(
+            if (selected) Modifier.border(2.dp, C.Accent, com.open115.pad.ui.theme.CardShape)
+            else Modifier
+        ),
+    ) {
+        com.open115.pad.ui.theme.AppCard(
+            modifier = Modifier.fillMaxWidth(),
+            onClick = {
+                when {
+                    selectMode -> onToggleSelect()
+                    task.status == 2 -> onJump() // 未完成任务点了没动作，状态徽章已说明原因
+                }
+            },
+            onLongClick = onEnterSelect,
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                if (selectMode) {
+                    Checkbox(checked = selected, onCheckedChange = { onToggleSelect() })
+                    Spacer(Modifier.width(2.dp))
+                }
+                when {
+                    isMagnet -> com.open115.pad.ui.theme.KindBadge(title, false, Modifier.size(36.dp))
+                    isArchive -> com.open115.pad.ui.theme.KindBadge(
+                        if (title.contains('.')) title else "x.zip", false, Modifier.size(36.dp),
+                    )
+                    isVideo -> com.open115.pad.ui.theme.KindBadge(
+                        if (title.contains('.')) title else "x.mp4", false, Modifier.size(36.dp),
+                    )
+                    else -> com.open115.pad.ui.theme.KindBadge(
+                        if (title.contains('.')) title else "x.bin", false, Modifier.size(36.dp),
+                    )
+                }
+                Spacer(Modifier.width(10.dp))
+                Text(
+                    title,
+                    style = MaterialTheme.typography.bodyMedium,
+                    fontWeight = FontWeight.SemiBold,
+                    color = C.TextPrimary,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f),
                 )
-                isVideo -> com.open115.pad.ui.theme.KindBadge(
-                    if (title.contains('.')) title else "x.mp4", false, Modifier.size(36.dp),
-                )
-                else -> com.open115.pad.ui.theme.KindBadge(
-                    if (title.contains('.')) title else "x.bin", false, Modifier.size(36.dp),
-                )
+                // 已完成任务才有产物可跳：目录按钮明示"打开所在目录"（点卡片同效）
+                if (!selectMode && task.status == 2) {
+                    IconButton(onClick = onJump, modifier = Modifier.size(36.dp)) {
+                        Icon(
+                            Icons.Outlined.Folder,
+                            contentDescription = "打开所在目录",
+                            tint = C.TextTertiary,
+                            modifier = Modifier.size(18.dp),
+                        )
+                    }
+                }
+                if (!selectMode) {
+                    IconButton(onClick = onDelete, modifier = Modifier.size(36.dp)) {
+                        Icon(
+                            Icons.Outlined.Delete,
+                            contentDescription = "删除任务",
+                            tint = C.TextTertiary,
+                            modifier = Modifier.size(18.dp),
+                        )
+                    }
+                }
             }
-            Spacer(Modifier.width(10.dp))
-            Text(
-                title,
-                style = MaterialTheme.typography.bodyMedium,
-                fontWeight = FontWeight.SemiBold,
-                color = C.TextPrimary,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-                modifier = Modifier.weight(1f),
-            )
-            IconButton(onClick = onDelete, modifier = Modifier.size(36.dp)) {
-                Icon(
-                    Icons.Outlined.Delete,
-                    contentDescription = "删除任务",
-                    tint = C.TextTertiary,
-                    modifier = Modifier.size(18.dp),
-                )
-            }
-        }
 
         // 状态徽章行
         Row(
@@ -583,6 +813,7 @@ private fun TaskCard(task: OfflineTask, onDelete: () -> Unit) {
                     color = C.TextSecondary,
                 )
             }
+        }
         }
     }
 }

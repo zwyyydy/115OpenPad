@@ -10,6 +10,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
@@ -87,13 +88,16 @@ fun thumbUrlFor(item: FileItem): String? = when {
     else -> null
 }
 
-/** 文件缩略卡：类型彩色底 + 缩略图（图/视频封面/文件夹封面）兜底。拖动幻影也用它 */
+/**
+ * 文件缩略卡：类型彩色底 + 缩略图（图/视频封面/文件夹封面）兜底。拖动幻影也用它。
+ * [iconSize] 是无缩略图时兜底图标的直径；有缩略图时铺满容器、图标被盖住不可见。
+ */
 @Composable
-internal fun Thumb(item: FileItem, modifier: Modifier = Modifier, iconSize: Int = 24) {
+internal fun Thumb(item: FileItem, modifier: Modifier = Modifier, iconSize: Int = 40) {
     val url = thumbUrlFor(item)
     Box(modifier, contentAlignment = Alignment.Center) {
         // 彩色类型视觉做底层常驻：缩略图加载失败/无缩略图时兜底，避免出现空白图标
-        KindBadge(item.fn, item.isDir, Modifier.size(40.dp))
+        KindBadge(item.fn, item.isDir, Modifier.size(iconSize.dp))
         if (url != null) {
             SubcomposeAsyncImage(
                 model = url,
@@ -118,6 +122,8 @@ fun FileListRow(
     onLongClick: (() -> Unit)?,
     /** 已置顶的文件夹：整行铺一层淡蓝底 + 图钉标记，让置顶区一眼可分 */
     pinned: Boolean = false,
+    /** 最近一次浏览（播放/看图/读文本）的时间戳；0 = 没看过，不显示时间行 */
+    lastViewed: Long = 0,
 ) {
     Row(
         Modifier
@@ -164,6 +170,17 @@ fun FileListRow(
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
             )
+            // 看过/播过/读过的条目：补一行最近浏览时间（数据来自操作记录的播放/看图/读文本三类）
+            // ago 吃毫秒：刚刚 / N 分钟前 / N 天前，超一周落回日期
+            if (lastViewed > 0) {
+                Text(
+                    "最近浏览 " + Format.ago(lastViewed),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = AppColors.AccentDeep,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
         }
         if (pinned) {
             Icon(
@@ -194,6 +211,8 @@ fun FileGridCard(
     onClick: () -> Unit,
     /** null = 不做长按检测（同 FileListRow） */
     onLongClick: (() -> Unit)?,
+    /** 大图标模式：兜底图标放大一档，文字随格子自然变大 */
+    large: Boolean = false,
     /** 已置顶的文件夹：卡片淡蓝底 + 左上角图钉角标 */
     pinned: Boolean = false,
 ) {
@@ -227,7 +246,7 @@ fun FileGridCard(
                     .clip(RoundedCornerShape(8.dp)),
                 contentAlignment = Alignment.Center,
             ) {
-                Thumb(item, Modifier.fillMaxSize(), iconSize = 40)
+                Thumb(item, Modifier.fillMaxSize(), iconSize = if (large) 64 else 40)
                 if (pinned) {
                     // 图钉角标放左上角，与右上角的勾选框分区，互不打架
                     Box(
@@ -262,21 +281,30 @@ fun FileGridCard(
                 item.fn,
                 style = MaterialTheme.typography.bodySmall,
                 textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                // 标题恒占两行：一行名的卡不再比两行名的矮，网格卡高度才能对齐
                 maxLines = 2,
+                minLines = 2,
                 overflow = TextOverflow.Ellipsis,
                 modifier = Modifier
                     .fillMaxWidth()
                     .padding(top = 6.dp),
             )
-            if (!item.isDir) {
-                Text(
-                    Format.size(item.fs),
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    textAlign = androidx.compose.ui.text.style.TextAlign.Center,
-                    maxLines = 1,
-                    modifier = Modifier.fillMaxWidth(),
-                )
+            // 尺寸行恒占位：文件夹没有尺寸，但占住同一行高，卡片高度才一致
+            Box(
+                Modifier
+                    .fillMaxWidth()
+                    .heightIn(min = 18.dp),
+            ) {
+                if (!item.isDir) {
+                    Text(
+                        Format.size(item.fs),
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                        maxLines = 1,
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                }
             }
         }
     }
