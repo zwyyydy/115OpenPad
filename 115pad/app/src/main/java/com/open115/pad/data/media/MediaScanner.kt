@@ -12,18 +12,101 @@ import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.serialization.Serializable
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.io.File
 
 /**
+ * 排队等待扫描的一个任务（一个媒体库一条；多根库的各根由 worker 依次跑）。
+ *
+ * 库的设置（限速 / 体积过滤 / 根路径）在**入队时快照**：任务代表"按下按钮那一刻的样子"，
+ * 之后在队列里等半天、用户改了库的设置，这一轮也不该跟着变（下一轮扫描用新设置）。
+ *
+ * 这个类要**落盘**（见 MediaScanner 的 ScanQueueSnapshot）：所以字段都是可序列化的基本类型，
+ * 库名也是冗余存下来的（重启后不用再查库就能显示"排队中：某某库"）。
+ */
+@Serializable
+data class QueuedScan(
+    val libraryId: Long,
+    val libraryName: String,
+    val rootCids: List<String>,
+    val rootPaths: List<String>,
+    val incremental: Boolean,
+    val rateLimitMs: Long = 0,
+    val minVideoSizeMb: Int = 0,
+) {
+    companion object {
+        /** 按库当前的设置造一个扫描任务 */
+        fun of(library: MediaLibraryEntity, incremental: Boolean) = QueuedScan(
+            libraryId = library.id,
+            libraryName = library.name,
+            rootCids = library.rootCids,
+            rootPaths = library.rootPaths,
+            incremental = incremental,
+            rateLimitMs = library.rateLimitMs,
+            minVideoSizeMb = library.minVideoSizeMb,
+        )
+    }
+}
+
+/**
+ * 落盘的队列快照：[running] 是上次正在跑的那一轮（进程被杀时它只跑了一半），
+ * [pending] 是还没轮到的。
+ *
+ * **分两段存**是为了重启后区别对待（见 [MediaScanner.restoreQueue]）：
+ * running 降级成增量接着跑，pending 原样恢复（用户当时选的是增量还是全量，照旧）。
+ */
+@Serializable
+internal data class ScanQueueSnapshot(
+    val running: QueuedScan? = null,
+    val pending: List<QueuedScan> = emptyList(),
+)
+
+/**
+ * 入队：**同一个库已经在队列里就就地替换**（不换位置），否则排到队尾。
+ *
+ * 替换而不是再排一条：用户连点两次扫描是"改主意"（比如把增量改成全量），不是想扫两遍；
+ * 重复入队的任务也不会把队列顶长。就地不换位置，则是别让重复点击把这一条一直挤到别人后面。
+ *
+ * 纯函数 —— 队列的顺序与去重语义单测直接打这个。
+ */
+internal fun queueWithTask(queue: List<QueuedScan>, task: QueuedScan): List<QueuedScan> {
+    val at = queue.indexOfFirst { it.libraryId == task.libraryId }
+    if (at < 0) return queue + task
+    return queue.toMutableList().also { it[at] = task }
+}
+
+/**
+ * 快照 → 要重新排的任务：上次没跑完的那条**降级成增量**（理由见 [MediaScanner.restoreQueue]），
+ * 排在最前面；当时排着的原样跟在后面（用户选的是增量还是全量，照旧）。
+ *
+ * 纯函数，单测直接打 —— 这条降级规则漏了、或者写成"原样恢复"，
+ * 重启后就会把一个扫了一半的库从头再问一遍。
+ */
+internal fun tasksToRestore(snapshot: ScanQueueSnapshot): List<QueuedScan> =
+    listOfNotNull(snapshot.running?.copy(incremental = true)) + snapshot.pending
+
+/**
  * 媒体库扫描引擎：手动触发、可续跑、带进度。
  * 扫描一个目录 = 列目录（响应里自带全部文件名，聚类零额外请求）→ 聚类 →
  * 逐条下载 .nfo（小文件）解析 → 入库（每条一个事务）→ 预取海报 → 更新 scan_state。
+ *
+ * 多个库可以**同时排进队列**（正在扫的时候再点扫描不再被拒绝），由 worker **顺序执行** ——
+ * 115 有频控，并发扫多个库只会互相拖慢、还更容易撞上限。
+ * 排队 / 取消 / 清空见 [enqueue] / [cancelQueued] / [clearQueue] / [skipCurrent] / [stopAll]。
+ * 队列会落盘（见 [restoreQueue]）：进程被杀之后重启，剩下的任务接着跑。
  *
  * 中断后重启能续跑：已完成的目录**指纹一致**就跳过（见 [dirFingerprintOf]）。
  * 早先只看"目录内 upt 的最大值"，那东西发现不了删除/改名/移入 —— 115 里目录项的 upt
@@ -51,6 +134,8 @@ class MediaScanner(
     /** 海报字节的落盘与直链解析（扫描期预取用）。为 null = 不预取海报 */
     private val imageUrlResolver: ImageUrlResolver? = null,
     private val imageCacheDir: File? = null,
+    /** 队列落盘（重启接着扫）。为 null = 不落盘（一次性实例 / 测试） */
+    private val prefs: MediaPrefs? = null,
 ) {
     /** 扫描阶段：进度条据此决定是"不确定"还是按目录数走 */
     enum class Phase { Idle, Listing, Indexing }
@@ -67,6 +152,10 @@ class MediaScanner(
          * 否则扫描会在删除之后把条目又写回来（见 MediaLibraryScreen 的删除确认）。
          */
         val rootCid: String = "",
+        /** 正在扫的是哪个库；null = 不是为某个库跑的（直接调 [runScan] 的场合） */
+        val libraryId: Long? = null,
+        /** 库名，进度卡片上显示"正在扫描「XX」"；空 = 只显示阶段与目录 */
+        val libraryName: String = "",
         val phase: Phase = Phase.Idle,
         val doneDirs: Int = 0,
         val totalDirs: Int = 0,
@@ -82,6 +171,14 @@ class MediaScanner(
         /** 本次扫描**新下载**的海报张数（命中落盘的不算） */
         val postersFetched: Int = 0,
         val finishedAt: Long = 0,
+        /**
+         * 这次「停止」连带撤掉的排队任务数。
+         *
+         * 「全部停止」停的是一批（当前 + 队列，见 [stopAll]），提示里要说清撤了几个 ——
+         * 不然用户排了 5 个库、只看到"扫描已停止"，会以为剩下的还在等着跑。
+         * 「跳过当前」不清队列，所以不置这个数（后面还会有下一个库接着跑）。
+         */
+        val cancelledQueued: Int = 0,
     )
 
     private val _progress = MutableStateFlow(Progress())
@@ -99,11 +196,278 @@ class MediaScanner(
      */
     private val stopRequested = java.util.concurrent.atomic.AtomicBoolean(false)
 
-    /** 请求停止当前扫描（UI 的「停止」按钮、删库前的收尾）。没在跑就什么都不做 */
-    fun requestStop() {
-        if (!_progress.value.running) return
+    // ---------------- 扫描队列（可排队、顺序执行） ----------------
+
+    private val _pending = MutableStateFlow<List<QueuedScan>>(emptyList())
+
+    /**
+     * 排队等待执行的扫描任务（界面拿它显示「排队中」）。**队首就是下一个要跑的**；
+     * 正在跑的那一条已经出队了，看不到它 —— 它体现在 [progress] 里。
+     */
+    val pending: StateFlow<List<QueuedScan>> = _pending
+
+    /** 队列锁：所有队列改动都在这把锁里做（纯内存操作，synchronized 够用，不必 Mutex） */
+    private val qLock = Any()
+
+    /** 有人在跑 [drain] 循环吗 —— 免得排一次队就起一个循环（多个循环会抢任务、就并发了） */
+    private var draining = false
+
+    /**
+     * 队列 worker 自己的 scope。
+     *
+     * **不能借用调用方的 scope**：界面上的调用点是 rememberCoroutineScope（离开媒体库页就没了，
+     * 扫描会被半路取消）。这个 scope 与进程同寿 —— 排好队之后切页、锁屏都照跑。
+     */
+    private val workerScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    /**
+     * 正在跑的那一条（已经出队了，所以不在 [pending] 里）。
+     *
+     * 界面不直接用它（进度卡上已经有库名了），它在这里是为了**落盘**：
+     * 进程被杀时这一条只跑了一半，重启后要靠它接着跑（见 [restoreQueue]）。
+     */
+    private val _current = MutableStateFlow<QueuedScan?>(null)
+
+    /**
+     * 队列落盘通道。**CONFLATED + 一个写协程**，不直接 launch：
+     * 每条任务起止都写一次，直接并发 launch 可能乱序落盘 —— 旧快照后到，
+     * 重启后就会捡回一条早跑完（或早被撤掉）的任务。通道只留最新一份，写协程按顺序写。
+     */
+    private val persistChannel = Channel<String>(Channel.CONFLATED)
+
+    /** 这一进程里捡过队列了吗（只捡一次，理由见 [restoreQueue]） */
+    private var queueRestored = false
+
+    init {
+        val p = prefs
+        if (p != null) {
+            workerScope.launch {
+                for (json in persistChannel) {
+                    runCatching { p.setScanQueue(json) }
+                        .onFailure { Log.w(TAG, "扫描队列落盘失败: ${it.message}") }
+                }
+            }
+        }
+    }
+
+    /**
+     * 把"当前 + 排队"整份写进偏好。**每次队列变动都调**（入队 / 撤单 / 清空 / 起跑 / 跑完）——
+     * 少调一处的后果是重启后状态对不上（比如把已撤掉的任务捡回来）。
+     *
+     * 落盘是尽力而为：写不进去只记日志（队列是"顺手的事"，不该因为它把扫描本身搞挂）。
+     */
+    private fun persistQueue() {
+        if (prefs == null) return
+        val json = runCatching {
+            // 快照在锁里取：当前 + 排队要**一起**读，不然可能拼出一个"任何时刻都不存在"的组合
+            // （比如刚被撤掉的那条又出现在排队里、而它已经开跑了）。synchronized 可重入，
+            // 所以从别的临界区里调进来也不会自己锁死自己。
+            synchronized(qLock) {
+                queueJson.encodeToString(
+                    ScanQueueSnapshot(running = _current.value, pending = _pending.value),
+                )
+            }
+        }.onFailure { Log.w(TAG, "扫描队列序列化失败: ${it.message}") }.getOrNull() ?: return
+        persistChannel.trySend(json)
+    }
+
+    /**
+     * 排一个扫描任务。**正在扫描时也能排** —— 排到队尾，当前这轮跑完自动开始下一个。
+     * 同一个库已经在队列里（还没轮到）时是**替换**，见 [queueWithTask]。
+     */
+    fun enqueue(task: QueuedScan) {
+        synchronized(qLock) { _pending.value = queueWithTask(_pending.value, task) }
+        persistQueue()
+        ensureDrain()
+    }
+
+    /** 按库当前的设置排队扫一个库（界面「增量/全量扫描」、启动自动扫描都走这里） */
+    fun enqueue(library: MediaLibraryEntity, incremental: Boolean) =
+        enqueue(QueuedScan.of(library, incremental))
+
+    /** 这个库已经有扫描在跑、或者排在队列里吗（启动自动扫描据此不重复排，见 App115） */
+    fun isBusy(libraryId: Long): Boolean =
+        _current.value?.libraryId == libraryId || _pending.value.any { it.libraryId == libraryId }
+
+    /** 撤掉某个库排队中的任务（排队卡片的 ×、删库前）。返回是否真的撤掉了 */
+    fun cancelQueued(libraryId: Long): Boolean {
+        var dropped = false
+        synchronized(qLock) {
+            val rest = _pending.value.filterNot { it.libraryId == libraryId }
+            dropped = rest.size != _pending.value.size
+            if (dropped) _pending.value = rest
+        }
+        if (dropped) persistQueue()
+        return dropped
+    }
+
+    /** 清空队列，返回撤掉了几个任务（「全部停止」连队列一起清时用，见 [stopAll]） */
+    fun clearQueue(): Int {
+        val n = synchronized(qLock) { _pending.value.size.also { _pending.value = emptyList() } }
+        if (n > 0) persistQueue()
+        return n
+    }
+
+    /**
+     * 把上次进程留下的队列捡回来（登录后调；**只捡一次**）。
+     *
+     * 自带一次性开关，不指望调用方记住：登录流会重复发 true（token 刷新也写 DataStore，
+     * 而 loggedInFlow 是 map 出来的），捡两次的后果很实在 —— 一条已经跑完的任务会被重新排回来。
+     *
+     * **正在跑的那一条降级成增量**：它跑完的目录早已写进 scan_state，增量扫描正好从断点接着跑；
+     * 原样按全量恢复的话，会把已经扫完的几百个目录从头再问一遍（白耗频控额度）。
+     *
+     * 顺序：未跑完的那条在前（它是更早的意图），然后是当时排着的。
+     */
+    suspend fun restoreQueue() {
+        val p = prefs ?: return
+        synchronized(qLock) {
+            if (queueRestored) return
+            queueRestored = true
+        }
+        val raw = runCatching { p.scanQueueJson() }.getOrNull()
+        val snapshot = raw?.takeIf { it.isNotBlank() }?.let {
+            runCatching { queueJson.decodeFromString<ScanQueueSnapshot>(it) }
+                .onFailure { e -> Log.w(TAG, "扫描队列读不回来（忽略）: ${e.message}") }
+                .getOrNull()
+        } ?: return
+        if (snapshot.running == null && snapshot.pending.isEmpty()) return
+        val tasks = tasksToRestore(snapshot)
+        tasks.forEach { enqueue(it) }
+        Log.i(
+            TAG,
+            "恢复上次的扫描队列：排队 ${snapshot.pending.size} 个" +
+                (snapshot.running?.let { "，未跑完「${it.libraryName}」（按增量接着扫）" } ?: ""),
+        )
+    }
+
+    /** 队列非空、又没人在跑时启动 drain。入队、以及 drain 自己收尾时都叫它 */
+    private fun ensureDrain() {
+        val start = synchronized(qLock) {
+            if (draining || _pending.value.isEmpty()) {
+                false
+            } else {
+                draining = true
+                true
+            }
+        }
+        if (start) workerScope.launch { drain() }
+    }
+
+    /**
+     * 队列循环：一条接一条顺序跑（115 有频控，并发扫多个库只会互相拖慢、更容易撞上限）。
+     *
+     * 取出任务时顺手**消费掉停止位**：那是上一条任务的停止意图（见 [skipCurrent] / [stopAll]），
+     * 不该让下一个库替它挨这一下 —— 「跳过当前，继续下一个」正是靠这里成立的。
+     */
+    private suspend fun drain() {
+        try {
+            while (true) {
+                val task = synchronized(qLock) {
+                    val head = _pending.value.firstOrNull()
+                    if (head != null) {
+                        _pending.value = _pending.value.drop(1)
+                        _current.value = head
+                        stopRequested.set(false)
+                    }
+                    head
+                } ?: return
+                persistQueue()
+                runCatching { runTask(task) }
+                    .onFailure { Log.w(TAG, "排队扫描「${task.libraryName}」中断: ${it.message}") }
+                // 这一条结束了（跑完 / 库已删跳过 / 抛了都一样）：清掉"正在跑"，落盘
+                synchronized(qLock) { _current.value = null }
+                persistQueue()
+            }
+        } finally {
+            // 释放 + 兜底重启：循环退出与"刚有人入队"撞在一起时（那一方看到 draining=true 就没起新循环），
+            // 这里再看一眼队列 —— 不然那条任务会永远躺在队列里没人跑。
+            synchronized(qLock) { draining = false }
+            ensureDrain()
+        }
+    }
+
+    /** 跑一条排队任务：先确认库还在，再把各根目录依次扫掉 */
+    private suspend fun runTask(task: QueuedScan) {
+        // 库可能在排队期间被删了：**不能扫** —— 扫了就是把条目写进一个不存在的库，
+        // 那些行既进不了海报墙、也不会再被任何一轮扫描清理（删库那条路径已经撤了队列里的它，
+        // 这里是兜底）。只认库不认根：库还在、根路径被改过照扫（那是用户自己的编辑）。
+        if (dao.library(task.libraryId) == null) {
+            Log.i(TAG, "跳过排队扫描「${task.libraryName}」：库已不存在")
+            return
+        }
+        task.rootCids.zip(task.rootPaths).forEach { (cid, path) ->
+            runScan(
+                cid, path,
+                incremental = task.incremental,
+                rateLimitMs = task.rateLimitMs,
+                minVideoSizeMb = task.minVideoSizeMb,
+                libraryId = task.libraryId,
+                libraryName = task.libraryName,
+            )
+        }
+    }
+
+    /**
+     * 跳过当前这一轮，**队列继续**（接着跑下一个）。UI 进度卡上的「跳过当前」。
+     *
+     * 没在跑也照样置停止位：队列里刚被取出、还没开始跑的那一条会在 [runScan] 开头看到它并放弃 ——
+     * 那正是"跳过"该有的样子（那个空隙只有几毫秒，但不置位的话用户在空隙里点跳过会跳不掉）。
+     *
+     * 被跳过的这一轮**不丢进度**：扫完的目录都在 scan_state 里，以后用增量扫描能接着跑。
+     */
+    fun skipCurrent() {
+        stopRequested.set(true)
+        if (_progress.value.running) {
+            _progress.value = _progress.value.copy(stopping = true)
+        }
+    }
+
+    /**
+     * 停当前这一轮 + **清空队列**（UI 排队卡上的「全部停止」、登出）。返回撤掉了几个排队任务。
+     *
+     * 与 [skipCurrent] 的分工：这个是"整批不干了"，那个是"这一个不干了、下一个接着上"。
+     * 一停一批的语义用在这两个地方都成立 —— 用户点「全部停止」时不会还想让后面的跑下去；
+     * 登出更是必须停（没 token 跑下去只会每个目录都失败、白占频控额度）。
+     */
+    fun stopAll(): Int {
+        stopRequested.set(true)
+        val dropped = clearQueue()
+        if (_progress.value.running) {
+            _progress.value = _progress.value.copy(stopping = true, cancelledQueued = dropped)
+        }
+        return dropped
+    }
+
+    /**
+     * 停掉**某一个库**：撤掉它排队中的任务；正在跑的就是它的话，再停这一轮。
+     * 返回 true = 真的停了正在跑的那一轮，调用方要等它收尾（见 [awaitStopped]）。
+     *
+     * 与 [skipCurrent] / [stopAll] 的区别是**不动别的库** —— 删库只该影响被删的那个库，
+     * 拿全局停止来做会把用户排着的其他库一起撤掉。
+     */
+    fun stopLibrary(libraryId: Long): Boolean {
+        cancelQueued(libraryId)
+        if (!_progress.value.running || _progress.value.libraryId != libraryId) return false
         stopRequested.set(true)
         _progress.value = _progress.value.copy(stopping = true)
+        return true
+    }
+
+    /**
+     * 等当前这一轮扫描收尾（[skipCurrent] / [stopAll] / [stopLibrary] 之后用；没在跑就直接返回）。
+     *
+     * 判据是 [Progress.finishedAt] 变没变，**不能等 `running == false`**：队列里还有下一条时，
+     * running 会在"这一条收尾、下一条起跑"之间闪一下 false，而 StateFlow 还会把中间态合并掉 ——
+     * 等它等于"下一个库也扫完了"。
+     *
+     * 超时兜底：万一收尾卡住（比如某个请求挂死），不让调用方永远等下去 ——
+     * 删库那边超时后照常删，最坏留几条孤儿行，比"删不掉"好。
+     */
+    suspend fun awaitStopped(timeoutMs: Long = 15_000) {
+        if (!_progress.value.running) return
+        val before = _progress.value.finishedAt
+        withTimeoutOrNull(timeoutMs) { progress.first { it.finishedAt != before } }
     }
 
     /**
@@ -206,7 +570,7 @@ class MediaScanner(
     }
 
     /**
-     * 实际执行（调用方在自己的 scope 里 launch）：手动触发、可续跑、带进度。
+     * 实际执行（**多由队列 worker 调**，见 [enqueue]；直接调 = 自己负责排队）：可续跑、带进度。
      * incremental=true 时按 scan_state 的 cloudUpt 增量跳过（目录列表 upt 未变 = 无新增资源）；
      * false 为全量扫描（不跳过任何目录）。
      *
@@ -214,8 +578,8 @@ class MediaScanner(
      * 在聚类阶段就滤掉，见 [sniffDirectory]。
      *
      * [libraryId] 非空 = 这一轮是为某个媒体库跑的：跑完把 `libraries.lastScanAt` 写掉
-     * （定时增量扫描靠它判断"距上次扫描够久了吗"）。调用方不给就什么都不记 ——
-     * 扫描器本身不认识"库"这个概念，只认识根目录。
+     * （定时增量扫描靠它判断"距上次扫描够久了吗"），进度里也带上它（界面据此显示是哪个库）。
+     * 调用方不给就什么都不记 —— 扫描器本身不认识"库"这个概念，只认识根目录。
      */
     suspend fun runScan(
         rootCid: String,
@@ -225,16 +589,24 @@ class MediaScanner(
         rateLimitMs: Long = 0,
         minVideoSizeMb: Int = 0,
         libraryId: Long? = null,
+        /** 库名，只用于进度显示（[Progress.libraryName]） */
+        libraryName: String = "",
     ) {
         mutex.withLock {
             if (_progress.value.running) return
-            // 清掉上一轮遗留的停止请求。**必须在 running 判断之后**——
-            // 放前面的话，一次被拒绝的并发调用会把正在跑的那轮扫描的停止标志擦掉。
-            stopRequested.set(false)
+            // 队列间隙里点的停止（上一条刚跑完、这一条已经出队还没开跑）：这一条不跑了。
+            // 与 running = true 在**同一个临界区**里，那个空隙才关得掉。
+            // 顺带把停止位消费掉，不让它留给下一个库（放进队循环也做同样的事，见 [drain]）。
+            if (stopRequested.getAndSet(false)) {
+                Log.i(TAG, "扫描开始前已被停止，跳过 $rootPath")
+                return
+            }
             postersFetched = 0
             _progress.value = Progress(
                 running = true,
                 rootCid = rootCid,
+                libraryId = libraryId,
+                libraryName = libraryName,
                 currentDir = rootPath,
                 phase = Phase.Listing,
             )
@@ -518,7 +890,7 @@ class MediaScanner(
                 )
             }.onFailure { Log.w(TAG, "写扫描记录失败: ${it.message}") }
             // 收尾统一放 finally：正常结束、抛异常、被停止三条路都要把 running 落回去，
-            // 否则 UI 会永远停在"扫描中"、且 requestStop 之后的等待永远等不到
+            // 否则 UI 会永远停在"扫描中"、且 awaitStopped 的等待永远等不到
             _progress.value = _progress.value.copy(
                 running = false,
                 stopping = false,
@@ -1017,6 +1389,15 @@ class MediaScanner(
 
         /** nfo 解析结果的序列化器（缓存里存的是 NfoMeta 的 JSON） */
         private val nfoJson = Json { ignoreUnknownKeys = true; encodeDefaults = true }
+
+        /**
+         * 扫描队列落盘用的 Json。
+         *
+         * `encodeDefaults = true`：快照里的默认值（限速 0 / 过滤 0）要写出来 ——
+         * 省掉它们的话，读回来靠默认值兜底虽然也对，但快照就不是"原样一份"了，
+         * 以后加字段容易读出错觉（哪些是存过的、哪些是补的默认值看不出来）。
+         */
+        internal val queueJson = Json { ignoreUnknownKeys = true; encodeDefaults = true }
 
         /** nfo 缓存的 key：`nfo|v<解析器版本>|<pickCode>|<upt>`（key 带 upt，文件没变就永久命中） */
         fun nfoCacheKey(pickCode: String, upt: Long): String =

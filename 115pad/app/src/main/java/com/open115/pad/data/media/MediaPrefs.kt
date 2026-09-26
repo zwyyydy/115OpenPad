@@ -7,6 +7,7 @@ import androidx.datastore.preferences.core.longPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 
 private val Context.mediaDataStore by preferencesDataStore(name = "media")
@@ -29,6 +30,17 @@ class MediaPrefs(private val context: Context) {
     /** 作品列表的排序方式（作品页表头那个菜单选的），存名字不存序号 —— 序号改了不至于串味 */
     val worksSort: Flow<WorksSort> =
         context.mediaDataStore.data.map { WorksSort.ofName(it[KEY_WORKS_SORT]) }
+
+    /**
+     * 扫描队列的整份快照（JSON，结构见 [MediaScanner] 里的 ScanQueueSnapshot）。
+     *
+     * 存**整份**而不是逐条增删：队列最多几条，一次写清楚比逐条维护简单得多，
+     * 也不会读出"删了一半"的状态。启动时读一次（[scanQueueJson]），之后由扫描器负责写。
+     */
+    suspend fun scanQueueJson(): String? = context.mediaDataStore.data.first()[KEY_SCAN_QUEUE]
+
+    suspend fun setScanQueue(json: String) =
+        context.mediaDataStore.edit { it[KEY_SCAN_QUEUE] = json }
 
     suspend fun setWorksSort(sort: WorksSort) =
         context.mediaDataStore.edit { it[KEY_WORKS_SORT] = sort.name }
@@ -54,6 +66,7 @@ class MediaPrefs(private val context: Context) {
         private val KEY_CACHE_ENABLED = booleanPreferencesKey("cache_enabled")
         private val KEY_CACHE_MAX_MB = longPreferencesKey("cache_max_mb")
         private val KEY_WORKS_SORT = stringPreferencesKey("works_sort")
+        private val KEY_SCAN_QUEUE = stringPreferencesKey("scan_queue")
 
         /**
          * nfo 文本池从总上限里分到的份额（5%）。

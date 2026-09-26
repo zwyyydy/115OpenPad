@@ -6,6 +6,7 @@ import androidx.datastore.preferences.core.longPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.sync.Mutex
@@ -41,7 +42,17 @@ class Session(private val context: Context) {
     val logoutNotice: kotlinx.coroutines.flow.StateFlow<String?> = _logoutNotice
 
     val clientIdFlow: Flow<String> = store.data.map { it[KEY_CLIENT_ID] ?: "" }
-    val loggedInFlow: Flow<Boolean> = store.data.map { !it[KEY_ACCESS_TOKEN].isNullOrBlank() }
+
+    /**
+     * 登录态。
+     *
+     * **必须 distinctUntilChanged**：DataStore 的 `data` 是"这个偏好文件任何一处变了就发一次"，
+     * 而 `map` 不会去重 —— token 刷新写一次 store，就会把 true 再发一遍。下游是
+     * "登录后自动跑一轮增量扫描 + 捡回扫描队列"那种一次性动作（见 App115），
+     * 多发一次就多扫一轮（间隔 0 = 不限的库每次都中招）。
+     */
+    val loggedInFlow: Flow<Boolean> =
+        store.data.map { !it[KEY_ACCESS_TOKEN].isNullOrBlank() }.distinctUntilChanged()
 
     suspend fun currentClientId(): String = clientIdFlow.first()
 

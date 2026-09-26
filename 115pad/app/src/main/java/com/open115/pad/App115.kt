@@ -170,6 +170,8 @@ class AppContainer(context: Context) {
         // （缓存命中时是纯文件判断，不占限速等待；缓存关掉时什么都不做）
         imageUrlResolver = imageUrlResolver,
         imageCacheDir = cacheDir,
+        // 队列落盘：进程被杀之后重启，没轮到 / 没跑完的扫描接着跑（见 restoreQueue）
+        prefs = mediaPrefs,
     )
 
     /** 云下载提交（含持久化的保存位置），手动添加/剪贴板/外部唤起共用 */
@@ -241,19 +243,38 @@ class AppContainer(context: Context) {
         // 登出必须停 —— 没有 token 还继续跑，只会把剩下的文件全跑成失败。
         scope.launch {
             session.loggedInFlow.collect { loggedIn ->
-                if (loggedIn) renameWorker.start(transferScope) else renameWorker.stop()
+                if (loggedIn) {
+                    renameWorker.start(transferScope)
+                } else {
+                    renameWorker.stop()
+                    // 媒体库扫描同理，而且队列化之后更明显：登出时排着 5 个库，
+                    // 不撤的话它们会一个一个跑下去，每个目录都请求失败 —— 白占频控额度。
+                    // stopAll 的语义正是要的：停当前那轮 + 清空队列（队列也一并落盘清掉，
+                    // 不然重启后还会把上一个账号的扫描捡回来）。
+                    // 启动时未登录也会走这里（流立刻发一个 false），此时队列是空的、没在跑，
+                    // 只是把停止位立起来 —— 下一次扫描开始时（队列出队处）就会被清掉，不影响。
+                    mediaScanner.stopAll()
+                }
             }
         }
 
         // 开关打开的库：登录后自动跑一轮**增量**扫描（upt 未变的目录全部跳过，
-        // 代价只有每目录一次列表请求；未登录不跑）。开关是**每库各自**的设置，
-        // mediaScanner 自带互斥，多个库连扫 + 用户随后手动扫描都不会并发。
+        // 代价只有每目录一次列表请求；未登录不跑）。开关是**每库各自**的设置。
+        //
+        // 几个库一起到点时不在这里串着跑，而是**排进 mediaScanner 的队列顺序执行**：
+        // 这样界面上能看见"还有谁在等"，用户在启动扫描期间手动点的扫描也不会像早先那样
+        // 被静默丢弃（那时是先来的那轮占着，后来的直接 return）。
+        //
+        // **先把上次留下的队列捡回来**（进程被杀 / 被系统清掉时剩下的任务）：顺序上它排在
+        // 自动扫描前面 —— 那是用户更早的意图。restoreQueue 自带一次性开关，这条流重复发 true
+        // 也不会重复捡（token 刷新也会让 DataStore 重新发一次）。
         //
         // 「间隔多少小时」也在这里判：**距上次扫描不足就把这个库跳过**（纯本地比较，零请求）。
         // 间隔 0 = 不限 → 每次启动都扫，与这个开关原来的行为一致（老库升级上来不会突变）。
         scope.launch {
             session.loggedInFlow.collect { loggedIn ->
                 if (!loggedIn) return@collect
+                mediaScanner.restoreQueue()
                 val dao = mediaDatabase.mediaDao()
                 val now = System.currentTimeMillis()
                 dao.libraries().first()
@@ -268,14 +289,11 @@ class AppContainer(context: Context) {
                             )
                             return@forEach
                         }
-                        lib.rootCids.zip(lib.rootPaths).forEach { (cid, path) ->
-                            mediaScanner.runScan(
-                                cid, path, incremental = true,
-                                rateLimitMs = lib.rateLimitMs,
-                                minVideoSizeMb = lib.minVideoSizeMb,
-                                libraryId = lib.id,
-                            )
-                        }
+                        // 已经在扫 / 已经排着队（比如刚从落盘里捡回来的那条）就不排第二次：
+                        // enqueue 对同库是**就地替换**，拿自动扫描的增量版盖掉用户要的全量版，
+                        // 会让他"重启前特意排的全量"变成增量
+                        if (mediaScanner.isBusy(lib.id)) return@forEach
+                        mediaScanner.enqueue(lib, incremental = true)
                     }
             }
         }

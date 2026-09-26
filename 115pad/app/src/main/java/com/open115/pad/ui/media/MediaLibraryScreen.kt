@@ -25,6 +25,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Add
+import androidx.compose.material.icons.outlined.Close
 import androidx.compose.material.icons.outlined.History
 import androidx.compose.material.icons.outlined.MoreVert
 import androidx.compose.material.icons.outlined.Update
@@ -71,6 +72,7 @@ import com.open115.pad.data.FileItem
 import com.open115.pad.data.media.MediaLibraryEntity
 import com.open115.pad.data.media.MediaScanner
 import com.open115.pad.data.media.MovieCard
+import com.open115.pad.data.media.QueuedScan
 import com.open115.pad.data.media.WatchHistoryRow
 import com.open115.pad.data.media.WorksSort
 import com.open115.pad.player.PlayerActivity
@@ -80,9 +82,7 @@ import com.open115.pad.ui.history.displayTitle
 import com.open115.pad.ui.history.isFinished
 import com.open115.pad.ui.theme.AdaptiveBody
 import com.open115.pad.util.Format
-import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withTimeoutOrNull
 
 /**
  * 媒体库页（类 Yamby）：左侧独立入口。
@@ -102,6 +102,8 @@ fun MediaLibraryScreen(api: com.open115.pad.data.OpenApi) {
 
     val libraries by dao.libraries().collectAsState(initial = emptyList())
     val scanProgress by container.mediaScanner.progress.collectAsState()
+    // 排队中的扫描任务（扫描中也能继续建 —— 顺序执行）。队首就是下一个要跑的
+    val pendingScans by container.mediaScanner.pending.collectAsState()
 
     var showCreate by remember { mutableStateOf(false) }
     var deleteTarget by remember { mutableStateOf<MediaLibraryEntity?>(null) }
@@ -169,20 +171,15 @@ fun MediaLibraryScreen(api: com.open115.pad.data.OpenApi) {
         value = recentPairs.mapNotNull { byKey[it.first] }
     }
 
-    /** 发起一个库的扫描（增量/全量共用，按钮收进了库卡片的「⋯」菜单） */
+    /**
+     * 发起一个库的扫描（增量/全量共用，按钮收进了库卡片的「⋯」菜单）。
+     *
+     * **只是排队**（不 suspend、也不借界面的 scope）：正在扫别的库时这一条排在队尾等着，
+     * 扫完自动开始 —— 早先是扫描中把按钮置灰、点了也白点。扫描本身跑在扫描器自己的
+     * worker scope 里，离开这一页也不会被取消。
+     */
     fun startScan(lib: MediaLibraryEntity, incremental: Boolean) {
-        scope.launch {
-            container.transferScope.launch {
-                lib.rootCids.zip(lib.rootPaths).forEach { (cid, path) ->
-                    container.mediaScanner.runScan(
-                        cid, path, incremental = incremental,
-                        rateLimitMs = lib.rateLimitMs,
-                        minVideoSizeMb = lib.minVideoSizeMb,
-                        libraryId = lib.id,
-                    )
-                }
-            }
-        }
+        container.mediaScanner.enqueue(lib, incremental)
     }
 
     /** 「继续观看」的卡片点了直接续播（与观影历史页同一套意图：本机源走 localIntent） */
@@ -250,21 +247,44 @@ fun MediaLibraryScreen(api: com.open115.pad.data.OpenApi) {
                 }
             }
 
-            // 全局扫描进度 + 停止。停止**在目录/簇边界生效**（不会打断正在进行的那个请求），
-            // 所以按钮点下去会先变成"停止中…"，等当前这一小步跑完才真的停。
+            // 全局扫描进度 + 跳过。跳过**在目录/簇边界生效**（不会打断正在进行的那个请求），
+            // 所以按钮点下去会先变成"跳过中…"，等当前这一小步跑完才真的跳。
             if (scanProgress.running) {
                 ScanProgressCard(
                     progress = scanProgress,
-                    onStop = { container.mediaScanner.requestStop() },
+                    // 后面还有排队的：这个键是"跳过这一轮，接着跑下一个"（语义变了，文案也要跟着）
+                    hasQueued = pendingScans.isNotEmpty(),
+                    onSkip = { container.mediaScanner.skipCurrent() },
                 )
             } else if (scanProgress.stopped) {
-                // 停止后说清两件事：进度没丢、怎么继续（续扫走增量，它按 scan_state 跳过已扫完的目录）
+                // 停止后说清两件事：进度没丢、怎么继续（续扫走增量，它按 scan_state 跳过已扫完的目录）。
+                // 停止是**连排队一起停**的，撤掉几个也要说 —— 不然排了 5 个库只看到"已停止"，
+                // 会以为剩下的还在等着跑。
                 Text(
-                    "扫描已停止（已完成 ${scanProgress.doneDirs}/${scanProgress.totalDirs} 个目录，已索引 ${scanProgress.moviesIndexed} 部）" +
-                        " · 用「增量扫描」可从断点继续",
+                    // listOfNotNull + joinToString 拼：字符串拼接里的 if 会吞掉后面几段（踩过的坑）
+                    listOfNotNull(
+                        "扫描已停止（已完成 ${scanProgress.doneDirs}/${scanProgress.totalDirs} 个目录，" +
+                            "已索引 ${scanProgress.moviesIndexed} 部）",
+                        if (scanProgress.cancelledQueued > 0) {
+                            "已取消排队中的 ${scanProgress.cancelledQueued} 个任务"
+                        } else {
+                            null
+                        },
+                        "用「增量扫描」可从断点继续",
+                    ).joinToString(" · "),
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
+                )
+            }
+
+            // 排队中的任务：一行一个库，顺序执行。每行都能单独撤（×）——
+            // 「全部停止」是一停一批（连正在跑的那个），只想跳过当前那个用上面进度卡的「跳过当前」。
+            if (pendingScans.isNotEmpty()) {
+                ScanQueueCard(
+                    tasks = pendingScans,
+                    onCancel = { libraryId -> container.mediaScanner.cancelQueued(libraryId) },
+                    onStopAll = { container.mediaScanner.stopAll() },
                 )
             }
 
@@ -333,7 +353,10 @@ fun MediaLibraryScreen(api: com.open115.pad.data.OpenApi) {
                             container = container,
                             refreshTick = wallTick,
                             scanFinishedAt = scanProgress.finishedAt,
-                            scanRunning = scanProgress.running,
+                            // 「扫描中 / 排队中」都是**按库**判的（早先只有一个全局 running，
+                            // 一个库在扫就把所有库的扫描按钮一起置灰 —— 队列化之后没这个问题了）
+                            scanning = scanProgress.running && scanProgress.libraryId == lib.id,
+                            queued = pendingScans.any { it.libraryId == lib.id },
                             compact = compact,
                             onOpen = { openedLib = lib },
                             onScan = { incremental -> startScan(lib, incremental) },
@@ -481,22 +504,32 @@ fun MediaLibraryScreen(api: com.open115.pad.data.OpenApi) {
     }
 
     deleteTarget?.let { lib ->
-        // 这个库正在被扫吗？是的话删除前必须先停 —— 否则扫描会在删除之后继续把条目写回来，
-        // 留下的孤儿行既没有库能进、也不会再被任何一次扫描清理（那个路径已经没有库了）
-        val scanningThis = scanProgress.running && scanProgress.rootCid in lib.rootCids
+        // 这个库正在被扫、或者排在队列里等着扫吗？两种都得先撤掉再删 —— 否则扫描会在删除之后
+        // 继续把条目写回来，留下的孤儿行既没有库能进、也不会再被任何一次扫描清理（那个路径已经没有库了）。
+        // 判据用 libraryId（每轮扫描都带着它）：早先只有 rootCid，库多根时对不齐。
+        val scanningThis = scanProgress.running && scanProgress.libraryId == lib.id
+        val queuedThis = pendingScans.any { it.libraryId == lib.id }
         AlertDialog(
             onDismissRequest = { deleteTarget = null },
             title = { Text("删除媒体库") },
             text = {
                 Text(
-                    "删除「${lib.name}」？只删除索引记录，不会动云盘里的文件。" +
-                        if (scanningThis) "\n\n该库正在扫描，删除会先停止扫描（已扫完的目录不会白跑）。" else "",
+                    // listOfNotNull + joinToString 拼：字符串拼接里的 if 会吞掉后面几段（踩过的坑）
+                    listOfNotNull(
+                        "删除「${lib.name}」？只删除索引记录，不会动云盘里的文件。",
+                        if (scanningThis || queuedThis) {
+                            "\n该库" + (if (scanningThis) "正在扫描" else "还在排队等着扫描") +
+                                "，删除会把它撤下来（已扫完的目录不会白跑）。"
+                        } else {
+                            null
+                        },
+                    ).joinToString(""),
                 )
             },
             confirmButton = {
                 TextButton(onClick = {
                     deleteTarget = null
-                    scope.launch { deleteLibraryFully(container, dao, lib, waitForScan = scanningThis) }
+                    scope.launch { deleteLibraryFully(container, dao, lib) }
                 }) { Text("删除") }
             },
             dismissButton = { TextButton(onClick = { deleteTarget = null }) { Text("取消") } },
@@ -506,26 +539,24 @@ fun MediaLibraryScreen(api: com.open115.pad.data.OpenApi) {
 }
 
 /**
- * 彻底删除一个媒体库：停扫描（如果正在扫它）→ 清索引 → 清该库对应的落盘缓存。
+ * 彻底删除一个媒体库：撤掉它的扫描（正在跑的停掉、排队里的移出）→ 清索引 → 清该库对应的落盘缓存。
  *
  * 顺序不能反：
  * - 先停扫描再清索引 —— 扫描是协程，清完索引它还会继续 upsert，条目又回来了；
- *   所以要先 requestStop 并**等它真的收尾**（running 落回 false）再动数据库。
+ *   所以要**等它真的收尾**再动数据库（见 [MediaScanner.awaitStopped]）。
  *   等待是有界的：停止在目录/簇边界生效，上界约等于一次请求 + 一个限速间隔。
  * - 先收集 pick_code 再清索引 —— 索引一删就查不到该清哪些缓存文件了。
+ *
+ * 用 [MediaScanner.stopLibrary] 而不是 requestStop：后者是界面上的「停止」（一停一批、
+ * 连队列一起清），删一个库不该把用户排着的**其他库**一起撤掉。
  */
 private suspend fun deleteLibraryFully(
     container: com.open115.pad.AppContainer,
     dao: com.open115.pad.data.media.MediaDao,
     lib: MediaLibraryEntity,
-    waitForScan: Boolean,
 ) {
-    if (waitForScan) {
-        container.mediaScanner.requestStop()
-        // 兜底超时：万一收尾卡住（比如某个请求挂死），不能让删除永远不执行。
-        // 超时后照常删 —— 最坏情况是留下几条孤儿行，比"删不掉"好。
-        withTimeoutOrNull(15_000) { container.mediaScanner.progress.first { !it.running } }
-    }
+    // 返回值 = 真的停了正在跑的那一轮（排队里的那条不管有没有在跑都已经被撤掉）
+    if (container.mediaScanner.stopLibrary(lib.id)) container.mediaScanner.awaitStopped()
 
     val paths = lib.rootPaths
     val nfoCodes = mutableListOf<String>()
@@ -595,6 +626,9 @@ private fun LibraryCountState(
  *
  * 操作（增量/全量扫描、编辑、删除）收进右上角「⋯」菜单：原先三个图标按钮常驻，
  * 删除（破坏性）和扫描并列，平板上误触的代价太高。
+ *
+ * 两个扫描菜单项**不再因为"别的库在扫"而置灰**：扫描是排队的，任何时候点都有效
+ * （正在扫这个库时再点 = 排在它后面再扫一遍）。
  */
 @Composable
 private fun LibraryCard(
@@ -604,7 +638,10 @@ private fun LibraryCard(
     /** 内容变了要重查的信号（删片、扫描落了新海报都算），见 PosterStrip / libraryCountState */
     refreshTick: Int,
     scanFinishedAt: Long,
-    scanRunning: Boolean,
+    /** 正在扫这个库 */
+    scanning: Boolean,
+    /** 这个库排在队列里等着扫 */
+    queued: Boolean,
     /** 手机窄屏：海报条从 3 张缩到 2 张并整体变小（见 PosterStrip 的说明） */
     compact: Boolean,
     onOpen: () -> Unit,
@@ -626,6 +663,12 @@ private fun LibraryCard(
                     if (count != null) {
                         Spacer(Modifier.width(8.dp))
                         CountPill(count)
+                    }
+                    // 扫描状态直接标在卡片上：点了扫描之后**必须**看得见它是排在队里还是正在跑，
+                    // 不然"点完没反应"和"没点上"分不出来
+                    if (scanning || queued) {
+                        Spacer(Modifier.width(8.dp))
+                        StatusPill(if (scanning) "扫描中" else "排队中")
                     }
                 }
                 Spacer(Modifier.height(2.dp))
@@ -664,17 +707,23 @@ private fun LibraryCard(
                     Icon(Icons.Outlined.MoreVert, contentDescription = "更多操作")
                 }
                 DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
+                    // 两个扫描项永远可点：扫描中再点就是**排队**（同库再点 = 替换掉排队里的那一条）
                     DropdownMenuItem(
-                        text = { Text("增量扫描（只扫新增；上次停止后也用它继续）") },
-                        enabled = !scanRunning,
+                        text = {
+                            Text(
+                                if (queued) "增量扫描（已在队列中，点此按新方式重排）"
+                                else "增量扫描（只扫新增；上次停止后也用它继续）",
+                            )
+                        },
                         onClick = {
                             menuOpen = false
                             onScan(true)
                         },
                     )
                     DropdownMenuItem(
-                        text = { Text("全量扫描（重新索引全部）") },
-                        enabled = !scanRunning,
+                        text = {
+                            Text(if (queued) "全量扫描（已在队列中，点此改成全量）" else "全量扫描（重新索引全部）")
+                        },
                         onClick = {
                             menuOpen = false
                             onScan(false)
@@ -761,6 +810,24 @@ private fun CountPill(count: Int) {
         color = MaterialTheme.colorScheme.primary,
         modifier = Modifier
             .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.14f), RoundedCornerShape(50))
+            .padding(horizontal = 8.dp, vertical = 2.dp),
+    )
+}
+
+/**
+ * 「扫描中 / 排队中」徽标。
+ *
+ * 用**次要色**（不是主色）：它跟「N 部」并排，两个都用主色会分不清哪个是数字哪个是状态；
+ * 而且这是个临时状态，不该比影片数更抢眼。
+ */
+@Composable
+private fun StatusPill(text: String) {
+    Text(
+        text,
+        style = MaterialTheme.typography.labelMedium,
+        color = MaterialTheme.colorScheme.tertiary,
+        modifier = Modifier
+            .background(MaterialTheme.colorScheme.tertiary.copy(alpha = 0.16f), RoundedCornerShape(50))
             .padding(horizontal = 8.dp, vertical = 2.dp),
     )
 }
@@ -1074,7 +1141,9 @@ private fun LibraryEditDialog(
 @Composable
 private fun ScanProgressCard(
     progress: MediaScanner.Progress,
-    onStop: () -> Unit,
+    /** 队列里还有等着的（决定按钮是"跳过当前"还是"停止"） */
+    hasQueued: Boolean,
+    onSkip: () -> Unit,
 ) {
     val listing = progress.phase == MediaScanner.Phase.Listing
     Surface(
@@ -1085,9 +1154,16 @@ private fun ScanProgressCard(
         Column(Modifier.padding(12.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(
-                    if (listing) "正在列目录" else "正在索引",
+                    // 多库排队之后"正在扫哪个库"成了必须显示的信息（早先只有一条进度，
+                    // 谁在扫就是谁）；没有库名（直接调 runScan 的场合）就只显示阶段
+                    listOfNotNull(
+                        if (listing) "正在列目录" else "正在索引",
+                        progress.libraryName.takeIf { it.isNotBlank() }?.let { "「$it」" },
+                    ).joinToString(""),
                     style = MaterialTheme.typography.titleSmall,
                     fontWeight = FontWeight.SemiBold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
                 )
                 Spacer(Modifier.width(8.dp))
                 Text(
@@ -1098,8 +1174,15 @@ private fun ScanProgressCard(
                     overflow = TextOverflow.Ellipsis,
                     modifier = Modifier.weight(1f),
                 )
-                TextButton(onClick = onStop, enabled = !progress.stopping) {
-                    Text(if (progress.stopping) "停止中…" else "停止")
+                TextButton(onClick = onSkip, enabled = !progress.stopping) {
+                    Text(
+                        when {
+                            // 后面还有排队的：这个键是"跳过当前、接着跑下一个"，说清楚
+                            progress.stopping -> if (hasQueued) "跳过中…" else "停止中…"
+                            hasQueued -> "跳过当前"
+                            else -> "停止"
+                        },
+                    )
                 }
             }
             val barModifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(50))
@@ -1134,6 +1217,79 @@ private fun ScanProgressCard(
         }
     }
 }
+
+/**
+ * 排队中的扫描任务卡片：一行一个库，**顺序执行**（队首是下一个要跑的）。
+ *
+ * 为什么要有这一块：能排队之后"点了扫描"必须看得见 —— 否则用户在扫描中点扫描，
+ * 界面上毫无变化，没法判断是排上了还是没点上。
+ *
+ * 每行的 × 只撤这一个；「全部停止」是**整批不干了**（连正在跑的那一轮一起停，
+ * 见 [MediaScanner.stopAll]）—— 只想跳过当前那个、让后面接着跑，用上面进度卡上的「跳过当前」。
+ *
+ * 行数封顶 [QUEUE_ROWS_SHOWN]：队列里塞了十几个库时，这块卡片会把下面的库列表挤没
+ * （它在 LazyColumn 外面、不跟着滚），多的只报个数，整队清就走「全部停止」。
+ */
+@Composable
+private fun ScanQueueCard(
+    tasks: List<QueuedScan>,
+    onCancel: (libraryId: Long) -> Unit,
+    onStopAll: () -> Unit,
+) {
+    Surface(
+        color = MaterialTheme.colorScheme.surface,
+        shape = RoundedCornerShape(12.dp),
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
+    ) {
+        Column(Modifier.padding(start = 12.dp, end = 4.dp, top = 8.dp, bottom = 8.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    "排队中 ${tasks.size} 个 · 依次扫描",
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.SemiBold,
+                    modifier = Modifier.weight(1f),
+                )
+                TextButton(onClick = onStopAll) { Text("全部停止") }
+            }
+            tasks.take(QUEUE_ROWS_SHOWN).forEach { task ->
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        "${task.libraryName}（${if (task.incremental) "增量" else "全量"}）",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f),
+                    )
+                    IconButton(onClick = { onCancel(task.libraryId) }) {
+                        Icon(
+                            Icons.Outlined.Close,
+                            contentDescription = "取消排队",
+                            modifier = Modifier.size(18.dp),
+                        )
+                    }
+                }
+            }
+            if (tasks.size > QUEUE_ROWS_SHOWN) {
+                Text(
+                    "…还有 ${tasks.size - QUEUE_ROWS_SHOWN} 个（点「全部停止」可一次清掉）",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            // 两个"停"长得像、作用不同，写一行说清分工（不然用户点错还会以为没生效）
+            Text(
+                "想跳过当前那一个、让后面接着跑：用上面进度卡上的「跳过当前」",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(top = 2.dp),
+            )
+        }
+    }
+}
+
+/** 排队卡最多列几行，多的只报个数（见 [ScanQueueCard]） */
+private const val QUEUE_ROWS_SHOWN = 4
 
 /**
  * 媒体库里可以叠起来的浮层（栈顶那个才是当前显示的）。
