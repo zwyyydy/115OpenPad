@@ -1,6 +1,7 @@
 package com.open115.pad.ui.settings
 
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.outlined.Bolt
 import androidx.compose.material.icons.outlined.CloudDownload
 import androidx.compose.material.icons.outlined.FolderOpen
 import androidx.compose.material.icons.outlined.Info
@@ -103,6 +104,7 @@ enum class SettingsCategory(
     PLAYER("播放器", Icons.Outlined.PlayCircle, "播放行为、手势与外挂字幕"),
     UI("界面", Icons.Outlined.Palette, "启动落在哪一页、全屏播放时右上角显示什么"),
     DOWNLOAD("下载", Icons.Outlined.CloudDownload, "链接识别与外部唤起"),
+    TASK("后台任务", Icons.Outlined.Bolt, "任务跑完再让系统回收：前台常驻与电池优化白名单"),
     STORAGE("存储与缓存", Icons.Outlined.FolderOpen, "各类本机缓存的开关、上限与清理"),
     LAB("实验室", Icons.Outlined.Science, "尝鲜功能，不稳定，随时可以关掉"),
     ACCOUNT("账号", Icons.Outlined.PersonOutline, "授权信息与退出登录"),

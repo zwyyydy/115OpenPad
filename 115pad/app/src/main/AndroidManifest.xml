@@ -5,6 +5,23 @@
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
 
     <!--
+      任务常驻（设置 → 后台任务 → 「任务进行时防止被杀」）：
+      扫描媒体库 / 上传 / 重命名期间挂一个前台服务，系统就不会随手回收进程。
+      dataSync 对应"数据同步"这一类任务；Android 14 起这个类型要单独声明下面那条权限。
+    -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+
+    <!-- 前台服务的常驻通知（Android 13+ 要用户同意才显示；不同意也不影响服务本身） -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!--
+      申请忽略电池优化：国产 ROM（华为/小米/OPPO/vivo…）光有前台服务还会被自家省电策略杀，
+      加进白名单是第二层保底。只有用户在设置里主动开那个开关时才会弹系统确认框。
+    -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+
+    <!--
       播放器截图存相册用。Android 10（API 29）起 MediaStore 不需要任何权限，
       所以只在 28 及以下声明（maxSdkVersion 让新系统上这条权限根本不出现）。
     -->
@@ -99,6 +116,15 @@
                 <data android:mimeType="audio/*" />
             </intent-filter>
         </activity>
+
+        <!--
+          任务常驻服务（设置 → 后台任务 → 「任务进行时防止被杀」）：有任务时挂常驻通知保命。
+          exported=false —— 只给自己用；类型 dataSync（上传/下载/扫描都属于这一类）。
+        -->
+        <service
+            android:name=".data.KeepAliveService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
     </application>
 
 </manifest>

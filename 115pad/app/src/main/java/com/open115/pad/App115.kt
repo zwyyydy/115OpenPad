@@ -6,6 +6,7 @@ import android.util.Log
 import com.open115.pad.data.AuthApi
 import com.open115.pad.data.AuthInterceptor
 import com.open115.pad.data.ImageUrlResolver
+import com.open115.pad.data.KeepAliveService
 import com.open115.pad.data.OpenApi
 import com.open115.pad.data.QrApi
 import com.open115.pad.data.Session
@@ -15,7 +16,13 @@ import kotlinx.serialization.json.Json
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.debounce
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -177,6 +184,69 @@ class AppContainer(context: Context) {
     /** 云下载提交（含持久化的保存位置），手动添加/剪贴板/外部唤起共用 */
     val downloadSubmitter = com.open115.pad.data.DownloadSubmitter(downloadPrefs)
 
+    /**
+     * "现在有什么任务在跑" —— 一句话描述，空闲为 null。
+     *
+     * 前台服务（防止被杀，见 [KeepAliveService]）靠它决定要不要常驻、通知上写什么；
+     * 也是全局唯一把三类任务汇总起来的地方。**只算"进程被杀就断"的任务**：
+     *  - 媒体库扫描：进程内协程（靠 scan_state + 落盘队列能续，但断在半路就白等一轮）
+     *  - 上传：进程内协程（有断点续传）
+     *  - 重命名队列：进程内 worker（任务逐条落库）
+     * 不包括云下载（在 115 服务端跑）和本机下载（系统 DownloadManager 扛着，App 死了也照下）。
+     */
+    val taskActivity: StateFlow<String?> = combine(
+        mediaScanner.progress,
+        mediaScanner.pending,
+        transferLog.uploads,
+        renameWorker.activeTaskId,
+    ) { scanning, pending, uploads, renaming ->
+        val bits = buildList {
+            if (scanning.running) {
+                add(
+                    if (scanning.libraryName.isNotBlank()) "正在扫描「${scanning.libraryName}」"
+                    else "正在扫描媒体库",
+                )
+                if (scanning.totalDirs > 0) add("${scanning.doneDirs}/${scanning.totalDirs} 个目录")
+            }
+            if (pending.isNotEmpty()) add("${pending.size} 个扫描排队")
+            val uploading = uploads.count { it.finishedAt == null && !it.paused }
+            if (uploading > 0) add("正在上传 $uploading 个文件")
+            if (renaming != null) add("正在重命名文件")
+        }
+        bits.takeIf { it.isNotEmpty() }?.joinToString(" · ")
+    }.stateIn(scope, SharingStarted.Eagerly, null)
+
+    /**
+     * 盯着"有没有任务在跑"，决定前台服务的起停（设置 → 后台任务）。
+     *
+     * ★ **必须防抖**。任务状态是毫秒级抖动的：队列里上一条刚出队、下一条的 Progress 还没置上
+     *   （`running` 还是 false、`pending` 已经空了）—— 那个空档会被当成"没任务了"。实测不防抖时
+     *   want 在 50 毫秒内翻了 4 次，前台服务刚 `startForeground` 就被系统按
+     *   "有 start 在等 startForeground" 判超时，**直接把进程杀掉**
+     *   （ForegroundServiceDidNotStartInTimeException）。
+     *   防抖 1.2 秒之后：短任务（<1.2s）根本不起服务，任务之间的空档也掀不起浪。
+     */
+    @OptIn(kotlinx.coroutines.FlowPreview::class)
+    private suspend fun watchTasksForKeepAlive(appContext: Context) {
+        combine(appPrefs.keepAlive, taskActivity) { on, act -> on to act }
+            .debounce(KEEP_ALIVE_DEBOUNCE_MS)
+            .distinctUntilChanged()
+            .collect { (on, act) ->
+                if (on && act != null) {
+                    Log.i("App115", "防止被杀：有任务在跑（$act），起前台服务")
+                    KeepAliveService.start(appContext)
+                } else if (KeepAliveService.isRunning) {
+                    // 两种成因分开写：排查"服务怎么没了"时，是任务跑完还是开关被关掉差别很大。
+                    // 只在"服务确实在跑"时才打这一行/才去停它 —— 冷启动本来就没服务，白打一行只添噪音
+                    Log.i(
+                        "App115",
+                        if (!on) "防止被杀：开关关掉了，停前台服务" else "防止被杀：任务跑完了，停前台服务",
+                    )
+                    KeepAliveService.stop(appContext)
+                }
+            }
+    }
+
     init {
         session.refresher = { refreshToken ->
             try {
@@ -192,6 +262,9 @@ class AppContainer(context: Context) {
                 .crossfade(true)
                 .build()
         )
+        // 防杀（设置 → 后台任务 → 「任务进行时防止被杀」）：开关开着 + 有任务 → 前台服务常驻，
+        // 空闲或关掉 → 停掉服务（服务自己也会在空闲时退场，这里管的是"开关被关掉"那一半）。
+        scope.launch { watchTasksForKeepAlive(context) }
         // 登出（含因终态授权码被强制登出）后，本机缓存必须作废：
         // 不清的话，换个账号登录会直接看到上一个账号的目录内容 / 海报 / 简介
         //
@@ -302,3 +375,6 @@ class AppContainer(context: Context) {
 
 val Context.appContainer: AppContainer
     get() = (applicationContext as App115).container
+
+/** 防杀服务的防抖时长（见 [AppContainer.watchTasksForKeepAlive]）*/
+private const val KEEP_ALIVE_DEBOUNCE_MS = 1200L

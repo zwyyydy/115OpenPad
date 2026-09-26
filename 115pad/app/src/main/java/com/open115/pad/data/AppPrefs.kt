@@ -1,6 +1,7 @@
 package com.open115.pad.data
 
 import android.content.Context
+import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
@@ -91,6 +92,20 @@ class AppPrefs(private val context: Context) {
 
     suspend fun setGlassRadiusDp(v: Int) = context.appDataStore.edit { it[KEY_GLASS_RADIUS] = v.coerceIn(0, 28) }
 
+    // ---- 后台任务：任务进行时防止被杀（设置 → 后台任务） ----
+
+    /**
+     * 任务进行时保持进程常驻（默认关）。
+     *
+     * 打开后：扫描媒体库 / 上传 / 重命名**有任务在跑时**挂一个前台服务 + 常驻通知
+     * （见 [KeepAliveService]）；关掉就什么都不做 —— 任务照旧跑，只是切后台/锁屏后
+     * 系统可能回收进程把它断在半路。默认关：它要挂一条常驻通知（还得用户同意通知权限），
+     * 这种事不能默认替用户答应。
+     */
+    val keepAlive: Flow<Boolean> = context.appDataStore.data.map { it[KEY_KEEP_ALIVE] ?: false }
+
+    suspend fun setKeepAlive(on: Boolean) = context.appDataStore.edit { it[KEY_KEEP_ALIVE] = on }
+
     private companion object {
         val KEY_START_PAGE = stringPreferencesKey("start_page")
         val KEY_THEME = stringPreferencesKey("theme_mode")
@@ -100,5 +115,6 @@ class AppPrefs(private val context: Context) {
         val KEY_GLASS_ALPHA = intPreferencesKey("glass_card_alpha")
         val KEY_GLASS_GAP = intPreferencesKey("glass_gap_dp")
         val KEY_GLASS_RADIUS = intPreferencesKey("glass_radius_dp")
+        val KEY_KEEP_ALIVE = booleanPreferencesKey("keep_alive")
     }
 }

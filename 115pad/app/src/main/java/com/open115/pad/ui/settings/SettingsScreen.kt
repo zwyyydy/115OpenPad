@@ -4,6 +4,7 @@ import android.content.Context
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -244,6 +245,35 @@ fun SettingsScreen(container: AppContainer) {
     }
     LaunchedEffect(Unit) { clientId = container.session.currentClientId() }
 
+    // ---- 后台任务（防止被杀）----
+    val keepAlive by container.appPrefs.keepAlive.collectAsState(initial = false)
+    /**
+     * 电池优化白名单**在系统那边**，不是本应用的状态：进页面读一次，回到前台再读一次
+     * （用户很可能刚去系统设置里加完就切回来）。
+     */
+    var batteryWhitelisted by remember { mutableStateOf(com.open115.pad.data.BatteryOptimization.isWhitelisted(context)) }
+    val lifecycleOwner = androidx.compose.ui.platform.LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
+            if (event == androidx.lifecycle.Lifecycle.Event.ON_RESUME) {
+                batteryWhitelisted = com.open115.pad.data.BatteryOptimization.isWhitelisted(context)
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+    /** 打开开关时排队的"下一步"：通知权限框关掉之后才去要电池优化白名单（两个系统框叠一起会互相顶掉） */
+    var requestBatteryAfterPermission by remember { mutableStateOf(false) }
+    val notificationPermission = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) {
+        // 允许与否都无所谓：常驻通知看不见不影响服务本身（我们要的是"进程别被杀"）
+        if (requestBatteryAfterPermission) {
+            requestBatteryAfterPermission = false
+            com.open115.pad.data.BatteryOptimization.request(context)
+        }
+    }
+
     val mp = com.open115.pad.data.media.MediaPrefs
 
     // 壁纸选图 → 裁切流程：选图本身不落盘，进裁切器横竖各裁一次，
@@ -319,6 +349,29 @@ fun SettingsScreen(container: AppContainer) {
         downloadSection(
             autoSubmitClipboard = autoSubmitClipboard,
             onAutoSubmitClipboard = { v -> scope.launch { container.downloadPrefs.setAutoSubmitClipboardDownload(v) } },
+        ),
+        taskSection(
+            keepAlive = keepAlive,
+            batteryWhitelisted = batteryWhitelisted,
+            onKeepAlive = { v ->
+                scope.launch { container.appPrefs.setKeepAlive(v) }
+                // 打开时顺手把两件"系统侧"的事要下来：通知权限（不然常驻通知看不见）与
+                // 电池优化白名单（不然国产 ROM 照样杀）。关掉时什么都不做 —— 已经给过的
+                // 权限不该由我们撤销，白名单用户自己会去系统里改。
+                if (!v) return@taskSection
+                val needNotify = android.os.Build.VERSION.SDK_INT >= 33 &&
+                    androidx.core.content.ContextCompat.checkSelfPermission(
+                        context, android.Manifest.permission.POST_NOTIFICATIONS,
+                    ) != android.content.pm.PackageManager.PERMISSION_GRANTED
+                val needBattery = !com.open115.pad.data.BatteryOptimization.isWhitelisted(context)
+                if (needNotify) {
+                    requestBatteryAfterPermission = needBattery
+                    notificationPermission.launch(android.Manifest.permission.POST_NOTIFICATIONS)
+                } else if (needBattery) {
+                    com.open115.pad.data.BatteryOptimization.request(context)
+                }
+            },
+            onRequestBattery = { com.open115.pad.data.BatteryOptimization.request(context) },
         ),
         storageSection(
             playerCacheEnabled = playerCacheEnabled,
@@ -948,6 +1001,57 @@ private fun downloadSection(
         title = "外部唤起下载",
         subtitle = "支持 mypad://download?url=… 、pan115://… 、magnet: 与「分享到」",
         detail = "外部唤起会直接提交，无需二次确认。",
+    )
+}
+
+/**
+ * 后台任务：任务进行时防止被杀。
+ *
+ * 两行分工：开关管"要不要挂前台服务"（[KeepAliveService]），动作行管系统侧的电池优化白名单
+ * —— 后者是国产 ROM 的第二层保底，用户可能只想加白名单、不想看常驻通知，所以分成两行而不是
+ * 一个开关包办。副标题会显示白名单当前状态（在系统里改的，进页面/回前台时重读）。
+ */
+private fun taskSection(
+    keepAlive: Boolean,
+    batteryWhitelisted: Boolean,
+    onKeepAlive: (Boolean) -> Unit,
+    onRequestBattery: () -> Unit,
+): SettingsSection = section(SettingsCategory.TASK) {
+    group("保持运行")
+    switch(
+        id = "keep_alive",
+        title = "任务进行时防止被杀",
+        subtitle = if (keepAlive) {
+            "已开启：有任务时挂一条常驻通知，进程不易被系统回收"
+        } else {
+            "关着：切后台或锁屏后，任务可能被系统中断"
+        },
+        detail = "扫描媒体库、上传、重命名都是本机在跑：切到后台或锁屏之后系统可能回收进程，" +
+            "任务就断在半路（扫描和上传能从断点续，但白等一轮）。\n\n" +
+            "打开后：有任务在跑时挂一个前台服务 —— 这是 Android 上唯一官方支持的\"别杀我\"手段，" +
+            "代价是任务期间有一条常驻通知；任务跑完，通知和服务一起消失。\n\n" +
+            "本机下载不受影响（那是系统的下载器在跑，应用关了也照下）；云下载在 115 服务端跑，同理不需要它。",
+        checked = keepAlive,
+        onChange = onKeepAlive,
+    )
+    action(
+        id = "battery_whitelist",
+        title = "电池优化白名单",
+        subtitle = if (batteryWhitelisted) {
+            "已在白名单：系统不会因省电策略限制后台"
+        } else {
+            "未加入：点一下去系统里允许"
+        },
+        detail = "华为 / 小米 / OPPO / vivo 这类系统除了前台服务，还有自家的省电策略 —— " +
+            "加进电池优化白名单能少一层被杀的由头。\n\n" +
+            "这些系统往往还有独立的「自启动」「后台弹出界面」（各家叫法不同），" +
+            "那些开关本应用看不到、也改不了，得在系统设置里手动打开。",
+        onClick = onRequestBattery,
+    )
+    info(
+        id = "keep_alive_note",
+        title = "从最近任务里划掉应用，任务仍会停止",
+        subtitle = "多数系统都是这个规矩，只能靠系统设置里的自启动 / 后台白名单兜底",
     )
 }
 
