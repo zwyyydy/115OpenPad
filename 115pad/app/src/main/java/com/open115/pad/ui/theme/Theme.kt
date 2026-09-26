@@ -4,40 +4,90 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.ui.graphics.Color
 
 /**
- * 全局浅色方案：柔和微冷浅灰底（#F8FAFC）+ 纯白卡片 + 高饱和现代蓝（#2563EB）。
- * 刻意不跟随系统深色与动态取色——客户端以浅色轻量质感为基准（播放器内部自成暗色空间）。
+ * 明亮方案（组合期构建：色值来自 [AppColors]，而后者现在是跟随主题的 @Composable 取值）。
+ * 柔和微冷浅灰底（#F8FAFC）+ 纯白卡片 + 高饱和现代蓝（#2563EB）。
+ *
+ * [wallpaper] 激活时的玻璃范围（[glassAlpha] 跟随"卡片不透明度"设置）：
+ * - surface（TopAppBar）与 surfaceContainer（NavigationBar/Rail）→ 半透明白，栏体融进壁纸；
+ * - surfaceContainerHigh/Highest（AlertDialog、DropdownMenu）与 Low（ModalBottomSheet）
+ *   → **保持实底**：这些是浮在页面之上的覆盖层，半透明会把两个叠着的对话框/底层内容
+ *   互相透视（实测：云下载"添加任务"里再开"选择保存位置"，两个对话框文字叠印）。
+ * AppColors.Card 系（自定义卡片）不经过这里，仍由各自控制。
  */
-private val LightColors = lightColorScheme(
-    primary = AppColors.Accent,
-    onPrimary = Color.White,
-    primaryContainer = AppColors.AccentSoft,
-    onPrimaryContainer = AppColors.AccentDeep,
-    secondary = Color(0xFF0284C7),
-    onSecondary = Color.White,
-    tertiary = AppColors.AccentDeep,
-    background = AppColors.Bg,
-    onBackground = AppColors.TextPrimary,
-    surface = AppColors.Card,
-    onSurface = AppColors.TextPrimary,
-    surfaceVariant = AppColors.GraySoft,
-    onSurfaceVariant = AppColors.TextSecondary,
-    surfaceContainer = AppColors.Card,
-    surfaceContainerLow = AppColors.Bg,
-    surfaceContainerHigh = AppColors.Card,
-    outline = Color(0xFFE2E8F0),
-    outlineVariant = AppColors.CardBorder,
-    error = Color(0xFFDC2626),
-    onError = Color.White,
-    errorContainer = AppColors.RedBg,
-    onErrorContainer = AppColors.RedFg,
-)
-
 @Composable
-fun Open115Theme(content: @Composable () -> Unit) {
-    MaterialTheme(colorScheme = LightColors, content = content)
+private fun lightColors(wallpaper: Boolean, glassAlpha: Float): androidx.compose.material3.ColorScheme {
+    val glassSurface = if (wallpaper) AppColors.Card.copy(alpha = glassAlpha) else AppColors.Card
+    return lightColorScheme(
+        primary = AppColors.Accent,
+        onPrimary = Color.White,
+        primaryContainer = AppColors.AccentSoft,
+        onPrimaryContainer = AppColors.AccentDeep,
+        secondary = Color(0xFF0284C7),
+        onSecondary = Color.White,
+        tertiary = AppColors.AccentDeep,
+        background = AppColors.Bg,
+        onBackground = AppColors.TextPrimary,
+        surface = glassSurface,
+        onSurface = AppColors.TextPrimary,
+        surfaceVariant = AppColors.GraySoft,
+        onSurfaceVariant = AppColors.TextSecondary,
+        surfaceContainer = glassSurface,
+        // 浮层容器实底：Low 用实底浅灰（不是半透明的 Bg token），High/Highest 用实底白
+        surfaceContainerLow = LightAppPalette.bg,
+        surfaceContainerHigh = AppColors.Card,
+        surfaceContainerHighest = AppColors.Card,
+        outline = Color(0xFFE2E8F0),
+        outlineVariant = AppColors.CardBorder,
+        error = Color(0xFFDC2626),
+        onError = Color.White,
+        errorContainer = AppColors.RedBg,
+        onErrorContainer = AppColors.RedFg,
+    )
+}
+
+/**
+ * 全局主题入口。
+ *
+ * [dark] 由设置里的「外观」三选一（明亮 / 黑暗 / 跟随系统）解析而来（MainActivity）。
+ * 同时提供两样东西：M3 色彩方案 + [LocalAppPalette] 调色板——
+ * 页面里 `MaterialTheme.colorScheme.*` 与 `AppColors.*` 两套取值必须一起切，缺一就会
+ * 出现"底色变暗、文字还是黑的"这类半身不遂。
+ *
+ * 媒体库不受此开关影响：它自己套 [Open115DarkTheme]（恒暗，沉浸式看片场景）。
+ */
+@Composable
+fun Open115Theme(
+    dark: Boolean = false,
+    wallpaper: Boolean = false,
+    /** 遮罩强度 0..1：决定可读性——壁纸上的白色蒙版 + 页面底色浓度都随它联动 */
+    wallpaperMask: Float = 0f,
+    /** 列表行玻璃卡参数（设置 → 壁纸里可调） */
+    glassCardAlpha: Float = 0.78f,
+    glassGapDp: Int = 8,
+    glassRadiusDp: Int = 14,
+    content: @Composable () -> Unit,
+) {
+    // 壁纸激活（仅明亮模式）：页面底色保底 0.55 的浅色垫底——列表行/设置行这类
+    // 直接压在底色上的文字可读；遮罩滑块拉高时垫底浓度联动加强（0.55→0.9）+
+    // 壁纸上的白蒙加厚。卡片/顶栏恒不透明。0% 遮罩 = 壁纸明显可见但文字仍有底。
+    val palette = (if (dark) DarkAppPalette else LightAppPalette).let {
+        if (wallpaper) it.copy(bg = it.bg.copy(alpha = 0.55f + 0.35f * wallpaperMask.coerceIn(0f, 1f))) else it
+    }
+    CompositionLocalProvider(
+        LocalAppPalette provides palette,
+        LocalWallpaperGlass provides WallpaperGlassStyle(
+            active = wallpaper,
+            cardAlpha = glassCardAlpha,
+            gapDp = glassGapDp,
+            radiusDp = glassRadiusDp,
+        ),
+    ) {
+        MaterialTheme(colorScheme = if (dark) DarkColors else lightColors(wallpaper, glassCardAlpha), content = content)
+    }
 }
 
 /**
@@ -84,8 +134,13 @@ private val DarkColors = darkColorScheme(
     onErrorContainer = Color(0xFFFFD2CF),
 )
 
-/** 媒体库这条线专用：把内容套进深色方案（路由层包一次，三个页面都跟着变） */
+/** 媒体库这条线专用：套深色方案 + 暗调色板，并把壁纸玻璃重置为未激活（媒体库不受壁纸影响），路由层包一次即可 */
 @Composable
 fun Open115DarkTheme(content: @Composable () -> Unit) {
-    MaterialTheme(colorScheme = DarkColors, content = content)
+    CompositionLocalProvider(
+        LocalAppPalette provides DarkAppPalette,
+        LocalWallpaperGlass provides WallpaperGlassStyle(active = false, cardAlpha = 1f, gapDp = 8, radiusDp = 14),
+    ) {
+        MaterialTheme(colorScheme = DarkColors, content = content)
+    }
 }

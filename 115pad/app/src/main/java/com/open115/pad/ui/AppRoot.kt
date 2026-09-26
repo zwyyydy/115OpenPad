@@ -32,6 +32,7 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
+import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.NavigationRail
@@ -145,7 +146,12 @@ private val moreRoutes = listOf("filter", "rename")
 @Composable
 fun AppRoot(container: AppContainer, widthClass: WindowWidthSizeClass) {
     val loggedIn by container.session.loggedInFlow.collectAsState(initial = null)
-    Surface(Modifier.fillMaxSize()) {
+    // 根 Surface 用 background 而非默认 surface：平时两者都被 Scaffold 盖住看不出差别，
+    // 壁纸激活时 background 是半透明 token（Open115Theme 里改的），壁纸才能从这里透出来
+    Surface(
+        Modifier.fillMaxSize(),
+        color = MaterialTheme.colorScheme.background,
+    ) {
         when (loggedIn) {
             null -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                 CircularProgressIndicator()

@@ -2,6 +2,7 @@ package com.open115.pad.ui.components
 
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -125,10 +126,29 @@ fun FileListRow(
     /** 最近一次浏览（播放/看图/读文本）的时间戳；0 = 没看过，不显示时间行 */
     lastViewed: Long = 0,
 ) {
+    // 壁纸激活时行变"玻璃卡"：半透明白底 + 圆角 + 细描边（不透明度/缝隙/圆角在设置里调），
+    // 壁纸从行间缝隙透出；置顶行用更浓的强调底区分。无壁纸时保持原扁平整宽行不变
+    val glass = com.open115.pad.ui.theme.LocalWallpaperGlass.current
+    val glassRadius = glass.radiusDp.dp
+    val glassGapPad = (glass.gapDp / 2).dp
     Row(
         Modifier
             .fillMaxWidth()
-            .then(if (pinned) Modifier.background(AppColors.AccentSoft) else Modifier)
+            .then(if (glass.active) Modifier.padding(horizontal = 12.dp, vertical = glassGapPad) else Modifier)
+            .then(
+                when {
+                    glass.active && pinned -> Modifier
+                        .clip(RoundedCornerShape(glassRadius))
+                        .background(AppColors.AccentSoft.copy(alpha = (glass.cardAlpha + 0.12f).coerceAtMost(1f)))
+                        .border(1.dp, AppColors.CardBorder, RoundedCornerShape(glassRadius))
+                    glass.active -> Modifier
+                        .clip(RoundedCornerShape(glassRadius))
+                        .background(AppColors.Card.copy(alpha = glass.cardAlpha))
+                        .border(1.dp, AppColors.CardBorder, RoundedCornerShape(glassRadius))
+                    pinned -> Modifier.background(AppColors.AccentSoft)
+                    else -> Modifier
+                }
+            )
             .combinedClickable(onClick = onClick, onLongClick = onLongClick)
             .padding(horizontal = 16.dp, vertical = 8.dp),
         verticalAlignment = Alignment.CenterVertically,

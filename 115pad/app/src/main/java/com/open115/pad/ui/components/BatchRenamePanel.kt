@@ -132,7 +132,8 @@ fun BatchRenamePanel(
             ?.plus(1)
     }
 
-    Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.surface) {
+    // 全屏覆盖面板：实底（scheme 的 surface 在壁纸激活时是半透明的，会透出底下的重命名页）
+    Surface(Modifier.fillMaxSize(), color = AppColors.Card) {
         Column(Modifier.fillMaxSize()) {
             TopBar(onDismiss)
 

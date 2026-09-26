@@ -305,7 +305,8 @@ private fun TaskRow(
     }
 }
 
-/** 状态徽章。文案与颜色跟传输中心保持一致，用户不用重新学一套 */
+/** 状态徽章。文案与颜色跟传输中心保持一致，用户不用重新学一套（取 AppColors 需在组合期） */
+@Composable
 private fun statusVisual(task: RenameTask, isActive: Boolean): Pair<String, Pair<androidx.compose.ui.graphics.Color, androidx.compose.ui.graphics.Color>> = when {
     task.finishedAt != null && task.cancelled -> "已取消" to (AppColors.SlateBg to AppColors.SlateFg)
     task.finishedAt != null && task.failed > 0 -> "部分失败" to (AppColors.RedBg to AppColors.RedFg)

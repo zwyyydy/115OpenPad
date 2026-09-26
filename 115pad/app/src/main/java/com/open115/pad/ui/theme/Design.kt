@@ -42,6 +42,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -63,58 +64,130 @@ import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.lazy.grid.items as gridItems
 
 /**
- * 全局设计系统（Design System Tokens）。
+ * 一套完整 UI 调色板：[AppColors] 的全部 Token。
+ * 明亮/黑暗各一版（[LightAppPalette] / [DarkAppPalette]），黑暗模式整体切换。
+ */
+data class AppPalette(
+    val bg: Color, val card: Color, val cardBorder: Color,
+    val accent: Color, val accentDeep: Color, val accentSoft: Color,
+    val textPrimary: Color, val textSecondary: Color, val textTertiary: Color,
+    val graySoft: Color, val divider: Color,
+    val greenBg: Color, val greenFg: Color,
+    val redBg: Color, val redFg: Color,
+    val blueBg: Color, val blueFg: Color,
+    val purpleBg: Color, val purpleFg: Color,
+    val amberBg: Color, val amberFg: Color,
+    val slateBg: Color, val slateFg: Color,
+)
+
+/** 明亮 = 现行配色原样搬入（视觉基准不变） */
+val LightAppPalette = AppPalette(
+    bg = Color(0xFFF8FAFC), card = Color(0xFFFFFFFF), cardBorder = Color(0x0D000000),
+    accent = Color(0xFF2563EB), accentDeep = Color(0xFF1D4ED8), accentSoft = Color(0xFFEFF6FF),
+    textPrimary = Color(0xFF0F172A), textSecondary = Color(0xFF64748B), textTertiary = Color(0xFF94A3B8),
+    graySoft = Color(0xFFF1F5F9), divider = Color(0xFFE2E8F0),
+    greenBg = Color(0xFFDCFCE7), greenFg = Color(0xFF16A34A),
+    redBg = Color(0xFFFEE2E2), redFg = Color(0xFFDC2626),
+    blueBg = Color(0xFFDBEAFE), blueFg = Color(0xFF2563EB),
+    purpleBg = Color(0xFFF3E8FF), purpleFg = Color(0xFF7C3AED),
+    amberBg = Color(0xFFFEF3C7), amberFg = Color(0xFFB45309),
+    slateBg = Color(0xFFF1F5F9), slateFg = Color(0xFF64748B),
+)
+
+/**
+ * 黑暗：冷灰底 + 亮字，与媒体库深色方案（#1C1C23 系）同一气质。
+ * 强调蓝提亮一档（#2563EB 在深底上偏闷）；语义徽章从"浅底深字"翻成"深底亮字"。
+ */
+val DarkAppPalette = AppPalette(
+    bg = Color(0xFF15171C), card = Color(0xFF1F2229), cardBorder = Color(0x1FFFFFFF),
+    accent = Color(0xFF3B82F6), accentDeep = Color(0xFF93C5FD), accentSoft = Color(0xFF1D2E4F),
+    textPrimary = Color(0xFFE6EAF0), textSecondary = Color(0xFF9AA7B8), textTertiary = Color(0xFF667588),
+    graySoft = Color(0xFF272C34), divider = Color(0xFF2D333C),
+    greenBg = Color(0xFF142A1B), greenFg = Color(0xFF4ADE80),
+    redBg = Color(0xFF3A1517), redFg = Color(0xFFF87171),
+    blueBg = Color(0xFF16294B), blueFg = Color(0xFF93C5FD),
+    purpleBg = Color(0xFF2B1C42), purpleFg = Color(0xFFC4B5FD),
+    amberBg = Color(0xFF3A2B10), amberFg = Color(0xFFFBBF24),
+    slateBg = Color(0xFF272C34), slateFg = Color(0xFF9AA7B8),
+)
+
+/** 当前生效的调色板，由 Open115Theme(dark) 按设置提供；[AppColors] 的取值全走这里 */
+val LocalAppPalette = staticCompositionLocalOf { LightAppPalette }
+
+/**
+ * 壁纸激活时列表行"玻璃卡"的样式参数（设置 → 界面显示 → 壁纸里可调）。
+ * [active] 为 false 时列表行保持扁平整宽行。
+ */
+data class WallpaperGlassStyle(
+    val active: Boolean,
+    /** 卡片底不透明度 0..1：越低玻璃感越强 */
+    val cardAlpha: Float,
+    /** 行间缝隙 dp（露壁纸的宽度；每行上下各占一半） */
+    val gapDp: Int,
+    /** 卡片圆角 dp，0 = 直角 */
+    val radiusDp: Int,
+)
+
+/** 壁纸玻璃卡样式，由 Open115Theme 按设置提供；FileListRow 等行组件从这里取 */
+val LocalWallpaperGlass = staticCompositionLocalOf { WallpaperGlassStyle(active = false, cardAlpha = 0.78f, gapDp = 8, radiusDp = 14) }
+
+/**
+ * 全局设计系统（Design System Tokens）色 Token。
  *
  * 视觉基准：柔和微冷浅灰底 + 纯白卡片（1px 微描边 + 微弥散投影）+ 高饱和现代蓝强调色，
- * 对齐 macOS / Raycast 的轻量质感。所有页面共用本文件的 Token 与组件，
- * 严禁在页面里再写死色值 / 圆角 / 阴影。
+ * 对齐 macOS / Raycast 的轻量质感。
  *
- * 尺寸安全基准：
- * - 点击热区 ≥ 44dp；功能图标 20~24dp；微胶囊高 32dp；卡片圆角 12~16dp；基础边距 8/12/16/24dp
- * - 宽屏防拉伸：列表内容用 [AdaptiveBody] 收进 max 960dp 居中容器；
- *   卡片流用 [AdaptiveCardGrid]（GridCells.Adaptive，手机 1 列 / 平板自动多列）
+ * 取值经 [LocalAppPalette] 跟随明亮/黑暗模式：getter 标了 @Composable，调用点
+ * `AppColors.X` 写在组合上下文（含组合期默认参数）即可，无需任何改动——
+ * 但**不能**在非组合上下文取值（remember{} 的计算块、draw lambda 等），先在外面取好再传进去。
  */
 object AppColors {
-    /** 全局页面底色：柔和微冷浅灰 */
-    val Bg = Color(0xFFF8FAFC)
+    /** 全局页面底色：明亮=柔和微冷浅灰 / 黑暗=冷灰 */
+    val Bg: Color @Composable get() = LocalAppPalette.current.bg
 
-    /** 卡片底色：纯白 */
-    val Card = Color(0xFFFFFFFF)
+    /** 卡片底色：明亮=纯白 */
+    val Card: Color @Composable get() = LocalAppPalette.current.card
 
-    /** 卡片描边：rgba(0,0,0,0.05) */
-    val CardBorder = Color(0x0D000000)
+    /** 卡片描边 */
+    val CardBorder: Color @Composable get() = LocalAppPalette.current.cardBorder
 
-    /** 品牌强调色（高饱和现代蓝） */
-    val Accent = Color(0xFF2563EB)
+    /** 品牌强调色（高饱和现代蓝；黑暗版提亮一档保证对比度） */
+    val Accent: Color @Composable get() = LocalAppPalette.current.accent
 
-    /** 强调色深阶（选中态文字） */
-    val AccentDeep = Color(0xFF1D4ED8)
+    /** 强调色深阶（明亮=深蓝 / 黑暗=浅蓝，均保证在对应选中底色上可读） */
+    val AccentDeep: Color @Composable get() = LocalAppPalette.current.accentDeep
 
-    /** 强调色浅底（选中胶囊底 / 激活容器） */
-    val AccentSoft = Color(0xFFEFF6FF)
+    /** 强调色选中底 */
+    val AccentSoft: Color @Composable get() = LocalAppPalette.current.accentSoft
 
     /** 一级文本 */
-    val TextPrimary = Color(0xFF0F172A)
+    val TextPrimary: Color @Composable get() = LocalAppPalette.current.textPrimary
 
-    /** 二级文本（分组标题 / 未选中胶囊） */
-    val TextSecondary = Color(0xFF64748B)
+    /** 二级文本 */
+    val TextSecondary: Color @Composable get() = LocalAppPalette.current.textSecondary
 
-    /** 三级文本（副标题 / 时间戳） */
-    val TextTertiary = Color(0xFF94A3B8)
+    /** 三级文本 */
+    val TextTertiary: Color @Composable get() = LocalAppPalette.current.textTertiary
 
-    /** 微交互浅灰底（未选中胶囊触摸显露） */
-    val GraySoft = Color(0xFFF1F5F9)
+    /** 微交互浅灰底 */
+    val GraySoft: Color @Composable get() = LocalAppPalette.current.graySoft
 
     /** 分隔线 */
-    val Divider = Color(0xFFE2E8F0)
+    val Divider: Color @Composable get() = LocalAppPalette.current.divider
 
-    // ---- 语义徽章（浅底 + 深字） ----
-    val GreenBg = Color(0xFFDCFCE7); val GreenFg = Color(0xFF16A34A)
-    val RedBg = Color(0xFFFEE2E2); val RedFg = Color(0xFFDC2626)
-    val BlueBg = Color(0xFFDBEAFE); val BlueFg = Color(0xFF2563EB)
-    val PurpleBg = Color(0xFFF3E8FF); val PurpleFg = Color(0xFF7C3AED)
-    val AmberBg = Color(0xFFFEF3C7); val AmberFg = Color(0xFFB45309)
-    val SlateBg = Color(0xFFF1F5F9); val SlateFg = Color(0xFF64748B)
+    // ---- 语义徽章：明亮=浅底+深字，黑暗=深底+亮字 ----
+    val GreenBg: Color @Composable get() = LocalAppPalette.current.greenBg
+    val GreenFg: Color @Composable get() = LocalAppPalette.current.greenFg
+    val RedBg: Color @Composable get() = LocalAppPalette.current.redBg
+    val RedFg: Color @Composable get() = LocalAppPalette.current.redFg
+    val BlueBg: Color @Composable get() = LocalAppPalette.current.blueBg
+    val BlueFg: Color @Composable get() = LocalAppPalette.current.blueFg
+    val PurpleBg: Color @Composable get() = LocalAppPalette.current.purpleBg
+    val PurpleFg: Color @Composable get() = LocalAppPalette.current.purpleFg
+    val AmberBg: Color @Composable get() = LocalAppPalette.current.amberBg
+    val AmberFg: Color @Composable get() = LocalAppPalette.current.amberFg
+    val SlateBg: Color @Composable get() = LocalAppPalette.current.slateBg
+    val SlateFg: Color @Composable get() = LocalAppPalette.current.slateFg
 }
 
 /** 卡片圆角基准：12~16dp */
@@ -134,6 +207,10 @@ fun AppCard(
     content: @Composable ColumnScope.() -> Unit,
 ) {
     val shape = CardShape
+    // 壁纸激活时卡片同列表行一起玻璃化（不透明度跟随"卡片不透明度"设置）；
+    // 媒体库等恒暗场景由 Open115DarkTheme 把 LocalWallpaperGlass 重置为未激活
+    val glass = LocalWallpaperGlass.current
+    val cardBg = if (glass.active) AppColors.Card.copy(alpha = glass.cardAlpha) else AppColors.Card
     val base = modifier
         .shadow(
             elevation = 3.dp,
@@ -143,7 +220,7 @@ fun AppCard(
             spotColor = Color(0x16000000),
         )
         .clip(shape)
-        .background(AppColors.Card)
+        .background(cardBg)
         .border(1.dp, AppColors.CardBorder, shape)
     Column(
         modifier = when {
@@ -446,7 +523,8 @@ private val videoExtsToken = setOf(
 )
 private val imageExtsToken = setOf("jpg", "jpeg", "png", "gif", "bmp", "webp", "heic", "avif", "tiff")
 
-/** 按文件名 / 类型推断彩色视觉（双层质感：淡色圆角底 + 深色图标） */
+/** 按文件名 / 类型推断彩色视觉（双层质感：淡色圆角底 + 深色图标）；取 AppColors 需在组合期 */
+@Composable
 fun kindVisualOf(name: String, isDir: Boolean): KindVisual {
     val ext = name.substringAfterLast('.', "").lowercase()
     return when {

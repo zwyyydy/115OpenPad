@@ -4,11 +4,21 @@ import android.content.Intent
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.compose.foundation.background
+import androidx.compose.foundation.isSystemInDarkTheme
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.windowsizeclass.ExperimentalMaterial3WindowSizeClassApi
 import androidx.compose.material3.windowsizeclass.calculateWindowSizeClass
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.lifecycle.lifecycleScope
+import com.open115.pad.data.ThemeMode
 import com.open115.pad.ui.AppRoot
 import com.open115.pad.ui.theme.Open115Theme
+import com.open115.pad.ui.theme.WallpaperLayer
 import com.open115.pad.util.LinkParser
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -32,9 +42,38 @@ class MainActivity : ComponentActivity() {
         hideSystemBars()
         consumeDownloadIntent(intent) // 冷启动带参
         setContent {
-            Open115Theme {
-                val widthClass = calculateWindowSizeClass(this).widthSizeClass
-                AppRoot(container = appContainer, widthClass = widthClass)
+            // 外观三选一（设置 → 界面显示）：明亮 / 黑暗 / 跟随系统。
+            // DataStore 首读是毫秒级，initial 给默认明亮即可，不为此加转圈。
+            val themeMode by appContainer.appPrefs.themeMode.collectAsState(initial = ThemeMode.LIGHT)
+            val wallpaperUri by appContainer.appPrefs.wallpaperUri.collectAsState(initial = null as String?)
+            val wallpaperMask by appContainer.appPrefs.wallpaperMask.collectAsState(initial = 0.45f)
+            val wallpaperBlur by appContainer.appPrefs.wallpaperBlur.collectAsState(initial = 0.3f)
+            val glassAlpha by appContainer.appPrefs.glassCardAlpha.collectAsState(initial = 0.78f)
+            val glassGapDp by appContainer.appPrefs.glassGapDp.collectAsState(initial = 8)
+            val glassRadiusDp by appContainer.appPrefs.glassRadiusDp.collectAsState(initial = 14)
+            val dark = when (themeMode) {
+                ThemeMode.DARK -> true
+                ThemeMode.SYSTEM -> isSystemInDarkTheme()
+                ThemeMode.LIGHT -> false
+            }
+            // 壁纸只作用于明亮模式（用户设定）；黑暗/媒体库/播放器不受影响
+            val wallpaperOn = !dark && wallpaperUri != null
+            Box(Modifier.fillMaxSize().background(Color(0xFFF8FAFC))) {
+                if (wallpaperOn) {
+                    // 壁纸铺在应用最底层：页面底色变半透明透出它，卡片仍不透明
+                    WallpaperLayer(uri = wallpaperUri!!, mask = wallpaperMask, blur = wallpaperBlur)
+                }
+                Open115Theme(
+                    dark = dark,
+                    wallpaper = wallpaperOn,
+                    wallpaperMask = wallpaperMask,
+                    glassCardAlpha = glassAlpha,
+                    glassGapDp = glassGapDp,
+                    glassRadiusDp = glassRadiusDp,
+                ) {
+                    val widthClass = calculateWindowSizeClass(this@MainActivity).widthSizeClass
+                    AppRoot(container = appContainer, widthClass = widthClass)
+                }
             }
         }
     }

@@ -340,6 +340,9 @@ private fun SchemeEditor(
     var pickerOpen by remember { mutableStateOf(false) }
 
     Scaffold(
+        // 全屏覆盖在方案列表之上：容器必须实底（默认 background 在壁纸激活时是半透明的，
+        // 会让底下的列表和壁纸全透出来，文字叠印）
+        containerColor = com.open115.pad.ui.theme.LightAppPalette.bg,
         topBar = {
             TopAppBar(
                 title = { Text(if (isNew) "新建方案" else "编辑方案") },

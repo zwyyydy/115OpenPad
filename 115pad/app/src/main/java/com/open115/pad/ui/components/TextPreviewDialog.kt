@@ -123,7 +123,8 @@ private fun TextPreviewOverlay(
     // 返回键 = 关闭预览，回到文件列表而不是退出程序（和图片画廊一致）
     BackHandler { onDismiss() }
 
-    Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.surface) {
+    // 全屏覆盖层：实底（scheme 的 surface 在壁纸激活时是半透明的，会透出底下的文件页）
+    Surface(Modifier.fillMaxSize(), color = AppColors.Card) {
         Column(Modifier.fillMaxSize()) {
             // 顶栏：文件名 + 元信息 + 下载/关闭
             Row(

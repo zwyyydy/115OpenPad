@@ -2,6 +2,8 @@ package com.open115.pad.ui.settings
 
 import android.content.Context
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -27,6 +29,7 @@ import androidx.compose.material.icons.outlined.ChevronRight
 import androidx.compose.material.icons.outlined.ExpandLess
 import androidx.compose.material.icons.outlined.Info
 import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
@@ -62,6 +65,7 @@ import com.open115.pad.AppContainer
 import com.open115.pad.data.ImageUrlResolver
 import com.open115.pad.data.OpenApi
 import com.open115.pad.data.StartPage
+import com.open115.pad.data.ThemeMode
 import com.open115.pad.data.UserInfo
 import com.open115.pad.ui.components.ConfirmDialog
 import com.open115.pad.ui.components.TextEntryDialog
@@ -108,7 +112,18 @@ fun UserInfoCard(modifier: Modifier = Modifier, api: OpenApi? = null, full: Bool
         }
     }
 
-    Card(modifier = modifier.fillMaxWidth()) {
+    // 壁纸激活时用户卡玻璃化（跟随"卡片不透明度"设置）；未激活保持 M3 默认实底
+    val glass = com.open115.pad.ui.theme.LocalWallpaperGlass.current
+    Card(
+        modifier = modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(
+            containerColor = if (glass.active) {
+                com.open115.pad.ui.theme.AppColors.Card.copy(alpha = glass.cardAlpha)
+            } else {
+                MaterialTheme.colorScheme.surfaceContainerHighest
+            },
+        ),
+    ) {
         when {
             loading && info == null -> Box(
                 Modifier.fillMaxWidth().padding(24.dp),
@@ -202,6 +217,13 @@ fun SettingsScreen(container: AppContainer) {
     val autoSubmitClipboard by container.downloadPrefs.autoSubmitClipboardDownload
         .collectAsState(initial = false)
     val startPage by container.appPrefs.startPage.collectAsState(initial = StartPage.FILES)
+    val themeMode by container.appPrefs.themeMode.collectAsState(initial = ThemeMode.LIGHT)
+    val wallpaperUri by container.appPrefs.wallpaperUri.collectAsState(initial = null as String?)
+    val wallpaperMask by container.appPrefs.wallpaperMask.collectAsState(initial = 0.45f)
+    val wallpaperBlur by container.appPrefs.wallpaperBlur.collectAsState(initial = 0.3f)
+    val glassCardAlpha by container.appPrefs.glassCardAlpha.collectAsState(initial = 0.78f)
+    val glassGapDp by container.appPrefs.glassGapDp.collectAsState(initial = 8)
+    val glassRadiusDp by container.appPrefs.glassRadiusDp.collectAsState(initial = 14)
     val mediaCacheEnabled by container.mediaPrefs.cacheEnabled.collectAsState(initial = true)
     val mediaCacheMaxMb by container.mediaPrefs.cacheMaxMb
         .collectAsState(initial = com.open115.pad.data.media.MediaPrefs.DEFAULT_MAX_MB)
@@ -223,6 +245,28 @@ fun SettingsScreen(container: AppContainer) {
     LaunchedEffect(Unit) { clientId = container.session.currentClientId() }
 
     val mp = com.open115.pad.data.media.MediaPrefs
+
+    // 壁纸选图 → 裁切流程：选图本身不落盘，进裁切器横竖各裁一次，
+    // 裁完的两份结果存应用私有目录（WallpaperCropFlow 内），不再依赖外部 provider 授权
+    var cropUri by remember { mutableStateOf<String?>(null) }
+    val wallpaperPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri != null) cropUri = uri.toString()
+    }
+
+    // 裁切流程浮层：横竖各裁一次，全部完成才落壁纸偏好
+    cropUri?.let { picked ->
+        com.open115.pad.ui.theme.WallpaperCropFlow(
+            uri = picked,
+            onFinished = {
+                scope.launch {
+                    container.appPrefs.setWallpaper(com.open115.pad.ui.theme.wallpaperBasePath(context))
+                }
+                cropUri = null
+            },
+            onCancelled = { cropUri = null },
+        )
+    }
+
     val sections = listOf(
         playerSection(
             speedBoost = speedBoost,
@@ -239,6 +283,28 @@ fun SettingsScreen(container: AppContainer) {
             onSubtitleBottomPercent = { v -> scope.launch { container.playerPrefs.setSubtitleBottomPercent((v / 5).roundToInt() * 5) } },
         ),
         uiSection(
+            themeMode = themeMode,
+            onThemeMode = { m -> scope.launch { container.appPrefs.setThemeMode(m) } },
+            wallpaperUri = wallpaperUri,
+            wallpaperMask = wallpaperMask,
+            wallpaperBlur = wallpaperBlur,
+            glassCardAlpha = glassCardAlpha,
+            glassGapDp = glassGapDp,
+            glassRadiusDp = glassRadiusDp,
+            onPickWallpaper = { wallpaperPicker.launch(arrayOf("image/*")) },
+            onClearWallpaper = {
+                scope.launch {
+                    withContext(Dispatchers.IO) {
+                        runCatching { java.io.File(context.filesDir, "wallpaper").deleteRecursively() }
+                    }
+                    container.appPrefs.setWallpaper(null)
+                }
+            },
+            onWallpaperMask = { v -> scope.launch { container.appPrefs.setWallpaperMask(v) } },
+            onWallpaperBlur = { v -> scope.launch { container.appPrefs.setWallpaperBlur(v) } },
+            onGlassCardAlpha = { v -> scope.launch { container.appPrefs.setGlassCardAlpha(v) } },
+            onGlassGapDp = { v -> scope.launch { container.appPrefs.setGlassGapDp(v) } },
+            onGlassRadiusDp = { v -> scope.launch { container.appPrefs.setGlassRadiusDp(v) } },
             startPage = startPage,
             showClock = showClock,
             showBattery = showBattery,
@@ -745,6 +811,21 @@ private fun playerSection(
 }
 
 private fun uiSection(
+    themeMode: ThemeMode,
+    onThemeMode: (ThemeMode) -> Unit,
+    wallpaperUri: String?,
+    wallpaperMask: Float,
+    wallpaperBlur: Float,
+    glassCardAlpha: Float,
+    glassGapDp: Int,
+    glassRadiusDp: Int,
+    onPickWallpaper: () -> Unit,
+    onClearWallpaper: () -> Unit,
+    onWallpaperMask: (Float) -> Unit,
+    onWallpaperBlur: (Float) -> Unit,
+    onGlassCardAlpha: (Float) -> Unit,
+    onGlassGapDp: (Int) -> Unit,
+    onGlassRadiusDp: (Int) -> Unit,
     startPage: StartPage,
     showClock: Boolean,
     showBattery: Boolean,
@@ -757,6 +838,16 @@ private fun uiSection(
     onShowSpecBadge: (Boolean) -> Unit,
 ): SettingsSection = section(SettingsCategory.UI) {
     choice(
+        id = "theme",
+        title = "外观",
+        subtitle = "明亮 / 黑暗 / 跟随系统",
+        detail = "黑暗作用于文件、传输、设置等页面。媒体库恒为深色（沉浸式看片），播放器自成暗色空间，均不受此开关影响。",
+        options = listOf("明亮" to ThemeMode.LIGHT, "黑暗" to ThemeMode.DARK, "跟随系统" to ThemeMode.SYSTEM),
+        selected = themeMode,
+        onSelect = onThemeMode,
+    )
+
+    choice(
         id = "start_page",
         title = "启动首页",
         subtitle = "程序启动后默认显示哪一页，下次启动生效",
@@ -765,6 +856,73 @@ private fun uiSection(
         selected = startPage,
         onSelect = onStartPage,
     )
+
+    group("壁纸（仅明亮模式显示）")
+    action(
+        id = "wallpaper_pick",
+        title = "选择壁纸图片",
+        subtitle = if (wallpaperUri != null) "已设置，点按更换" else "从设备选取一张图片",
+        onClick = onPickWallpaper,
+    )
+    if (wallpaperUri != null) {
+        action(
+            id = "wallpaper_clear",
+            title = "恢复默认背景",
+            subtitle = "移除壁纸，回到纯色背景",
+            danger = true,
+            confirm = "确定移除壁纸？",
+        ) { onClearWallpaper() }
+        slider(
+            id = "wallpaper_mask",
+            title = "遮罩强度",
+            valueText = "${(wallpaperMask * 100).roundToInt()}%",
+            value = wallpaperMask,
+            range = 0f..1f,
+            steps = 10,
+            subtitle = "壁纸上的白色蒙版，越强文字越清楚",
+            onChange = onWallpaperMask,
+        )
+        slider(
+            id = "wallpaper_blur",
+            title = "模糊强度",
+            valueText = "${(wallpaperBlur * 100).roundToInt()}%",
+            value = wallpaperBlur,
+            range = 0f..1f,
+            steps = 10,
+            subtitle = "越高越朦胧",
+            onChange = onWallpaperBlur,
+        )
+        slider(
+            id = "glass_card_alpha",
+            title = "卡片不透明度",
+            valueText = "${(glassCardAlpha * 100).roundToInt()}%",
+            value = glassCardAlpha,
+            range = 0f..1f,
+            steps = 9,
+            subtitle = "列表行玻璃卡的底，越低玻璃感越强、越依赖遮罩",
+            onChange = onGlassCardAlpha,
+        )
+        slider(
+            id = "glass_gap",
+            title = "行间缝隙",
+            valueText = "$glassGapDp dp",
+            value = glassGapDp.toFloat(),
+            range = 0f..16f,
+            steps = 7,
+            subtitle = "卡片之间露壁纸的缝隙宽度",
+            onChange = { onGlassGapDp(it.roundToInt()) },
+        )
+        slider(
+            id = "glass_radius",
+            title = "卡片圆角",
+            valueText = "$glassRadiusDp dp",
+            value = glassRadiusDp.toFloat(),
+            range = 0f..28f,
+            steps = 13,
+            subtitle = "0 = 直角",
+            onChange = { onGlassRadiusDp(it.roundToInt()) },
+        )
+    }
 
     group("全屏播放时右上角")
     switch("hud_clock", "显示实时时间", "当前系统时钟，每分钟同步", checked = showClock, onChange = onShowClock)
