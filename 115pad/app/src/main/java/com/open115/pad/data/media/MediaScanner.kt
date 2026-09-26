@@ -507,8 +507,11 @@ class MediaScanner(
      *
      * 兜底两道：`page.items` 为空就停（服务端 count 不准时不至于死循环）、
      * 总页数封顶 [MAX_PAGES]（真遇到病态目录宁可少扫也不能把频控额度耗光）。
+     *
+     * [dirPath] 只用于日志：光打 cid 的话那句"只取到 X/Y 项"没人看得懂是哪个目录
+     * （排查"某个目录少扫了内容"时，路径才是能对上号的那个信息）。
      */
-    private suspend fun listFiles(cid: String, rateLimitMs: Long): FilesPage {
+    private suspend fun listFiles(cid: String, dirPath: String, rateLimitMs: Long): FilesPage {
         val first = parseFilesResponse(
             run { throttle(rateLimitMs); openApi.files(cid = cid, limit = PAGE_SIZE) },
         )
@@ -526,7 +529,7 @@ class MediaScanner(
             all += page.items
         }
         if (all.size < first.count) {
-            Log.w(TAG, "目录 $cid 只取到 ${all.size}/${first.count} 项（分页上限 $MAX_PAGES 页）")
+            Log.w(TAG, "目录 $dirPath 只取到 ${all.size}/${first.count} 项（分页上限 $MAX_PAGES 页，cid=$cid）")
         }
         return first.copy(items = all)
     }
@@ -592,13 +595,21 @@ class MediaScanner(
         /** 库名，只用于进度显示（[Progress.libraryName]） */
         libraryName: String = "",
     ) {
+        /**
+         * 日志里标识"这一轮扫的是哪个库的哪个根"。
+         *
+         * 队列化之后日志里会连着出现好几个库的好几轮扫描 —— 光有"跳过 7/7 个目录"认不出是谁，
+         * 只给库名又认不出多根库的哪一个根，所以两样都给（单根库看着有点冗余，但读日志的人
+         * 不用再去查一遍库表）。库名为空（直接调 runScan 的场合）时只剩路径。
+         */
+        val roundLabel = if (libraryName.isBlank()) rootPath else "$libraryName:$rootPath"
         mutex.withLock {
             if (_progress.value.running) return
             // 队列间隙里点的停止（上一条刚跑完、这一条已经出队还没开跑）：这一条不跑了。
             // 与 running = true 在**同一个临界区**里，那个空隙才关得掉。
             // 顺带把停止位消费掉，不让它留给下一个库（放进队循环也做同样的事，见 [drain]）。
             if (stopRequested.getAndSet(false)) {
-                Log.i(TAG, "扫描开始前已被停止，跳过 $rootPath")
+                Log.i(TAG, "「$roundLabel」在开始前被停止，这一轮跳过")
                 return
             }
             postersFetched = 0
@@ -629,7 +640,7 @@ class MediaScanner(
             if (stopRequested.get()) {
                 // 列目录阶段没有写入，停在这里没有任何损失（续扫会重新列）
                 stoppedEarly = true
-                Log.i(TAG, "扫描在列目录阶段被停止")
+                Log.i(TAG, "「$roundLabel」扫描在列目录阶段被停止")
             } else {
                 // 老数据自愈：哪些目录还是"元数据与视频分成两条"的样子（`ABC-101-4K-C` + `ABC-101-U`）。
                 // 合并逻辑是后加的，而指纹一致时下面的循环会跳过这个目录 —— 不特判就永远合不起来。
@@ -655,7 +666,7 @@ class MediaScanner(
                         continue
                     }
                     // includeSubDirs=false 时 collectDirs 没列过这个目录，这里补一次
-                    val page = listing.page ?: listFiles(listing.cid, rateLimitMs)
+                    val page = listing.page ?: listFiles(listing.cid, listing.path, rateLimitMs)
                     val files = fileRefsOf(page)
                     // 以前扫进去的"附加内容"（花絮/预告）要清掉：那些目录现在被屏蔽了、
                     // 不会再出现在 allDirs 里，靠循环末尾那套"陈旧条目清理"永远够不着它们，
@@ -693,7 +704,7 @@ class MediaScanner(
                             if (includeSubDirs && (wantFanart || wantActors) &&
                                 dao.rowsMissingSideArt(listing.cid, wantFanart, wantActors) > 0
                             ) {
-                                val art = sideArtOf(page.items, rateLimitMs)
+                                val art = sideArtOf(page.items, listing.path, rateLimitMs)
                                 dao.backfillSideArtInDir(
                                     dirKey = listing.cid,
                                     fanartCodes = encodePickCodes(art.fanart.map { it.pickCode }),
@@ -723,7 +734,7 @@ class MediaScanner(
                     //   代价：父目录指纹不含它们的内容，"只往 extrafanart 加图、nfo 没动"
                     //   要等全量扫描才更新（重刮通常连 nfo 一起改，所以少见）。
                     //   includeSubDirs=false 时传 null = "这次看不到" → 入库时保留原值。
-                    val sideArt = if (includeSubDirs) sideArtOf(page.items, rateLimitMs) else null
+                    val sideArt = if (includeSubDirs) sideArtOf(page.items, listing.path, rateLimitMs) else null
                     val scan = sniffDirectory(files, minVideoSizeMb.toLong() * 1024 * 1024)
                     // 分 CD / 分片的资源（`ABC-201-cd1` + `-cd2`）**合成一条**：造一个"系列"行，
                     // 各 CD 挂到它名下当分集 —— 海报墙出一张卡，点进去列 CD1/CD2。
@@ -844,10 +855,21 @@ class MediaScanner(
                                 postersFetched = postersFetched,
                             )
                 }
-                if (skipped > 0) Log.i(TAG, "增量扫描完成：跳过 $skipped/${allDirs.size} 个未变化目录")
+                // 每轮跑完都留一行 —— 多库排队之后，这是日志里回答"这一轮是谁、扫成什么样"的地方。
+                // 早先只有"增量扫描且跳过了目录"才打（全量扫描在日志里完全是静默的，几轮连跑时
+                // 只剩几条 per-目录 的日志，根本拼不出哪一轮到哪了）。
+                val mode = if (incremental) "增量" else "全量"
+                val bits = listOfNotNull(
+                    "目录 $done/${allDirs.size}",
+                    if (skipped > 0) "跳过 $skipped 个未变化" else null,
+                    "入库 $movies 部",
+                    "耗时 ${System.currentTimeMillis() - startedAt}ms",
+                    if (stoppedEarly) "被停止" else null,
+                ).joinToString(" · ")
+                Log.i(TAG, "「$roundLabel」${mode}扫描完成：$bits")
             }
         } catch (e: Exception) {
-            Log.w("MediaScanner", "扫描中断: ${e.message}")
+            Log.w(TAG, "「$roundLabel」扫描中断: ${e.message}")
         } finally {
             val finishedAt = System.currentTimeMillis()
             // 记"这个库刚扫完"。**一个目录都没跑完就不记**（done == 0 通常是列目录阶段就抛了，
@@ -855,7 +877,7 @@ class MediaScanner(
             // 用户中途按停止 → done > 0 → 照记（他确实扫过一轮了，别每次启动都来烦他）。
             if (libraryId != null && done > 0) {
                 runCatching { dao.markLibraryScanned(libraryId, finishedAt) }
-                    .onFailure { Log.w(TAG, "记录扫描时间失败 libraryId=$libraryId: ${it.message}") }
+                    .onFailure { Log.w(TAG, "「$roundLabel」记录扫描时间失败 libraryId=$libraryId: ${it.message}") }
             }
             // 媒体库自己的记录里留一条：**何时扫的、扫的哪个库、结果、新增了哪些片**
             // （表 scan_log → 媒体库页的「扫描记录」，那里用海报图展示新增影片）。
@@ -888,7 +910,7 @@ class MediaScanner(
                         newKeys = newKeys.joinToString("\n"),
                     ),
                 )
-            }.onFailure { Log.w(TAG, "写扫描记录失败: ${it.message}") }
+            }.onFailure { Log.w(TAG, "「$roundLabel」写扫描记录失败: ${it.message}") }
             // 收尾统一放 finally：正常结束、抛异常、被停止三条路都要把 running 落回去，
             // 否则 UI 会永远停在"扫描中"、且 awaitStopped 的等待永远等不到
             _progress.value = _progress.value.copy(
@@ -926,7 +948,7 @@ class MediaScanner(
         // 不递归时这里不列目录，交给调用方（它本来就要列一次）
         if (!includeSubDirs) return listOf(DirListing(rootCid, rootPath, null))
 
-        val rootPage = listFiles(rootCid, rateLimitMs)
+        val rootPage = listFiles(rootCid, rootPath, rateLimitMs)
         val result = mutableListOf(DirListing(rootCid, rootPath, rootPage))
         val queue = ArrayDeque<Pair<String, String>>()
         rootPage.items.filter { it.isDir }.forEach { dir ->
@@ -937,7 +959,7 @@ class MediaScanner(
         while (queue.isNotEmpty()) {
             if (stopRequested.get()) break
             val (cid, path) = queue.removeFirst()
-            val page = listFiles(cid, rateLimitMs)
+            val page = listFiles(cid, path, rateLimitMs)
             result.add(DirListing(cid, path, page))
             // 这一阶段没有分母（目录数正是它要算的东西），至少让"已发现 N 个目录"在动
             _progress.value = _progress.value.copy(
@@ -987,19 +1009,27 @@ class MediaScanner(
      * 没有这两个目录就返回空 SideArt（调用方据此清掉旧值）—— 与"这次拿不到清单"
      * （includeSubDirs=false，调用方直接传 null）必须分开。
      *
+     * [parentPath] 只用于日志里的目录标识（见 [listFiles]）。
+     *
      * 只认直接子目录（`X/extrafanart`、`X/.actors`）：这是刮削器的固定写法。
      * 深一层（`.actors/<演员名>/folder.jpg`）是 Emby 另一套，实测库里没有，不做。
      */
-    private suspend fun sideArtOf(parentItems: List<FileItem>, rateLimitMs: Long): SideArt {
+    private suspend fun sideArtOf(
+        parentItems: List<FileItem>,
+        parentPath: String,
+        rateLimitMs: Long,
+    ): SideArt {
         val fanartDir = sideDirItem(parentItems, EXTRAFANART_DIR_NAMES)
         val actorsDir = sideDirItem(parentItems, ACTORS_DIR_NAMES)
         return SideArt(
-            fanart = fanartDir?.let { extraFanartFilesOf(fileRefsOf(listFiles(it.fid!!, rateLimitMs))) }
-                ?: emptyList(),
+            fanart = fanartDir?.let {
+                extraFanartFilesOf(fileRefsOf(listFiles(it.fid!!, "$parentPath/${it.fn}", rateLimitMs)))
+            } ?: emptyList(),
             fanartDirCid = fanartDir?.fid,
             actorsDirCid = actorsDir?.fid,
-            actorAvatars = actorsDir?.let { actorAvatarFilesOf(fileRefsOf(listFiles(it.fid!!, rateLimitMs))) }
-                ?: emptyMap(),
+            actorAvatars = actorsDir?.let {
+                actorAvatarFilesOf(fileRefsOf(listFiles(it.fid!!, "$parentPath/${it.fn}", rateLimitMs)))
+            } ?: emptyMap(),
         )
     }
 
