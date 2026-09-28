@@ -33,9 +33,12 @@ import kotlin.math.roundToInt
  *   * API <31 → Coil + RenderScript 变换（半径 5px 一档量化，Coil 按 cacheKey 缓存，
  *     代价是换档瞬间重载一下，老设备上可接受）。
  * - [mask] 0..1 的白色蒙版压住壁纸，越高文字越可读；明亮模式专用。
+ * - [stamp] "这一版壁纸"的标记（见 AppPrefs.wallpaperStamp）。**必须进 Coil 的缓存键**：
+ *   裁切结果固定写同两个文件名，换图时路径不变，而 Coil 默认只按路径做键 ——
+ *   不加它，换完壁纸画面上还是旧图（真机实测：要旋转屏幕才刷新）。
  */
 @Composable
-fun WallpaperLayer(uri: String, mask: Float, blur: Float) {
+fun WallpaperLayer(uri: String, mask: Float, blur: Float, stamp: Long) {
     val context = LocalContext.current
     val renderEffectBlur = Build.VERSION.SDK_INT >= 31
     val blurDp = blur * 24f
@@ -61,6 +64,9 @@ fun WallpaperLayer(uri: String, mask: Float, blur: Float) {
     SubcomposeAsyncImage(
         model = ImageRequest.Builder(context)
             .data(model)
+            // 缓存键带上 [stamp]：同一路径换了内容也要重新解码（理由见函数注释）
+            .memoryCacheKey("$model|$stamp")
+            .diskCacheKey("$model|$stamp")
             .transformations(
                 if (!renderEffectBlur && radius >= 5f) listOf(WallpaperBlurTransformation(context, radius))
                 else emptyList()

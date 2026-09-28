@@ -11,6 +11,7 @@ import com.open115.pad.data.OpenApi
 import com.open115.pad.data.QrApi
 import com.open115.pad.data.Session
 import com.open115.pad.data.TokenAuthenticator
+import com.open115.pad.data.media.ScanMode
 import com.open115.pad.data.media.autoScanDue
 import kotlinx.serialization.json.Json
 import kotlinx.coroutines.CoroutineScope
@@ -138,7 +139,12 @@ class AppContainer(context: Context) {
      * 队列执行器：一条常驻协程把队列里的任务**顺序**跑完。挂在容器上（而不是面板或
      * ViewModel 里）—— 关面板、切页、切任务页都不该中断它，跟上传一样由 [transferScope] 承载。
      */
-    val renameWorker = com.open115.pad.data.RenameQueueWorker(openApi, renameQueue, opLog)
+    val renameWorker = com.open115.pad.data.RenameQueueWorker(
+        openApi, renameQueue, opLog,
+        // 改过名的目录要作废媒体库的扫描状态：115 的目录 upt 不随改名变，
+        // 而快速扫描正是靠"父目录看到的 upt 没变"跳过目录的（理由见 worker 的构造参数注释）
+        invalidateDir = { cid -> mediaDatabase.mediaDao().invalidateScanState(cid) },
+    )
 
     /** 高级文件过滤：方案存储 + 文件页右上角总开关 */
     val filterPrefs = com.open115.pad.data.FilterPrefs(context)
@@ -146,6 +152,9 @@ class AppContainer(context: Context) {
     /** 媒体库（类 Yamby）：Room 索引 + 手动扫描引擎。扫描由调用方在 transferScope 里 launch。 */
     val mediaDatabase = com.open115.pad.data.media.MediaDatabase.build(context)
     val mediaPrefs = com.open115.pad.data.media.MediaPrefs(context)
+
+    /** 弹幕客户端（实验室：弹幕）：对兼容弹弹play 协议的源做匹配与拉取，带 Room 缓存 */
+    internal val danmuClient by lazy { com.open115.pad.player.DanmuClient(okHttpClient) }
 
     /**
      * 媒体库缓存设置的两份镜像（设置里改完要立刻生效，不能等重启）。
@@ -181,8 +190,28 @@ class AppContainer(context: Context) {
         prefs = mediaPrefs,
     )
 
+    /**
+     * 流水线同步：服务器（刮削流水线）每轮刮完会往 115 里写一份「本次变了哪些目录」
+     * 的信号文件，这里轮询它，把变动的目录排成"只扫这几个目录"的扫描任务（见 PadSync）。
+     *
+     * 只在登录后跑，启停在下面的 loggedInFlow 里（和改名 worker 同一处）。
+     */
+    val padSync = com.open115.pad.data.media.PadSync(
+        openApi, okHttpClient, mediaDatabase.mediaDao(), mediaScanner, mediaPrefs,
+        mediaCache, imageUrlResolver, cacheDir, scope,
+    )
+
     /** 云下载提交（含持久化的保存位置），手动添加/剪贴板/外部唤起共用 */
     val downloadSubmitter = com.open115.pad.data.DownloadSubmitter(downloadPrefs)
+
+    /**
+     * 文件页「分类整理」：递归扫描当前目录，把文件按类型移进本目录的 视频/音频/文本/
+     * 应用程序/图片/压缩包/其他 七个文件夹。挂应用级（transferScope 跑任务、进度进下面的
+     * taskActivity 让前台服务跟着亮），切页不停、进程死了就断（断点无从谈起，纯云端移动）。
+     */
+    val fileOrganizer = com.open115.pad.data.FileOrganizer(
+        openApi, opLog, dirCache, transferScope,
+    )
 
     /**
      * "现在有什么任务在跑" —— 一句话描述，空闲为 null。
@@ -192,6 +221,7 @@ class AppContainer(context: Context) {
      *  - 媒体库扫描：进程内协程（靠 scan_state + 落盘队列能续，但断在半路就白等一轮）
      *  - 上传：进程内协程（有断点续传）
      *  - 重命名队列：进程内 worker（任务逐条落库）
+     *  - 分类整理：进程内协程（纯云端移动，进程死了剩下的文件留在原地，重跑一遍即可）
      * 不包括云下载（在 115 服务端跑）和本机下载（系统 DownloadManager 扛着，App 死了也照下）。
      */
     val taskActivity: StateFlow<String?> = combine(
@@ -199,7 +229,8 @@ class AppContainer(context: Context) {
         mediaScanner.pending,
         transferLog.uploads,
         renameWorker.activeTaskId,
-    ) { scanning, pending, uploads, renaming ->
+        fileOrganizer.progress,
+    ) { scanning, pending, uploads, renaming, organizing ->
         val bits = buildList {
             if (scanning.running) {
                 add(
@@ -212,6 +243,7 @@ class AppContainer(context: Context) {
             val uploading = uploads.count { it.finishedAt == null && !it.paused }
             if (uploading > 0) add("正在上传 $uploading 个文件")
             if (renaming != null) add("正在重命名文件")
+            if (organizing.running) add("正在分类整理文件")
         }
         bits.takeIf { it.isNotEmpty() }?.joinToString(" · ")
     }.stateIn(scope, SharingStarted.Eagerly, null)
@@ -318,8 +350,11 @@ class AppContainer(context: Context) {
             session.loggedInFlow.collect { loggedIn ->
                 if (loggedIn) {
                     renameWorker.start(transferScope)
+                    // 流水线同步：轮询服务器写在 115 里的信号文件（幂等，重复发 true 不会起第二个循环）
+                    padSync.start()
                 } else {
                     renameWorker.stop()
+                    padSync.stop()
                     // 媒体库扫描同理，而且队列化之后更明显：登出时排着 5 个库，
                     // 不撤的话它们会一个一个跑下去，每个目录都请求失败 —— 白占频控额度。
                     // stopAll 的语义正是要的：停当前那轮 + 清空队列（队列也一并落盘清掉，
@@ -366,7 +401,9 @@ class AppContainer(context: Context) {
                         // enqueue 对同库是**就地替换**，拿自动扫描的增量版盖掉用户要的全量版，
                         // 会让他"重启前特意排的全量"变成增量
                         if (mediaScanner.isBusy(lib.id)) return@forEach
-                        mediaScanner.enqueue(lib, incremental = true)
+                        // 自动扫描仍然走**增量**（原行为）：快速扫描先在库菜单里手动跑，
+                        // 验证几轮没问题再把它切过来也不迟 —— 它剪掉的目录下一轮才复核。
+                        mediaScanner.enqueue(lib, ScanMode.Incremental)
                     }
             }
         }

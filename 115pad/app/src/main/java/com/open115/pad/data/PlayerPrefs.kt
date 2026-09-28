@@ -157,6 +157,87 @@ class PlayerPrefs(private val context: Context) {
     suspend fun setLabFilterParams(v: String) =
         context.playerDataStore.edit { it[KEY_LAB_FILTER_PARAMS] = v }
 
+    /**
+     * 自定义滤镜模板列表（JSON 串：[{name, params}]）。
+     *
+     * 与 [labFilterParams] 同款"不透明字符串"分工：编解码归播放器侧
+     * （`CustomFilterPresetsCodec`），存储层不认识模板长什么样。
+     */
+    val labFilterCustomPresets: Flow<String> =
+        context.playerDataStore.data.map { it[KEY_LAB_FILTER_CUSTOM_PRESETS] ?: "" }
+
+    suspend fun setLabFilterCustomPresets(v: String) =
+        context.playerDataStore.edit { it[KEY_LAB_FILTER_CUSTOM_PRESETS] = v }
+
+    // ---- 实验室：弹幕 ----
+
+    /** 弹幕总开关（设置页「实验室」）。关着时播放器连弹幕按钮都不出现。 */
+    val labDanmuEnabled: Flow<Boolean> =
+        context.playerDataStore.data.map { it[KEY_LAB_DANMU_ENABLED] ?: false }
+
+    /**
+     * 弹幕源地址：任何**兼容弹弹play 协议**的 HTTP 服务（自托管 danmu_api、
+     * 弹弹play 官方、局域网实例都行），**默认留空**，要用弹幕就自己填一个。
+     * 写入时去尾斜杠，拼路径的地方就不用二回了。
+     */
+    val labDanmuApi: Flow<String> =
+        context.playerDataStore.data.map { it[KEY_LAB_DANMU_API] ?: DANMU_API_DEFAULT }
+
+    /** 弹幕铺满屏幕上部多少（百分比：25/50/75/100），全局口味，不分条目 */
+    val labDanmuArea: Flow<Int> =
+        context.playerDataStore.data.map { it[KEY_LAB_DANMU_AREA] ?: 50 }
+
+    /** 弹幕字号（sp） */
+    val labDanmuTextSize: Flow<Float> =
+        context.playerDataStore.data.map { it[KEY_LAB_DANMU_TEXT_SIZE] ?: 16f }
+
+    /** 弹幕不透明度（0.3~1.0） */
+    val labDanmuOpacity: Flow<Float> =
+        context.playerDataStore.data.map { it[KEY_LAB_DANMU_OPACITY] ?: 1f }
+
+    /** 弹幕滚动速度倍率（0.5~2.0，>1 更快） */
+    val labDanmuScroll: Flow<Float> =
+        context.playerDataStore.data.map { it[KEY_LAB_DANMU_SCROLL] ?: 1f }
+
+    /** 屏蔽词原始串（逗号/顿号/换行分隔，见 DanmuClient.parseBlocklist） */
+    val labDanmuBlocklist: Flow<String> =
+        context.playerDataStore.data.map { it[KEY_LAB_DANMU_BLOCKLIST] ?: "" }
+
+    /** 弹幕密度（25/50/75/100）：按时间轴均匀抽稀，实际只显示这个比例的弹幕 */
+    val labDanmuDensity: Flow<Int> =
+        context.playerDataStore.data.map { it[KEY_LAB_DANMU_DENSITY] ?: 100 }
+
+    /** 弹幕缓存时效（天，1~30）：期内同一部片命中本机缓存不再走网络 */
+    val labDanmuCacheDays: Flow<Int> =
+        context.playerDataStore.data.map { it[KEY_LAB_DANMU_CACHE_DAYS] ?: 7 }
+
+    suspend fun setLabDanmuEnabled(v: Boolean) =
+        context.playerDataStore.edit { it[KEY_LAB_DANMU_ENABLED] = v }
+
+    suspend fun setLabDanmuApi(v: String) =
+        context.playerDataStore.edit { it[KEY_LAB_DANMU_API] = v.trim().trimEnd('/') }
+
+    suspend fun setLabDanmuArea(v: Int) =
+        context.playerDataStore.edit { it[KEY_LAB_DANMU_AREA] = v }
+
+    suspend fun setLabDanmuTextSize(v: Float) =
+        context.playerDataStore.edit { it[KEY_LAB_DANMU_TEXT_SIZE] = v }
+
+    suspend fun setLabDanmuOpacity(v: Float) =
+        context.playerDataStore.edit { it[KEY_LAB_DANMU_OPACITY] = v }
+
+    suspend fun setLabDanmuScroll(v: Float) =
+        context.playerDataStore.edit { it[KEY_LAB_DANMU_SCROLL] = v }
+
+    suspend fun setLabDanmuBlocklist(v: String) =
+        context.playerDataStore.edit { it[KEY_LAB_DANMU_BLOCKLIST] = v }
+
+    suspend fun setLabDanmuDensity(v: Int) =
+        context.playerDataStore.edit { it[KEY_LAB_DANMU_DENSITY] = v }
+
+    suspend fun setLabDanmuCacheDays(v: Int) =
+        context.playerDataStore.edit { it[KEY_LAB_DANMU_CACHE_DAYS] = v }
+
     // ---- 本地/外部源的续播位置 ----
     // 云盘片走 115 的观看记录；本地文件（已下载的、外部应用传进来的）没有那个接口，
     // 只能在本机记一份。不做的话 40 分钟的下载片每次进都从头开始，体验像半成品。
@@ -198,6 +279,19 @@ class PlayerPrefs(private val context: Context) {
         val KEY_VR_WINDOW = stringPreferencesKey("vr_window")
         val KEY_LAB_FILTER_ENABLED = booleanPreferencesKey("lab_filter_enabled")
         val KEY_LAB_FILTER_PARAMS = stringPreferencesKey("lab_filter_params")
+        val KEY_LAB_FILTER_CUSTOM_PRESETS = stringPreferencesKey("lab_filter_custom_presets")
+        val KEY_LAB_DANMU_ENABLED = booleanPreferencesKey("lab_danmu_enabled")
+        val KEY_LAB_DANMU_API = stringPreferencesKey("lab_danmu_api")
+        val KEY_LAB_DANMU_AREA = intPreferencesKey("lab_danmu_area")
+        val KEY_LAB_DANMU_TEXT_SIZE = floatPreferencesKey("lab_danmu_text_size")
+        val KEY_LAB_DANMU_OPACITY = floatPreferencesKey("lab_danmu_opacity")
+        val KEY_LAB_DANMU_SCROLL = floatPreferencesKey("lab_danmu_scroll")
+        val KEY_LAB_DANMU_BLOCKLIST = stringPreferencesKey("lab_danmu_blocklist")
+        val KEY_LAB_DANMU_DENSITY = intPreferencesKey("lab_danmu_density")
+        val KEY_LAB_DANMU_CACHE_DAYS = intPreferencesKey("lab_danmu_cache_days")
+
+        /** 弹幕源默认地址：留空 = 未配置（弹幕源自托管，不预置公共地址） */
+        const val DANMU_API_DEFAULT = ""
         val KEY_LOCAL_RESUME = stringPreferencesKey("local_resume")
     }
 }

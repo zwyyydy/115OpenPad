@@ -159,6 +159,14 @@ data class FileItem(
     @Serializable(with = LenientLongSerializer::class) val play_long: Long = 0,
     @Serializable(with = LenientLongSerializer::class) val upt: Long = 0,
     @Serializable(with = LenientLongSerializer::class) val uppt: Long = 0,
+    /**
+     * 115 的 `uet` 字段（请求文档里它和 `upt` 都写作"修改时间"，重复得可疑）。
+     *
+     * 单独解析它是因为**改文件名不顶 `upt`**（实测），而快速扫描的剪枝判据需要知道
+     * "这个子目录项还动过没有" —— 它有没有反应还没验过，所以先记进 scan_state 并打日志观察。
+     * 老响应没有这个字段时是 0（与 `upt` 一样恒为 0 就说明 115 没给）。
+     */
+    @Serializable(with = LenientLongSerializer::class) val uet: Long = 0,
 ) {
     val isDir: Boolean get() = fc == 0
 }

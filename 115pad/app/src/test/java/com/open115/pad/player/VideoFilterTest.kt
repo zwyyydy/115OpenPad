@@ -98,4 +98,32 @@ class VideoFilterTest {
             }
         }
     }
+
+    // ---- 自定义模板 ----
+
+    @Test
+    fun `模板编解码往返无损`() {
+        val p = FilterParams(
+            brightness = 0.12f, contrast = 1.25f, saturation = 1.4f,
+            temperature = -0.1f, smooth = 0.35f, vignette = 0.22f,
+            tint = 0.01f, shadowTintB = 0.04f, highlightTintR = 0.05f,
+            gamma = 1.03f, fade = 0.1f,
+        )
+        val list = listOf(
+            CustomFilterPreset("我的夜视", FilterParams(contrast = 1.3f).toPrefString()),
+            CustomFilterPreset("老电视", p.toPrefString()),
+        )
+        val round = CustomFilterPresetsCodec.decode(CustomFilterPresetsCodec.encode(list))
+        assertEquals(list, round)
+        // 还原出来的参数串要能走 FilterParams 的老路重建（与内置预设同一条回放路径）
+        assertEquals(p, FilterParams.fromPrefString(round[1].params))
+    }
+
+    @Test
+    fun `坏模板数据退回空表`() {
+        assertTrue(CustomFilterPresetsCodec.decode(null).isEmpty())
+        assertTrue(CustomFilterPresetsCodec.decode("").isEmpty())
+        assertTrue(CustomFilterPresetsCodec.decode("不是json").isEmpty())
+        assertTrue(CustomFilterPresetsCodec.decode("""[{"name":"x"}]""").isEmpty()) // 缺 params 字段
+    }
 }

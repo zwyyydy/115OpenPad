@@ -219,6 +219,8 @@ internal fun PlayerGestureOverlay(
     player: Player,
     config: DoubleTapConfig,
     longPressSpeed: Float,
+    /** 长按倍速链路每次实际改变播放速度时回调（按住/微调/松手）——弹幕时间轴靠它跟手 */
+    onSpeedChange: (Float) -> Unit = {},
     seekCurve: SeekCurveConfig = SeekCurveConfig(),
     onToggleController: () -> Unit,
     onSeekPreview: (Long, Int, Boolean) -> Unit,
@@ -331,6 +333,7 @@ internal fun PlayerGestureOverlay(
                     TapPhase.LONG_PRESS -> {
                         // 长按倍速：按住即 longPressSpeed，横移微调，松手恢复 1x
                         player.setPlaybackSpeed(longPressSpeed)
+                        onSpeedChange(longPressSpeed)
                         onSpeedHud(speedHudText(longPressSpeed))
                         var acc = 0f
                         while (true) {
@@ -341,9 +344,11 @@ internal fun PlayerGestureOverlay(
                             acc += ch.positionChange().x
                             val s = (longPressSpeed + acc / SPEED_DRAG_PX).coerceIn(0.5f, 4f)
                             player.setPlaybackSpeed(s)
+                            onSpeedChange(s)
                             onSpeedHud(speedHudText(s))
                         }
                         player.setPlaybackSpeed(1f)
+                        onSpeedChange(1f)
                         onSpeedHud(null)
                     }
 

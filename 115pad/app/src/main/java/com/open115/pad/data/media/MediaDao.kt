@@ -44,6 +44,8 @@ data class MediaPickCodes(
     val nfoPickCode: String?,
     val posterPickCode: String?,
     val fanartPickCode: String?,
+    /** 自己目录里的缩略图（番号式的 `-thumb.jpg`）——刮削器会覆盖写它，清缓存时要一起清 */
+    val thumbPickCode: String?,
 )
 
 /** 一条"作品 → 名字"（标签名 / 演员名，给列表筛选批量取用，见 [MediaDao.tagNamesOf] / [MediaDao.actorNamesOf]） */
@@ -524,9 +526,9 @@ interface MediaDao {
     // 一律用**子查询**而不是 `IN (:keys)` —— SQLite 的变量上限是 999，几千部片的库
     // 直接 "too many SQL variables" 报错。子查询没有这个限制。
 
-    /** 删库前先收集要清缓存的 pick_code（投影，不取整个实体） */
+    /** 删库 / 流水线同步前先收集要清缓存的 pick_code（投影，不取整个实体） */
     @Query(
-        "SELECT nfoPickCode, posterPickCode, fanartPickCode FROM movies " +
+        "SELECT nfoPickCode, posterPickCode, fanartPickCode, thumbPickCode FROM movies " +
             "WHERE dirPath = :prefix OR dirPath LIKE :prefix || '/%'",
     )
     suspend fun pickCodesInPath(prefix: String): List<MediaPickCodes>
@@ -773,6 +775,15 @@ interface MediaDao {
     @Query("SELECT * FROM scan_state WHERE dirKey = :dirKey")
     suspend fun scanState(dirKey: String): ScanStateEntity?
 
+    /**
+     * 按目录路径反查 cid（[PadSync] 用：服务器信号里给的是**路径**，扫目录要的是 cid）。
+     *
+     * 只对"扫过的目录"有效 —— 新目录得拿它的上级路径先反查再用列目录换 cid，
+     * 那条逐级上溯的逻辑在 PadSync 里。
+     */
+    @Query("SELECT dirKey FROM scan_state WHERE dirPath = :path LIMIT 1")
+    suspend fun scanStateKeyByPath(path: String): String?
+
     @Query("SELECT * FROM scan_state ORDER BY scannedAt DESC")
     fun scanStates(): Flow<List<ScanStateEntity>>
 
@@ -780,15 +791,22 @@ interface MediaDao {
     suspend fun scanningCount(): Int
 
     /**
-     * 把一个目录的扫描状态作废，让下次**增量**扫描重新处理它。
+     * 把一个目录的扫描状态作废，让下次**增量/快速**扫描重新处理它。
      *
      * 增量跳过的条件是 `status == 2 && cloudUpt 未变`（见 MediaScanner）。而「仅从媒体库移除」
      * 不碰云端，目录的 upt 自然不变 —— 于是那个目录永远被跳过，刚删掉的条目再也回不来，
      * 只有全量扫描才能重新入库。这里把状态和 upt 一起抹掉，两条判据同时失效。
      *
+     * ★ 快速扫描另用一组判据（`parentUet` / `hasSubDirs` / `logicVersion`），所以**也要一起抹**：
+     * 只清 cloudUpt 的话，剪枝那边看到"父视角没变 + 老版本号"照样可能判成没变。
+     * 抹 logicVersion 是最稳的一道：它不是当前版本就一定会被重新列一次。
+     *
      * 不用删行：留着 dirPath / scannedAt，重扫一遍状态就回来了。
      */
-    @Query("UPDATE scan_state SET status = 0, cloudUpt = 0 WHERE dirKey = :dirKey")
+    @Query(
+        "UPDATE scan_state SET status = 0, cloudUpt = 0, parentUet = 0, logicVersion = 0 " +
+            "WHERE dirKey = :dirKey",
+    )
     suspend fun invalidateScanState(dirKey: String)
 
     /**
@@ -913,6 +931,75 @@ interface MediaDao {
 
     @Query("DELETE FROM watch_history")
     suspend fun clearWatchHistory()
+
+    // ---------------- 弹幕缓存（实验室：弹幕） ----------------
+
+    /**
+     * 取一行缓存的**元数据**（匹配到了哪部哪集、时间戳、弹幕条数、本体有多少字符）。
+     *
+     * ⚠️ 绝不能写成 `SELECT *`：本体一列能到几 MB，而 Android 的 CursorWindow 装不下
+     * 单行（默认约 2MB）时 SQLite 直接抛 SQLiteBlobTooBigException，**整行都读不回来**
+     * —— 实测一部 4 万条弹幕的片，"再次打开"就静默变成没有弹幕（异常被 fetchFor 的
+     * runCatching 咽掉）。本体一律走 [danmuJson] 分块捞。
+     */
+    @Query(
+        "SELECT pickCode, episodeId, animeTitle, episodeTitle, matchedAt, commentsAt, commentCount, " +
+            "length(commentsJson) AS jsonLength FROM danmu_cache WHERE pickCode = :pickCode",
+    )
+    suspend fun danmuMeta(pickCode: String): DanmuCacheMeta?
+
+    /** 本体字符数（TEXT 列按字符数）；null = 行不存在或没拉到过（commentsJson 为 NULL） */
+    @Query("SELECT length(commentsJson) FROM danmu_cache WHERE pickCode = :pickCode")
+    suspend fun danmuJsonLength(pickCode: String): Int?
+
+    /** 本体的一小块：[start] 为 1 基字符下标，[count] 为字符数（见 [DANMU_JSON_CHUNK_CHARS]） */
+    @Query("SELECT substr(commentsJson, :start, :count) FROM danmu_cache WHERE pickCode = :pickCode")
+    suspend fun danmuJsonChunk(pickCode: String, start: Int, count: Int): String?
+
+    /**
+     * 分块拼回完整本体 JSON；行不存在 / 没拉到过 / 全是空串都返回 null。
+     *
+     * 拼出来的字符串与原值一字不差：列是 TEXT，SQLite 的 substr/length 都按**字符**走，
+     * 中文与 emoji（代理对）不会切坏 —— 按字节切才会。
+     */
+    @Transaction
+    suspend fun danmuJson(pickCode: String): String? {
+        val total = danmuJsonLength(pickCode) ?: return null
+        if (total <= 0) return null
+        val sb = StringBuilder(total)
+        var start = 1
+        while (start <= total) {
+            sb.append(danmuJsonChunk(pickCode, start, DANMU_JSON_CHUNK_CHARS) ?: break)
+            start += DANMU_JSON_CHUNK_CHARS
+        }
+        return sb.toString()
+    }
+
+    /** 一部视频一条（pickCode 主键）：重匹配/重拉弹幕都是覆盖同一条 */
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsertDanmu(row: DanmuCacheEntity)
+
+    /** 只保留最新 [keep] 条（按匹配时间倒序数） */
+    @Query(
+        "DELETE FROM danmu_cache WHERE pickCode NOT IN " +
+            "(SELECT pickCode FROM danmu_cache ORDER BY matchedAt DESC LIMIT :keep)",
+    )
+    suspend fun trimDanmu(keep: Int)
+
+    @Transaction
+    suspend fun addDanmu(row: DanmuCacheEntity) {
+        upsertDanmu(row)
+        trimDanmu(DANMU_CACHE_KEEP)
+    }
+
+    /**
+     * 作废某一条目的弹幕缓存（换弹幕源时用）。
+     *
+     * 缓存是按 pickCode 存的、跟源地址无关：不删的话换源后还是吐旧源那份
+     * （时效没过就一直命中），看着像"改了没反应"。
+     */
+    @Query("DELETE FROM danmu_cache WHERE pickCode = :pickCode")
+    suspend fun deleteDanmu(pickCode: String)
 
     // ---------------- 扫描记录（媒体库自己的流水） ----------------
 

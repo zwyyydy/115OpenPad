@@ -29,6 +29,7 @@ import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.gestures.animateScrollBy
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
@@ -58,6 +59,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.QueueMusic
 import androidx.compose.material.icons.outlined.Audiotrack
+import androidx.compose.material.icons.outlined.Forum
 import androidx.compose.material.icons.outlined.LightMode
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.outlined.LockOpen
@@ -141,6 +143,7 @@ import com.open115.pad.data.JsonArray
 import com.open115.pad.data.JsonNull
 import com.open115.pad.data.JsonObject
 import com.open115.pad.data.JsonPrimitive
+import com.open115.pad.data.OpType
 import com.open115.pad.data.PlaylistEntry
 import com.open115.pad.data.VideoPlayData
 import com.open115.pad.data.envData
@@ -390,6 +393,8 @@ class PlayerActivity : ComponentActivity() {
         private const val EXTRA_SOURCE_URI = "source_uri"
         private const val EXTRA_START_MS = "start_ms"
         private const val EXTRA_RECORD_HISTORY = "record_history"
+        private const val EXTRA_OP_LOG_CID = "op_log_cid"
+        private const val EXTRA_OP_LOG_PATH = "op_log_path"
 
         /**
          * @param playlist 当前视图的播放列表（可为空：此时上一集/下一集均置灰）。
@@ -401,6 +406,10 @@ class PlayerActivity : ComponentActivity() {
          * @param recordHistory 是否写「观影历史」。**只有媒体库那条链路传 true**：
          *                 文件页的播放记录在操作记录里，两处各记一份是重复；
          *                 本机文件（传输中心/外部分享）也不记 —— 它们不在媒体库里。
+         * @param opLogCid/opLogPath 文件页那路播放才带（其余入口为 null）：播放起点的目录
+         *                 cid 与目录名。非空 = 播放器内**切集也要补一条 VIDEO_PLAY 操作记录**
+         *                 —— 文件页的「最近浏览」按 `cid/文件名` 取最新记录，入口那条
+         *                 只盖第一个视频，切集后的各集靠这两个值在 loadEpisodeAt 里补。
          */
         fun intent(
             context: Context,
@@ -410,6 +419,8 @@ class PlayerActivity : ComponentActivity() {
             index: Int = 0,
             startMs: Long = 0L,
             recordHistory: Boolean = false,
+            opLogCid: String? = null,
+            opLogPath: String? = null,
         ): Intent {
             val json = runCatching {
                 Json.encodeToString(ListSerializer(PlaylistEntry.serializer()), playlist)
@@ -421,6 +432,8 @@ class PlayerActivity : ComponentActivity() {
                 .putExtra(EXTRA_INDEX, index)
                 .putExtra(EXTRA_START_MS, startMs)
                 .putExtra(EXTRA_RECORD_HISTORY, recordHistory)
+                .putExtra(EXTRA_OP_LOG_CID, opLogCid)
+                .putExtra(EXTRA_OP_LOG_PATH, opLogPath)
         }
 
         /**
@@ -479,6 +492,8 @@ class PlayerActivity : ComponentActivity() {
             .coerceIn(0, (playlist.size - 1).coerceAtLeast(0))
         val startMs = intent.getLongExtra(EXTRA_START_MS, 0L)
         val recordHistory = intent.getBooleanExtra(EXTRA_RECORD_HISTORY, false)
+        val opLogCid = intent.getStringExtra(EXTRA_OP_LOG_CID)
+        val opLogPath = intent.getStringExtra(EXTRA_OP_LOG_PATH)
         setContent {
             Open115Theme {
                 PlayerScreen(
@@ -490,6 +505,8 @@ class PlayerActivity : ComponentActivity() {
                     initialIndex = index,
                     initialStartMs = startMs,
                     recordHistory = recordHistory,
+                    opLogCid = opLogCid,
+                    opLogPath = opLogPath,
                     onBack = { finish() },
                 )
             }
@@ -534,6 +551,26 @@ private data class PlayerPrefValues(
     val labFilterEnabled: Boolean,
     /** 实验室：滤镜参数串（16 个 float 逗号分隔，见 [FilterParams]） */
     val labFilterParams: String,
+    /** 实验室：自定义滤镜模板（JSON 串，见 [CustomFilterPresetsCodec]） */
+    val labFilterCustomPresets: String,
+    /** 实验室：弹幕总开关（设置页「实验室」） */
+    val labDanmuEnabled: Boolean,
+    /** 实验室：弹幕源地址（弹幕面板里也能改，改完立刻按新源重匹配） */
+    val labDanmuApi: String,
+    /** 实验室：弹幕显示区域（屏幕上部高度的百分比） */
+    val labDanmuArea: Int,
+    /** 实验室：弹幕字号（sp） */
+    val labDanmuTextSize: Float,
+    /** 实验室：弹幕不透明度（0.3~1） */
+    val labDanmuOpacity: Float,
+    /** 实验室：弹幕滚动速度倍率（0.5~2） */
+    val labDanmuScroll: Float,
+    /** 实验室：弹幕屏蔽词原始串 */
+    val labDanmuBlocklist: String,
+    /** 实验室：弹幕密度（25/50/75/100，按时间轴均匀抽稀） */
+    val labDanmuDensity: Int,
+    /** 实验室：弹幕缓存时效（天） */
+    val labDanmuCacheDays: Int,
 )
 
 @Composable
@@ -556,6 +593,14 @@ fun PlayerScreen(
      * 切集也只是换 currentPickCode，都不会重新进 onCreate。
      */
     recordHistory: Boolean = false,
+    /**
+     * 文件页那路播放才带（媒体库/本机/外部源为 null）：播放起点目录的 cid 与目录名。
+     * 非空 = 播放器内**切集也要补写一条 VIDEO_PLAY 操作记录**：文件页列表的
+     * 「最近浏览」时间按 `cid/文件名` 取最新记录，入口那条只盖第一个视频，
+     * 切集（上下集/列表点播/连播顺延）后的各集靠 [loadEpisodeAt] 里补写。
+     */
+    opLogCid: String? = null,
+    opLogPath: String? = null,
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
@@ -931,6 +976,16 @@ fun PlayerScreen(
             showSpecBadge = container.playerPrefs.showSpecBadge.first(),
             labFilterEnabled = container.playerPrefs.labFilterEnabled.first(),
             labFilterParams = container.playerPrefs.labFilterParams.first(),
+            labFilterCustomPresets = container.playerPrefs.labFilterCustomPresets.first(),
+            labDanmuEnabled = container.playerPrefs.labDanmuEnabled.first(),
+            labDanmuApi = container.playerPrefs.labDanmuApi.first(),
+            labDanmuArea = container.playerPrefs.labDanmuArea.first(),
+            labDanmuTextSize = container.playerPrefs.labDanmuTextSize.first(),
+            labDanmuOpacity = container.playerPrefs.labDanmuOpacity.first(),
+            labDanmuScroll = container.playerPrefs.labDanmuScroll.first(),
+            labDanmuBlocklist = container.playerPrefs.labDanmuBlocklist.first(),
+            labDanmuDensity = container.playerPrefs.labDanmuDensity.first(),
+            labDanmuCacheDays = container.playerPrefs.labDanmuCacheDays.first(),
         )
     }
     val prefs = pv
@@ -961,6 +1016,23 @@ fun PlayerScreen(
     val filterViewRef = remember { java.util.concurrent.atomic.AtomicReference<FilterViewportView?>(null) }
 
     /**
+     * 对比模式（**会话级，不落盘**）：开了滤镜时画面左半原图、右半滤镜，中间一条细白线，
+     * 调滑块时两边差异一眼可见。只对滤镜渲染路径有意义 —— 参数是原图（TextureView 路径）
+     * 时面板上的对比键是灰的，这里的状态也就无从生效。
+     */
+    var filterCompare by remember { mutableStateOf(false) }
+
+    /**
+     * 自定义滤镜模板：本地状态 + 整表落盘。增删选只发生在这个面板里（没有第二个写入方），
+     * 所以像 [filterParams] 一样"启动读一次、改动后自己写回"就够，不需要订阅 Flow。
+     */
+    var customFilterPresets by remember(prefs) {
+        mutableStateOf(CustomFilterPresetsCodec.decode(prefs.labFilterCustomPresets))
+    }
+    /** 「存模板」的命名弹层 */
+    var showFilterSaveDialog by remember { mutableStateOf(false) }
+
+    /**
      * 这次播放走不走滤镜渲染路径。
      *
      * 三个条件缺一不可：设置页开了开关、参数不是原图、当前不在 VR 里。
@@ -976,6 +1048,7 @@ fun PlayerScreen(
         val v = filterViewRef.get() ?: return
         v.updateParams(filterParams)
         v.updateGeometry(vsVideoSize.width, vsVideoSize.height, videoRotation)
+        v.updateSplit(if (filterCompare) 0.5f else -1f)
     }
 
     /** 参数落盘。拖动时每帧都写太浪费，抬手/点预设时写一次就够 */
@@ -986,13 +1059,22 @@ fun PlayerScreen(
         scope.launch { container.playerPrefs.setLabFilterParams(raw) }
     }
 
+    /** 模板列表落盘：列表很小（上限 20），增删存都整表覆写，不做增量 */
+    fun persistCustomFilterPresets() {
+        scope.launch {
+            container.playerPrefs.setLabFilterCustomPresets(
+                CustomFilterPresetsCodec.encode(customFilterPresets),
+            )
+        }
+    }
+
     /**
      * 旋转角 / 帧尺寸变化时补推一次几何。
      *
      * 不能只靠 `AndroidView` 的 update 块：那里面读状态**不订阅**（它是普通回调不是
      * 组合作用域），漏推的表现就是"点了旋转、画面还是躺着的"。
      */
-    LaunchedEffect(filterActive, videoRotation, vsVideoSize) {
+    LaunchedEffect(filterActive, videoRotation, vsVideoSize, filterCompare) {
         pushFilterState()
     }
 
@@ -1001,6 +1083,145 @@ fun PlayerScreen(
     LaunchedEffect(vrMode) {
         if (vrMode != null) filterMenuOpen = false
     }
+
+    // ---- 实验室：弹幕 ----
+    /** 会话内开关（弹幕面板里切换）：总开关在设置页实验室，这里只管"这次看不看" */
+    var danmuOn by androidx.compose.runtime.saveable.rememberSaveable { mutableStateOf(true) }
+    /**
+     * 拉到的弹幕**本体**（未过滤）。过滤是纯派生（见 [danmuComments]）——
+     * 这样面板里改密度/屏蔽词不必重新拉，立刻就能看到效果。
+     */
+    var danmuRaw by remember { mutableStateOf<List<DanmuComment>?>(null) }
+    val danmuViewRef = remember { java.util.concurrent.atomic.AtomicReference<DanmakuRenderView?>(null) }
+    var danmuMenuOpen by remember { mutableStateOf(false) }
+    var showDanmuMatch by remember { mutableStateOf(false) }
+    var showDanmuBlockEdit by remember { mutableStateOf(false) }
+    var showDanmuApiEdit by remember { mutableStateOf(false) }
+    /** 弹幕源地址（弹幕面板里可改；改完连本条目的缓存一起作废重拉） */
+    var danmuApi by remember(prefs) { mutableStateOf(prefs.labDanmuApi) }
+    /** 匹配状态：弹幕面板的状态行显示"当前爬的是哪部/哪集、成没成功" */
+    var danmuStatus by remember { mutableStateOf<DanmuStatus>(DanmuStatus.Loading) }
+
+    /**
+     * 弹幕可调参数（会话副本）：初值取设置页那份，面板里改立刻上屏、抬手/点选时落盘。
+     * 每次改动都**换新实例**（copy 后改字段）：普通 data class 原地改字段不会让读取它的
+     * Compose 重新组合，面板上的滑块/胶囊也就不会跟着动（同 FilterParams 那条注释）。
+     */
+    var danmuTuning by remember(prefs) {
+        mutableStateOf(
+            DanmuTuning(
+                area = prefs.labDanmuArea,
+                textSize = prefs.labDanmuTextSize,
+                opacity = prefs.labDanmuOpacity,
+                scroll = prefs.labDanmuScroll,
+                density = prefs.labDanmuDensity,
+                blocklist = prefs.labDanmuBlocklist,
+                cacheDays = prefs.labDanmuCacheDays,
+            ),
+        )
+    }
+    /** 已经落盘的那份：避免重复写（DataStore 每次写都是一次磁盘事务） */
+    var danmuPersisted by remember(prefs) { mutableStateOf(danmuTuning) }
+
+    /** 落盘，只写变了的键。拖动中每帧写一次 DataStore 纯属浪费，抬手/点选时调一次 */
+    fun persistDanmuTuning() {
+        val cur = danmuTuning
+        val prev = danmuPersisted
+        if (cur == prev) return
+        danmuPersisted = cur
+        scope.launch {
+            if (cur.area != prev.area) container.playerPrefs.setLabDanmuArea(cur.area)
+            if (cur.textSize != prev.textSize) container.playerPrefs.setLabDanmuTextSize(cur.textSize)
+            if (cur.opacity != prev.opacity) container.playerPrefs.setLabDanmuOpacity(cur.opacity)
+            if (cur.scroll != prev.scroll) container.playerPrefs.setLabDanmuScroll(cur.scroll)
+            if (cur.density != prev.density) container.playerPrefs.setLabDanmuDensity(cur.density)
+            if (cur.blocklist != prev.blocklist) container.playerPrefs.setLabDanmuBlocklist(cur.blocklist)
+            if (cur.cacheDays != prev.cacheDays) container.playerPrefs.setLabDanmuCacheDays(cur.cacheDays)
+        }
+    }
+
+    /**
+     * 弹幕过滤：先按屏蔽词丢，再按**密度**抽稀 —— 25% = 每 4 条留 1 条，
+     * 按时间轴均匀分布，同样的缓存每次抽到同一条（确定性）。
+     * 参数从面板那份（[danmuTuning]）取而不是 prefs：面板里改完要立刻见效。
+     */
+    fun filterDanmu(list: List<DanmuComment>, blocklist: String, density: Int): List<DanmuComment> {
+        val words = DanmuClient.parseBlocklist(blocklist)
+        val afterWords = if (words.isEmpty()) list
+        else list.filter { c -> words.none { w -> c.text.contains(w, ignoreCase = true) } }
+        if (density >= 100) return afterWords
+        val keep = (density * 4 / 100).coerceIn(1, 3) // 25→1 / 50→2 / 75→3（每 4 条窗口里留几条）
+        return afterWords.filterIndexed { i, _ -> i % 4 < keep }
+    }
+
+    /** 上屏用的弹幕（= 本体过滤后）：密度/屏蔽词一改立刻重算，不重新走网络 */
+    val danmuComments = remember(danmuRaw, danmuTuning.blocklist, danmuTuning.density) {
+        danmuRaw?.let { filterDanmu(it, danmuTuning.blocklist, danmuTuning.density) }
+    }
+
+    /** 已设的屏蔽词个数（面板入口上标一下，免得忘了自己屏蔽过什么） */
+    val danmuBlockCount = remember(danmuTuning.blocklist) {
+        DanmuClient.parseBlocklist(danmuTuning.blocklist).size
+    }
+
+    /**
+     * 弹幕加载：切集 / 开关变化 / **换源** 时重取。DanmuClient 内部带 Room 缓存
+     * （episodeId 永久、弹幕本体按时效、匹配失败负缓存 3 天），命中缓存是零网络即时返回。
+     * 弹幕是附属品：拉取失败返回空列表，绝不影响播放。
+     *
+     * 缓存时效**不进 keys**：面板里拖那个滑块只该影响下一次拉取 ——
+     * 进来的话每拖一档就重拉一次（还会被 DanmuClient 的频控反咬）。
+     */
+    LaunchedEffect(currentPickCode, prefs.labDanmuEnabled, localUri, danmuApi) {
+        danmuRaw = null
+        danmuStatus = DanmuStatus.Loading
+        if (!prefs.labDanmuEnabled || localUri != null || currentPickCode.isBlank()) {
+            danmuStatus = DanmuStatus.NotFound
+            return@LaunchedEffect
+        }
+        val result = container.danmuClient.fetchFor(
+            currentPickCode, currentName, container.mediaDatabase.mediaDao(), danmuApi,
+            cacheDays = danmuTuning.cacheDays,
+        )
+        danmuRaw = result.comments
+        danmuStatus = if (result.matched) {
+            DanmuStatus.Matched(result.animeTitle, result.episodeTitle)
+        } else {
+            DanmuStatus.NotFound
+        }
+    }
+
+    /** 弹幕渲染路径开着的全部条件：实验室开关 + 会话开关 + 真拉到了 + 云盘源 + 非 VR */
+    val danmuActive = prefs.labDanmuEnabled && danmuOn && !danmuComments.isNullOrEmpty() &&
+        localUri == null && vrMode == null
+
+    /**
+     * 弹幕面板状态行文案（条数是**过滤后**的：改了密度即时反映）。
+     *
+     * 源地址空着时单列一条：不特判的话这里显示的是「未匹配到弹幕」，
+     * 让人以为是没搜到，其实是压根没配源（默认值就是空的）。
+     */
+    val danmuStatusText = if (danmuApi.isBlank()) {
+        "当前：未配置弹幕源 —— 点「弹幕源…」填一个兼容弹弹play 协议的地址"
+    } else when (val s = danmuStatus) {
+        is DanmuStatus.Matched ->
+            "当前：${s.animeTitle} · ${s.episodeTitle}（${danmuComments?.size ?: 0} 条）"
+        DanmuStatus.Loading -> "当前：正在匹配弹幕…"
+        DanmuStatus.NotFound -> "当前：未匹配到弹幕，可手动搜索"
+    }
+
+    // 进 VR 时收起弹幕面板：VR 里弹幕根本不显示（播放器按钮也藏了），
+    // 面板留在屏幕上只会让人以为"点了没反应"
+    LaunchedEffect(vrMode) {
+        if (vrMode != null) danmuMenuOpen = false
+    }
+
+    /**
+     * 贴底的面板开着，两侧圆钮列（截图/锁屏、滤镜/VR/复位）就整体让位：
+     * 面板贴底且很高，横屏下正好盖住那两列，留着就是被压在面板底下的"影子按钮"。
+     * VR 菜单较矮不在此列（它一直在旁边挂着，也一直是能点的）。
+     */
+    val sideColumnsHidden = filterMenuOpen || danmuMenuOpen
 
     val player = remember(prefs) {
         // 独立带宽计：状态栏实时网速的数据源（Builder.setBandwidthMeter 注入后全程累计估算）
@@ -1462,6 +1683,25 @@ fun PlayerScreen(
         currentPickCode = playQueue[index].pc
         currentName = playQueue[index].fn
 
+        // 文件页链路：切到的新视频补一条播放记录，文件页「最近浏览」才会跟着更新。
+        // 入口那条由 FilesScreen 写（只有它拿得到当时所在目录），这里复用同两个值 ——
+        // 文件页的播放列表恒为当前视图里的视频，cid/path 对整条队列都成立。
+        // 媒体库链路 opLogCid 为 null 不写：那边记在观影历史里，两处都记是重复。
+        if (opLogCid != null) {
+            val entry = playQueue[index]
+            container.transferScope.launch {
+                runCatching {
+                    container.opLog.log(
+                        OpType.VIDEO_PLAY,
+                        entry.fn,
+                        if (playQueue.size > 1) "连播 ${playQueue.size} 项" else null,
+                        opLogCid,
+                        opLogPath,
+                    )
+                }
+            }
+        }
+
         // 需求：切集后进度归零、总时长等待元数据、缓冲中
         pendingStartMs = 0L
         // 切集要按新一集自己的规则重选档位，别把上一集"重建播放器"时留的档位带过来
@@ -1672,6 +1912,12 @@ fun PlayerScreen(
                 positionMs = player.currentPosition.coerceAtLeast(0L)
                 durationMs = player.duration.coerceAtLeast(0L)
                 bufferedMs = player.bufferedPosition.coerceAtLeast(0L)
+                // 弹幕（实验室）跟随：跳变当 seek、平稳定期校锚，逻辑都在视图内部。
+                // ⚠️ 这里**不能**再判 danmuActive：它是组合期的局部值，而本效应只在
+                // keys 变化时重启、一直持有**首次组合**那份闭包 —— 那时弹幕还没到、
+                // danmuActive 恒为 false，于是校锚永远不跑（续播落点、seek、快进之后
+                // 弹幕时间轴一路漂）。视图在才拿得到 ref，判 ref 就够了。
+                danmuViewRef.get()?.syncPosition(positionMs)
             }
             delay(250)
         }
@@ -1706,9 +1952,14 @@ fun PlayerScreen(
     }
 
     // 定期上报播放进度
+    // 循环条件不能带 data != null：首次组合时 videoPlay 还没回来、data 恒为 null，
+    // 循环会在第一轮检查就整个退出，而 keys 不变不会再重启 —— 进入播放器的
+    // 第一部片（云端进度 + 本机观影历史）就永远只剩退出时补的那一笔。
+    // 改成"这轮没准备好就跳过"，循环本身常驻。
     LaunchedEffect(currentPickCode, prefs) {
-        while (isActive && data != null) {
+        while (isActive) {
             delay(10_000)
+            if (data == null) continue
             val pos = player.currentPosition / 1000
             if (pos > 0) {
                 val ended = player.playbackState == Player.STATE_ENDED
@@ -2467,11 +2718,30 @@ fun PlayerScreen(
                                 v.updateGeometry(
                                     vsVideoSize.width, vsVideoSize.height, videoRotation,
                                 )
+                                v.updateSplit(if (filterCompare) 0.5f else -1f)
                             },
                             modifier = Modifier.fillMaxSize(),
                         )
                     } else {
                         AndroidView(factory = { _ -> textureView }, modifier = Modifier.fillMaxSize())
+                    }
+                    // 弹幕（实验室）：挂在画面之上、字幕之下，高度 = 弹幕面板里
+                    // 「显示区域」的比例。View 本身不可点，触摸穿到手势层。
+                    if (danmuActive) {
+                        DanmakuOverlay(
+                            comments = danmuComments,
+                            startPosMs = positionMs,
+                            playing = isPlaying && !rebuffering,
+                            speed = currentSpeed,
+                            viewRef = danmuViewRef,
+                            textSizeSp = danmuTuning.textSize,
+                            opacity = danmuTuning.opacity,
+                            scrollFactor = danmuTuning.scroll,
+                            modifier = Modifier
+                                .align(Alignment.TopCenter)
+                                .fillMaxWidth()
+                                .fillMaxHeight(danmuTuning.area / 100f),
+                        )
                     }
                     AndroidView(
                         factory = { _ -> subtitleView },
@@ -2554,6 +2824,7 @@ fun PlayerScreen(
                 player = player,
                 config = doubleTapConfig,
                 longPressSpeed = prefs.speedBoost,
+                onSpeedChange = { s -> currentSpeed = s },
                 onToggleController = {
                     // 自带控制条已停用：单击切换右下角控制排的显隐
                     if (controlRowVisible) {
@@ -2616,7 +2887,8 @@ fun PlayerScreen(
             ) {
                 Box(Modifier.size(44.dp), contentAlignment = Alignment.Center) {
                     androidx.compose.animation.AnimatedVisibility(
-                        visible = controlRowVisible && !screenLocked,
+                        // 贴底的面板（滤镜/弹幕）开着时让位：面板贴底且很高，横屏下正好盖住这列
+                        visible = controlRowVisible && !screenLocked && !sideColumnsHidden,
                         enter = fadeIn(tween(160)),
                         exit = fadeOut(tween(200)),
                     ) {
@@ -2640,7 +2912,8 @@ fun PlayerScreen(
                 // 与右侧「VR / 复位」同间距，两列竖排视觉上对称
                 Spacer(Modifier.height(12.dp))
                 androidx.compose.animation.AnimatedVisibility(
-                    visible = screenLocked || controlRowVisible,
+                    // 锁定态恒可见（那是唯一的解锁入口）；其余情况在贴底面板打开时让位
+                    visible = screenLocked || (controlRowVisible && !sideColumnsHidden),
                     enter = fadeIn(tween(160)),
                     exit = fadeOut(tween(200)),
                 ) {
@@ -2656,7 +2929,14 @@ fun PlayerScreen(
                                 .clickable(
                                     interactionSource = remember { MutableInteractionSource() },
                                     indication = null,
-                                ) { if (screenLocked) unlockScreen() else lockScreen() },
+                                ) {
+                                    if (screenLocked) unlockScreen() else {
+                                        lockScreen()
+                                        // 锁定 = 要一块干净画面：贴底的面板跟着收起
+                                        filterMenuOpen = false
+                                        danmuMenuOpen = false
+                                    }
+                                },
                             contentAlignment = Alignment.Center,
                         ) {
                             Icon(
@@ -2674,8 +2954,10 @@ fun PlayerScreen(
             // 右侧竖排：VR 开关（识别到 VR 素材才出现）+ 旋转/复位。
             // VR 模式下这个位置变成「复位视角」：视窗本来就满屏，画面旋转对 VR 没意义，
             // 而陀螺仪无磁力计必然缓慢漂移，恰恰最需要一个快速回正的入口。
+            // 贴底的面板开着时整列让位（面板自己带收起键）—— 面板贴底且很高，
+            // 横屏下正好盖住这列，留着就是被面板压在下面的"影子按钮"。
             androidx.compose.animation.AnimatedVisibility(
-                visible = controlRowVisible && !screenLocked,
+                visible = controlRowVisible && !screenLocked && !sideColumnsHidden,
                 enter = fadeIn(tween(160)),
                 exit = fadeOut(tween(200)),
                 modifier = Modifier.align(Alignment.CenterEnd),
@@ -2696,8 +2978,11 @@ fun PlayerScreen(
                                 else Color.Black.copy(alpha = 0.55f),
                                 onClick = {
                                     filterMenuOpen = !filterMenuOpen
-                                    // 两个面板都挂在控制排顶部，同时开就叠在一起了
-                                    if (filterMenuOpen) vrMenuOpen = false
+                                    // 三个面板都挂在控制排顶部，同时开就叠在一起了
+                                    if (filterMenuOpen) {
+                                        vrMenuOpen = false
+                                        danmuMenuOpen = false
+                                    }
                                     pulseControlRow()
                                 },
                             )
@@ -2720,8 +3005,11 @@ fun PlayerScreen(
                                         indication = null,
                                     ) {
                                         vrMenuOpen = !vrMenuOpen
-                                        // 与滤镜面板互斥（同挂在控制排顶部）
-                                        if (vrMenuOpen) filterMenuOpen = false
+                                        // 与另两个面板互斥（同挂在控制排顶部）
+                                        if (vrMenuOpen) {
+                                            filterMenuOpen = false
+                                            danmuMenuOpen = false
+                                        }
                                         pulseControlRow()
                                     },
                                 contentAlignment = Alignment.Center,
@@ -2908,9 +3196,45 @@ fun PlayerScreen(
                     // 滤镜面板（实验室）：与 VR 菜单同一个位置、同一套交互 ——
                     // 贴底挂在控制排顶部，跟进度条/按钮排同生共死，4 秒淡出一致。
                     if (filterMenuOpen) {
+                        // 命中判定：先比内置预设，没中再比自定义模板 —— 两边参数可能一样
+                        //（用户照着内置存了个一模一样的），高亮给先命中的一方就够
+                        val builtinPresetIndex = FilterPresets.indexOf(filterParams)
+                        val customPresetIndex = if (builtinPresetIndex < 0) {
+                            customFilterPresets.indexOfFirst {
+                                FilterParams.fromPrefString(it.params) == filterParams
+                            }
+                        } else -1
                         FilterMenu(
                             params = filterParams,
-                            presetIndex = FilterPresets.indexOf(filterParams),
+                            presetIndex = builtinPresetIndex,
+                            customPresets = customFilterPresets,
+                            selectedCustomIndex = customPresetIndex,
+                            canSaveTemplate = !filterParams.isNeutral(),
+                            onSaveTemplate = {
+                                showFilterSaveDialog = true
+                                pulseControlRow()
+                            },
+                            onPickCustom = { i ->
+                                filterParams = FilterParams.fromPrefString(customFilterPresets[i].params)
+                                pushFilterState()
+                                persistFilterParams()
+                                pulseControlRow()
+                            },
+                            onDeleteCustom = { i ->
+                                val removed = customFilterPresets[i]
+                                customFilterPresets = customFilterPresets.filterIndexed { idx, _ -> idx != i }
+                                persistCustomFilterPresets()
+                                toast("已删除模板「${removed.name}」")
+                                pulseControlRow()
+                            },
+                            compareOn = filterCompare,
+                            compareAvailable = filterActive,
+                            onToggleCompare = {
+                                filterCompare = !filterCompare
+                                pushFilterState()
+                                pulseControlRow()
+                            },
+                            onDismiss = { filterMenuOpen = false },
                             onPickPreset = { i ->
                                 val p = FilterPresets.all[i].params.copy()
                                 filterParams = p
@@ -2926,6 +3250,41 @@ fun PlayerScreen(
                             },
                             // 抬手才落盘：拖动过程中每帧写一次 DataStore 纯属浪费
                             onParamCommit = { persistFilterParams() },
+                            modifier = Modifier.align(Alignment.CenterHorizontally),
+                        )
+                    }
+                    // 弹幕面板（实验室）：与 VR 菜单/滤镜面板同一个位置、同一套交互 ——
+                    // 贴底挂在控制排顶部，跟进度条/按钮排同生共死，4 秒淡出一致。
+                    if (danmuMenuOpen) {
+                        DanmuMenu(
+                            tuning = danmuTuning,
+                            statusText = danmuStatusText,
+                            displayOn = danmuOn,
+                            blockCount = danmuBlockCount,
+                            onTuning = { t ->
+                                danmuTuning = t
+                                // 拖一下滑块/点一下档位控制排就续命一次，否则调一半整排淡出
+                                pulseControlRow()
+                            },
+                            onTuningCommit = { persistDanmuTuning() },
+                            onToggleDisplay = {
+                                danmuOn = !danmuOn
+                                setIndicator(if (danmuOn) "弹幕已开启" else "弹幕已关闭")
+                                pulseControlRow()
+                            },
+                            onRematch = {
+                                showDanmuMatch = true
+                                pulseControlRow()
+                            },
+                            onEditBlocklist = {
+                                showDanmuBlockEdit = true
+                                pulseControlRow()
+                            },
+                            onEditApi = {
+                                showDanmuApiEdit = true
+                                pulseControlRow()
+                            },
+                            onDismiss = { danmuMenuOpen = false },
                             modifier = Modifier.align(Alignment.CenterHorizontally),
                         )
                     }
@@ -3170,6 +3529,27 @@ fun PlayerScreen(
                                         }
                                     }
                                 }
+                                // 弹幕（实验室）：点开贴底的弹幕面板 —— 显示开关、重新匹配、
+                                // 显示区域/密度/字号/不透明度/速度/屏蔽词/缓存时效/源地址都在里面，
+                                // 不必退出播放去设置页。只有云盘源 + 非 VR + 实验室开了才出现
+                                if (prefs.labDanmuEnabled && localUri == null && vrMode == null) {
+                                    IconButton(onClick = {
+                                        danmuMenuOpen = !danmuMenuOpen
+                                        // 三个面板都挂在控制排顶部，同时开就叠在一起了
+                                        if (danmuMenuOpen) {
+                                            filterMenuOpen = false
+                                            vrMenuOpen = false
+                                        }
+                                        pulseControlRow()
+                                    }) {
+                                        Icon(
+                                            Icons.Outlined.Forum,
+                                            "弹幕设置",
+                                            tint = if (danmuOn) Color(0xFFFFC107)
+                                            else Color.White.copy(alpha = 0.7f),
+                                        )
+                                    }
+                                }
                                 // 倍速
                                 Box {
                                     TextButton(onClick = { speedMenuOpen = true }) {
@@ -3326,8 +3706,9 @@ fun PlayerScreen(
         // ① 横屏片：满宽、高度按比例，**整体垂直居中**（不再钉在屏幕顶部）；
         // ② 竖屏片：直接占满状态栏以下的可用高度、宽度按比例收窄——等效全屏
         //    且不裁切内容（左右仅留极窄黑边）；③ VR 仍满屏；④ 标题/时长/集数
-        //  chips 改为贴屏幕底部的悬浮层（渐变遮罩），控制排弹出或锁屏时隐藏，
-        //    避免与压在视频底沿的进度条/按钮排互相遮挡。
+        //  chips 贴屏幕底部的悬浮层（渐变遮罩）：画面没占满整屏高时与控制排同进同出
+        //    （与横屏顶栏一致）；占满时（控制排压在屏幕底沿）互斥且 4 秒自淡出，
+        //    避免盖住压在视频底沿的进度条/按钮排。
         // 系统栏已全沉浸（上方 DisposableEffect），无需再让出状态栏/导航栏空间
         BoxWithConstraints(
             Modifier
@@ -3384,9 +3765,23 @@ fun PlayerScreen(
                 onSubSearch = { showSubSearch = true },
             )
             // 底部悬浮信息层：标题 + 时长画质 + 集数 chips（有队列才显示）。
-            // 控制排的进度条和按钮排压在画面底沿，与这块是同一区域，二者互斥显隐。
+            // 画面没占满整屏高（横片竖看，上下留黑）：控制排贴视频底沿、在屏幕中部，
+            // 与贴屏幕底的这块互不相干 —— 同进同出，4 秒无操作一起淡出（与横屏顶栏一致）。
+            // 画面占满整屏高（竖片）：控制排压在屏幕底沿、与这块同区域，只能互斥 ——
+            // 但出场 4 秒后自己收掉，不再"控制排一藏就常显"（竖屏信息层常驻的老 bug）。
+            val infoMustYield = boxH >= maxH
+            var yieldInfoShown by remember { mutableStateOf(false) }
+            LaunchedEffect(controlRowVisible, screenLocked, infoMustYield) {
+                if (infoMustYield && !controlRowVisible && !screenLocked) {
+                    yieldInfoShown = true
+                    delay(4000L)
+                    yieldInfoShown = false
+                } else {
+                    yieldInfoShown = false
+                }
+            }
             AnimatedVisibility(
-                visible = !controlRowVisible && !screenLocked,
+                visible = if (infoMustYield) yieldInfoShown else (controlRowVisible && !screenLocked),
                 enter = fadeIn(tween(200)),
                 exit = fadeOut(tween(160)),
                 modifier = Modifier
@@ -3605,6 +4000,106 @@ fun PlayerScreen(
                 loadOnlineSub(cfg, bytes, ext)
             },
             onDismiss = { showSubSearch = false },
+        )
+    }
+
+    // 手动匹配弹幕：关键词可编辑（自动清洗只是初值），选定剧集后写缓存并立即上屏
+    if (showDanmuMatch) {
+        DanmuMatchDialog(
+            initialKeyword = DanmuClient.cleanTitle(currentName).ifBlank { currentName.substringBeforeLast('.') },
+            onSearch = { kw -> container.danmuClient.search(danmuApi, kw) },
+            onPick = { anime, ep ->
+                scope.launch {
+                    val list = container.danmuClient.bindManual(
+                        currentPickCode, container.mediaDatabase.mediaDao(),
+                        danmuApi, anime.title, ep.title, ep.episodeId,
+                    )
+                    danmuRaw = list // 过滤是派生的（密度/屏蔽词），这里存本体
+                    danmuOn = true
+                    danmuStatus = DanmuStatus.Matched(anime.title, ep.title)
+                    setIndicator(if (list.isEmpty()) "这部片没拉到弹幕" else "已绑定：${ep.title.take(24)}")
+                }
+            },
+            onDismiss = { showDanmuMatch = false },
+        )
+    }
+
+    // 屏蔽词 / 弹幕源地址：面板里只有「…」入口，真正的输入框还是弹层（要用软键盘）
+    if (showDanmuBlockEdit) {
+        PlayerTextEditDialog(
+            title = "弹幕屏蔽词",
+            label = "关键词（逗号/顿号/换行分隔）",
+            hint = "含任一关键词的弹幕不显示（子串匹配、忽略大小写）。保存后立刻生效，本机记住。",
+            initial = danmuTuning.blocklist,
+            singleLine = false,
+            onSave = { text ->
+                showDanmuBlockEdit = false
+                danmuTuning = danmuTuning.copy(blocklist = text)
+                persistDanmuTuning()
+                setIndicator("屏蔽词已更新")
+            },
+            onDismiss = { showDanmuBlockEdit = false },
+        )
+    }
+    if (showDanmuApiEdit) {
+        PlayerTextEditDialog(
+            title = "弹幕源地址",
+            label = "服务地址",
+            hint = "任何兼容弹弹play 协议的 HTTP 服务（自托管 danmu_api / 官方 / 局域网实例）。" +
+                "保存后本条的弹幕缓存作废、立刻按新源重新匹配。",
+            initial = danmuApi,
+            singleLine = true,
+            onSave = { text ->
+                showDanmuApiEdit = false
+                val next = text.trim().trimEnd('/')
+                scope.launch {
+                    container.playerPrefs.setLabDanmuApi(next)
+                    // 缓存按 pick_code 存、跟源地址无关：不作废的话换了源还是吐旧源那份
+                    if (currentPickCode.isNotBlank()) {
+                        container.mediaDatabase.mediaDao().deleteDanmu(currentPickCode)
+                    }
+                    // 放在作废之后：这一改会触发重拉（danmuApi 是拉取效应的 key），得先删掉旧缓存
+                    danmuApi = next
+                    setIndicator("弹幕源已更新，正在重新匹配…")
+                }
+            },
+            onDismiss = { showDanmuApiEdit = false },
+        )
+    }
+    // 保存滤镜模板的命名弹层：把当前参数存成模板。同名 = 覆盖（改完滑块想微调某个
+    // 模板时不用先删旧的），满员/空白名在 onSave 里拦截。
+    if (showFilterSaveDialog) {
+        PlayerTextEditDialog(
+            title = "保存滤镜模板",
+            label = "模板名称",
+            hint = "把当前的滑块参数（含风格）存成一个模板，会出现在滤镜面板的预设行里。" +
+                "同名保存 = 覆盖；长按面板里的模板胶囊可删除。",
+            initial = "",
+            singleLine = true,
+            onSave = { name ->
+                showFilterSaveDialog = false
+                val trimmed = name.trim()
+                if (trimmed.isEmpty()) return@PlayerTextEditDialog
+                val entry = CustomFilterPreset(trimmed, filterParams.toPrefString())
+                val existing = customFilterPresets.indexOfFirst { it.name == trimmed }
+                when {
+                    existing >= 0 -> {
+                        customFilterPresets =
+                            customFilterPresets.toMutableList().also { it[existing] = entry }
+                        persistCustomFilterPresets()
+                        toast("已覆盖模板「$trimmed」")
+                    }
+                    customFilterPresets.size >= CustomFilterPresetsCodec.MAX ->
+                        toast("模板最多 ${CustomFilterPresetsCodec.MAX} 个，长按模板可删除")
+                    else -> {
+                        customFilterPresets = customFilterPresets + entry
+                        persistCustomFilterPresets()
+                        toast("已保存模板「$trimmed」")
+                    }
+                }
+                pulseControlRow()
+            },
+            onDismiss = { showFilterSaveDialog = false },
         )
     }
 }
@@ -3864,13 +4359,34 @@ private val VrActiveColor = Color(0xFF8A6A16)
  *
  * 与 [VrModeMenu] 同一套外观与行为（贴底、跟控制排同生共死），不另起弹层：
  * 播放器里弹层与控制排的淡出节奏对不齐时，用户会以为点空了。
+ *
+ * 打开面板时左右两侧的截图/锁屏/VR 按钮列会让位淡出（横屏下面板正好盖住它们），
+ * 所以面板自带收起键 —— 收起键放在预设行的滚动区**外**，胶囊再多也滚不走它。
  */
 @Composable
 internal fun FilterMenu(
     params: FilterParams,
-    /** 命中的预设下标；-1 = 参数被改过（自定义） */
+    /** 命中的内置预设下标；-1 = 参数被改过或来自自定义模板 */
     presetIndex: Int,
+    /** 自定义模板列表（用户存过的参数组合），排在内置预设后面 */
+    customPresets: List<CustomFilterPreset>,
+    /** 命中的自定义模板下标；-1 = 没命中（内置命中 / 拖过滑块） */
+    selectedCustomIndex: Int,
+    /** 当前参数能不能存成模板：原图（中性参数）没有存的价值，置灰 */
+    canSaveTemplate: Boolean,
+    onSaveTemplate: () -> Unit,
+    /** 对比模式是否开着（只对滤镜渲染路径有意义，见 [FilterViewportView.updateSplit]） */
+    compareOn: Boolean,
+    /** 对比键可不可用：参数是原图（没走 GL）时对比无从谈起，置灰 */
+    compareAvailable: Boolean,
+    onToggleCompare: () -> Unit,
+    /** 收起面板（两侧按钮列随之回来） */
+    onDismiss: () -> Unit,
     onPickPreset: (Int) -> Unit,
+    /** 点自定义模板：整组参数回到存档那一刻的样子 */
+    onPickCustom: (Int) -> Unit,
+    /** 长按自定义模板：删除（无确认，可再存回来） */
+    onDeleteCustom: (Int) -> Unit,
     /** 拖动中：换一组参数（调用方负责实时上屏） */
     onParam: (FilterParams) -> Unit,
     /** 抬手：落盘 */
@@ -3883,27 +4399,70 @@ internal fun FilterMenu(
         modifier = modifier.padding(start = 12.dp, end = 12.dp, bottom = 6.dp),
     ) {
         Column(modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)) {
-            // 低分辨率横屏下 9 个胶囊可能超宽，允许横向滚动兜底（同 VR 菜单）
             Row(
                 verticalAlignment = Alignment.CenterVertically,
-                modifier = Modifier.horizontalScroll(rememberScrollState()),
+                modifier = Modifier.fillMaxWidth(),
             ) {
                 Text(
-                    if (presetIndex < 0) "自定义" else "预设",
+                    when {
+                        presetIndex >= 0 -> "预设"
+                        selectedCustomIndex >= 0 -> "模板"
+                        else -> "自定义"
+                    },
                     color = Color.White.copy(alpha = 0.75f),
                     style = MaterialTheme.typography.labelMedium,
                     maxLines = 1,
                     modifier = Modifier.padding(end = 6.dp),
                 )
-                FilterPresets.all.forEachIndexed { i, preset ->
+                // 低分辨率横屏下胶囊可能超宽，允许横向滚动兜底（同 VR 菜单）
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.weight(1f).horizontalScroll(rememberScrollState()),
+                ) {
+                    FilterPresets.all.forEachIndexed { i, preset ->
+                        VrChip(
+                            preset.name,
+                            selected = i == presetIndex,
+                            onClick = { onPickPreset(i) },
+                        )
+                    }
+                    // 自定义模板：点一下整组参数回到存档那一刻；长按删除（toast 兜底说明）
+                    customPresets.forEachIndexed { i, custom ->
+                        VrChip(
+                            custom.name,
+                            selected = presetIndex < 0 && i == selectedCustomIndex,
+                            onClick = { onPickCustom(i) },
+                            onLongClick = { onDeleteCustom(i) },
+                        )
+                    }
+                    // 存模板 = 把当前参数起个名字收进上面那排；原图没存的价值，置灰
                     VrChip(
-                        preset.name,
-                        selected = i == presetIndex,
-                        onClick = { onPickPreset(i) },
+                        "存模板",
+                        selected = false,
+                        enabled = canSaveTemplate,
+                        onClick = onSaveTemplate,
+                    )
+                    // 重置 = 回到原图（中性参数），渲染路径也随之退回 TextureView
+                    VrChip("重置", selected = false, onClick = { onPickPreset(0) })
+                    // 对比：左半原图、右半滤镜。参数是原图时没走 GL，置灰不可点
+                    VrChip(
+                        "对比",
+                        selected = compareOn,
+                        enabled = compareAvailable,
+                        onClick = onToggleCompare,
                     )
                 }
-                // 重置 = 回到原图（中性参数），渲染路径也随之退回 TextureView
-                VrChip("重置", selected = false, onClick = { onPickPreset(0) })
+                IconButton(
+                    onClick = onDismiss,
+                    modifier = Modifier.size(30.dp),
+                ) {
+                    Icon(
+                        Icons.Outlined.Close,
+                        contentDescription = "收起滤镜面板",
+                        tint = Color.White,
+                        modifier = Modifier.size(16.dp),
+                    )
+                }
             }
             Spacer(Modifier.height(4.dp))
             // 两列三行：平板横屏下不至于挡掉大半画面，竖屏窄屏也还能用
@@ -4089,14 +4648,18 @@ internal fun VrModeMenu(
     }
 }
 
+/** 面板/菜单共用的小胶囊（VR 模式、滤镜预设、弹幕档位都是它） */
 @Composable
-private fun VrChip(
+@OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
+internal fun VrChip(
     label: String,
     selected: Boolean,
     enabled: Boolean = true,
+    /** 长按动作（可空）；目前只有自定义模板用它做删除 */
+    onLongClick: (() -> Unit)? = null,
+    // ⚠️ 必须是最后一个参数：全工程十几处 VrChip(...) { ... } 的尾随 lambda 绑的都是它
     onClick: () -> Unit,
-) {
-    Surface(
+) {    Surface(
         color = when {
             !enabled -> Color.White.copy(alpha = 0.10f)
             selected -> Color.White
@@ -4105,11 +4668,13 @@ private fun VrChip(
         shape = RoundedCornerShape(50),
         modifier = Modifier
             .padding(horizontal = 3.dp)
-            .clickable(
+            .combinedClickable(
                 interactionSource = remember { MutableInteractionSource() },
                 indication = null,
                 enabled = enabled,
-            ) { onClick() },
+                onClick = { onClick() },
+                onLongClick = onLongClick,
+            ),
     ) {
         Text(
             label,

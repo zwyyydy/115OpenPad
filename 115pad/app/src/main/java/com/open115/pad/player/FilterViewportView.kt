@@ -99,6 +99,16 @@ internal class FilterViewportView(context: Context) : GLSurfaceView(context) {
         requestRender()
     }
 
+    /**
+     * 对比分屏：v ≤ 0 = 关；0..1 = 分屏线在屏幕宽度上的位置。
+     * 线**左**画原图、线**右**画滤镜后的画面（先原后改，与修图软件同习惯），
+     * 线本身画一条细白竖线。
+     */
+    fun updateSplit(v: Float) {
+        renderer.split = v
+        requestRender()
+    }
+
     override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
         super.onSizeChanged(w, h, oldw, oldh)
         requestRender()
@@ -121,6 +131,10 @@ internal class FilterViewportView(context: Context) : GLSurfaceView(context) {
 
         @Volatile
         var rotation: Int = 0
+
+        /** 对比分屏位置：≤0 = 关；0..1 = 分屏线在屏幕宽度上的位置（左原图、右滤镜） */
+        @Volatile
+        var split: Float = -1f
 
         private val frameLock = Any()
         private var framePending = false
@@ -152,6 +166,7 @@ internal class FilterViewportView(context: Context) : GLSurfaceView(context) {
         private var uGamma = 0
         private var uFade = 0
         private var uMono = 0
+        private var uSplit = 0
 
         override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) {
             releaseSurface()
@@ -213,6 +228,7 @@ internal class FilterViewportView(context: Context) : GLSurfaceView(context) {
             uGamma = GLES20.glGetUniformLocation(program, "uGamma")
             uFade = GLES20.glGetUniformLocation(program, "uFade")
             uMono = GLES20.glGetUniformLocation(program, "uMono")
+            uSplit = GLES20.glGetUniformLocation(program, "uSplit")
             aPos = GLES20.glGetAttribLocation(program, "aPos")
 
             val bb = ByteBuffer.allocateDirect(QUAD.size * 4)
@@ -277,6 +293,7 @@ internal class FilterViewportView(context: Context) : GLSurfaceView(context) {
             GLES20.glUniform1f(uGamma, p.gamma)
             GLES20.glUniform1f(uFade, p.fade)
             GLES20.glUniform1f(uMono, p.mono)
+            GLES20.glUniform1f(uSplit, split)
 
             val q = quadBuf
             if (q != null && aPos >= 0) {
@@ -371,6 +388,9 @@ internal class FilterViewportView(context: Context) : GLSurfaceView(context) {
             uniform float uGamma;
             uniform float uFade;
             uniform float uMono;
+            // 对比分屏：≤0 = 关；0..1 = 分屏线位置（线左原图、线右滤镜），
+            // 线本身画一条细白竖线，两个"版本"中间那条就是它。
+            uniform float uSplit;
 
             float luma(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }
 
@@ -396,7 +416,9 @@ internal class FilterViewportView(context: Context) : GLSurfaceView(context) {
             }
 
             void main() {
-                vec3 c = sampleAt(vUv);
+                // 原图留一份：分屏对比的"另一边"直接用它，不用再算一遍
+                vec3 orig = sampleAt(vUv);
+                vec3 c = orig;
 
                 // ---- 磨皮：3x3 模糊，用局部亮度差做边缘保护 ----
                 if (uSmooth > 0.001) {
@@ -446,6 +468,20 @@ internal class FilterViewportView(context: Context) : GLSurfaceView(context) {
                     vec2 d = vUv - 0.5;
                     float dist = length(d) * 1.414;
                     c *= 1.0 - uVignette * smoothstep(0.25, 1.05, dist);
+                }
+
+                // ---- 分屏对比（滤镜只在对比开启时才走这段）----
+                // 线宽用 uv 常数（0.0018 ≈ 720p 下 1.3px、1080p 下 2px），不做宽高比校正：
+                // 竖线只要看得见就行，两侧差一个像素毫无影响。
+                if (uSplit > 0.0) {
+                    if (abs(vUv.x - uSplit) < 0.0018) {
+                        gl_FragColor = vec4(1.0);
+                        return;
+                    }
+                    if (vUv.x < uSplit) {
+                        gl_FragColor = vec4(clamp(orig, 0.0, 1.0), 1.0);
+                        return;
+                    }
                 }
 
                 gl_FragColor = vec4(clamp(c, 0.0, 1.0), 1.0);

@@ -71,11 +71,14 @@ fun Open115Theme(
     glassRadiusDp: Int = 14,
     content: @Composable () -> Unit,
 ) {
-    // 壁纸激活（仅明亮模式）：页面底色保底 0.55 的浅色垫底——列表行/设置行这类
-    // 直接压在底色上的文字可读；遮罩滑块拉高时垫底浓度联动加强（0.55→0.9）+
-    // 壁纸上的白蒙加厚。卡片/顶栏恒不透明。0% 遮罩 = 壁纸明显可见但文字仍有底。
+    // 壁纸激活（仅明亮模式）：页面底色**垫底**——列表行/设置行这类直接压在底色上的文字靠它可读。
+    // 浓度 = 0.15 + 0.75 × 遮罩：
+    //   * 0%   → 0.15：壁纸几乎原样露出来（早先是固定 0.55 起，等于"0% 也蒙着一层"，
+    //                  用户实测就觉得"0% 的效果也偏强、壁纸看不透"）；
+    //   * 100% → 0.90：与调整前一致，顶到头接近实底、只留一点壁纸纹理。
+    // 壁纸上的白蒙版另算一笔（WallpaperLayer 里的 Color.White.copy(alpha = mask)），两者一起动。
     val palette = (if (dark) DarkAppPalette else LightAppPalette).let {
-        if (wallpaper) it.copy(bg = it.bg.copy(alpha = 0.55f + 0.35f * wallpaperMask.coerceIn(0f, 1f))) else it
+        if (wallpaper) it.copy(bg = it.bg.copy(alpha = 0.15f + 0.75f * wallpaperMask.coerceIn(0f, 1f))) else it
     }
     CompositionLocalProvider(
         LocalAppPalette provides palette,

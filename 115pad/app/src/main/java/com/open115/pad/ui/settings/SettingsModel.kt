@@ -9,6 +9,7 @@ import androidx.compose.material.icons.outlined.Palette
 import androidx.compose.material.icons.outlined.PersonOutline
 import androidx.compose.material.icons.outlined.PlayCircle
 import androidx.compose.material.icons.outlined.Science
+import androidx.compose.material.icons.outlined.Sync
 import androidx.compose.ui.graphics.vector.ImageVector
 
 /**
@@ -106,6 +107,7 @@ enum class SettingsCategory(
     DOWNLOAD("下载", Icons.Outlined.CloudDownload, "链接识别与外部唤起"),
     TASK("后台任务", Icons.Outlined.Bolt, "任务跑完再让系统回收：前台常驻与电池优化白名单"),
     STORAGE("存储与缓存", Icons.Outlined.FolderOpen, "各类本机缓存的开关、上限与清理"),
+    PIPELINE("流水线同步", Icons.Outlined.Sync, "服务器刮削完自动更新媒体库"),
     LAB("实验室", Icons.Outlined.Science, "尝鲜功能，不稳定，随时可以关掉"),
     ACCOUNT("账号", Icons.Outlined.PersonOutline, "授权信息与退出登录"),
     ABOUT("关于", Icons.Outlined.Info, "版本与说明"),

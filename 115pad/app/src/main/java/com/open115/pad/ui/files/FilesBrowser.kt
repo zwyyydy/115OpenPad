@@ -25,6 +25,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.PushPin
 import androidx.compose.material.icons.outlined.Check
+import androidx.compose.material.icons.outlined.Category
 import androidx.compose.material.icons.outlined.ChevronRight
 import androidx.compose.material.icons.outlined.CloudDownload
 import androidx.compose.material.icons.outlined.ContentCopy
@@ -96,6 +97,12 @@ import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.runtime.rememberUpdatedState
 import kotlinx.coroutines.withTimeoutOrNull
 
+/**
+ * 列表条目的稳定身份：既是 LazyColumn/Grid 的 item key，也是滚动位置记忆的锚。
+ * 两处**必须共用这一份表达式** —— 锚点是拿它回查下标的，写法一旦分叉就再也对不上。
+ */
+private fun fileItemKey(item: FileItem): String = (item.fid ?: "") + "#" + item.fn
+
 private val sortOptions = listOf(
     "file_name" to "按名称",
     "file_size" to "按大小",
@@ -127,6 +134,12 @@ fun FilesBrowserPane(
     onUploadFolder: () -> Unit,
     onCreateFolder: () -> Unit,
     onOpenFilterRules: () -> Unit,
+    /** 分类整理：点顶栏按键，弹确认框（确认与否由 FilesScreen 决定） */
+    onOrganize: () -> Unit = {},
+    /** 分类整理进行中的进度快照；null 或 running=false 时横幅不显示 */
+    organizing: com.open115.pad.data.FileOrganizer.Progress? = null,
+    /** 横幅上的「停止」 */
+    onStopOrganize: () -> Unit = {},
     /** 拖动到快捷目录的会话；null（窄屏没有侧栏）时拖动整体不启用 */
     quickDirDrag: QuickDirDragHost? = null,
     /** 拖到快捷目录条目上松手：把当前多选移过去 */
@@ -174,6 +187,11 @@ fun FilesBrowserPane(
                     }
                 },
                 actions = {
+                    // 分类整理：递归扫当前目录，把文件按类型移进本目录的六个分类文件夹 + 其他。
+                    // 放最左（漏斗前面），是低频但一用就是"大动作"的入口
+                    IconButton(onClick = onOrganize) {
+                        Icon(Icons.Outlined.Category, contentDescription = "分类整理")
+                    }
                     // 入口 B：高级过滤总开关（漏斗）。
                     // 有生效方案 → 点击开/关过滤（开启高亮主色）；
                     // 没有生效方案 → 点击跳转规则配置中心（而不是做成点不动的死按钮）。
@@ -326,6 +344,85 @@ fun FilesBrowserPane(
                 }
             }
 
+            // 从搜索结果点进来的提示条：目录内容与搜索结果一眼分不清，这条同时告诉用户
+            // "这层是从哪儿来的"和"怎么回去" —— 点它、按返回键、按返回箭头都是同一个动作
+            // （见 FilesViewModel.backToSearchResults）。只在从结果进来的这一支里出现。
+            ui.searchBackQuery?.let { q ->
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable { vm.backToSearchResults() }
+                        .padding(horizontal = 12.dp, vertical = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Icon(
+                        Icons.Outlined.Search,
+                        contentDescription = null,
+                        tint = com.open115.pad.ui.theme.AppColors.TextSecondary,
+                        modifier = Modifier.size(14.dp),
+                    )
+                    Text(
+                        "来自搜索「$q」",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = com.open115.pad.ui.theme.AppColors.TextSecondary,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f).padding(start = 6.dp),
+                    )
+                    Text(
+                        "回到结果",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = com.open115.pad.ui.theme.AppColors.AccentDeep,
+                    )
+                    Icon(
+                        Icons.Outlined.ChevronRight,
+                        contentDescription = null,
+                        tint = com.open115.pad.ui.theme.AppColors.AccentDeep,
+                        modifier = Modifier.size(16.dp),
+                    )
+                }
+            }
+
+            // 分类整理进行中的横幅（与"来自搜索"提示条同款样式）：
+            // 扫描阶段报"扫了几个目录、见了几个文件"，移动阶段报"移了几个/共几个"。
+            // 任务在应用级跑，这里只是它的一面仪表盘 —— 人切走了再回来，横幅照常挂着
+            organizing?.takeIf { it.running }?.let { p ->
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 12.dp, vertical = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Icon(
+                        Icons.Outlined.Category,
+                        contentDescription = null,
+                        tint = com.open115.pad.ui.theme.AppColors.AccentDeep,
+                        modifier = Modifier.size(14.dp),
+                    )
+                    Text(
+                        if (p.phase == com.open115.pad.data.FileOrganizer.Phase.MOVE) {
+                            "分类整理中：已移动 ${p.movedFiles}/${p.totalToMove} 项" +
+                                (if (p.failed > 0) "，失败 ${p.failed}" else "")
+                        } else {
+                            "分类整理中：已扫描 ${p.scannedDirs} 个目录，发现 ${p.foundFiles} 个文件"
+                        },
+                        style = MaterialTheme.typography.labelSmall,
+                        color = com.open115.pad.ui.theme.AppColors.TextSecondary,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f).padding(start = 6.dp),
+                    )
+                    Text(
+                        "停止",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = com.open115.pad.ui.theme.AppColors.AccentDeep,
+                        modifier = Modifier
+                            .clickable { onStopOrganize() }
+                            .padding(horizontal = 6.dp, vertical = 2.dp),
+                    )
+                }
+            }
+
             // 分类筛选：轻量分段胶囊（无粗边框）
             LazyRow(
                 modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp),
@@ -366,34 +463,59 @@ fun FilesBrowserPane(
         //    而不是继承上一个目录的偏移——子目录内容短时偏移会被夹到 0，返回上级就成了"回弹到顶部"。
         val listState = rememberLazyListState()
         val gridState = rememberLazyGridState()
-        val listScroll = remember { mutableStateMapOf<String, Pair<Int, Int>>() }
-        val gridScroll = remember { mutableStateMapOf<String, Pair<Int, Int>>() }
-        val curCid = ui.stack.last().cid
-        var lastCid by remember { mutableStateOf(curCid) }
+        // 位置记的是"第一个可见项的**条目 key** + 偏移"，不是下标。
+        // 下标会随列表内容与顺序漂：置顶项会浮到最前、搜索结果不重排、改过滤会换一套列表，
+        // 而 LazyColumn 自己又按条目 key 锚定（内容整表替换时它把"人眼刚看到的那一条"
+        // 留在原位）—— 实测根目录首行的置顶项一进出搜索就从 index 0 变 index 3，
+        // 记下标的话"回到目录"就落在列表中间。按 key 找回它在新列表里的下标才对得上人眼。
+        val listScroll = remember { mutableStateMapOf<String, Pair<String?, Int>>() }
+        val gridScroll = remember { mutableStateMapOf<String, Pair<String?, Int>>() }
+        /** 当前视口第一项的条目 key（列表为空时 null） */
+        fun listAnchor(): Pair<String?, Int> =
+            (listState.layoutInfo.visibleItemsInfo.firstOrNull()?.key as? String) to
+                listState.firstVisibleItemScrollOffset
+
+        fun gridAnchor(): Pair<String?, Int> =
+            (gridState.layoutInfo.visibleItemsInfo.firstOrNull()?.key as? String) to
+                gridState.firstVisibleItemScrollOffset
+
+        /** 条目 key 在列表里的下标；找不到（被删了/换了目录）就回顶部 */
+        fun anchorIndex(key: String?): Int {
+            if (key == null) return 0
+            val i = ui.display.indexOfFirst { fileItemKey(it) == key }
+            return if (i < 0) 0 else i
+        }
+
+        // 滚动位置的键：目录用 cid；**搜索结果单独一档**（关键词进键）——
+        // 结果列表与来源目录的列表根本不是一回事，共用一份偏移只会互相串位；
+        // 分开之后"结果 → 点进子目录 → 回到结果"能把结果停在原处。
+        val scrollKey = if (ui.searching) "search:${ui.searchQuery}" else ui.stack.last().cid
+        var lastKey by remember { mutableStateOf(scrollKey) }
         var pendingRestore by remember { mutableStateOf<String?>(null) }
 
-        // 目录切换：先把上一个目录的位置存下来，并标记待恢复的目标目录
-        LaunchedEffect(curCid) {
-            if (curCid == lastCid) return@LaunchedEffect
-            listScroll[lastCid] = listState.firstVisibleItemIndex to listState.firstVisibleItemScrollOffset
-            gridScroll[lastCid] = gridState.firstVisibleItemIndex to gridState.firstVisibleItemScrollOffset
-            lastCid = curCid
-            pendingRestore = curCid
+        // 目录/视图切换：先把上一个位置存下来，并标记待恢复的目标
+        LaunchedEffect(scrollKey) {
+            if (scrollKey == lastKey) return@LaunchedEffect
+            listScroll[lastKey] = listAnchor()
+            gridScroll[lastKey] = gridAnchor()
+            lastKey = scrollKey
+            pendingRestore = scrollKey
         }
 
         // 恢复必须等**新目录的数据到位之后**：LazyColumn 是按 item key 记忆位置的，
         // 数据还是上一级目录时恢复会被随后的整表替换重置回顶部（实测踩过）。
-        LaunchedEffect(curCid, ui.loading, ui.items) {
-            if (ui.loading || pendingRestore != curCid) return@LaunchedEffect
+        // 等的是 display（不是 items）：过滤/置顶重排后的列表才是要定位的那一份。
+        LaunchedEffect(scrollKey, ui.loading, ui.display) {
+            if (ui.loading || pendingRestore != scrollKey) return@LaunchedEffect
             pendingRestore = null
             // 只恢复当前显示模式那一个（另一个没在组合里，别去碰它）；没有记录就从顶部开始
             runCatching {
                 if (ui.viewMode != 0) {
-                    val (i, o) = gridScroll[curCid] ?: (0 to 0)
-                    gridState.scrollToItem(i, o)
+                    val (k, o) = gridScroll[scrollKey] ?: (null to 0)
+                    gridState.scrollToItem(anchorIndex(k), o)
                 } else {
-                    val (i, o) = listScroll[curCid] ?: (0 to 0)
-                    listState.scrollToItem(i, o)
+                    val (k, o) = listScroll[scrollKey] ?: (null to 0)
+                    listState.scrollToItem(anchorIndex(k), o)
                 }
             }
         }
@@ -453,7 +575,7 @@ fun FilesBrowserPane(
                         verticalArrangement = Arrangement.spacedBy(8.dp),
                         horizontalArrangement = Arrangement.spacedBy(8.dp),
                     ) {
-                        items(ui.display, key = { (it.fid ?: "") + "#" + it.fn }) { item ->
+                        items(ui.display, key = { fileItemKey(it) }) { item ->
                             QuickDirDragSource(
                                 enabled = ui.selectMode,
                                 host = quickDirDrag,
@@ -482,7 +604,7 @@ fun FilesBrowserPane(
                             }
                     }
                     LazyColumn(state = listState, modifier = Modifier.fillMaxSize()) {
-                        listItems(ui.display, key = { (it.fid ?: "") + "#" + it.fn }) { item ->
+                        listItems(ui.display, key = { fileItemKey(it) }) { item ->
                             QuickDirDragSource(
                                 enabled = ui.selectMode,
                                 host = quickDirDrag,

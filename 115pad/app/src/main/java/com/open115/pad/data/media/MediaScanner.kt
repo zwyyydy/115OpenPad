@@ -29,6 +29,22 @@ import okhttp3.Request
 import java.io.File
 
 /**
+ * 扫描方式。
+ *
+ * - [Full]：全量，不跳过任何目录（重新索引一切）
+ * - [Incremental]：**原来的增量**（判据 `cloudUpt + dirFingerprint`）：每个目录都列一次，
+ *   没变只跳过"重新索引"。列目录请求数 ≈ 目录数 —— 所有版本一直以来的行为
+ * - [Fast]：快速，**没变的叶子目录连列都不列**（判据逐条写在 [MediaScanner.collectDirs]）：
+ *   父目录列表里这个子目录项的 `upt`/`uet` 跟上次记的一样、它上次扫时又不是"有下级"的目录
+ *   → 它的内容不可能变（115 的目录 `upt` 对成员的增删移入敏感，实测）。省的是列目录请求
+ *   （媒体库里绝大多数目录是叶子）。盲区只有"目录内改名"（实测：改名不顶任何时间字段），
+ *   靠每轮抽查一部分 + 全量兜底。
+ *
+ * 新加一种方式而不是改掉增量：这条路的判据多、容易出偏差，增量与全量随时可以退回去。
+ */
+enum class ScanMode { Full, Incremental, Fast }
+
+/**
  * 排队等待扫描的一个任务（一个媒体库一条；多根库的各根由 worker 依次跑）。
  *
  * 库的设置（限速 / 体积过滤 / 根路径）在**入队时快照**：任务代表"按下按钮那一刻的样子"，
@@ -44,19 +60,56 @@ data class QueuedScan(
     val rootCids: List<String>,
     val rootPaths: List<String>,
     val incremental: Boolean,
+    /** 快速模式（见 [ScanMode.Fast]）。落盘的老快照没有这个字段 → false = 原增量，正好 */
+    val fast: Boolean = false,
     val rateLimitMs: Long = 0,
     val minVideoSizeMb: Int = 0,
+    /**
+     * 单目录任务（[PadSync] 用）：[rootCids]/[rootPaths] 里是**一个个具体目录**，不往下递归。
+     *
+     * 服务器只改了几个影片目录（写 nfo/海报），没必要把整棵树再走一遍 ——
+     * 这也是这个功能存在的意义：一轮只花几次列目录请求。
+     * 落盘的老快照没有这个字段 → false = 原来的整根递归，正好兼容。
+     */
+    val noRecurse: Boolean = false,
 ) {
+    val mode: ScanMode
+        get() = when {
+            !incremental -> ScanMode.Full
+            fast -> ScanMode.Fast
+            else -> ScanMode.Incremental
+        }
+
     companion object {
         /** 按库当前的设置造一个扫描任务 */
-        fun of(library: MediaLibraryEntity, incremental: Boolean) = QueuedScan(
+        fun of(library: MediaLibraryEntity, mode: ScanMode) = QueuedScan(
             libraryId = library.id,
             libraryName = library.name,
             rootCids = library.rootCids,
             rootPaths = library.rootPaths,
-            incremental = incremental,
+            incremental = mode != ScanMode.Full,
+            fast = mode == ScanMode.Fast,
             rateLimitMs = library.rateLimitMs,
             minVideoSizeMb = library.minVideoSizeMb,
+        )
+
+        /**
+         * 造一条"只扫这几个目录"的任务（流水线同步用）。
+         *
+         * 固定 Full + 不递归：**不能被增量/快速的判据跳过**。云盘上的 nfo/海报是原地覆盖写的，
+         * upt 与 pick_code 都可能没变 —— 增量那条"指纹没变就只刷新状态行"的分支正好会把
+         * 我们要的重新索引跳掉（见 [PadSync] 里的说明）。
+         */
+        fun targeted(library: MediaLibraryEntity, dirs: List<Pair<String, String>>) = QueuedScan(
+            libraryId = library.id,
+            libraryName = library.name,
+            rootCids = dirs.map { it.first },
+            rootPaths = dirs.map { it.second },
+            incremental = false,
+            fast = false,
+            rateLimitMs = library.rateLimitMs,
+            minVideoSizeMb = library.minVideoSizeMb,
+            noRecurse = true,
         )
     }
 }
@@ -83,7 +136,9 @@ internal data class ScanQueueSnapshot(
  * 纯函数 —— 队列的顺序与去重语义单测直接打这个。
  */
 internal fun queueWithTask(queue: List<QueuedScan>, task: QueuedScan): List<QueuedScan> {
-    val at = queue.indexOfFirst { it.libraryId == task.libraryId }
+    // ★ 卡位是"库 + 任务类型"而不是只有库：单目录任务（流水线同步，见 [PadSync]）与整库任务
+    //   各占一格。只看库的话，一条定向任务会把用户/自动扫描排的整库任务顶掉（反过来也一样）。
+    val at = queue.indexOfFirst { it.libraryId == task.libraryId && it.noRecurse == task.noRecurse }
     if (at < 0) return queue + task
     return queue.toMutableList().also { it[at] = task }
 }
@@ -92,11 +147,58 @@ internal fun queueWithTask(queue: List<QueuedScan>, task: QueuedScan): List<Queu
  * 快照 → 要重新排的任务：上次没跑完的那条**降级成增量**（理由见 [MediaScanner.restoreQueue]），
  * 排在最前面；当时排着的原样跟在后面（用户选的是增量还是全量，照旧）。
  *
+ * 降级连 `fast` 一起清：快速模式的判据比增量多（`hasSubDirs` / `logicVersion` 这些），
+ * "跑了一半"的状态上接着用快速模式，出偏差时最难查 —— 宁可这一轮走一遍全目录的增量。
+ *
  * 纯函数，单测直接打 —— 这条降级规则漏了、或者写成"原样恢复"，
  * 重启后就会把一个扫了一半的库从头再问一遍。
  */
 internal fun tasksToRestore(snapshot: ScanQueueSnapshot): List<QueuedScan> =
-    listOfNotNull(snapshot.running?.copy(incremental = true)) + snapshot.pending
+    listOfNotNull(
+        snapshot.running?.let {
+            // 单目录任务**不降级**：它本来就只扫几个目录、固定 Full（"降级成增量"在它身上
+            // 反而会把要的重新索引跳掉，而它便宜得不值得省）
+            if (it.noRecurse) it else it.copy(incremental = true, fast = false)
+        },
+    ) + snapshot.pending
+
+/** 扫描方式名。日志、扫描记录、队列卡片共用一份文案 */
+val ScanMode.label: String
+    get() = when (this) {
+        ScanMode.Full -> "全量"
+        ScanMode.Incremental -> "增量"
+        ScanMode.Fast -> "快速"
+    }
+
+/**
+ * 扫描逻辑版本 —— 快速扫描只剪"用当前这套判据扫过的目录"。
+ *
+ * `scan_state.logicVersion` 与它相等是剪枝条件之一：升级上来的老行是 0 → 每个目录先被列一次
+ * （补上 parentUpt/parentUet/hasSubDirs，顺带把既有的老数据自愈逻辑跑完），之后才开始剪。
+ * 以后加新判据就 +1，全库自动重列一轮 —— 与 [NfoParser.PARSER_VERSION] 是同一个套路。
+ *
+ * 版本史：
+ * - 1：初版（`hasSubDirs` 把屏蔽目录也算进去）
+ * - 2：`hasSubDirs` 改成只算**会递归进去的**子目录 —— 带 extrafanart/.actors 的影片目录
+ *   从此算叶子（1 的时候它们全都剪不动，真机实测快速扫描与增量一样慢）。存量行是 1，
+ *   所以升级后**下一轮快速扫描会再全列一遍**重算，再下一轮才真正省。
+ */
+internal const val SCAN_LOGIC_VERSION = 2
+
+/** 快速扫描每轮最多抽查复核几个"剪掉的目录" */
+internal const val FAST_SAMPLE_MAX = 20
+
+/**
+ * 快速扫描每轮抽查多少个被剪掉的目录**真正列一次**复核。
+ *
+ * 为什么至少 1 个：小库（只有几个影片目录）取 10% 会取整成 0，那就等于"永远不复核"，
+ * 而"目录内改名"恰恰只靠复核才发现。为什么封顶 [FAST_SAMPLE_MAX]：大库里不能让抽查
+ * 把省下来的请求又吃回去。
+ *
+ * 纯函数，单测直接打。
+ */
+internal fun fastSampleSize(candidates: Int): Int =
+    if (candidates <= 0) 0 else (candidates / 10).coerceIn(1, FAST_SAMPLE_MAX)
 
 /**
  * 媒体库扫描引擎：手动触发、可续跑、带进度。
@@ -281,9 +383,25 @@ class MediaScanner(
         ensureDrain()
     }
 
-    /** 按库当前的设置排队扫一个库（界面「增量/全量扫描」、启动自动扫描都走这里） */
-    fun enqueue(library: MediaLibraryEntity, incremental: Boolean) =
-        enqueue(QueuedScan.of(library, incremental))
+    /** 按库当前的设置排队扫一个库（界面「快速/增量/全量扫描」、启动自动扫描都走这里） */
+    fun enqueue(library: MediaLibraryEntity, mode: ScanMode) =
+        enqueue(QueuedScan.of(library, mode))
+
+    /**
+     * 排一条"只扫这几个目录"的任务（流水线同步，见 [PadSync]）。[dirs] 是 (cid, path) 对。
+     *
+     * 同一个库已经有排队中的定向任务时**把目录并进去**再替换（[queueWithTask] 对同类型是就地替换）：
+     * 信号是一批一批来的，直接替换会把上一批还没轮到的目录丢掉。
+     * 正在跑的那条不算进来 —— 它的目录已经在扫了。
+     */
+    fun enqueueTargeted(library: MediaLibraryEntity, dirs: List<Pair<String, String>>) {
+        if (dirs.isEmpty()) return
+        val queuedDirs = synchronized(qLock) {
+            _pending.value.firstOrNull { it.libraryId == library.id && it.noRecurse }
+        }?.let { it.rootCids.zip(it.rootPaths) }.orEmpty()
+        val merged = (queuedDirs + dirs).distinctBy { it.first }
+        enqueue(QueuedScan.targeted(library, merged))
+    }
 
     /** 这个库已经有扫描在跑、或者排在队列里吗（启动自动扫描据此不重复排，见 App115） */
     fun isBusy(libraryId: Long): Boolean =
@@ -399,7 +517,9 @@ class MediaScanner(
         task.rootCids.zip(task.rootPaths).forEach { (cid, path) ->
             runScan(
                 cid, path,
-                incremental = task.incremental,
+                // 单目录任务只扫这一个目录：不递归（[QueuedScan.noRecurse]）
+                includeSubDirs = !task.noRecurse,
+                mode = task.mode,
                 rateLimitMs = task.rateLimitMs,
                 minVideoSizeMb = task.minVideoSizeMb,
                 libraryId = task.libraryId,
@@ -490,6 +610,14 @@ class MediaScanner(
      */
     private var postersFetched = 0
 
+    /**
+     * 本次扫描的**列目录请求次数**（[listFiles] 里逐次累加，含翻页与侧挂素材目录）。
+     *
+     * 存在的意义是量化快速扫描省了多少：增量模式它 ≈ 处理过的目录数，快速模式应当明显更小。
+     * 扫描由 mutex 串行化，用普通字段就够；[runScan] 开头清零。
+     */
+    private var listRequests = 0
+
     private suspend fun throttle(rateLimitMs: Long) {
         if (rateLimitMs <= 0) return
         val now = System.currentTimeMillis()
@@ -512,6 +640,7 @@ class MediaScanner(
      * （排查"某个目录少扫了内容"时，路径才是能对上号的那个信息）。
      */
     private suspend fun listFiles(cid: String, dirPath: String, rateLimitMs: Long): FilesPage {
+        listRequests++
         val first = parseFilesResponse(
             run { throttle(rateLimitMs); openApi.files(cid = cid, limit = PAGE_SIZE) },
         )
@@ -519,6 +648,7 @@ class MediaScanner(
 
         val all = first.items.toMutableList()
         while (all.size < first.count && all.size < MAX_PAGES * PAGE_SIZE) {
+            listRequests++
             val page = parseFilesResponse(
                 run {
                     throttle(rateLimitMs)
@@ -574,8 +704,8 @@ class MediaScanner(
 
     /**
      * 实际执行（**多由队列 worker 调**，见 [enqueue]；直接调 = 自己负责排队）：可续跑、带进度。
-     * incremental=true 时按 scan_state 的 cloudUpt 增量跳过（目录列表 upt 未变 = 无新增资源）；
-     * false 为全量扫描（不跳过任何目录）。
+     * [mode] 见 [ScanMode]：全量不跳过任何目录；增量按 scan_state 的 cloudUpt + 指纹跳过**重索引**；
+     * 快速在此之上连"没变的叶子目录"都不列（省列目录请求，判据见 [collectDirs]）。
      *
      * [minVideoSizeMb] 是**每库**的体积过滤（0 = 不过滤）：小于它的视频不入库。
      * 在聚类阶段就滤掉，见 [sniffDirectory]。
@@ -588,13 +718,15 @@ class MediaScanner(
         rootCid: String,
         rootPath: String,
         includeSubDirs: Boolean = true,
-        incremental: Boolean = false,
+        mode: ScanMode = ScanMode.Incremental,
         rateLimitMs: Long = 0,
         minVideoSizeMb: Int = 0,
         libraryId: Long? = null,
         /** 库名，只用于进度显示（[Progress.libraryName]） */
         libraryName: String = "",
     ) {
+        val incremental = mode != ScanMode.Full
+        val fast = mode == ScanMode.Fast
         /**
          * 日志里标识"这一轮扫的是哪个库的哪个根"。
          *
@@ -613,6 +745,7 @@ class MediaScanner(
                 return
             }
             postersFetched = 0
+            listRequests = 0
             _progress.value = Progress(
                 running = true,
                 rootCid = rootCid,
@@ -628,24 +761,41 @@ class MediaScanner(
         var done = 0
         var movies = 0
         var skipped = 0
+        /** 其中是**快速模式剪掉的**（一次都没列）—— 日志与扫描记录里用来量化省了多少 */
+        var pruned = 0
         var totalDirsSeen = 0
+        /** 方式名（"全量"/"增量"/"快速"）：日志与扫描记录共用，收尾的 finally 里还要用 */
+        val modeLabel = mode.label
         /** 本次**新增**的顶层影片键（分集不单列）—— 存进扫描记录，界面拿它 join 出海报与标题 */
         val newKeys = mutableListOf<String>()
         val startedAt = System.currentTimeMillis()
         try {
+            // 老数据自愈：哪些目录还是"元数据与视频分成两条"的样子（`ABC-101-4K-C` + `ABC-101-U`）。
+            // 合并逻辑是后加的，而指纹一致时下面的循环会跳过这个目录 —— 不特判就永远合不起来。
+            // 判据是纯本地的，一次查完全库（见 dao.dirsNeedingOrphanMerge）。
+            // 提前到列目录之前：**快速模式的剪枝也要拿它当判据**（在集合里的目录不能剪）。
+            val orphanMergeDirs = if (incremental) dao.dirsNeedingOrphanMerge().toHashSet() else emptySet()
             // 递归列目录。**这一步列到的结果直接传给下面复用**，不再对同一个目录重复请求
             // （早先是 collectDirs 列一遍找子目录、下面的循环再列一遍取文件，等于每目录 2 次）
-            val allDirs = collectDirs(rootCid, rootPath, includeSubDirs, rateLimitMs)
+            val allDirs = collectDirs(
+                rootCid, rootPath, includeSubDirs, rateLimitMs,
+                fast = fast,
+                orphanMergeDirs = orphanMergeDirs,
+            )
             totalDirsSeen = allDirs.size
             if (stopRequested.get()) {
                 // 列目录阶段没有写入，停在这里没有任何损失（续扫会重新列）
                 stoppedEarly = true
                 Log.i(TAG, "「$roundLabel」扫描在列目录阶段被停止")
             } else {
-                // 老数据自愈：哪些目录还是"元数据与视频分成两条"的样子（`ABC-101-4K-C` + `ABC-101-U`）。
-                // 合并逻辑是后加的，而指纹一致时下面的循环会跳过这个目录 —— 不特判就永远合不起来。
-                // 判据是纯本地的，一次查完全库（见 dao.dirsNeedingOrphanMerge），之后每目录只查一次集合。
-                val orphanMergeDirs = if (incremental) dao.dirsNeedingOrphanMerge().toHashSet() else emptySet()
+                if (fast) {
+                    val kept = allDirs.count { it.pruned }
+                    Log.i(
+                        TAG,
+                        "「$roundLabel」快速扫描：${allDirs.size - kept}/${allDirs.size} 个目录要列" +
+                            "（${kept} 个没变的叶子目录被剪掉，其中含每轮抽查复核的）",
+                    )
+                }
                 _progress.value = _progress.value.copy(
                     totalDirs = allDirs.size,
                     phase = Phase.Indexing,
@@ -661,6 +811,17 @@ class MediaScanner(
                     // 而是静默多出垃圾条目。仍然算作"处理完一个目录"（进度条的分母是 allDirs.size）。
                     val isRoot = listing.path.trimEnd('/') == rootPath.trimEnd('/')
                     if (!isRoot && isIgnoredDirName(listing.path.substringAfterLast('/'))) {
+                        done++
+                        _progress.value = _progress.value.copy(doneDirs = done, moviesIndexed = movies)
+                        continue
+                    }
+                    // 快速模式剪掉的目录（见 collectDirs）：本轮**一次请求都不发** ——
+                    // 父目录那一页告诉我们"它的成员集合没变"，而它上次扫的时候又不是"有下级"的目录。
+                    // 海报照旧从库里已有的 pick_code 补（全都在本地时零请求），与增量模式被跳过的目录同款待遇。
+                    if (listing.pruned) {
+                        prefetchDirPosters(listing.cid, rateLimitMs)
+                        pruned++
+                        skipped++
                         done++
                         _progress.value = _progress.value.copy(doneDirs = done, moviesIndexed = movies)
                         continue
@@ -691,6 +852,21 @@ class MediaScanner(
                         if (!cdPending && !orphanPending && state != null && state.status == 2 && state.cloudUpt == dirUpt &&
                             dirUpt > 0 && state.dirFingerprint == dirFingerprint
                         ) {
+                            // ★ 复算"剪枝要用的那几列"。**这个分支不重新索引，但状态行必须跟上**：
+                            //   老行（DB v15 之前）的 logicVersion 是 0、hasSubDirs 还是"屏蔽目录也算"的
+                            //   旧口径 —— 补不上的话快速扫描永远等不到"版本对得上"，会一轮轮全列下去。
+                            //   真机踩到过：两轮快速扫描的列目录数跟增量一模一样，库里全是 lv=1 的行。
+                            //   走到这里说明指纹与 cloudUpt 都匹配，所以只刷新这几列、不动它们。
+                            dao.upsertScanState(
+                                state.copy(
+                                    dirPath = listing.path,
+                                    parentUpt = listing.parentUpt,
+                                    parentUet = listing.parentUet,
+                                    hasSubDirs = hasTraversableSubDirs(page),
+                                    logicVersion = SCAN_LOGIC_VERSION,
+                                    scannedAt = System.currentTimeMillis(),
+                                ),
+                            )
                             // 跳过不等于不管：把库里已有条目的海报补到本地。
                             // 缓存被清过 / 新装机的机器上，增量扫描是用户最常用的那条路，
                             // 不补的话海报墙仍要一张张现下。已命中的不产生任何请求。
@@ -846,6 +1022,17 @@ class MediaScanner(
                             cloudUpt = dirUpt,
                             dirFingerprint = dirFingerprint,
                             scannedAt = System.currentTimeMillis(),
+                            // 这几个是给快速模式用的：下次扫描靠它们判断"这个目录还用不用列"。
+                            // 父视角的两个值直接来自**发现它时那一页**（免费），不是这次列出来的。
+                            parentUpt = listing.parentUpt,
+                            parentUet = listing.parentUet,
+                            // 只算**会递归进去的**子目录：屏蔽目录（extrafanart / .actors / 花絮…）不算。
+                            // 它们里面的图变化不顶本目录的任何时间字段，拿它们当"有下级"等于让每个
+                            // 带侧挂素材的影片目录永远不能剪 —— 实测某库 248 个目录里 164 个就是它们，
+                            // 那样快速扫描一点都不省（真机实测过：列目录数与增量一样）。
+                            // 代价：往 extrafanart 里加图只影响详情页剧照，要等抽查/全量才补上。
+                            hasSubDirs = hasTraversableSubDirs(page),
+                            logicVersion = SCAN_LOGIC_VERSION,
                         ),
                     )
                     done++
@@ -858,15 +1045,16 @@ class MediaScanner(
                 // 每轮跑完都留一行 —— 多库排队之后，这是日志里回答"这一轮是谁、扫成什么样"的地方。
                 // 早先只有"增量扫描且跳过了目录"才打（全量扫描在日志里完全是静默的，几轮连跑时
                 // 只剩几条 per-目录 的日志，根本拼不出哪一轮到哪了）。
-                val mode = if (incremental) "增量" else "全量"
                 val bits = listOfNotNull(
                     "目录 $done/${allDirs.size}",
                     if (skipped > 0) "跳过 $skipped 个未变化" else null,
+                    if (pruned > 0) "其中 $pruned 个按父目录时间剪掉、一次都没列" else null,
+                    "列目录 $listRequests 次",
                     "入库 $movies 部",
                     "耗时 ${System.currentTimeMillis() - startedAt}ms",
                     if (stoppedEarly) "被停止" else null,
                 ).joinToString(" · ")
-                Log.i(TAG, "「$roundLabel」${mode}扫描完成：$bits")
+                Log.i(TAG, "「$roundLabel」${modeLabel}扫描完成：$bits")
             }
         } catch (e: Exception) {
             Log.w(TAG, "「$roundLabel」扫描中断: ${e.message}")
@@ -894,6 +1082,8 @@ class MediaScanner(
                     postersFetched = postersFetched,
                     newCount = newKeys.size,
                     stopped = stoppedEarly,
+                    mode = modeLabel,
+                    listRequests = listRequests,
                 )
                 dao.addScanLog(
                     ScanLogEntity(
@@ -907,6 +1097,8 @@ class MediaScanner(
                         indexed = report.indexed,
                         postersFetched = report.postersFetched,
                         stopped = report.stopped,
+                        mode = report.mode,
+                        listRequests = report.listRequests,
                         newKeys = newKeys.joinToString("\n"),
                     ),
                 )
@@ -922,8 +1114,35 @@ class MediaScanner(
         }
     }
 
-    /** 一个目录 + **发现它时那一次列目录的结果**（扫描循环直接复用，不再重复请求） */
-    private data class DirListing(val cid: String, val path: String, val page: FilesPage?)
+    /**
+     * 一个目录 + **发现它时那一次列目录的结果**（扫描循环直接复用，不再重复请求）。
+     *
+     * [parentUpt] / [parentUet] 是**父目录列表里这个目录项自己的**两个时间字段：既要落进
+     * scan_state（下轮剪枝的判据），也要在剪枝时跟当前这一页的值比。根目录没有父，是 0。
+     */
+    private data class DirListing(
+        val cid: String,
+        val path: String,
+        val page: FilesPage?,
+        /** 快速模式：这一条被**剪掉**了 —— 本轮不列它（判据见 [collectDirs]） */
+        val pruned: Boolean = false,
+        /** 上一次真正列它的时间：抽查时优先复核最久没看过的那些 */
+        val lastVerifiedAt: Long = 0,
+        val parentUpt: Long = 0,
+        val parentUet: Long = 0,
+    )
+
+    /** 待访问的目录 + 父目录那一页里它的条目（快速模式剪枝要靠条目里的时间字段） */
+    private data class PendingDir(val cid: String, val path: String, val entry: FileItem)
+
+    /**
+     * 这一页里有没有**会递归进去的**子目录 —— 屏蔽目录（extrafanart / .actors / 花絮…）不算。
+     *
+     * 就是快速扫描 `scan_state.hasSubDirs` 那一列的算法：有下级的目录不能剪（变化不向上传播），
+     * 但屏蔽目录不算"下级"，否则带侧挂素材的影片目录永远剪不动（详见 [collectDirs] 的判据 4）。
+     */
+    private fun hasTraversableSubDirs(page: FilesPage): Boolean =
+        page.items.any { it.isDir && !isIgnoredDirName(it.fn) }
 
     /**
      * 递归收集子目录（手动扫描是一次性任务，不并发，控制频控代价）。
@@ -938,43 +1157,150 @@ class MediaScanner(
      * 停止请求在这里也查：大库的列目录阶段本身就是几百次请求、可能占掉整轮扫描的大半时间，
      * 不在这里响应的话用户点了「停止」要等很久才有反应。中途退出返回的是**不完整**的列表，
      * 所以调用方看到停止标志后必须整个放弃（那里也确实这么做了）。
+     *
+     * ★ [fast] = 快速模式：**没变的叶子目录连列都不列**，判据全在下面这段里（缺一不可）：
+     *  1. `state.parentUpt` == 父目录那一页里这个条目的 `upt`。这是主判据：115 的目录 `upt`
+     *     对**成员集合**变化敏感（文件/子目录的新增、删除、移入移出 —— 实测），所以"现在给我的
+     *     upt 跟我记的一样"就等于"我这层的成员没动过"。★ 注意必须在**父目录那一页**里比：
+     *     它自己那一页是"它下面有什么"，不是"它自己变没变"。
+     *  2. `state.parentUet` == 同一页里的 `uet`。`upt` 对**改名**不敏感（实测），`uet` 有没有反应
+     *     还没验过 —— 现在这条是个恒等比较（值相同就放行），等日志里看出它会动，判据自动就紧了。
+     *  3. `state.dirPath` == 当前路径。**这一条专门挡"目录被改名"**：改名不改 cid、也不顶任何
+     *     时间字段，只有路径对不上才看得出来；不放行的话库里那些行会一直挂着旧路径。
+     *  4. `!state.hasSubDirs`：上次列它时它没有**会递归进去的**子目录。有下级的目录不能剪 ——
+     *     变化不向上传播，想确认下级没变只能列它看下级的 upt。
+     *     ★ 这里**不算**屏蔽目录（extrafanart / .actors / 花絮）：它们的内容变化本来就不顶本目录的
+     *     任何时间字段，拿它们当"有下级"会让每个带侧挂素材的影片目录永远剪不动（真机实测过：
+     *     列目录数与增量完全一样）。代价是"往 extrafanart 里加图"要等抽查/全量才补上 ——
+     *     那只影响详情页剧照区多几张图，不影响片名与索引。
+     *  5. `state.status == 2 && state.logicVersion == SCAN_LOGIC_VERSION`：上次扫完了，而且是用
+     *     **当前这套判据**扫的。升级上来的老行是 0 → 先全列一遍补判据（顺带跑完既有的老数据自愈）。
+     *  6. 不在老数据自愈集合里（[MediaDao.dirsNeedingOrphanMerge]，纯本地查询，零请求）。
+     *
+     * 剪掉的目录**照样进返回列表**（`pruned = true`）：调用方仍要给它们补海报、计入"已处理"。
+     * 之后按"最久没复核的优先"抽 [fastSampleSize] 个真正列一次 —— 改名不顶任何字段，只有真列出来
+     * 才看得见，抽查就是把"漏掉一次改名"变成"漏几次"的那道兜底。
      */
     private suspend fun collectDirs(
         rootCid: String,
         rootPath: String,
         includeSubDirs: Boolean,
         rateLimitMs: Long,
+        fast: Boolean = false,
+        orphanMergeDirs: Set<String> = emptySet(),
     ): List<DirListing> {
         // 不递归时这里不列目录，交给调用方（它本来就要列一次）
         if (!includeSubDirs) return listOf(DirListing(rootCid, rootPath, null))
 
         val rootPage = listFiles(rootCid, rootPath, rateLimitMs)
         val result = mutableListOf(DirListing(rootCid, rootPath, rootPage))
-        val queue = ArrayDeque<Pair<String, String>>()
-        rootPage.items.filter { it.isDir }.forEach { dir ->
-            // 屏蔽的目录不递归（理由见下面循环里那段）
-            if (isIgnoredDirName(dir.fn)) return@forEach
-            dir.fid?.let { queue.add(it to "$rootPath/${dir.fn}") }
+        val queue = ArrayDeque<PendingDir>()
+
+        /**
+         * 把一页里的子目录排进待访问队列。
+         *
+         * ★ 屏蔽的目录（侧挂素材 extrafanart/.actors、附加内容 behind the scenes/extras…）
+         *   **不递归**：侧挂素材的内容由 [sideArtOf] 在"这个影片目录需要重扫"时单独列；
+         *   附加内容是整棵丢弃。列进这里等于每轮扫描都白问一遍（实测某库 248 个目录里
+         *   164 个是它们），附加内容还会把花絮当成正片入库。
+         */
+        fun pushChildren(page: FilesPage, basePath: String) {
+            page.items.forEach { dir ->
+                if (!dir.isDir || isIgnoredDirName(dir.fn)) return@forEach
+                dir.fid?.let { queue.add(PendingDir(it, "$basePath/${dir.fn}", dir)) }
+            }
         }
+
+        pushChildren(rootPage, rootPath)
+        // 剪枝"一个都没剪"时最容易被当成功能坏了（真机上就撞过一次：所有影片目录都带 extrafanart，
+        // 全被判成有下级）。所以把"没剪的原因"数出来，一个都没剪时打一行 —— 只有诊断价值，不影响扫描。
+        var prunedCount = 0
+        var whyVersion = 0
+        var whyChildren = 0
+        var whyChanged = 0
+        var whyOther = 0
         while (queue.isNotEmpty()) {
             if (stopRequested.get()) break
-            val (cid, path) = queue.removeFirst()
-            val page = listFiles(cid, path, rateLimitMs)
-            result.add(DirListing(cid, path, page))
+            val next = queue.removeFirst()
+            if (fast) {
+                val st = dao.scanState(next.cid)
+                val prunable = st != null && st.status == 2 &&
+                    st.logicVersion == SCAN_LOGIC_VERSION &&
+                    st.dirPath == next.path &&
+                    !st.hasSubDirs &&
+                    st.parentUpt == next.entry.upt &&
+                    st.parentUet == next.entry.uet &&
+                    next.cid !in orphanMergeDirs
+                if (prunable && st != null) {
+                    // 日志里留一份判据现场：`uet` 到底动没动、`upt` 对不对得上，
+                    // 排查"该剪的没剪/不该剪的剪了"时只有这行能回答
+                    Log.i(
+                        TAG,
+                        "快速·剪掉 ${next.path}（upt=${next.entry.upt} uet=${next.entry.uet}）",
+                    )
+                    prunedCount++
+                    result.add(
+                        DirListing(
+                            cid = next.cid,
+                            path = next.path,
+                            page = null,
+                            pruned = true,
+                            lastVerifiedAt = st.scannedAt,
+                            parentUpt = next.entry.upt,
+                            parentUet = next.entry.uet,
+                        ),
+                    )
+                    continue
+                }
+                when {
+                    st == null || st.status != 2 || st.dirPath != next.path -> whyOther++
+                    st.logicVersion != SCAN_LOGIC_VERSION -> whyVersion++
+                    st.hasSubDirs -> whyChildren++
+                    st.parentUpt != next.entry.upt || st.parentUet != next.entry.uet -> whyChanged++
+                    else -> whyOther++
+                }
+                // 顺带的观测：这个目录**这轮要列**，把判据现场打出来。
+                // 想验"改名顶不顶 uet / upt"，就看同一个目录两轮日志里的这两个值 ——
+                // 剪掉的那条也会打（上面那行），所以"该剪 / 不该剪"都能对上号。
+                Log.i(TAG, "快速·列 ${next.path}（upt=${next.entry.upt} uet=${next.entry.uet}）")
+            }
+            val page = listFiles(next.cid, next.path, rateLimitMs)
+            result.add(
+                DirListing(
+                    cid = next.cid,
+                    path = next.path,
+                    page = page,
+                    parentUpt = next.entry.upt,
+                    parentUet = next.entry.uet,
+                ),
+            )
             // 这一阶段没有分母（目录数正是它要算的东西），至少让"已发现 N 个目录"在动
             _progress.value = _progress.value.copy(
                 phase = Phase.Listing,
                 discoveredDirs = result.size,
-                currentDir = path,
+                currentDir = next.path,
             )
-            page.items.filter { it.isDir }.forEach { dir ->
-                // ★ 屏蔽的目录（侧挂素材 extrafanart/.actors、附加内容 behind the scenes/extras…）
-                //   **不递归**：侧挂素材的内容由 [sideArtOf] 在"这个影片目录需要重扫"时单独列；
-                //   附加内容是整棵丢弃。列进这里等于每轮扫描都白问一遍（实测某库 248 个目录里
-                //   164 个是它们），附加内容还会把花絮当成正片入库。
-                if (isIgnoredDirName(dir.fn)) return@forEach
-                dir.fid?.let { queue.add(it to "$path/${dir.fn}") }
+            pushChildren(page, next.path)
+        }
+        if (!fast) return result
+
+        if (prunedCount == 0 && result.size > 1) {
+            Log.i(
+                TAG,
+                "快速·这轮一个都没剪（候选 ${result.size - 1} 个）：判据版本待补 $whyVersion 个、" +
+                    "有下级 $whyChildren 个、父视角时间变了 $whyChanged 个、其他 $whyOther 个",
+            )
+        }
+
+        // 抽查复核：剪掉的那些里，按"最久没复核"排序取最前面的几个真正列一次。
+        // 不改 pruned 之外的字段 —— 走的是同一条"列目录 → 指纹判断要不要重索引"的路。
+        val candidates = result.withIndex().filter { it.value.pruned }
+        val sample = fastSampleSize(candidates.size)
+        if (sample > 0) {
+            candidates.sortedBy { it.value.lastVerifiedAt }.take(sample).forEach { (i, listing) ->
+                result[i] = listing.copy(pruned = false)
             }
+            Log.i(TAG, "快速·抽查 $sample 个最久没复核的目录（候选 ${candidates.size} 个）")
         }
         return result
     }

@@ -19,8 +19,9 @@ import androidx.sqlite.db.SupportSQLiteDatabase
         MediaLibraryEntity::class,
         WatchHistoryEntity::class,
         ScanLogEntity::class,
+        DanmuCacheEntity::class,
     ],
-    version = 14,
+    version = 16,
     exportSchema = false,
 )
 abstract class MediaDatabase : RoomDatabase() {
@@ -211,13 +212,53 @@ abstract class MediaDatabase : RoomDatabase() {
         }
     }
 
+    /**
+     * 快速扫描（叶子剪枝）要的两组信息：
+     *
+     * - `scan_state` 加四列：`parentUpt` / `parentUet`（父目录列表里这个目录项自己的时间字段）、
+     *   `hasSubDirs`（上次列它时有没有**会递归进去的**子目录；屏蔽目录不算）、`logicVersion`（扫描逻辑版本）。
+     *   **老数据这四列是默认值** → `logicVersion = 0` ≠ 当前版本 → 全库每个目录先被列一次
+     *   （补判据 + 顺便跑完既有的老数据自愈），之后才开始剪。
+     * - `scan_log` 加两列：`mode`（全量/增量/快速）与 `listRequests`（本轮列目录次数，用来量化剪枝省了多少）。
+     *
+     * 增量模式（原行为）的判据（cloudUpt + dirFingerprint）**一个都没动** —— 快速模式是新加的一条路，
+     * 出问题就把菜单里的"快速扫描"停用即可，不影响旧路径。
+     */
+    private val MIGRATION_14_15 = object : Migration(14, 15) {
+        override fun migrate(db: SupportSQLiteDatabase) {
+            db.execSQL("ALTER TABLE scan_state ADD COLUMN parentUpt INTEGER NOT NULL DEFAULT 0")
+            db.execSQL("ALTER TABLE scan_state ADD COLUMN parentUet INTEGER NOT NULL DEFAULT 0")
+            db.execSQL("ALTER TABLE scan_state ADD COLUMN hasSubDirs INTEGER NOT NULL DEFAULT 0")
+            db.execSQL("ALTER TABLE scan_state ADD COLUMN logicVersion INTEGER NOT NULL DEFAULT 0")
+            db.execSQL("ALTER TABLE scan_log ADD COLUMN mode TEXT NOT NULL DEFAULT ''")
+            db.execSQL("ALTER TABLE scan_log ADD COLUMN listRequests INTEGER NOT NULL DEFAULT 0")
+        }
+    }
+
+    /** DB v16：弹幕缓存表（实验室：弹幕）—— 新表，旧数据原样保留 */
+    private val MIGRATION_15_16 = object : Migration(15, 16) {
+        override fun migrate(db: SupportSQLiteDatabase) {
+            db.execSQL(
+                "CREATE TABLE IF NOT EXISTS danmu_cache (" +
+                    "pickCode TEXT NOT NULL PRIMARY KEY, " +
+                    "episodeId TEXT NOT NULL, " +
+                    "animeTitle TEXT NOT NULL, " +
+                    "episodeTitle TEXT NOT NULL, " +
+                    "matchedAt INTEGER NOT NULL, " +
+                    "commentsJson TEXT, " +
+                    "commentsAt INTEGER NOT NULL, " +
+                    "commentCount INTEGER NOT NULL)",
+            )
+        }
+    }
+
     fun build(context: Context): MediaDatabase =
         Room.databaseBuilder(context, MediaDatabase::class.java, "media.db")
             .addMigrations(
                 MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5,
                 MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9,
                 MIGRATION_9_10, MIGRATION_10_11, MIGRATION_11_12, MIGRATION_12_13,
-                MIGRATION_13_14,
+                MIGRATION_13_14, MIGRATION_14_15, MIGRATION_15_16,
             )
             .fallbackToDestructiveMigration()
             .build()

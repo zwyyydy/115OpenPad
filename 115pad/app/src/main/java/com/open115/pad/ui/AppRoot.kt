@@ -3,6 +3,7 @@ package com.open115.pad.ui
 import android.app.Activity
 import android.content.Context
 import android.content.ContextWrapper
+import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.EnterTransition
 import androidx.compose.animation.ExitTransition
@@ -11,13 +12,17 @@ import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.expandHorizontally
 import androidx.compose.animation.fadeIn
-import androidx.compose.animation.fadeOut
 import androidx.compose.animation.slideInHorizontally
 import androidx.compose.animation.slideInVertically
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.CloudDownload
 import androidx.compose.material.icons.outlined.Movie
@@ -56,6 +61,7 @@ import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
@@ -65,6 +71,7 @@ import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.IntSize
+import androidx.compose.ui.unit.dp
 import kotlin.math.hypot
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
@@ -103,9 +110,12 @@ import kotlinx.coroutines.launch
 
 private data class Dest(val route: String, val label: String, val icon: ImageVector)
 
+/** 媒体库的路由名。它单独沉在平板左栏底部（见 AppRoot 里导航栏那段），所以路由名抽出来共用 */
+private const val MEDIA_ROUTE = "media"
+
 private val destinations = listOf(
     Dest("files", "文件", Icons.Outlined.Folder),
-    Dest("media", "媒体库", Icons.Outlined.Movie),
+    Dest(MEDIA_ROUTE, "媒体库", Icons.Outlined.Movie),
     Dest("filter", "过滤规则", Icons.Outlined.Tune),
     Dest("offline", "云下载", Icons.Outlined.CloudDownload),
     Dest("transfer", "传输中心", Icons.Outlined.Download),
@@ -216,6 +226,17 @@ private fun MainScaffold(container: AppContainer, widthClass: WindowWidthSizeCla
     // 背后，随后暗色淡出、溶进媒体库自己的深色底里。原先"淡入+上浮"过渡期间跟页面
     // 组装抢主线程造成的卡顿生硬，就这么绕开了。
     var mediaWave by remember { mutableStateOf<Offset?>(null) }
+    /** 这一波是**退场**（暗面收缩回按键）还是入场（从按键扩散铺满）—— 同一套画法，方向相反 */
+    var waveBack by remember { mutableStateOf(false) }
+    /**
+     * 退场的**起手铺满**：点返回的那一刻同步置位，画面上立刻是一层满屏暗色。
+     *
+     * 为什么不靠"把半径 snap 到 maxR"：那是协程里的动作，跑到它的时机和这一帧的绘制谁先谁后
+     * 是竞态 —— 真机上约一半概率会多露几帧媒体库画面（用户实测报的"停留几帧才切"）。
+     * 铺满这一下看不出来（波色就是媒体库底色），所以用最笨也最稳的办法：同步盖住，
+     * 等收缩动画起来时（effect 里）再交回给圆。
+     */
+    var waveCovered by remember { mutableStateOf(false) }
     val waveRadius = remember { Animatable(0f) }
     val waveAlpha = remember { Animatable(1f) }
     var waveAreaSize by remember { mutableStateOf(IntSize.Zero) }
@@ -227,29 +248,71 @@ private fun MainScaffold(container: AppContainer, widthClass: WindowWidthSizeCla
         // 波面进行中不响应切页：路由在暗面底下跳变会穿帮
         if (mediaWave != null) return
         val center = navCenters[dest.route]
-        if (dest.route == "media" && center != null) {
+        if (dest.route == MEDIA_ROUTE && center != null) {
+            waveBack = false
             mediaWave = center
         } else {
             navigateRoute(dest.route)
         }
     }
 
-    LaunchedEffect(mediaWave) {
+    /**
+     * 离开媒体库：入场的**反向** —— 暗面从满屏收缩回「媒体库」那个按键，一来一回。
+     *
+     * 顺序是**先切路由、再收缩**：路由一换，下面的页面就在暗面背后组装就位，
+     * 缩到最后露出来的是一个已经画完的页面（而不是"边淡入边被露出来"）。
+     * 起手那一下（暗面盖满全屏）看不见 —— 媒体库页本身就是这个颜色。
+     */
+    fun leaveMediaWave() {
+        if (mediaWave != null) return
+        val center = navCenters[MEDIA_ROUTE]
+            ?: Offset(waveAreaSize.width / 2f, waveAreaSize.height / 2f)
+        // 同步盖满（见 waveCovered 的注释）：这一帧起画面就是暗面，不再依赖协程调度次序
+        waveCovered = true
+        waveBack = true
+        mediaWave = center
+    }
+
+    // 返回键离开媒体库也走反向水波 —— 但**不能挂在这里**：NavHost 自己的返回回调注册得更晚、
+    // 优先级更高，会把返回直接吃掉（真机实测：挂这里时波根本不出现）。它挂在 media 路由的内容里，
+    // 见下面 NavHost 的 composable("media")。
+
+    LaunchedEffect(mediaWave, waveBack) {
         val center = mediaWave ?: return@LaunchedEffect
-        waveRadius.snapTo(0f)
-        waveAlpha.snapTo(1f)
-        // 等一帧：波面 Box 的实际尺寸（onSizeChanged）先落下来
-        withFrameNanos { }
         val w = waveAreaSize.width.coerceAtLeast(1).toFloat()
         val h = waveAreaSize.height.coerceAtLeast(1).toFloat()
         val maxR = hypot(maxOf(center.x, w - center.x), maxOf(center.y, h - center.y))
-        // 扩散：暗色铺满全屏
-        waveRadius.animateTo(maxR, tween(420, easing = FastOutSlowInEasing))
-        // 盖严的瞬间才切路由（导航栏的滑出也发生在纯暗背后，不可见）
-        navigateRoute("media")
-        // 淡出：波色就是媒体库深色方案的 background，淡出即溶进页面底色
-        waveAlpha.animateTo(0f, tween(320))
-        mediaWave = null
+        if (waveBack) {
+            // 起手（waveCovered）已经在按下返回的那一瞬间同步盖住了，这里**等两帧**再切路由：
+            // 第一帧等暗面真的画上屏，第二帧才动手切 —— 切路由（返回文件页：整页重组 + 列表取数）
+            // 是这一帧里最重的一件事，跟"画暗面"挤在同一帧时会把暗面推后，
+            // 屏幕上就还是媒体库画面（用户实测："返回后媒体库画面还停留几帧才切到文件"）。
+            // 这两帧看着是静止的，但暗面颜色就是媒体库底色，看不出来。
+            waveRadius.snapTo(maxR)
+            waveAlpha.snapTo(1f)
+            withFrameNanos { }
+            withFrameNanos { }
+            navController.popBackStack()
+            // 路由换完再把画面交回给圆：收缩从"铺满"开始
+            waveCovered = false
+            waveRadius.animateTo(0f, tween(420, easing = FastOutSlowInEasing))
+            // 尾巴上淡一下：收成小圆点时不至于突兀
+            waveAlpha.animateTo(0f, tween(180))
+            waveBack = false
+            mediaWave = null
+        } else {
+            waveRadius.snapTo(0f)
+            waveAlpha.snapTo(1f)
+            // 等一帧：波面 Box 的实际尺寸（onSizeChanged）先落下来
+            withFrameNanos { }
+            // 扩散：暗色铺满全屏
+            waveRadius.animateTo(maxR, tween(420, easing = FastOutSlowInEasing))
+            // 盖严的瞬间才切路由（导航栏的滑出也发生在纯暗背后，不可见）
+            navigateRoute(MEDIA_ROUTE)
+            // 淡出：波色就是媒体库深色方案的 background，淡出即溶进页面底色
+            waveAlpha.animateTo(0f, tween(320))
+            mediaWave = null
+        }
     }
 
     /**
@@ -272,15 +335,22 @@ private fun MainScaffold(container: AppContainer, widthClass: WindowWidthSizeCla
         landed = true
     }
 
-    val onPlayVideo: (FileItem, List<PlaylistEntry>, Int) -> Unit = { item, playlist, index ->
-        val pc = item.pc
-        if (pc.isNullOrBlank()) {
-            scope.launch { snackbarHostState.showSnackbar("该文件缺少提取码，无法播放") }
-        } else {
-            // 记录点在 FilesScreen（只有那里拿得到"当时所在的目录"），这里只负责启动播放
-            context.startActivity(PlayerActivity.intent(context, pc, item.fn, playlist, index))
+    val onPlayVideo: (FileItem, List<PlaylistEntry>, Int, String?, String?) -> Unit =
+        { item, playlist, index, opLogCid, opLogPath ->
+            val pc = item.pc
+            if (pc.isNullOrBlank()) {
+                scope.launch { snackbarHostState.showSnackbar("该文件缺少提取码，无法播放") }
+            } else {
+                // 记录点在 FilesScreen（只有那里拿得到"当时所在的目录"），这里只负责启动播放；
+                // cid/path 原样进播放器 —— 播放器内切集时补的操作记录要用同一对值
+                context.startActivity(
+                    PlayerActivity.intent(
+                        context, pc, item.fn, playlist, index,
+                        opLogCid = opLogCid, opLogPath = opLogPath,
+                    )
+                )
+            }
         }
-    }
 
     // ---------------- 大图画廊（应用根层级渲染，才能盖住侧栏） ----------------
     var imageGallery by remember { mutableStateOf<Pair<List<ImageMediaItem>, Int>?>(null) }
@@ -377,6 +447,11 @@ private fun MainScaffold(container: AppContainer, widthClass: WindowWidthSizeCla
             .drawWithContent {
                 drawContent()
                 val center = mediaWave ?: return@drawWithContent
+                // 退场起手那一帧：整屏盖住（同步置位，不等协程 —— 见 waveCovered 的注释）
+                if (waveCovered) {
+                    drawRect(MediaWaveDark)
+                    return@drawWithContent
+                }
                 drawCircle(
                     color = MediaWaveDark.copy(alpha = waveAlpha.value),
                     radius = waveRadius.value,
@@ -390,7 +465,9 @@ private fun MainScaffold(container: AppContainer, widthClass: WindowWidthSizeCla
             // 回到其他页的滑入动画保留
             AnimatedVisibility(
                 visible = !expanded && !immersiveMedia,
-                enter = fadeIn(tween(250)) + slideInVertically(tween(300)) { it / 2 },
+                // 同左栏：反向水波那一下瞬时（理由见左栏那段），平时保留滑入
+                enter = if (waveBack) EnterTransition.None
+                else fadeIn(tween(250)) + slideInVertically(tween(300)) { it / 2 },
                 exit = ExitTransition.None,
             ) {
                 NavigationBar {
@@ -413,14 +490,19 @@ private fun MainScaffold(container: AppContainer, widthClass: WindowWidthSizeCla
         Row(Modifier.fillMaxSize().padding(padding)) {
             // 平板左侧导航栏：同底栏——进媒体库时收起必须瞬时。原来"滑出+收合宽度"的
             // 退场会让内容区在暗色淡出窗口里被挤着扩宽，波面一透明就看见导航栏闪现、
-            // 页面变形；从媒体库回其他页的滑入+展开保留
+            // 页面变形；从媒体库回其他页的滑入+展开保留 —— ★ 除了"反向水波"那一下
+            // （waveBack）：那时也必须瞬时。展开宽度是**改布局**的动画，每帧都要把内容区
+            // 重新排版一遍，和收缩水波抢主线程，暗面会被推后几帧才画出来
+            // （真机反馈："返回后媒体库画面还停留几帧才切到文件"）。暗面盖着，瞬时进出都看不见。
             AnimatedVisibility(
                 visible = expanded && !immersiveMedia,
-                enter = fadeIn(tween(250)) + slideInHorizontally(tween(300)) { -it / 2 } + expandHorizontally(tween(300)),
+                enter = if (waveBack) EnterTransition.None
+                else fadeIn(tween(250)) + slideInHorizontally(tween(300)) { -it / 2 } + expandHorizontally(tween(300)),
                 exit = ExitTransition.None,
             ) {
                 NavigationRail {
-                    destinations.forEach { dest ->
+                    // 常规入口（媒体库不在这里，见下面）
+                    destinations.filter { it.route != MEDIA_ROUTE }.forEach { dest ->
                         NavigationRailItem(
                             selected = currentRoute == dest.route,
                             onClick = { navigate(dest) },
@@ -429,6 +511,36 @@ private fun MainScaffold(container: AppContainer, widthClass: WindowWidthSizeCla
                             },
                             icon = { Icon(dest.icon, contentDescription = dest.label) },
                             label = { Text(dest.label) },
+                        )
+                    }
+                    // ★ 媒体库**沉到栏底**、和上面那组用一条分隔线隔开：
+                    //   它不是"又一个页面"，而是一整层沉浸式界面（进去会把导航栏整个收掉、
+                    //   出来走暗色水波），位置上也不该跟切页的入口混成一串。
+                    //   加一层浅底色是第二重区分：一眼看出这不是同类的入口。
+                    Spacer(Modifier.weight(1f))
+                    // ★ 宽度必须写死：导航栏的列是**松约束**（宽度由子项决定），用 fillMaxWidth()
+                    //   会让这条线按"可用最大宽度"去量，等于撑满整屏、把内容区挤成 0 宽。
+                    Box(
+                        Modifier
+                            .width(48.dp)
+                            .padding(vertical = 10.dp)
+                            .height(1.dp)
+                            .background(MaterialTheme.colorScheme.outlineVariant),
+                    )
+                    destinations.firstOrNull { it.route == MEDIA_ROUTE }?.let { media ->
+                        NavigationRailItem(
+                            selected = currentRoute == media.route,
+                            onClick = { navigate(media) },
+                            modifier = Modifier
+                                // 底部留出边距：贴到屏幕最下沿时这个圆角色的下半部分会被切掉
+                                .padding(start = 4.dp, end = 4.dp, top = 2.dp, bottom = 14.dp)
+                                .clip(RoundedCornerShape(18.dp))
+                                .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.12f))
+                                .onGloballyPositioned {
+                                    navCenters[media.route] = it.boundsInRoot().center
+                                },
+                            icon = { Icon(media.icon, contentDescription = media.label) },
+                            label = { Text(media.label) },
                         )
                     }
                 }
@@ -442,7 +554,12 @@ private fun MainScaffold(container: AppContainer, widthClass: WindowWidthSizeCla
                     // 首帧遮一下：跳转还没发生前别把文件页露出来（见 landed 的注释）
                     modifier = Modifier.fillMaxSize().alpha(if (landed) 1f else 0f),
                 ) {
-                    composable("files") {
+                    composable(
+                        "files",
+                        // 从媒体库"收缩"回来时是贴着暗面现身的：这时的入场必须是 None ——
+                        // 默认那 700ms 淡入会让收缩过程中露出来的画面是半透明的，跟入场水波不对称
+                        enterTransition = { if (waveBack) EnterTransition.None else fadeIn(tween(700)) },
+                    ) {
                         val vm: FilesViewModel = viewModel(initializer = {
                             FilesViewModel(
                                 container.openApi,
@@ -452,6 +569,10 @@ private fun MainScaffold(container: AppContainer, widthClass: WindowWidthSizeCla
                                 container.pinnedPrefs,
                                 container.dirCache,
                                 container.opLog,
+                                // 文件页改名的目录要作废媒体库的扫描状态（理由见 FilesViewModel 的构造参数）
+                                invalidateMediaDir = { cid ->
+                                    container.mediaDatabase.mediaDao().invalidateScanState(cid)
+                                },
                             )
                         })
                         FilesScreen(
@@ -469,13 +590,21 @@ private fun MainScaffold(container: AppContainer, widthClass: WindowWidthSizeCla
                             onJumpConsumed = { pendingCloudJump = null },
                         )
                     }
-                    // 媒体库页：入场交给「暗色水波」编排（见 MainScaffold 的 mediaWave）——
-                    // 路由在波面盖严全屏的瞬间才切，这里直接就位即可；退出仍是快速淡出
+                    // 媒体库页：进场出场都交给「暗色水波」编排（见 MainScaffold 的 mediaWave）——
+                    // 路由在波面盖严全屏的瞬间才切，这里直接就位即可。
+                    // **出场也必须瞬时**：默认的 200ms 淡出会让收缩过程中露出来的区域里
+                    // 还叠着半透明的媒体库页（用户实测："退出后媒体库画面还会停留几帧"）。
                     composable(
                         "media",
                         enterTransition = { EnterTransition.None },
-                        exitTransition = { fadeOut(tween(200)) },
+                        exitTransition = { ExitTransition.None },
                     ) {
+                        // 返回键：走**反向水波**离开媒体库（一来一回，见 leaveMediaWave）。
+                        // 这个 BackHandler 必须挂在这一层：挂到外层的 Scaffold 上不生效 ——
+                        // NavHost 自己的返回回调注册得更晚、优先级更高，返回会被它直接吃掉。
+                        // 放在页面内容**之前**：页面内部的返回（清搜索词 / 退海报墙 / 退浮层）
+                        // 都在它后面注册、优先消费，所以这里只在"真要从媒体库退出"时才触发。
+                        BackHandler(enabled = mediaWave == null) { leaveMediaWave() }
                         // 媒体库整条线走深色：列表 / 海报墙 / 详情页三屏连成一体，
                         // 详情页是 fanart 铺满 + 取色底色，前两屏跟着暗才不割裂。
                         // 在这里包一次即可 —— 三个页面都只用 MaterialTheme.colorScheme.*

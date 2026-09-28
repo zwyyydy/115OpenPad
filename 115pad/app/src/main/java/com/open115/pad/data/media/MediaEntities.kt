@@ -209,6 +209,39 @@ data class ScanStateEntity(
      */
     val dirFingerprint: String = "",
     val scannedAt: Long = 0,
+    /**
+     * 上次扫描时，**父目录列表里**这个目录项自己的 `upt`。
+     *
+     * 这是快速扫描最要紧的一列：`upt` 对"成员集合变化"敏感（文件/子目录的新增、删除、移入移出
+     * —— 实测），所以"现在父目录给我的 upt 跟我记的一样"就等于"我这层的成员没动过"。
+     * 注意它跟 [cloudUpt] **不是一回事**：那个是"目录内各条目 upt 的最大值"，是我们自己算的。
+     */
+    val parentUpt: Long = 0,
+    /**
+     * 同上，父目录列表里这个目录项自己的 `uet`（见 [FileItem.uet]）。
+     *
+     * `upt` 对改名不敏感，所以再拿 `uet` 兜一道 —— 它要是也对改名无感，这条判据就是个恒等比较，无害。
+     */
+    val parentUet: Long = 0,
+    /**
+     * 上次列这个目录时，它的列表里**有没有会递归进去的**子目录（屏蔽目录 `extrafanart` / `.actors` /
+     * 花絮那些**不算**）。
+     *
+     * 有子目录 = 不是叶子 → 快速扫描**不剪**它：变化不向上传播，想确认它的子目录没变，
+     * 只能把它列出来看子项的 `upt`。
+     *
+     * ★ 屏蔽目录故意不算：它们的内容变化本来就不顶本目录的任何时间字段，把它们算"有下级"
+     * 会让每个带侧挂素材的影片目录永远剪不动（真机实测：列目录数与增量完全一样）。
+     * 代价是"往 extrafanart 里加图"要等抽查/全量才补上 —— 只影响详情页剧照，不影响片名与索引。
+     */
+    val hasSubDirs: Boolean = false,
+    /**
+     * 扫描逻辑版本（见 [MediaScanner.SCAN_LOGIC_VERSION]）。
+     *
+     * 快速扫描只剪"用当前这套判据扫过的目录"：老版本写的行是 0 → 一律先列一次把判据补上，
+     * 之后再剪。以后加判据（比如哪天验出 `uet` 对改名有反应）就 +1，全库自动重列一轮。
+     */
+    val logicVersion: Int = 0,
 )
 
 /** 用户建的媒体库：一个或多个云盘根路径 = 一个库（如「示例系列」「演员目录」） */
@@ -312,6 +345,70 @@ data class WatchHistoryEntity(
 )
 
 /**
+ * 弹幕缓存（实验室：弹幕）：一条 = 一部视频（key 就是它的 pick_code）。
+ *
+ * 两级内容：匹配结果（episodeId）与弹幕本体（commentsJson）。
+ *  - episodeId 空串 = **匹配失败的负缓存**：弹幕源里没这部片，短期内别再去搜它
+ *    （搜索要走外网，反复空查纯浪费）；
+ *  - commentsJson 为 null = 匹配成功但弹幕没拉到（拉取接口有频控，失败留给下次重试，
+ *    不动 episodeId）。
+ *
+ * 弹幕本体存紧凑 JSON（[timeMs, mode, color, text] 数组），同一片覆盖写不堆行；
+ * 整表按 [DANMU_CACHE_KEEP] 条 LRU 裁剪。
+ *
+ * ⚠️ 本体一列可能到几 MB（`withRelated=true` 会把关联源的弹幕一起拉来，一部 3 小时的片
+ * 实测四万多条 ≈ 1.5M 字符 ≈ 4MB UTF-8）。**读它绝不能走 SELECT ***：Android 的
+ * CursorWindow 放不下单行（默认约 2MB）时 SQLite 抛 SQLiteBlobTooBigException，
+ * 连元数据都读不回来 —— 读元数据用 [DanmuCacheMeta]，读本体用分块（见 MediaDao.danmuJson）。
+ */
+@Entity(tableName = "danmu_cache")
+data class DanmuCacheEntity(
+    @PrimaryKey val pickCode: String,
+    /** 弹弹play 语义的 episodeId；空串 = 没匹配上 */
+    val episodeId: String,
+    val animeTitle: String,
+    val episodeTitle: String,
+    /** 匹配时间：负缓存的保鲜判据，也是整表 LRU 的排序键 */
+    val matchedAt: Long,
+    /** 拉到的弹幕（紧凑 JSON）；null = 还没拉到 */
+    val commentsJson: String?,
+    /** 弹幕拉取时间：本体按它保鲜（弹幕会持续新增，隔太久的重拉一遍） */
+    val commentsAt: Long,
+    val commentCount: Int,
+)
+
+/**
+ * [DanmuCacheEntity] 的元数据视图（**不含弹幕本体**）：匹配结果 + 时间戳 + 本体字符数。
+ * `jsonLength` 非空 = 拉到过弹幕本体（本体本身分块读，见 MediaDao.danmuJson）。
+ */
+data class DanmuCacheMeta(
+    val pickCode: String,
+    /** 空串 = 匹配失败的负缓存 */
+    val episodeId: String,
+    val animeTitle: String,
+    val episodeTitle: String,
+    /** 匹配时间：负缓存的保鲜判据，也是整表 LRU 的排序键 */
+    val matchedAt: Long,
+    /** 弹幕拉取时间：本体按它保鲜 */
+    val commentsAt: Long,
+    val commentCount: Int,
+    /** 本体的字符数；null = 还没拉到 */
+    val jsonLength: Int?,
+)
+
+/** danmu_cache 的保留条数：一部电影一条，400 条远超任何人的观看速度 */
+const val DANMU_CACHE_KEEP = 400
+
+/**
+ * 弹幕本体单次读的字符数（MediaDao.danmuJson 分块）。
+ *
+ * CursorWindow 默认约 2MB（部分 OEM 4MB），而一列 TEXT 在窗口里按 UTF-8 计：最坏情况
+ * 全 4 字节字符 → 256K 字符 ≈ 1MB，离下限还有一倍余量；4MB 的本体 = 16 次查询，
+ * 每次都是同一行的页缓存读，代价可以忽略。
+ */
+const val DANMU_JSON_CHUNK_CHARS = 256_000
+
+/**
  * 观影历史 + **媒体库里的元数据**（海报 / 更像片名的标题），列表页直接用。
  *
  * join 规则：历史行的 key 就是视频的 pick_code，而 `movies.videoPickCode` 正是它 ——
@@ -361,6 +458,15 @@ data class ScanLogEntity(
     val indexed: Int = 0,
     val postersFetched: Int = 0,
     val stopped: Boolean = false,
+    /** 扫描方式（"全量"/"增量"/"快速"）。老记录是空串 = 当"增量"看 */
+    val mode: String = "",
+    /**
+     * 这一轮**列目录请求次数**（[MediaScanner] 里的计数器）。
+     *
+     * 存在的意义就是量化快速扫描省了多少：增量模式它约等于处理过的目录数，
+     * 快速模式应该显著更小 —— 数字不对就说明剪枝没生效。
+     */
+    val listRequests: Int = 0,
     /** 新增影片的 mediaKey，`\n` 分隔（路径里不会出现换行，键同理） */
     val newKeys: String = "",
 ) {
@@ -378,5 +484,7 @@ data class ScanLogEntity(
         postersFetched = postersFetched,
         newCount = newKeyList.size,
         stopped = stopped,
+        mode = mode,
+        listRequests = listRequests,
     )
 }

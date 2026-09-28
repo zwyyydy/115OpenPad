@@ -161,6 +161,14 @@ class FilesViewModel(
     private val cache: DirCache? = null,
     /** 操作记录（未注入则不记录，行为与从前一致） */
     private val opLog: OpLog? = null,
+    /**
+     * 改名成功后把**这个目录**在媒体库里的扫描状态作废（未注入则什么都不做）。
+     *
+     * 115 的目录 `upt` 不随改名变（实测），而媒体库快速扫描靠"父目录看到的 upt 没变"跳过目录 ——
+     * 不通知的话，在文件页改完名，那一轮扫描会把这个目录当成"没变"跳过，库里一直挂旧文件名。
+     * 走容器注入而不是这里直接拿 DAO：文件页不该认识媒体库那套表（同 urlResolver 的写法）。
+     */
+    private val invalidateMediaDir: suspend (cid: String) -> Unit = {},
 ) : ViewModel() {
 
     data class DirEntry(val cid: String, val name: String)
@@ -187,9 +195,34 @@ class FilesViewModel(
         val starOnly: Boolean = false,
         val searching: Boolean = false,
         val searchQuery: String = "",
+        /**
+         * 非空 = 当前这层目录是从**这条搜索**的结果里点进来的（值是那次的关键词）。
+         * 界面据此显示"回到结果"条；返回键/返回箭头也是同一个动作（见 [popDir]）。
+         */
+        val searchBackQuery: String? = null,
     ) {
         val selectMode: Boolean get() = selection.isNotEmpty()
     }
+
+    /**
+     * 从搜索结果点进某个目录时留下的"回去的路"：搜索前的目录链 + 进入的那一层
+     * （[enteredPath]，用来判断用户还在不在这一支里）+ 当时的整份结果集。
+     *
+     * 为什么要有它：搜索状态在进目录时必须退出（load 靠 searching 区分"列目录"和"搜结果"），
+     * 退出后返回键就只会沿目录链退到搜索前所在的那一层 —— 用户是从结果里跳进来的，
+     * 想回去的是**那份结果**。把结果整份存下来，返回时原样端回去（零请求，连已翻的页都在），
+     * 再按一次返回才真的退出搜索。
+     */
+    private data class SearchReturn(
+        val stack: List<DirEntry>,
+        val enteredPath: List<DirEntry>,
+        val items: List<FileItem>,
+        val count: Long,
+        val query: String,
+        val typeFilter: Int?,
+    )
+
+    private var searchReturn: SearchReturn? = null
 
     /**
      * "可见列表"重算的输入指纹：其中任一项变化都必须重排。
@@ -438,27 +471,97 @@ class FilesViewModel(
     // 切目录、改排序筛选都是"换一个视角看数据"，缓存 key 里带了参数，命不中自然会去请求。
     // 只有点刷新按钮和写操作之后才需要强制绕过缓存。
 
+    /**
+     * 记/清"回搜索"的路。**状态里的那条提示必须跟着一起动**：两者一旦不同步，
+     * 界面上就会出现一条点了没反应的"回到结果"（或该有的提示不出现）。
+     */
+    private fun setSearchReturn(r: SearchReturn?) {
+        searchReturn = r
+        _ui.update { it.copy(searchBackQuery = r?.query) }
+    }
+
+    /** 当前浏览位置是否还在 [path] 这一支里（含 path 本身）；比 cid 不比名字，父目录改名不影响 */
+    private fun onSearchPath(path: List<DirEntry>): Boolean {
+        val s = _ui.value.stack
+        if (s.size < path.size) return false
+        return s.take(path.size).map { it.cid } == path.map { it.cid }
+    }
+
+    private fun dropSearchReturnIfOffPath() {
+        val r = searchReturn ?: return
+        if (!onSearchPath(r.enteredPath)) setSearchReturn(null)
+    }
+
     fun openDir(item: FileItem) {
         val fid = item.fid ?: return
-        // 从搜索结果点进子目录要退出搜索：否则 load() 里 s.searching 仍为 true，
-        // "进入"后加载的还是搜索结果而不是子目录内容。
+        val s = _ui.value
+        if (s.searching) {
+            // 从搜索结果点进子目录：先记下"回去的路"（见 [SearchReturn]）。搜索状态本身仍要退出：
+            // 否则 load() 里 s.searching 仍为 true，"进入"后加载的还是搜索结果而不是目录内容。
+            setSearchReturn(
+                SearchReturn(
+                    stack = s.stack,
+                    enteredPath = s.stack + DirEntry(fid, item.fn),
+                    items = s.items,
+                    count = s.count,
+                    query = s.searchQuery,
+                    typeFilter = s.typeFilter,
+                ),
+            )
+        } else {
+            dropSearchReturnIfOffPath()
+        }
         _ui.update {
             it.copy(stack = it.stack + DirEntry(fid, item.fn), selection = emptySet(), searching = false, searchQuery = "")
         }
         loadCurrent()
     }
 
+    /**
+     * 返回上一级。**从搜索结果进来的那一层例外**：先回到搜索结果（见 [backToSearchResults]），
+     * 再按一次返回才退出搜索、回到目录浏览。
+     */
     fun popDir() {
+        if (backToSearchResults()) return
         if (_ui.value.stack.size > 1) {
             _ui.update { it.copy(stack = it.stack.dropLast(1), selection = emptySet()) }
+            // 绕出这一支之后，"回搜索"的路作废：用户已经在别的地方看东西了，
+            // 再返回时冒出一份旧结果只会莫名其妙
+            dropSearchReturnIfOffPath()
             loadCurrent()
         }
+    }
+
+    /**
+     * 回到这次搜索的结果页（结果整份端回去，零请求、连已翻的页都在）。
+     * 返回 false = 当前没有可回的结果页（不在"从搜索结果进来的那一层"）。
+     */
+    fun backToSearchResults(): Boolean {
+        val r = searchReturn ?: return false
+        // 只在"正站在从结果里点进来的那个目录"时成立；更深一层（结果 > A > B）先按普通返回退，
+        // 退回到 A 再按才回结果 —— 与浏览器的原路返回一致
+        if (_ui.value.stack.size != r.enteredPath.size) return false
+        setSearchReturn(null)
+        _ui.update {
+            it.copy(
+                stack = r.stack,
+                selection = emptySet(),
+                searching = true,
+                searchQuery = r.query,
+                typeFilter = r.typeFilter,
+                items = r.items,
+                count = r.count,
+                error = null,
+            )
+        }
+        return true
     }
 
     fun jumpTo(index: Int) {
         // 已在目标层级时直接返回，避免一次无谓的列表刷新
         if (index >= _ui.value.stack.lastIndex) return
         _ui.update { it.copy(stack = it.stack.subList(0, index + 1), selection = emptySet()) }
+        dropSearchReturnIfOffPath()
         loadCurrent()
     }
 
@@ -476,6 +579,8 @@ class FilesViewModel(
                 searchQuery = "",
             )
         }
+        // 换了一条完全不同的路：即便 stack 深度凑巧和"从搜索进来的那层"一样，也不能再回那份结果
+        setSearchReturn(null)
         loadCurrent()
     }
 
@@ -523,6 +628,9 @@ class FilesViewModel(
 
     fun exitSearch() {
         _ui.update { it.copy(searching = false, searchQuery = "") }
+        // 这一次搜索到此为止：连带清掉"回结果"的路 —— 用户已经主动退出搜索了，
+        // 之后某次返回再冒出一份旧结果只会莫名其妙
+        setSearchReturn(null)
         // 退出搜索回到目录浏览：大概率能命中缓存，回来即刻就有内容
         loadCurrent()
     }
@@ -552,7 +660,13 @@ class FilesViewModel(
         val fid = item.fid ?: return@runOp false to "缺少文件ID"
         val resp = api.updateFile(fid, newName)
         val ok = resp.envOk()
-        if (ok) refresh()
+        if (ok) {
+            // 改名**不顶 115 的目录 upt**（实测），而媒体库的快速扫描正是靠"父目录看到的 upt 没变"
+            // 跳过目录的 —— 不在这里作废该目录的扫描状态，改完名那一轮扫描会当成"没变"跳过，
+            // 库里一直挂旧文件名。增量/全量扫描不需要这个（它们每个目录都列），但代价只是一次 UPDATE。
+            invalidateMediaDir(currentCid())
+            refresh()
+        }
         ok to (resp.envMsg() ?: "重命名失败")
     }
 
@@ -743,7 +857,7 @@ fun FilesScreen(
     vm: FilesViewModel,
     expanded: Boolean,
     snackbarHostState: SnackbarHostState,
-    onPlayVideo: (item: FileItem, playlist: List<PlaylistEntry>, index: Int) -> Unit,
+    onPlayVideo: (item: FileItem, playlist: List<PlaylistEntry>, index: Int, opLogCid: String?, opLogPath: String?) -> Unit,
     onOpenGallery: (items: List<ImageMediaItem>, index: Int) -> Unit,
     onPreviewText: (item: FileItem) -> Unit,
     /** 多选时进批量重命名面板；入参里带上了整个目录的列表，面板可一键扩到全目录 */
@@ -770,6 +884,11 @@ fun FilesScreen(
     var showDeleteConfirm by remember { mutableStateOf(false) }
     var moveMode by remember { mutableStateOf<String?>(null) }
     var downloadTarget by remember { mutableStateOf<FileItem?>(null) }
+    // 分类整理：任务挂在应用级 FileOrganizer 上（切页不停、前台服务跟着亮），
+    // 这里只负责"弹确认框、发车、攒一句结束语"
+    val organizer = context.appContainer.fileOrganizer
+    val organizing by organizer.progress.collectAsState()
+    var showOrganizeConfirm by remember { mutableStateOf(false) }
     /** 当前视图里的图片序列（大图画廊用），保持用户看到的顺序 */
     val galleryItems = remember(ui.items) {
         ui.items.filter { isImageItem(it) }.map { it.toImageMediaItem() }
@@ -804,6 +923,24 @@ fun FilesScreen(
         ) {
             vm.refresh()
         }
+    }
+
+    // 从搜索结果点进目录后再返回时，搜索状态是 VM 端回来的（searching 重新为 true）——
+    // 这里把搜索栏一并展开，用户看到的就是刚才那份结果（关键词也还在）
+    LaunchedEffect(ui.searching) {
+        if (ui.searching) searchMode = true
+    }
+
+    // 分类整理结束（完成/停止/失败）后报一句结果，并在"整理的就是当前目录"时刷新列表。
+    // finishedAt 是唯一判据：0 = 没有过结果；换新值 = 有一条没报过。
+    // lastOrganizeFinishedAt 挡住"离开文件页再回来"时的重放（rememberSaveable 存档跨重组有效）。
+    var lastOrganizeFinishedAt by rememberSaveable { mutableStateOf(0L) }
+    LaunchedEffect(organizing.finishedAt) {
+        val fin = organizing.finishedAt
+        if (fin == 0L || fin == lastOrganizeFinishedAt) return@LaunchedEffect
+        lastOrganizeFinishedAt = fin
+        notify(organizing.summary ?: "分类整理完成")
+        if (organizing.rootCid == vm.currentCid()) vm.refresh()
     }
 
     // ---- 返回键分级处理（后注册的优先级更高）----
@@ -992,7 +1129,9 @@ fun FilesScreen(
                     ui.stack.last().name,
                 )
             }
-            onPlayVideo(item, entries, index)
+            // cid/path 除了写操作记录，还要带给播放器：播放器内切集时补的记录
+            // 用同一对值，文件页「最近浏览」的时间才会跟着切集走
+            onPlayVideo(item, entries, index, vm.currentTargetCid(), ui.stack.last().name)
         } else if (isImageItem(item)) {
             // 传"图片序列 + 索引"给大图画廊，才能左右翻页；同时带上归一化后的元数据
             // 把"图片序列 + 索引"上抛，画廊在应用根层级渲染（才能盖住侧栏）
@@ -1092,6 +1231,13 @@ fun FilesScreen(
                 onUploadFolder = { folderPicker.launch(null) },
                 onOpenFilterRules = onOpenFilterRules,
                 onCreateFolder = { showCreate = true },
+                onOrganize = {
+                    // 已有整理在跑就不重复发车：横幅就挂在顶栏下面，不会有"点了没反应"的困惑
+                    if (organizing.running) notify("已有分类整理任务在进行")
+                    else showOrganizeConfirm = true
+                },
+                organizing = organizing,
+                onStopOrganize = { organizer.stop() },
                 quickDirDrag = quickDirDrag,
                 onQuickDirDrop = ::onQuickDirDrop,
             )
@@ -1147,6 +1293,13 @@ fun FilesScreen(
                 onUploadFolder = { folderPicker.launch(null) },
                 onOpenFilterRules = onOpenFilterRules,
                 onCreateFolder = { showCreate = true },
+                onOrganize = {
+                    // 已有整理在跑就不重复发车：横幅就挂在顶栏下面，不会有"点了没反应"的困惑
+                    if (organizing.running) notify("已有分类整理任务在进行")
+                    else showOrganizeConfirm = true
+                },
+                organizing = organizing,
+                onStopOrganize = { organizer.stop() },
                 quickDirDrag = quickDirDrag,
                 onQuickDirDrop = ::onQuickDirDrop,
             )
@@ -1166,6 +1319,23 @@ fun FilesScreen(
             showCreate = false
             scope.launch { notify(vm.addFolder(it)) }
         }, onDismiss = { showCreate = false })
+    }
+    if (showOrganizeConfirm) {
+        ConfirmDialog(
+            title = "分类整理当前目录",
+            text = "将递归扫描「${ui.stack.last().name}」下的所有文件（含子文件夹里的），按类型移动到本目录下的「视频」「音频」「文本」「应用程序」「图片」「压缩包」六个文件夹，其余进「其他」。\n\n" +
+                "· 只搬文件，子文件夹本身不动\n" +
+                "· 目标文件夹已存在则直接复用\n" +
+                "· 同名文件 115 会自动改成「xxx（1）」，不会覆盖\n" +
+                "· 文件多时耗时较长，顶栏下方的横幅里可随时停止",
+            confirmText = "开始整理",
+            onConfirm = {
+                showOrganizeConfirm = false
+                organizer.start(vm.currentCid(), ui.stack.joinToString(" / ") { it.name })
+                notify("分类整理已开始")
+            },
+            onDismiss = { showOrganizeConfirm = false },
+        )
     }
     renameTarget?.let { target ->
         TextEntryDialog("重命名", "新名称", initial = target.fn, onConfirm = {

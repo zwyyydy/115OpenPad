@@ -6,6 +6,7 @@ android-sdk/
 build/
 app/build/
 .gradle/
+.kotlin/
 local.properties
 *.apk.idsig
 *.apk
@@ -14,6 +15,10 @@ local.properties
 spb*.bin
 fix_pb.py
 .fresh_token
+
+# 本机 SSH 助手脚本（里面写着服务器地址与口令，绝不上库）
+/*.py
+ssh_run.py
 
 # 截图等临时产物
 *.png

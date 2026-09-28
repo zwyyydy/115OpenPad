@@ -1,5 +1,8 @@
 package com.open115.pad.player
 
+import kotlinx.serialization.decodeFromString
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.json.Json
 import java.util.Locale
 
 /**
@@ -198,3 +201,29 @@ internal val FILTER_SLIDERS: List<FilterSlider> = listOf(
         { String.format(Locale.US, "%.2f", it) },
     ),
 )
+
+// ---- 自定义模板 ----
+
+/**
+ * 用户自定义滤镜模板：名字 + 整组参数（16 个 float 的逗号串，见 [FilterParams.toPrefString]）。
+ *
+ * 保存的是面板**当前的全部参数**（含不开放滑块的风格组）——回放走 [FilterParams.fromPrefString]，
+ * 与内置预设完全同一条路。PlayerPrefs 只存 [CustomFilterPresetsCodec.encode] 出来的不透明串，
+ * 跟当前参数（`lab_filter_params`）同一套"存储层不认识滤镜"的分工。
+ */
+@kotlinx.serialization.Serializable
+internal data class CustomFilterPreset(val name: String, val params: String)
+
+internal object CustomFilterPresetsCodec {
+    private val json = Json { ignoreUnknownKeys = true }
+
+    /** 模板数量上限：多了预设行也滚不到头；满了提示先删再存 */
+    const val MAX = 20
+
+    fun encode(list: List<CustomFilterPreset>): String = json.encodeToString(list)
+
+    /** 坏数据（空串 / 脏 JSON）一律退回空表：模板解析失败不该影响播放 */
+    fun decode(raw: String?): List<CustomFilterPreset> =
+        runCatching { json.decodeFromString<List<CustomFilterPreset>>(raw ?: "") }
+            .getOrDefault(emptyList())
+}

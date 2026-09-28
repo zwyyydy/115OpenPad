@@ -4,6 +4,7 @@ import android.content.Context
 import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.intPreferencesKey
+import androidx.datastore.preferences.core.longPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import kotlinx.coroutines.flow.Flow
@@ -64,11 +65,25 @@ class AppPrefs(private val context: Context) {
 
     // ---- 壁纸（仅明亮模式显示；URI 来自 SAF，需持久化读权限） ----
     val wallpaperUri: Flow<String?> = context.appDataStore.data.map { it[KEY_WALLPAPER] }
+
+    /**
+     * 壁纸的"这一版"标记（毫秒时间戳），每次设/换壁纸都变。
+     *
+     * 为什么必须有它：裁切结果永远写到**同两个文件**（`wallpaper_land.jpg` / `wallpaper_port.jpg`），
+     * 所以换壁纸时 [wallpaperUri] 的值**一模一样** —— 光看它，Compose 认为状态没变、不重组，
+     * 而 Coil 的缓存键又只认文件路径：两下一凑，换完壁纸画面上还是旧图，
+     * 只有旋转屏幕（切到另一个方向的那份文件）才会重新解码（真机实测到的 bug）。
+     * 把它带进 ImageRequest 的缓存键 + 让 UI 观察它，换图才能立刻生效。
+     */
+    val wallpaperStamp: Flow<Long> = context.appDataStore.data.map { it[KEY_WALLPAPER_STAMP] ?: 0L }
+
     val wallpaperMask: Flow<Float> = context.appDataStore.data.map { (it[KEY_WALLPAPER_MASK] ?: 45) / 100f }
     val wallpaperBlur: Flow<Float> = context.appDataStore.data.map { (it[KEY_WALLPAPER_BLUR] ?: 30) / 100f }
 
     suspend fun setWallpaper(uri: String?) = context.appDataStore.edit {
         if (uri == null) it.remove(KEY_WALLPAPER) else it[KEY_WALLPAPER] = uri
+        // 与 uri 同一次写入：观察者要么看到"旧 uri + 旧标记"，要么"新 uri + 新标记"
+        it[KEY_WALLPAPER_STAMP] = System.currentTimeMillis()
     }
 
     suspend fun setWallpaperMask(v: Float) = context.appDataStore.edit {
@@ -110,6 +125,7 @@ class AppPrefs(private val context: Context) {
         val KEY_START_PAGE = stringPreferencesKey("start_page")
         val KEY_THEME = stringPreferencesKey("theme_mode")
         val KEY_WALLPAPER = stringPreferencesKey("wallpaper_uri")
+        val KEY_WALLPAPER_STAMP = longPreferencesKey("wallpaper_stamp")
         val KEY_WALLPAPER_MASK = intPreferencesKey("wallpaper_mask")
         val KEY_WALLPAPER_BLUR = intPreferencesKey("wallpaper_blur")
         val KEY_GLASS_ALPHA = intPreferencesKey("glass_card_alpha")

@@ -35,24 +35,30 @@ data class ScanReport(
     val newCount: Int,
     /** 是被用户/系统停掉的（没跑完全部目录） */
     val stopped: Boolean,
+    /** 扫描方式（"全量"/"增量"/"快速"）。空串 = 老记录，摘要里不显示 */
+    val mode: String = "",
+    /** 本轮**列目录请求次数** —— 快速扫描省了多少就看它（增量模式约等于目录数），0 = 没统计 */
+    val listRequests: Int = 0,
 ) {
     val elapsedMs: Long get() = (finishedAt - startedAt).coerceAtLeast(0L)
 
     /** 一个目录都没跑完（列目录阶段就中断/被停）—— 这种结果与"扫完了没新增"必须区分开 */
     val aborted: Boolean get() = doneDirs <= 0
 
-    /** 摘要一行。顺序按用户最关心的：新增 → 目录 → 索引 → 海报 → 用时 */
+    /** 摘要一行。顺序按用户最关心的：方式 → 新增 → 目录 → 索引 → 海报 → 用时 */
     fun summary(): String = buildString {
         if (aborted) {
             append(if (stopped) "已停止（未开始索引）" else "未完成（列目录中断）")
         } else {
             if (stopped) append("已停止 · ")
+            if (mode.isNotBlank()) append(mode).append(" · ")
             append("新增 $newCount 部")
             append(" · 目录 $doneDirs/$totalDirs")
             if (skippedDirs > 0) append("（跳过 $skippedDirs）")
             append(" · 索引 $indexed 项")
             if (postersFetched > 0) append(" · 缓存海报 $postersFetched 张")
         }
+        if (listRequests > 0) append(" · 列目录 $listRequests 次")
         append(" · 用时 ").append(Format.duration(elapsedMs / 1000).ifEmpty { "0:00" })
     }
 

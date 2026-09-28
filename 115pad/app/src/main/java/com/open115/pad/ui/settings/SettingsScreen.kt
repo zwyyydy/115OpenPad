@@ -68,12 +68,15 @@ import com.open115.pad.data.OpenApi
 import com.open115.pad.data.StartPage
 import com.open115.pad.data.ThemeMode
 import com.open115.pad.data.UserInfo
+import com.open115.pad.data.media.PadSync
 import com.open115.pad.ui.components.ConfirmDialog
+import com.open115.pad.ui.components.FolderPickerDialog
 import com.open115.pad.ui.components.TextEntryDialog
 import com.open115.pad.ui.theme.AppChip
 import com.open115.pad.ui.theme.AppColors
 import com.open115.pad.ui.theme.AppSlider
 import com.open115.pad.ui.theme.SectionHeader
+import com.open115.pad.util.Format
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -200,6 +203,8 @@ fun SettingsScreen(container: AppContainer) {
     /** 手机模式下是否已点进某个分类。平板两栏同屏，不需要这个状态 */
     var phoneOpened by rememberSaveable { mutableStateOf(false) }
     var showEditAppId by remember { mutableStateOf(false) }
+    var showEditDanmuApi by remember { mutableStateOf(false) }
+    var showEditDanmuBlocklist by remember { mutableStateOf(false) }
     var clientId by remember { mutableStateOf("") }
 
     val speedBoost by container.playerPrefs.speedBoost.collectAsState(initial = 2.5f)
@@ -215,6 +220,15 @@ fun SettingsScreen(container: AppContainer) {
     val subtitleBottomPercent by container.playerPrefs.subtitleBottomPercent.collectAsState(initial = 0)
     val softwareDecode by container.playerPrefs.softwareDecode.collectAsState(initial = false)
     val labFilterEnabled by container.playerPrefs.labFilterEnabled.collectAsState(initial = false)
+    val labDanmuEnabled by container.playerPrefs.labDanmuEnabled.collectAsState(initial = false)
+    val labDanmuApi by container.playerPrefs.labDanmuApi.collectAsState(initial = "")
+    val labDanmuArea by container.playerPrefs.labDanmuArea.collectAsState(initial = 50)
+    val labDanmuTextSize by container.playerPrefs.labDanmuTextSize.collectAsState(initial = 16f)
+    val labDanmuOpacity by container.playerPrefs.labDanmuOpacity.collectAsState(initial = 1f)
+    val labDanmuScroll by container.playerPrefs.labDanmuScroll.collectAsState(initial = 1f)
+    val labDanmuBlocklist by container.playerPrefs.labDanmuBlocklist.collectAsState(initial = "")
+    val labDanmuDensity by container.playerPrefs.labDanmuDensity.collectAsState(initial = 100)
+    val labDanmuCacheDays by container.playerPrefs.labDanmuCacheDays.collectAsState(initial = 7)
     val autoSubmitClipboard by container.downloadPrefs.autoSubmitClipboardDownload
         .collectAsState(initial = false)
     val startPage by container.appPrefs.startPage.collectAsState(initial = StartPage.FILES)
@@ -228,6 +242,16 @@ fun SettingsScreen(container: AppContainer) {
     val mediaCacheEnabled by container.mediaPrefs.cacheEnabled.collectAsState(initial = true)
     val mediaCacheMaxMb by container.mediaPrefs.cacheMaxMb
         .collectAsState(initial = com.open115.pad.data.media.MediaPrefs.DEFAULT_MAX_MB)
+
+    // ---- 流水线同步（服务器刮削完把结果搬进媒体库，见 PadSync）----
+    val padEnabled by container.mediaPrefs.padSyncEnabled.collectAsState(initial = true)
+    val padDirName by container.mediaPrefs.padSignalName.collectAsState(initial = "")
+    val padPollMinutes by container.mediaPrefs.padPollMinutes.collectAsState(initial = 10)
+    val padLastAt by container.mediaPrefs.padLastAt.collectAsState(initial = 0L)
+    val padNote by container.mediaPrefs.padLastNote.collectAsState(initial = "")
+    var showPadPickDir by remember { mutableStateOf(false) }
+    /** 手动同步在跑（「立即同步」那行顺便当进度提示用） */
+    var padSyncing by remember { mutableStateOf(false) }
 
     /**
      * 落盘缓存的占用（-1 = 还在算）。
@@ -402,9 +426,46 @@ fun SettingsScreen(container: AppContainer) {
                 }
             },
         ),
+        pipelineSection(
+            enabled = padEnabled,
+            dirName = padDirName,
+            pollMinutes = padPollMinutes,
+            lastAt = padLastAt,
+            note = if (padSyncing) "同步中…" else padNote,
+            onEnabled = { v -> scope.launch { container.mediaPrefs.setPadSyncEnabled(v) } },
+            onPollMinutes = { m -> scope.launch { container.mediaPrefs.setPadPollMinutes(m) } },
+            onPickDir = { showPadPickDir = true },
+            onSyncNow = {
+                if (!padSyncing) {
+                    padSyncing = true
+                    scope.launch {
+                        container.padSync.syncNow()
+                        padSyncing = false
+                    }
+                }
+            },
+        ),
         labSection(
             labFilterEnabled = labFilterEnabled,
             onLabFilterEnabled = { v -> scope.launch { container.playerPrefs.setLabFilterEnabled(v) } },
+            labDanmuEnabled = labDanmuEnabled,
+            labDanmuApi = labDanmuApi,
+            labDanmuArea = labDanmuArea,
+            labDanmuTextSize = labDanmuTextSize,
+            labDanmuOpacity = labDanmuOpacity,
+            labDanmuScroll = labDanmuScroll,
+            labDanmuBlocklist = labDanmuBlocklist,
+            labDanmuDensity = labDanmuDensity,
+            labDanmuCacheDays = labDanmuCacheDays,
+            onLabDanmuEnabled = { v -> scope.launch { container.playerPrefs.setLabDanmuEnabled(v) } },
+            onLabDanmuArea = { v -> scope.launch { container.playerPrefs.setLabDanmuArea(v) } },
+            onLabDanmuTextSize = { v -> scope.launch { container.playerPrefs.setLabDanmuTextSize(v) } },
+            onLabDanmuOpacity = { v -> scope.launch { container.playerPrefs.setLabDanmuOpacity(v) } },
+            onLabDanmuScroll = { v -> scope.launch { container.playerPrefs.setLabDanmuScroll(v) } },
+            onLabDanmuDensity = { v -> scope.launch { container.playerPrefs.setLabDanmuDensity(v) } },
+            onLabDanmuCacheDays = { v -> scope.launch { container.playerPrefs.setLabDanmuCacheDays(v.toInt()) } },
+            onEditDanmuApi = { showEditDanmuApi = true },
+            onEditDanmuBlocklist = { showEditDanmuBlocklist = true },
         ),
         accountSection(
             clientId = clientId,
@@ -471,6 +532,44 @@ fun SettingsScreen(container: AppContainer) {
                 scope.launch { container.session.saveClientId(newId) }
             },
             onDismiss = { showEditAppId = false },
+        )
+    }
+
+    if (showEditDanmuApi) {
+        TextEntryDialog(
+            title = "弹幕源地址",
+            label = "兼容弹弹play 协议的 HTTP 地址",
+            initial = labDanmuApi,
+            onConfirm = { newUrl ->
+                showEditDanmuApi = false
+                scope.launch { container.playerPrefs.setLabDanmuApi(newUrl) }
+            },
+            onDismiss = { showEditDanmuApi = false },
+        )
+    }
+
+    if (showEditDanmuBlocklist) {
+        TextEntryDialog(
+            title = "弹幕屏蔽词",
+            label = "逗号 / 顿号 / 换行分隔",
+            initial = labDanmuBlocklist,
+            onConfirm = { newWords ->
+                showEditDanmuBlocklist = false
+                scope.launch { container.playerPrefs.setLabDanmuBlocklist(newWords) }
+            },
+            onDismiss = { showEditDanmuBlocklist = false },
+        )
+    }
+
+    if (showPadPickDir) {
+        FolderPickerDialog(
+            api = container.openApi,
+            title = "选择信号目录（${PadSync.SIGNAL_DIR_NAME}）",
+            onDismiss = { showPadPickDir = false },
+            onPick = { cid, name ->
+                showPadPickDir = false
+                scope.launch { container.mediaPrefs.setPadSignalDir(cid, name) }
+            },
         )
     }
 }
@@ -931,8 +1030,10 @@ private fun uiSection(
             valueText = "${(wallpaperMask * 100).roundToInt()}%",
             value = wallpaperMask,
             range = 0f..1f,
-            steps = 10,
-            subtitle = "壁纸上的白色蒙版，越强文字越清楚",
+            // 三根百分比滑块一律 10% 一格（steps = 间隔数，9 → 0/10/…/100 共 11 档）。
+            // 早先这两根是 10（每格 9.09%，显示成 9%、18%…），跟「卡片不透明度」对不齐
+            steps = 9,
+            subtitle = "壁纸上的白色蒙版：越高越像磨砂纸，文字越清楚",
             onChange = onWallpaperMask,
         )
         slider(
@@ -941,7 +1042,7 @@ private fun uiSection(
             valueText = "${(wallpaperBlur * 100).roundToInt()}%",
             value = wallpaperBlur,
             range = 0f..1f,
-            steps = 10,
+            steps = 9,
             subtitle = "越高越朦胧",
             onChange = onWallpaperBlur,
         )
@@ -1151,9 +1252,105 @@ private fun storageSection(
     }
 }
 
+/**
+ * 流水线同步：服务器（刮削流水线）每轮刮完会往 115 里写一份「本次变了哪些目录」的信号文件，
+ * 这里只是开关与观察窗口 —— 真正干活的是 [PadSync]，它按间隔在后台轮询。
+ */
+private fun pipelineSection(
+    enabled: Boolean,
+    dirName: String,
+    pollMinutes: Int,
+    lastAt: Long,
+    note: String,
+    onEnabled: (Boolean) -> Unit,
+    onPollMinutes: (Int) -> Unit,
+    onPickDir: () -> Unit,
+    onSyncNow: () -> Unit,
+): SettingsSection = section(SettingsCategory.PIPELINE) {
+    group("流水线同步")
+    switch(
+        id = "pad_enabled",
+        title = "自动同步",
+        subtitle = if (enabled) "每 $pollMinutes 分钟看一次信号目录" else "已关闭",
+        detail = "服务器每轮刮削跑完会往 115 里写一个信号文件（默认是媒体库根目录下的 " +
+            "${PadSync.SIGNAL_DIR_NAME}，内容是这次变了哪些目录）。打开后 App 会在后台轮询那个目录 ——" +
+            "没新文件时一轮只有 1 次列目录请求；发现变动就**只扫那几个目录**来更新媒体库，" +
+            "不必整库重扫。信号不只看新增：重刮过的老片也会带上（元数据原地更新同样要重新索引）。",
+        checked = enabled,
+        onChange = onEnabled,
+    )
+    choice(
+        id = "pad_poll_minutes",
+        title = "轮询间隔",
+        subtitle = "服务器写信号之后，最迟多久被 App 处理",
+        options = listOf("5 分钟" to 5, "10 分钟" to 10, "30 分钟" to 30, "1 小时" to 60),
+        selected = pollMinutes,
+        onSelect = onPollMinutes,
+    )
+    action(
+        id = "pad_dir",
+        title = "信号目录",
+        subtitle = dirName.ifBlank { "自动查找（媒体库根下的 ${PadSync.SIGNAL_DIR_NAME}）" },
+        detail = "默认自动在媒体库根目录下面找 ${PadSync.SIGNAL_DIR_NAME}，不用配。" +
+            "只有在服务器把信号写在别处时才需要手选 —— 选到那个目录本身即可。",
+        onClick = onPickDir,
+    )
+    action(
+        id = "pad_sync_now",
+        title = "立即同步",
+        subtitle = note.ifBlank { "还没同步过" },
+        detail = "不等下一轮，马上读一次信号目录。服务器刚跑完刮削、想立刻看到结果时用它。" +
+            "同步本身不扫目录，它只是把变动的目录排进扫描队列（进度看媒体库页的扫描卡片）。",
+        onClick = onSyncNow,
+    )
+    info(
+        id = "pad_last",
+        title = "上次同步",
+        subtitle = Format.ago(lastAt),
+        detail = "上面「立即同步」那行显示的是最近一次同步的结果：读了几份信号、" +
+            "排了多少个目录进扫描队列、清掉了几个已移走的目录。",
+    )
+    info(
+        id = "pad_signal_format",
+        title = "信号文件格式",
+        subtitle = "自己搭流水线看这里",
+        detail = "信号就是一个 JSON 文件，放进「信号目录」、文件名用时间戳（如 20260928-103138.json）：\n" +
+            "{\n" +
+            "  \"dirs\": [\"/媒体库根/子目录/ABC-123 示例演员\"],\n" +
+            "  \"gone\": [\"/媒体库根/ABC-123\"]\n" +
+            "}\n" +
+            "· dirs = 需要重扫的目录（115 里的绝对路径）。要写到「影片目录」那一层，且必须落在某个" +
+            "媒体库的根目录下，否则会被忽略\n" +
+            "· gone = 已经移走/删掉的目录（可不写）。App 会清掉这些路径下的索引\n" +
+            "· 重刮过的老片也要写进 dirs —— App 会先清该目录的 nfo/海报缓存再重扫，" +
+            "否则 115 原地覆盖的新内容看不到\n" +
+            "· 只放新文件、别改已写过的：App 按文件名排序，只处理没读过的那些\n" +
+            "· 可选字段 codes / actors 仅用于日志排查，App 不依赖\n" +
+            "· 每轮只需 1 次列目录请求；有信号时每个变动目录再花几次（列目录 + nfo/海报）",
+    )
+}
+
 private fun labSection(
     labFilterEnabled: Boolean,
     onLabFilterEnabled: (Boolean) -> Unit,
+    labDanmuEnabled: Boolean,
+    labDanmuApi: String,
+    labDanmuArea: Int,
+    labDanmuTextSize: Float,
+    labDanmuOpacity: Float,
+    labDanmuScroll: Float,
+    labDanmuBlocklist: String,
+    labDanmuDensity: Int,
+    labDanmuCacheDays: Int,
+    onLabDanmuEnabled: (Boolean) -> Unit,
+    onLabDanmuArea: (Int) -> Unit,
+    onLabDanmuTextSize: (Float) -> Unit,
+    onLabDanmuOpacity: (Float) -> Unit,
+    onLabDanmuScroll: (Float) -> Unit,
+    onLabDanmuDensity: (Int) -> Unit,
+    onLabDanmuCacheDays: (Float) -> Unit,
+    onEditDanmuApi: () -> Unit,
+    onEditDanmuBlocklist: () -> Unit,
 ): SettingsSection = section(SettingsCategory.LAB) {
     switch(
         id = "video_filter",
@@ -1163,6 +1360,87 @@ private fun labSection(
             "仍走原来的渲染路径，零额外开销。VR 视角下滤镜不生效（那条路径的画面由 VR 视窗自己画）。",
         checked = labFilterEnabled,
         onChange = onLabFilterEnabled,
+    )
+    switch(
+        id = "danmu",
+        title = "弹幕",
+        subtitle = "播放器底部多一个「弹幕」按钮：点开就是弹幕面板，配置都在里面改",
+        detail = "弹幕从**兼容弹弹play 协议**的源拉取（自托管 danmu_api / 弹弹play 官方 / 局域网实例），本机缓存" +
+            "匹配结果与弹幕本体，接口有频控所以同一集短时间内不会重复请求。剧集按文件名里的集号对号入座；" +
+            "电影取搜索的第一条。匹配不上的片（含大部分番号内容）就是没有弹幕，属正常。" +
+            "本页这些参数在播放器的弹幕面板里也能改，改完立刻上看效果、同时写回这里。",
+        checked = labDanmuEnabled,
+        onChange = onLabDanmuEnabled,
+    )
+    choice(
+        id = "danmu_area",
+        title = "弹幕显示区域",
+        subtitle = "弹幕铺满屏幕上部多少",
+        options = listOf("1/4 屏" to 25, "半屏" to 50, "3/4 屏" to 75, "满屏" to 100),
+        selected = labDanmuArea,
+        onSelect = onLabDanmuArea,
+    )
+    choice(
+        id = "danmu_density",
+        title = "弹幕密度",
+        subtitle = "实际显示多少比例的弹幕（按时间轴均匀抽稀）",
+        options = listOf("25%" to 25, "50%" to 50, "75%" to 75, "100%" to 100),
+        selected = labDanmuDensity,
+        onSelect = onLabDanmuDensity,
+    )
+    slider(
+        id = "danmu_cache_days",
+        title = "弹幕缓存时效",
+        valueText = "$labDanmuCacheDays 天",
+        value = labDanmuCacheDays.toFloat(),
+        range = 1f..30f,
+        steps = 29,
+        subtitle = "期内同一部片直接用本机缓存，不再走网络",
+        onChange = onLabDanmuCacheDays,
+    )
+    slider(
+        id = "danmu_text_size",
+        title = "弹幕字号",
+        valueText = "${labDanmuTextSize.toInt()} sp",
+        value = labDanmuTextSize,
+        range = 12f..28f,
+        steps = 7,
+        onChange = onLabDanmuTextSize,
+    )
+    slider(
+        id = "danmu_opacity",
+        title = "弹幕不透明度",
+        valueText = "${(labDanmuOpacity * 100).toInt()}%",
+        value = labDanmuOpacity,
+        range = 0.3f..1f,
+        steps = 6,
+        onChange = onLabDanmuOpacity,
+    )
+    slider(
+        id = "danmu_scroll",
+        title = "弹幕速度",
+        valueText = "${"%.2f".format(labDanmuScroll)}×",
+        value = labDanmuScroll,
+        range = 0.5f..2f,
+        steps = 5,
+        subtitle = "数值越大滚得越快",
+        onChange = onLabDanmuScroll,
+    )
+    action(
+        id = "danmu_blocklist",
+        title = "弹幕屏蔽词",
+        subtitle = labDanmuBlocklist.ifBlank { "未设置" },
+        detail = "逗号/顿号/换行分隔。弹幕文本里含任一关键词就不显示（子串匹配、忽略大小写）。" +
+            "播放器里的弹幕面板也能改，那边改完立刻生效。",
+        onClick = onEditDanmuBlocklist,
+    )
+    action(
+        id = "danmu_api",
+        title = "弹幕源地址",
+        subtitle = labDanmuApi.ifBlank { "未设置（弹幕需自填源地址）" },
+        detail = "任何兼容弹弹play 协议的 HTTP 服务都行。播放器里的弹幕面板也能改 ——" +
+            "在那边改完会连本条目的弹幕缓存一起作废、立刻按新源重新匹配。",
+        onClick = onEditDanmuApi,
     )
 }
 

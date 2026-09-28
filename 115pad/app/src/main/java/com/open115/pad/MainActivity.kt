@@ -46,6 +46,8 @@ class MainActivity : ComponentActivity() {
             // DataStore 首读是毫秒级，initial 给默认明亮即可，不为此加转圈。
             val themeMode by appContainer.appPrefs.themeMode.collectAsState(initial = ThemeMode.LIGHT)
             val wallpaperUri by appContainer.appPrefs.wallpaperUri.collectAsState(initial = null as String?)
+            // 换壁纸时 uri 的值不变（裁切结果固定写同两个文件），靠这个标记才能立刻刷新（见 AppPrefs）
+            val wallpaperStamp by appContainer.appPrefs.wallpaperStamp.collectAsState(initial = 0L)
             val wallpaperMask by appContainer.appPrefs.wallpaperMask.collectAsState(initial = 0.45f)
             val wallpaperBlur by appContainer.appPrefs.wallpaperBlur.collectAsState(initial = 0.3f)
             val glassAlpha by appContainer.appPrefs.glassCardAlpha.collectAsState(initial = 0.78f)
@@ -61,7 +63,12 @@ class MainActivity : ComponentActivity() {
             Box(Modifier.fillMaxSize().background(Color(0xFFF8FAFC))) {
                 if (wallpaperOn) {
                     // 壁纸铺在应用最底层：页面底色变半透明透出它，卡片仍不透明
-                    WallpaperLayer(uri = wallpaperUri!!, mask = wallpaperMask, blur = wallpaperBlur)
+                    WallpaperLayer(
+                        uri = wallpaperUri!!,
+                        mask = wallpaperMask,
+                        blur = wallpaperBlur,
+                        stamp = wallpaperStamp,
+                    )
                 }
                 Open115Theme(
                     dark = dark,

@@ -73,8 +73,10 @@ import com.open115.pad.data.media.MediaLibraryEntity
 import com.open115.pad.data.media.MediaScanner
 import com.open115.pad.data.media.MovieCard
 import com.open115.pad.data.media.QueuedScan
+import com.open115.pad.data.media.ScanMode
 import com.open115.pad.data.media.WatchHistoryRow
 import com.open115.pad.data.media.WorksSort
+import com.open115.pad.data.media.label
 import com.open115.pad.player.PlayerActivity
 import com.open115.pad.ui.history.WatchHistoryScreen
 import com.open115.pad.ui.history.displaySubtitle
@@ -178,8 +180,8 @@ fun MediaLibraryScreen(api: com.open115.pad.data.OpenApi) {
      * 扫完自动开始 —— 早先是扫描中把按钮置灰、点了也白点。扫描本身跑在扫描器自己的
      * worker scope 里，离开这一页也不会被取消。
      */
-    fun startScan(lib: MediaLibraryEntity, incremental: Boolean) {
-        container.mediaScanner.enqueue(lib, incremental)
+    fun startScan(lib: MediaLibraryEntity, mode: ScanMode) {
+        container.mediaScanner.enqueue(lib, mode)
     }
 
     /** 「继续观看」的卡片点了直接续播（与观影历史页同一套意图：本机源走 localIntent） */
@@ -359,7 +361,7 @@ fun MediaLibraryScreen(api: com.open115.pad.data.OpenApi) {
                             queued = pendingScans.any { it.libraryId == lib.id },
                             compact = compact,
                             onOpen = { openedLib = lib },
-                            onScan = { incremental -> startScan(lib, incremental) },
+                            onScan = { mode -> startScan(lib, mode) },
                             onEdit = { editTarget = lib },
                             onDelete = { deleteTarget = lib },
                             modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
@@ -567,6 +569,7 @@ private suspend fun deleteLibraryFully(
             p.nfoPickCode?.let(nfoCodes::add)
             p.posterPickCode?.let(imageCodes::add)
             p.fanartPickCode?.let(imageCodes::add)
+            p.thumbPickCode?.let(imageCodes::add)
         }
         dao.deleteLibraryContent(prefix)
     }
@@ -575,8 +578,8 @@ private suspend fun deleteLibraryFully(
     container.mediaScanner.clearStoppedNotice()
 
     // 清缓存。**按 pick_code 精确失效**，不能用粗粒度前缀：
-    // nfo 的 key 是 `nfo|<pickCode>|<upt>`，清 "nfo|" 会把别的库的 nfo 一起清掉。
-    container.mediaCache.invalidateAll(nfoCodes.distinct().map { "nfo|$it|" })
+    // nfo 的 key 是 `nfo|v<解析器版本>|<pickCode>|<upt>`，清 "nfo|" 会把别的库的 nfo 一起清掉。
+    container.mediaCache.invalidateAll(nfoCodes.distinct().map { MediaScanner.nfoCachePrefix(it) })
     container.imageUrlResolver.evictPosterCache(imageCodes, container.cacheDir)
 }
 
@@ -645,7 +648,7 @@ private fun LibraryCard(
     /** 手机窄屏：海报条从 3 张缩到 2 张并整体变小（见 PosterStrip 的说明） */
     compact: Boolean,
     onOpen: () -> Unit,
-    onScan: (incremental: Boolean) -> Unit,
+    onScan: (ScanMode) -> Unit,
     onEdit: () -> Unit,
     onDelete: () -> Unit,
     modifier: Modifier = Modifier,
@@ -707,17 +710,29 @@ private fun LibraryCard(
                     Icon(Icons.Outlined.MoreVert, contentDescription = "更多操作")
                 }
                 DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
-                    // 两个扫描项永远可点：扫描中再点就是**排队**（同库再点 = 替换掉排队里的那一条）
+                    // 三个扫描项永远可点：扫描中再点就是**排队**（同库再点 = 替换掉排队里的那一条）
                     DropdownMenuItem(
                         text = {
                             Text(
-                                if (queued) "增量扫描（已在队列中，点此按新方式重排）"
-                                else "增量扫描（只扫新增；上次停止后也用它继续）",
+                                if (queued) "快速扫描（已在队列中，点此按新方式重排）"
+                                else "快速扫描（没变的影片目录连列都不列）",
                             )
                         },
                         onClick = {
                             menuOpen = false
-                            onScan(true)
+                            onScan(ScanMode.Fast)
+                        },
+                    )
+                    DropdownMenuItem(
+                        text = {
+                            Text(
+                                if (queued) "增量扫描（已在队列中，点此按新方式重排）"
+                                else "增量扫描（逐个目录核对；上次停止后也用它继续）",
+                            )
+                        },
+                        onClick = {
+                            menuOpen = false
+                            onScan(ScanMode.Incremental)
                         },
                     )
                     DropdownMenuItem(
@@ -726,7 +741,7 @@ private fun LibraryCard(
                         },
                         onClick = {
                             menuOpen = false
-                            onScan(false)
+                            onScan(ScanMode.Full)
                         },
                     )
                     DropdownMenuItem(
@@ -1254,7 +1269,7 @@ private fun ScanQueueCard(
             tasks.take(QUEUE_ROWS_SHOWN).forEach { task ->
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text(
-                        "${task.libraryName}（${if (task.incremental) "增量" else "全量"}）",
+                        "${task.libraryName}（${task.mode.label}）",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         maxLines = 1,

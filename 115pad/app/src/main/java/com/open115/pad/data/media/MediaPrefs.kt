@@ -3,6 +3,7 @@ package com.open115.pad.data.media
 import android.content.Context
 import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
+import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.longPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
@@ -52,6 +53,51 @@ class MediaPrefs(private val context: Context) {
         it[KEY_CACHE_MAX_MB] = if (mb <= 0L) UNLIMITED_MB else mb.coerceIn(MIN_MAX_MB, MAX_MAX_MB)
     }
 
+    // ---- 流水线同步（服务器刮削完把结果搬进媒体库，见 [PadSync]）----
+
+    /** 自动同步总开关。默认开：没配过也能自己找到信号目录（媒体库根下的 `.pad_signal`） */
+    val padSyncEnabled: Flow<Boolean> = context.mediaDataStore.data.map { it[KEY_PAD_ENABLED] ?: true }
+
+    /** 信号目录的 cid（自动找到或用户手选；空 = 还没找到，下次轮询再找） */
+    val padSignalCid: Flow<String> = context.mediaDataStore.data.map { it[KEY_PAD_DIR_CID] ?: "" }
+
+    /** 信号目录的名字，只为设置页显示（真正的定位靠 cid） */
+    val padSignalName: Flow<String> = context.mediaDataStore.data.map { it[KEY_PAD_DIR_NAME] ?: "" }
+
+    /**
+     * 已处理到哪个信号文件（文件名就是时间戳，按字符串比大小即时间序）。
+     *
+     * 落盘而不是只放内存：App 没开着的期间服务器攒下的信号，下次启动要接着处理。
+     */
+    val padCursor: Flow<String> = context.mediaDataStore.data.map { it[KEY_PAD_CURSOR] ?: "" }
+
+    /** 轮询间隔（分钟） */
+    val padPollMinutes: Flow<Int> = context.mediaDataStore.data.map { it[KEY_PAD_POLL_MINUTES] ?: 10 }
+
+    /** 上次轮询时刻（设置页状态行） */
+    val padLastAt: Flow<Long> = context.mediaDataStore.data.map { it[KEY_PAD_LAST_AT] ?: 0L }
+
+    /** 上次轮询结果一句话（设置页状态行） */
+    val padLastNote: Flow<String> = context.mediaDataStore.data.map { it[KEY_PAD_LAST_NOTE] ?: "" }
+
+    suspend fun setPadSyncEnabled(enabled: Boolean) =
+        context.mediaDataStore.edit { it[KEY_PAD_ENABLED] = enabled }
+
+    suspend fun setPadSignalDir(cid: String, name: String) = context.mediaDataStore.edit {
+        it[KEY_PAD_DIR_CID] = cid
+        it[KEY_PAD_DIR_NAME] = name
+    }
+
+    suspend fun setPadCursor(name: String) = context.mediaDataStore.edit { it[KEY_PAD_CURSOR] = name }
+
+    suspend fun setPadPollMinutes(minutes: Int) =
+        context.mediaDataStore.edit { it[KEY_PAD_POLL_MINUTES] = minutes.coerceIn(1, 24 * 60) }
+
+    suspend fun setPadLast(at: Long, note: String) = context.mediaDataStore.edit {
+        it[KEY_PAD_LAST_AT] = at
+        it[KEY_PAD_LAST_NOTE] = note
+    }
+
     companion object {
         const val DEFAULT_MAX_MB = 2048L
         const val MIN_MAX_MB = 512L
@@ -67,6 +113,13 @@ class MediaPrefs(private val context: Context) {
         private val KEY_CACHE_MAX_MB = longPreferencesKey("cache_max_mb")
         private val KEY_WORKS_SORT = stringPreferencesKey("works_sort")
         private val KEY_SCAN_QUEUE = stringPreferencesKey("scan_queue")
+        private val KEY_PAD_ENABLED = booleanPreferencesKey("pad_sync_enabled")
+        private val KEY_PAD_DIR_CID = stringPreferencesKey("pad_signal_cid")
+        private val KEY_PAD_DIR_NAME = stringPreferencesKey("pad_signal_name")
+        private val KEY_PAD_CURSOR = stringPreferencesKey("pad_cursor")
+        private val KEY_PAD_POLL_MINUTES = intPreferencesKey("pad_poll_minutes")
+        private val KEY_PAD_LAST_AT = longPreferencesKey("pad_last_at")
+        private val KEY_PAD_LAST_NOTE = stringPreferencesKey("pad_last_note")
 
         /**
          * nfo 文本池从总上限里分到的份额（5%）。

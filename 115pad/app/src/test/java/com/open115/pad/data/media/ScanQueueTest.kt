@@ -4,6 +4,7 @@ import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -116,5 +117,92 @@ class ScanQueueTest {
     @Test
     fun `空快照恢复出空队列_队列早就跑完时重启不该又扫一遍`() {
         assertTrue(tasksToRestore(ScanQueueSnapshot()).isEmpty())
+    }
+
+    // ---- 快速扫描（ScanMode.Fast）相关的纯规则 ----
+
+    @Test
+    fun `三个扫描方式由两个布尔值还原`() {
+        assertSame(ScanMode.Full, task(1, incremental = false).mode)
+        assertSame(ScanMode.Incremental, task(1).mode)
+        // fast=true 但 incremental=false 是非法组合（永远不会被构造出来），按全量算
+        assertSame(ScanMode.Full, task(1, incremental = false).copy(fast = true).mode)
+    }
+
+    @Test
+    fun `未跑完的快速扫描恢复时降级成普通增量`() {
+        val restored = tasksToRestore(
+            ScanQueueSnapshot(running = task(1).copy(fast = true)),
+        ).single()
+        // 快速模式判据多（hasSubDirs / logicVersion），"跑了一半"的状态上接着用最难查
+        assertTrue(restored.incremental)
+        assertFalse(restored.fast)
+        assertSame(ScanMode.Incremental, restored.mode)
+    }
+
+    @Test
+    fun `老快照没有 fast 字段_读回来是普通增量`() {
+        // 升级前的落盘 JSON（只有 incremental），读回来必须是原增量而不是快速
+        val raw = """{"pending":[{"libraryId":3,"libraryName":"库3","rootCids":["c3"],
+            "rootPaths":["/p3"],"incremental":true,"rateLimitMs":0,"minVideoSizeMb":0}]}"""
+        val t = tasksToRestore(MediaScanner.queueJson.decodeFromString<ScanQueueSnapshot>(raw)).single()
+        assertSame(ScanMode.Incremental, t.mode)
+    }
+
+    @Test
+    fun `抽查数量_至少一个_最多封顶`() {
+        assertEquals(0, fastSampleSize(0))
+        // 小库：10% 取整是 0，但必须至少抽 1 个 —— 否则"目录内改名"永远发现不了
+        assertEquals(1, fastSampleSize(3))
+        assertEquals(1, fastSampleSize(10))
+        assertEquals(2, fastSampleSize(25))
+        // 大库：封顶，别把剪枝省下来的请求又吃回去
+        assertEquals(FAST_SAMPLE_MAX, fastSampleSize(5000))
+    }
+
+    // ---- 单目录任务（流水线同步，noRecurse）：与整库任务各占一格 ----
+
+    private fun targeted(id: Long, dirs: List<String> = listOf("/a")) = QueuedScan(
+        libraryId = id,
+        libraryName = "库$id",
+        rootCids = dirs.map { "cid$it" },
+        rootPaths = dirs,
+        incremental = false,
+        noRecurse = true,
+    )
+
+    @Test
+    fun `单目录任务不顶整库任务_反过来也一样`() {
+        // 卡位只按库号的话：自动扫描排的整库任务会被一条定向任务顶掉（反之亦然），
+        // 用户看到的是"排好的全量扫描不见了"
+        val q = queueWithTask(queueWithTask(listOf(task(1)), targeted(1)), task(1, incremental = false))
+        assertEquals(listOf(1L, 1L), ids(q))
+        assertFalse(q[0].noRecurse)
+        assertTrue(q[1].noRecurse)
+        // 定向任务恒全量：被增量判据跳过就等于白排
+        assertFalse(q[1].incremental)
+    }
+
+    @Test
+    fun `同一条单目录任务再入队_仍是就地替换`() {
+        val q = queueWithTask(listOf(targeted(1)), targeted(1, listOf("/a", "/b")))
+        assertEquals(1, q.size)
+        assertEquals(listOf("/a", "/b"), q.single().rootPaths)
+    }
+
+    @Test
+    fun `未跑完的单目录任务恢复时不降级`() {
+        val restored = tasksToRestore(ScanQueueSnapshot(running = targeted(1))).single()
+        assertTrue(restored.noRecurse)
+        assertFalse(restored.incremental)
+        assertSame(ScanMode.Full, restored.mode)
+    }
+
+    @Test
+    fun `老快照没有 noRecurse 字段_读回来是整根扫描`() {
+        val raw = """{"pending":[{"libraryId":3,"libraryName":"库3","rootCids":["c3"],
+            "rootPaths":["/p3"],"incremental":false,"rateLimitMs":0,"minVideoSizeMb":0}]}"""
+        val t = tasksToRestore(MediaScanner.queueJson.decodeFromString<ScanQueueSnapshot>(raw)).single()
+        assertFalse(t.noRecurse)
     }
 }

@@ -1,5 +1,6 @@
 package com.open115.pad.data
 
+import android.util.Log
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
@@ -13,6 +14,8 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+
+private const val TAG = "RenameQueueWorker"
 
 /**
  * 批量重命名的**队列执行器**：一条常驻协程，把 [RenameQueue] 里的任务**一个一个**跑完。
@@ -28,6 +31,16 @@ class RenameQueueWorker(
     private val api: OpenApi,
     private val queue: RenameQueue,
     private val opLog: OpLog?,
+    /**
+     * 改名成功后把**这个目录**的媒体库扫描状态作废（媒体库侧的钩子，见 MediaDao.invalidateScanState）。
+     *
+     * 为什么改名必须专门通知：115 的目录 `upt` **不随改名变**（实测），而媒体库的快速扫描
+     * 正是靠"父目录看到的 upt 没变"来跳过目录的 —— 不通知的话，改完名那一轮扫描会把这个目录
+     * 当成"没变"直接跳过，库里一直挂着旧文件名，直到下一次全量或抽查。
+     *
+     * 默认什么都不做：这个 worker 不认识媒体库，接不接由容器决定（App115）。
+     */
+    private val invalidateDir: suspend (cid: String) -> Unit = {},
 ) {
 
     private val _activeTaskId = MutableStateFlow<Long?>(null)
@@ -113,6 +126,8 @@ class RenameQueueWorker(
         _activeTaskId.value = task.id
         runningTask = kotlinx.coroutines.currentCoroutineContext()[Job]
         var consecutive = 0
+        /** 这一轮真的改成了至少一个吗（决定收尾要不要作废媒体库的扫描状态） */
+        var anyRenamed = false
         try {
             val pending = task.items.withIndex().filter { it.value.st == RenameItemStatus.PENDING }
             for ((n, entry) in pending.withIndex()) {
@@ -124,6 +139,7 @@ class RenameQueueWorker(
                 if (reason == null) {
                     queue.setItemStatus(task.id, index, RenameItemStatus.DONE)
                     consecutive = 0
+                    anyRenamed = true
                 } else {
                     queue.setItemStatus(task.id, index, RenameItemStatus.FAILED, reason)
                     consecutive++
@@ -151,6 +167,15 @@ class RenameQueueWorker(
             _activeTaskId.value = null
             runningTask = null
             logSummary(task.id)
+            // 改过名的目录按目录作废媒体库扫描状态（理由见构造参数 invalidateDir）。
+            // 放 NonCancellable：暂停/取消这条路径也会走到 finally，而 suspend 调用在已取消的
+            // 上下文里会立刻抛 —— 那样这次通知就丢了，而"名已经改了"是不可逆的事实。
+            if (anyRenamed) {
+                withContext(NonCancellable) {
+                    runCatching { invalidateDir(task.cid) }
+                        .onFailure { Log.w(TAG, "作废媒体库扫描状态失败 cid=${task.cid}: ${it.message}") }
+                }
+            }
         }
     }
 

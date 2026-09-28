@@ -52,6 +52,7 @@ fun JsonObject.toFileItem(): FileItem = FileItem(
     play_long = optLong("play_long"),
     upt = optLong("upt"),
     uppt = optLong("uppt"),
+    uet = optLong("uet"),
 )
 
 fun JsonObject.toSearchItem(): SearchRawItem = SearchRawItem(
