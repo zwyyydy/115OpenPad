@@ -5,6 +5,7 @@ import com.open115.pad.data.ImageUrlResolver
 import com.open115.pad.data.OpenApi
 import com.open115.pad.data.envMsg
 import com.open115.pad.data.envOk
+import com.open115.pad.data.VideoPreviewStore
 import com.open115.pad.data.parseFilesResponse
 import java.io.File
 
@@ -55,6 +56,10 @@ sealed interface MovieDeleteResult {
  *   增量扫描跳过目录的依据是"目录列表 upt 没变"，而删除**不会**让目录 upt 变
  *   （它是剩余项 upt 的最大值，删掉一个旧文件根本不改它）——
  *   不作废的话，本地删掉的片在增量扫描里永远回不来，只有全量扫描能救。
+ *
+ * ★ 顺带清掉它在**衍生记录**里的痕迹（见 dao.purgeMovieTraces）：观影历史（「继续观看」）
+ *   与扫描记录的「新增影片」。两者都按 pick_code / mediaKey 存字符串、没有外键，
+ *   不清的话删完还会在首页横排里挂着一张点开必然失败的卡。
  */
 suspend fun deleteMovie(
     api: OpenApi,
@@ -64,6 +69,14 @@ suspend fun deleteMovie(
     cacheDir: File,
     mediaKey: String,
     alsoCloud: Boolean,
+    /**
+     * 视频预览图缓存（文件页缩略图 + 预览条那套）。
+     *
+     * **只在 [alsoCloud] = true（彻底删除）时清**：预览图按视频 pick_code 哈希存，云端文件一删，
+     * 那个 pick_code 再也不会被引用，留着只是占地方（每部片约 40KB 封面 + 2~10 帧预览条）。
+     * 「只删本机索引」时云端文件还在，留着下次直接能看，不清。
+     */
+    videoPreviews: VideoPreviewStore? = null,
 ): MovieDeleteResult {
     // 系列卡会把整季分集一起带出来 —— 删系列就该连分集一起删，
     // 否则留下的是"没有系列的分集"，海报墙上再也不显示，也永远不会被清理
@@ -126,7 +139,10 @@ suspend fun deleteMovie(
     }
 
     // 本地：索引 + 落盘缓存（图按 pickCode 精确删；nfo 按 nfo|<pickCode>| 前缀失效）
-    dao.deleteMovies(files.map { it.mediaKey })
+    // ★ 先清衍生记录再删索引：观影历史与扫描记录都靠 movies 表反查（见 dao.purgeMovieTraces）
+    val doomedKeysOrdered = files.map { it.mediaKey }
+    dao.purgeMovieTraces(doomedKeysOrdered)
+    dao.deleteMovies(doomedKeysOrdered)
     dirKeys.forEach { dao.invalidateScanState(it) }
     mediaCache?.invalidateAll(
         files.mapNotNull { it.nfoPickCode }.distinct().map { MediaScanner.nfoCachePrefix(it) },
@@ -135,6 +151,12 @@ suspend fun deleteMovie(
         files.flatMap { listOfNotNull(it.posterPickCode, it.fanartPickCode, it.thumbPickCode) + decodePickCodes(it.extraFanartPickCodes) },
         cacheDir,
     )
+    // 视频预览图（文件页缩略图 + 预览条）：**只有彻底删除才清**。
+    // 它按 pick_code 哈希存，云端文件一删就再没人引用；「只删本机索引」时云端还在，留着。
+    if (alsoCloud) {
+        val n = videoPreviews?.deleteFor(files.mapNotNull { it.videoPickCode }) ?: 0
+        if (n > 0) Log.i(TAG, "清掉 ${files.size} 部片的预览图缓存：$n 个文件")
+    }
     // 头像文件真删掉了的那些演员，引用也要清（不然详情页拿着一个不存在的文件反复解析直链）。
     // 只在**云端真的删了**时清：只删本地索引时云端文件还在，引用留着下次还能用。
     if (alsoCloud && doomedAvatars.isNotEmpty()) {

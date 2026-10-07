@@ -2,7 +2,6 @@ package com.open115.pad.ui.media
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -23,8 +22,6 @@ import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
-import androidx.compose.foundation.pager.HorizontalPager
-import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -32,7 +29,9 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.ArrowBack
 import androidx.compose.material.icons.outlined.Delete
+import androidx.compose.material.icons.outlined.Movie
 import androidx.compose.material.icons.outlined.PlayArrow
+import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material.icons.outlined.Star
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
@@ -46,6 +45,7 @@ import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -60,24 +60,28 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.layout.ContentScale
+import coil.compose.AsyncImage
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.window.Dialog
-import androidx.compose.ui.window.DialogProperties
 import com.open115.pad.data.PlaylistEntry
 import com.open115.pad.data.media.backgroundSourceOf
 import com.open115.pad.data.media.ActorCard
 import com.open115.pad.data.media.EpisodeEntity
 import com.open115.pad.data.media.MediaDao
+import com.open115.pad.data.media.ActorAvatarSource
 import com.open115.pad.data.media.MovieCard
+import com.open115.pad.data.media.MovieRecommender
+import com.open115.pad.data.media.RecommendationSeed
+import com.open115.pad.data.media.loadRecommendations
 import com.open115.pad.data.media.MovieEntity
 import com.open115.pad.data.media.NfoMeta
 import com.open115.pad.data.media.MovieDeleteResult
 import com.open115.pad.data.media.deleteMovie
 import com.open115.pad.data.media.episodeSortKey
 import com.open115.pad.player.PlayerActivity
+import com.open115.pad.ui.components.PreviewZoomHost
 import com.open115.pad.ui.components.dissolve
 import com.open115.pad.ui.theme.AdaptiveBody
 import com.open115.pad.ui.theme.rememberTone
@@ -130,6 +134,11 @@ fun MediaDetailScreen(
      * **跨所有媒体库** —— 演员本来就不属于某一个库。
      */
     onOpenWorks: (WorksKind, String) -> Unit = { _, _ -> },
+    /**
+     * 点底部「推荐影片」里的一张：外面**再开一层详情**（浮层栈支持 Detail→Detail）。
+     * [list] 传的是这一批推荐（不是进来的那个列表）—— 这样"播完自动接下一部"就在推荐里走。
+     */
+    onOpenMovie: (MovieCard, List<MovieCard>, Int) -> Unit = { _, _, _ -> },
     onBack: () -> Unit,
 ) {
     val context = LocalContext.current
@@ -163,6 +172,49 @@ fun MediaDetailScreen(
                 },
             )
         }
+    }
+
+    /**
+     * 库里**没有剧照**的片：拿它播放时抓的本机预览帧顶替剧照（用户要求：媒体库没有预览图
+     * （剧照）那么还是继续生成，以后充当剧照）。抓帧那侧在 PlayerActivity.ensurePreviewThumb：
+     * 只有库里确实没剧照（只有单张 fanart.jpg 也算没剧照）的片才会被抓条，所以读出来的帧
+     * 必然是这部片自己的画面，而且全在本机（零请求）。声明在 Scaffold 外面：内容区那排缩略图
+     * 与全屏查看要读**同一份**。
+     */
+    val previewStore = remember(context) { container.videoPreviews }
+    val previewVersion by previewStore.version.collectAsState()
+    val stripHostPickCode = card.videoPickCode
+        ?: data?.seriesEpisodes?.firstOrNull()?.videoPickCode
+        ?: data?.episodes?.firstOrNull()?.videoPickCode
+    val localFanarts = remember(data?.fanarts, stripHostPickCode, previewVersion) {
+        if (!data?.fanarts.isNullOrEmpty() || stripHostPickCode == null) {
+            emptyList()
+        } else {
+            previewStore.stripFiles(stripHostPickCode)
+        }
+    }
+
+    /**
+     * 「换一批」的次数：只用来派生推荐种子（见 [RecommendationSeed]）。
+     *
+     * 种子必须稳定，所以推荐**不能**每次重组都重算 —— `produceState` 的 key 只吃
+     * "哪部片 + 第几批"，滚动/改窗口大小都不会让它重算。
+     */
+    var shuffleTick by remember { mutableStateOf(0) }
+    val recommendations by produceState<List<MovieRecommender.Recommendation>>(
+        initialValue = emptyList(),
+        card.mediaKey,
+        shuffleTick,
+    ) {
+        // 推荐是锦上添花：查失败（库正在被改/被删）就当没有，不该让详情页跟着报错
+        value = runCatching {
+            loadRecommendations(
+                dao = dao,
+                selfKey = card.mediaKey,
+                count = RECOMMEND_COUNT,
+                seed = RecommendationSeed.of(card.mediaKey, shuffleTick),
+            )
+        }.getOrDefault(emptyList())
     }
 
     /**
@@ -219,16 +271,41 @@ fun MediaDetailScreen(
     val movieEntries = remember(playlist) {
         playlist.mapNotNull { c -> c.videoPickCode?.let { pc -> PlaylistEntry(pc, c.title) } }
     }
+    /**
+     * 头像仓库补的演员头像：**名字 → 图片 URL**。
+     *
+     * 开关关着、或本地还没建索引时直接是空表（一次网络都不发）。开着时查的是本地那份紧凑索引
+     * （一次扫描，见 [ActorAvatarSource.lookup]），**不联网**；图片本身由 Coil 加载并缓存。
+     */
+    val avatarSourceEnabled by container.mediaPrefs.avatarSourceEnabled.collectAsState(initial = false)
+    val avatarBaseUrl by container.mediaPrefs.avatarSourceUrl.collectAsState(initial = "")
+    val avatarFallbackUrls by produceState<Map<String, String>>(emptyMap(), card.mediaKey, data) {
+        value = emptyMap()
+        if (!avatarSourceEnabled) return@produceState
+        val dir = context.filesDir
+        if (!ActorAvatarSource.hasIndex(dir)) return@produceState
+        val missing = data?.actors.orEmpty().filter { it.avatarPickCode.isNullOrBlank() }.map { it.name }
+        if (missing.isEmpty()) return@produceState
+        val base = avatarBaseUrl.ifBlank { ActorAvatarSource.DEFAULT_BASE }
+        value = ActorAvatarSource.lookup(dir, missing)
+            .mapValues { (_, path) -> ActorAvatarSource.imageUrl(base, path) }
+    }
 
     fun play(pc: String, name: String, entries: List<PlaylistEntry>, at: Int) {
-        context.startActivity(
-            PlayerActivity.intent(
-                context, pc, name, entries,
-                at.coerceIn(0, (entries.size - 1).coerceAtLeast(0)),
-                // 媒体库的播放要进「观影历史」（文件页的播放不记，那边看操作记录）
-                recordHistory = true,
-            ),
-        )
+        // 预览图要上传到视频所在目录：先按卡片反查一次 dirCid（主片与分集都挂在同一张卡上，
+        // 查 card.mediaKey 就够了），查不到就是 null —— 播放器里那个功能会提示不可用
+        scope.launch {
+            val cid = runCatching { dao.dirCidOf(card.mediaKey) }.getOrNull()
+            context.startActivity(
+                PlayerActivity.intent(
+                    context, pc, name, entries,
+                    at.coerceIn(0, (entries.size - 1).coerceAtLeast(0)),
+                    // 媒体库的播放要进「观影历史」（文件页的播放不记，那边看操作记录）
+                    recordHistory = true,
+                    sourceCid = cid,
+                ),
+            )
+        }
     }
 
     /** 播第 i 集：用 pickCode 在播放列表里反查下标 —— 有集缺 pickCode 时下标会错位，不能直接用 i */
@@ -442,7 +519,7 @@ fun MediaDetailScreen(
                         // nfo 里的角色名（`<actor><role>`）：名字对得上就显示"饰 XXX"
                         val roles = remember(current.nfo) { current.nfo?.actorPairs?.toMap().orEmpty() }
                         if (current.actors.any { !it.avatarPickCode.isNullOrBlank() }) {
-                            ActorAvatarRow(current.actors, roles) { onOpenWorks(WorksKind.Actor, it) }
+                            ActorAvatarRow(current.actors, roles, avatarFallbackUrls) { onOpenWorks(WorksKind.Actor, it) }
                         } else {
                             LabelFlow(
                                 current.actors.map { a ->
@@ -455,26 +532,48 @@ fun MediaDetailScreen(
                         }
                     }
 
-                    // 剧照（extrafanart）：横排缩略图，点开全屏翻页
-                    if (current.fanarts.isNotEmpty()) {
+                    // 剧照（extrafanart）：横排缩略图，点开全屏翻页。
+                    // 库里没有剧照的片（localFanarts 非空）用播放时抓的本机帧顶上，两种图源都点得开
+                    val fanartCount = if (current.fanarts.isNotEmpty()) current.fanarts.size else localFanarts.size
+                    if (fanartCount > 0) {
                         Spacer(Modifier.height(16.dp))
                         Text(
-                            "剧照（${current.fanarts.size}）",
+                            "剧照（$fanartCount）",
                             style = MaterialTheme.typography.titleSmall,
                             color = Color.White,
                         )
                         Spacer(Modifier.height(6.dp))
                         LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            itemsIndexed(current.fanarts) { i, pc ->
-                                Box(
-                                    Modifier
-                                        .width(196.dp)
-                                        .aspectRatio(16f / 9f)
-                                        .clip(RoundedCornerShape(8.dp))
-                                        .background(Color.White.copy(alpha = 0.08f))
-                                        .clickable { viewingFanart = i },
-                                ) {
-                                    PickCodeImage(pc, Modifier.fillMaxSize())
+                            if (current.fanarts.isNotEmpty()) {
+                                itemsIndexed(current.fanarts) { i, pc ->
+                                    Box(
+                                        Modifier
+                                            .width(196.dp)
+                                            .aspectRatio(16f / 9f)
+                                            .clip(RoundedCornerShape(8.dp))
+                                            .background(Color.White.copy(alpha = 0.08f))
+                                            .clickable { viewingFanart = i },
+                                    ) {
+                                        PickCodeImage(pc, Modifier.fillMaxSize())
+                                    }
+                                }
+                            } else {
+                                itemsIndexed(localFanarts) { i, f ->
+                                    Box(
+                                        Modifier
+                                            .width(196.dp)
+                                            .aspectRatio(16f / 9f)
+                                            .clip(RoundedCornerShape(8.dp))
+                                            .background(Color.White.copy(alpha = 0.08f))
+                                            .clickable { viewingFanart = i },
+                                    ) {
+                                        AsyncImage(
+                                            model = localFrameRequest(context, f),
+                                            contentDescription = null,
+                                            contentScale = ContentScale.Crop,
+                                            modifier = Modifier.fillMaxSize(),
+                                        )
+                                    }
                                 }
                             }
                         }
@@ -513,6 +612,50 @@ fun MediaDetailScreen(
                         }
                     }
 
+                    // 推荐影片：本地四路信号（同演员 / 同系列与标签 / 近期口味 / 随机扰动），
+                    // 全程零网络。一条都没有（这部片没演员没标签、口味也空）时整段不显示 ——
+                    // 宁可没有，也别出现一个空标题
+                    if (recommendations.isNotEmpty()) {
+                        val recCards = remember(recommendations) { recommendations.map { it.card } }
+                        Spacer(Modifier.height(20.dp))
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(
+                                "推荐影片",
+                                style = MaterialTheme.typography.titleSmall,
+                                color = Color.White,
+                                modifier = Modifier.weight(1f),
+                            )
+                            // 换一批 = 换种子重算一遍（本地查询，点一下就走）
+                            Row(
+                                Modifier
+                                    .clip(RoundedCornerShape(50))
+                                    .background(Color.White.copy(alpha = 0.10f))
+                                    .clickable { shuffleTick++ }
+                                    .padding(horizontal = 10.dp, vertical = 5.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Icon(
+                                    Icons.Outlined.Refresh,
+                                    contentDescription = null,
+                                    tint = MaterialTheme.colorScheme.primary,
+                                    modifier = Modifier.size(15.dp),
+                                )
+                                Spacer(Modifier.width(4.dp))
+                                Text(
+                                    "换一批",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.primary,
+                                )
+                            }
+                        }
+                        Spacer(Modifier.height(8.dp))
+                        LazyRow(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                            itemsIndexed(recommendations) { i, rec ->
+                                RecommendTile(rec) { onOpenMovie(rec.card, recCards, i) }
+                            }
+                        }
+                    }
+
                     Spacer(Modifier.height(24.dp))
                     Text(
                         current.movie.dirPath ?: "",
@@ -541,6 +684,7 @@ fun MediaDetailScreen(
                         cacheDir = container.cacheDir,
                         mediaKey = card.mediaKey,
                         alsoCloud = alsoCloud,
+                        videoPreviews = container.videoPreviews,
                     )
                     when (r) {
                         MovieDeleteResult.Ok -> {
@@ -557,20 +701,29 @@ fun MediaDetailScreen(
         )
     }
 
-    // 剧照全屏查看（Dialog 叠在最上层，自己处理返回键）
+    // 剧照全屏浏览（页面内全屏浮层叠在详情页之上，自己处理返回键；手势/顶栏/胶片条见 [FanartViewer]）
     val fanarts = data?.fanarts.orEmpty()
     val viewing = viewingFanart
-    if (viewing != null && fanarts.isNotEmpty()) {
-        FanartViewer(
-            pickCodes = fanarts,
-            initial = viewing,
-            onDismiss = { viewingFanart = null },
-        )
+    if (viewing != null && (fanarts.isNotEmpty() || localFanarts.isNotEmpty())) {
+        PreviewZoomHost(onDismissed = { viewingFanart = null }) { requestClose ->
+            FanartViewer(
+                pickCodes = fanarts,
+                localFiles = localFanarts,
+                initial = viewing,
+                resolver = container.imageUrlResolver,
+                cacheDir = container.cacheDir,
+                title = data?.movie?.title.orEmpty(),
+                onDismiss = requestClose,
+            )
+        }
     }
 }
 
 /** 剧照预取每次批量解析多少条直链（一次 downurl 能带多个 pick_code；十几张一批就够） */
 private const val FANART_PREFETCH_BATCH = 20
+
+/** 推荐影片一次显示几部：与首页那两排横排的密度一致（再多一屏也看不完，还得横向滑） */
+private const val RECOMMEND_COUNT = 12
 
 /**
  * 演员头像卡：圆形头像 + 名字。
@@ -584,6 +737,11 @@ private fun ActorAvatarRow(
     actors: List<ActorCard>,
     /** 演员 → 角色名（来自 nfo 的 `<actor><role>`），没有就不显示第二行 */
     roles: Map<String, String> = emptyMap(),
+    /**
+     * 名字 → 头像仓库里的图片 URL（见 [ActorAvatarSource]）。**只在没有本地头像时用**，
+     * 查不到就退回原来的首字母圆底 —— 绝不拿一张对不上的脸充数。
+     */
+    fallbackUrls: Map<String, String> = emptyMap(),
     onClick: (String) -> Unit,
 ) {
     LazyRow(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -603,14 +761,24 @@ private fun ActorAvatarRow(
                         .background(Color.White.copy(alpha = 0.14f)),
                     contentAlignment = Alignment.Center,
                 ) {
-                    if (actor.avatarPickCode.isNullOrBlank()) {
-                        Text(
+                    when {
+                        !actor.avatarPickCode.isNullOrBlank() ->
+                            PickCodeImage(actor.avatarPickCode, Modifier.fillMaxSize())
+
+                        // 本地没有头像时，看头像仓库有没有对得上的：有就加载它（Coil 落盘缓存），
+                        // 没有才回首字母 —— 网络失败/地址失效都会自动落回这里
+                        fallbackUrls[actor.name] != null -> AsyncImage(
+                            model = fallbackUrls[actor.name],
+                            contentDescription = null,
+                            contentScale = ContentScale.Crop,
+                            modifier = Modifier.fillMaxSize(),
+                        )
+
+                        else -> Text(
                             actor.name.take(1),
                             color = Color.White,
                             style = MaterialTheme.typography.titleLarge,
                         )
-                    } else {
-                        PickCodeImage(actor.avatarPickCode, Modifier.fillMaxSize())
                     }
                 }
                 Spacer(Modifier.height(6.dp))
@@ -632,67 +800,6 @@ private fun ActorAvatarRow(
                         textAlign = TextAlign.Center,
                     )
                 }
-            }
-        }
-    }
-}
-
-/**
- * 剧照全屏查看：左右翻页、点任意处或返回键退出。
- *
- * 用 Dialog 而不是页面内浮层：海报墙那边本来就叠着详情页浮层，再叠一层要自己管返回栈与层级。
- * 图片 `Fit` 而不是 `Crop` —— 全屏看剧照时把画面裁掉一块是不能接受的。
- */
-@Composable
-private fun FanartViewer(pickCodes: List<String>, initial: Int, onDismiss: () -> Unit) {
-    val pager = rememberPagerState(
-        initialPage = initial.coerceIn(0, (pickCodes.size - 1).coerceAtLeast(0)),
-    ) { pickCodes.size }
-    Dialog(
-        onDismissRequest = onDismiss,
-        properties = DialogProperties(usePlatformDefaultWidth = false),
-    ) {
-        Box(
-            Modifier
-                .fillMaxSize()
-                .background(Color.Black.copy(alpha = 0.96f))
-                .clickable(
-                    interactionSource = remember { MutableInteractionSource() },
-                    indication = null,
-                    onClick = onDismiss,
-                ),
-        ) {
-            HorizontalPager(state = pager, modifier = Modifier.fillMaxSize()) { page ->
-                // 每页自己也吃掉点击：pager 只消费拖拽，点击会冒泡到外层那个 dismiss
-                Box(
-                    Modifier.fillMaxSize().clickable(
-                        interactionSource = remember { MutableInteractionSource() },
-                        indication = null,
-                        onClick = onDismiss,
-                    ),
-                ) {
-                    // getOrNull：数据若在看图期间刷新（列表变短），page 可能越界，
-                    // 直接下标会崩 —— 翻页看剧照崩掉是最没必要的一种崩
-                    pickCodes.getOrNull(page)?.let { pc ->
-                        PickCodeImage(
-                            pickCode = pc,
-                            modifier = Modifier.fillMaxSize().padding(horizontal = 24.dp, vertical = 56.dp),
-                            contentScale = ContentScale.Fit,
-                        )
-                    }
-                }
-            }
-            Surface(
-                color = Color.Black.copy(alpha = 0.55f),
-                shape = RoundedCornerShape(50),
-                modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 24.dp),
-            ) {
-                Text(
-                    "${pager.currentPage + 1} / ${pickCodes.size}",
-                    color = Color.White,
-                    style = MaterialTheme.typography.labelLarge,
-                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
-                )
             }
         }
     }
@@ -795,6 +902,57 @@ private fun NfoFactsSection(nfo: NfoMeta) {
                     modifier = Modifier.weight(1f),
                 )
             }
+        }
+    }
+}
+
+/**
+ * 推荐卡：海报 + 两行标题 + 一行「为什么推它」。
+ *
+ * 结构与首页「最近新增」那排一致（108×158、12dp 圆角、标题恒两行），只多一行理由 ——
+ * 那行是让人**信**这段推荐的关键：一屏陌生人脸，没有理由只会被当成随机塞的。
+ * 理由取不到时（既没共同点也没高分）那一行不占位，卡片也不会高矮不齐（标题本来就恒两行）。
+ */
+@Composable
+private fun RecommendTile(rec: MovieRecommender.Recommendation, onClick: () -> Unit) {
+    Column(Modifier.width(108.dp).clickable(onClick = onClick)) {
+        Box(
+            Modifier
+                .fillMaxWidth()
+                .height(158.dp)
+                .clip(RoundedCornerShape(12.dp))
+                .background(Color.White.copy(alpha = 0.08f)),
+        ) {
+            // 兜底图标在下层：海报没加载出来/本来就没有时不剩一块空白
+            Icon(
+                Icons.Outlined.Movie,
+                contentDescription = null,
+                tint = Color.White.copy(alpha = 0.55f),
+                modifier = Modifier.align(Alignment.Center).size(26.dp),
+            )
+            PosterImage(
+                posterPickCode = rec.card.posterPickCode,
+                backgroundPickCode = rec.card.fanartPickCode,
+                modifier = Modifier.fillMaxSize(),
+            )
+        }
+        Spacer(Modifier.height(4.dp))
+        Text(
+            rec.card.title,
+            style = MaterialTheme.typography.bodySmall,
+            color = Color.White,
+            maxLines = 2,
+            minLines = 2,
+            overflow = TextOverflow.Ellipsis,
+        )
+        rec.reason?.let {
+            Text(
+                it,
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.primary,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
         }
     }
 }

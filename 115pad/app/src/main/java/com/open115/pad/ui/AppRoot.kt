@@ -15,6 +15,7 @@ import androidx.compose.animation.fadeIn
 import androidx.compose.animation.slideInHorizontally
 import androidx.compose.animation.slideInVertically
 import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -34,6 +35,8 @@ import androidx.compose.material.icons.outlined.RestoreFromTrash
 import androidx.compose.material.icons.outlined.Settings
 import androidx.compose.material.icons.outlined.Tune
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Badge
+import androidx.compose.material3.BadgedBox
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
@@ -51,11 +54,13 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.windowsizeclass.WindowWidthSizeClass
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.State
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
@@ -80,8 +85,10 @@ import androidx.navigation.compose.rememberNavController
 import androidx.navigation.NavGraph.Companion.findStartDestination
 import androidx.navigation.NavType
 import androidx.navigation.navArgument
+import androidx.lifecycle.createSavedStateHandle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.open115.pad.AppContainer
+import com.open115.pad.mainUiVisible
 import com.open115.pad.data.DownloadRequest
 import com.open115.pad.data.DownloadSubmitter
 import com.open115.pad.data.FileItem
@@ -90,14 +97,24 @@ import com.open115.pad.data.LinkSource
 import com.open115.pad.data.OpType
 import com.open115.pad.data.PlaylistEntry
 import com.open115.pad.data.Session
+import com.open115.pad.data.TaskDoneNotifier
+import com.open115.pad.data.media.MediaScanner
+import com.open115.pad.data.media.ScanMode
+import com.open115.pad.data.media.label
 import com.open115.pad.player.PlayerActivity
 import com.open115.pad.ui.components.BatchRenamePanel
 import com.open115.pad.ui.components.DownloadLinkSheet
 import com.open115.pad.ui.components.ImageGalleryDialog
+import com.open115.pad.ui.components.PreviewZoomHost
 import com.open115.pad.ui.components.TextPreviewHost
+import com.open115.pad.ui.components.observeLastTapPoint
 import com.open115.pad.util.Downloader
 import com.open115.pad.util.Format
 import com.open115.pad.ui.files.BatchRenameRequest
+import com.open115.pad.ui.files.DupScanRequest
+import com.open115.pad.ui.files.PreviewPanel
+import com.open115.pad.ui.files.PreviewRequest
+import com.open115.pad.ui.files.DuplicatePanel
 import com.open115.pad.ui.files.FilesScreen
 import com.open115.pad.ui.files.FilesViewModel
 import com.open115.pad.ui.login.LoginScreen
@@ -106,12 +123,35 @@ import com.open115.pad.ui.offline.OfflineViewModel
 import com.open115.pad.ui.recycle.RecycleScreen
 import com.open115.pad.ui.recycle.RecycleViewModel
 import com.open115.pad.ui.settings.SettingsScreen
+import kotlinx.coroutines.FlowPreview
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.debounce
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 
 private data class Dest(val route: String, val label: String, val icon: ImageVector)
 
 /** 媒体库的路由名。它单独沉在平板左栏底部（见 AppRoot 里导航栏那段），所以路由名抽出来共用 */
 private const val MEDIA_ROUTE = "media"
+
+/**
+ * 媒体库"忙"判据的防抖窗口。
+ *
+ * 扫描队列里上一条出队、下一条还没起跑之间会闪一下假空闲（`running=false`、`pending` 也空了）——
+ * 不防抖的话导航栏红点会抖、完成提示还会在换任务的空档里提前弹。1.2 秒同 App115 里前台服务的
+ * 判据（见 watchTasksForKeepAlive），短任务之间的空档掀不起浪。
+ */
+private const val SCAN_BUSY_DEBOUNCE_MS = 1200L
+
+/**
+ * 「这个结果是刚出的吗」的判据窗口（重命名 / 整理用）。
+ *
+ * 这两类任务的结束状态是**持久**的（finishedAt 留在任务/进度里），而暂停、取消、停止
+ * 也会把"忙"翻成"闲"、走同一条边沿 —— 靠时间窗把它们分开：刚结束的才值得报一句。
+ */
+private const val FINISH_WINDOW_MS = 15_000L
 
 private val destinations = listOf(
     Dest("files", "文件", Icons.Outlined.Folder),
@@ -152,6 +192,138 @@ private fun phoneSelectedTab(route: String?): String? = when {
 
 /** 「更多」收纳页的入口清单（按序展示）。以后手机模式新增低频功能，把 route 追加到这里即可 */
 private val moreRoutes = listOf("filter", "rename")
+
+/**
+ * 把一个"忙不忙"的流做成**防抖**的 Compose 状态，并在"忙 → 闲"的边沿调一次 [onFinished]。
+ *
+ * 防抖理由同 [SCAN_BUSY_DEBOUNCE_MS]：队列换任务的空档会闪假空闲，不防抖红点会抖、
+ * 完成提示还会在空档里提前弹。[onFinished] 经 rememberUpdatedState 取最新一份（闭包冻结坑）。
+ */
+@OptIn(FlowPreview::class)
+@Composable
+private fun rememberBusyEdge(busy: Flow<Boolean>, onFinished: suspend () -> Unit): State<Boolean> {
+    val state = remember { mutableStateOf(false) }
+    val callback = rememberUpdatedState(onFinished)
+    LaunchedEffect(Unit) {
+        var was = false
+        busy.debounce(SCAN_BUSY_DEBOUNCE_MS).distinctUntilChanged().collect { now ->
+            state.value = now
+            if (was && !now) callback.value()
+            was = now
+        }
+    }
+    return state
+}
+
+/**
+ * 导航入口图标上的"任务在跑"小红点（扫描 → 媒体库、重命名 → 重命名/更多、整理 → 文件）。
+ *
+ * 挂在导航栏上而不是各页面里 —— 任务跑着时用户往往已经退到别的页，这个点是"那边还有活在干"
+ * 的唯一指示：跑完红点消失，同时弹一条完成提示（见 notifyXxxFinished）。
+ */
+@Composable
+private fun BusyDestIcon(icon: ImageVector, label: String, busy: Boolean) {
+    if (busy) {
+        BadgedBox(badge = { Badge() }) { Icon(icon, contentDescription = label) }
+    } else {
+        Icon(icon, contentDescription = label)
+    }
+}
+
+/**
+ * 三类后台任务（扫描 / 重命名 / 整理）跑完时的收尾提示。
+ *
+ * 「停止 / 取消 / 暂停」都不算完成，各自判据见下面三个函数 —— 停止类语义在各自的页面里
+ * 本来就有文案（媒体库进度卡的"扫描已停止"、重命名页的任务状态），这里只报**真的干完了**。
+ */
+private suspend fun notifyScanFinished(context: Context, container: AppContainer, snackbar: SnackbarHostState) {
+    val p = container.mediaScanner.progress.value
+    if (p.stopped) return
+    // 用**队列累计**而不是 Progress.moviesIndexed：后者只是最后一个目录的数字
+    // （流水线同步一次排 6 个目录，拿它报会少报成"新增 1 部"）
+    val indexed = container.mediaScanner.batchIndexed.value
+    val extra = if (indexed > 0) "，新增 $indexed 部" else ""
+    val name = p.libraryName.trim()
+    finishNotice(context, snackbar, if (name.isEmpty()) "媒体库扫描完成$extra" else "「$name」扫描完成$extra")
+}
+
+/**
+ * 重命名完成：读队列里"刚刚完成"的任务（[FINISH_WINDOW_MS] 内、且不是被暂停/取消的）。
+ *
+ * 为什么按 finishedAt 时间筛而不是看 activeTaskId 的变化：暂停/取消也会清空它、触发同一条
+ * 边沿 —— 那些不是"完成"，不该报；真完成的任务 finishedAt 是刚写的，时间窗把两者分开。
+ */
+private suspend fun notifyRenameFinished(context: Context, container: AppContainer, snackbar: SnackbarHostState) {
+    val task = container.renameQueue.tasks.value
+        .filter { it.finishedAt != null && !it.cancelled && !it.paused }
+        .maxByOrNull { it.finishedAt!! }
+        ?: return
+    if (System.currentTimeMillis() - task.finishedAt!! > FINISH_WINDOW_MS) return
+    val text = buildString {
+        append("批量重命名完成：成功 ${task.succeeded} 个")
+        if (task.failed > 0) append("，失败 ${task.failed} 个")
+    }
+    finishNotice(context, snackbar, text)
+}
+
+/** 整理结束：summary 自带措辞（完成 / 已停止 / 中断 / 失败），原样报 —— 与它以前在文件页里的口径一致 */
+private suspend fun notifyOrganizeFinished(context: Context, container: AppContainer, snackbar: SnackbarHostState) {
+    val p = container.fileOrganizer.progress.value
+    if (p.finishedAt == 0L || System.currentTimeMillis() - p.finishedAt > FINISH_WINDOW_MS) return
+    finishNotice(context, snackbar, p.summary ?: "文件整理完成")
+}
+
+/**
+ * 提示走哪条路看主界面在不在前台：看得见 → Snackbar；看不见（切走 / 锁屏 / 在播放器里）→ 系统通知。
+ * 不做"两边都发"：通知栏和屏幕同时各响一次是双份打扰。
+ */
+private suspend fun finishNotice(context: Context, snackbar: SnackbarHostState, text: String) {
+    if (context.mainUiVisible) snackbar.showSnackbar(text)
+    else TaskDoneNotifier.notifyDone(context, text)
+}
+
+/**
+ * 「上次没跑完的扫描」弹窗的正文。
+ *
+ * 用 listOfNotNull + joinToString 拼（字符串拼接里的 if 会吞掉后面几段，是踩过的坑）。
+ * 断在哪个目录也写出来：多根库能据此看出是哪个根，长目录名能看出是扫到哪一部了。
+ * 异常原因可能很长（OkHttp 的文案），截一下 —— 这句只是给用户一个线索，完整原因在日志里。
+ */
+private fun resumeScanText(p: MediaScanner.ResumeProposal): String {
+    val r = p.resume
+    return listOfNotNull(
+        // 单目录任务（流水线同步排的）不该说成"某某扫描"—— 它是"这 N 个目录要重扫"，
+        // 而且它的进度计数是"一次调用一个目录"，说成 N/M 个目录会误导
+        if (p.task.noRecurse) {
+            "流水线同步排的 ${p.task.rootPaths.size} 个目录上次没扫完。"
+        } else {
+            "「${p.task.libraryName}」上次的${p.task.mode.label}扫描没跑完。"
+        },
+        if (p.task.noRecurse || r.doneDirs <= 0) {
+            null
+        } else if (r.totalDirs > 0) {
+            "已完成 ${r.doneDirs}/${r.totalDirs} 个目录（已发现），已入库 ${r.moviesIndexed} 部。"
+        } else {
+            "已完成 ${r.doneDirs} 个目录，已入库 ${r.moviesIndexed} 部。"
+        },
+        r.currentDir.takeIf { it.isNotBlank() }?.let { "断在：$it" },
+        if (r.reason.isBlank()) {
+            "中断原因：程序上次在扫描中被关闭。"
+        } else {
+            "中断原因：${r.reason.take(120)}"
+        },
+        // 整库全量续扫没有意义（它的语义是"重新索引一切"），acceptResume 会按增量跳过已完成的目录 ——
+        // 先跟用户说一声，免得他看到队列卡片上写的是"增量"以为选错了。
+        // 单目录任务不受影响（它本来就只扫几个目录、固定全量）
+        if (p.task.mode == ScanMode.Full && !p.task.noRecurse) {
+            "继续会按增量扫描，已完成的目录会自动跳过。"
+        } else {
+            null
+        },
+        // 三个答复里"跳过本次"是新的、也最容易被当成"不再询问"：说清它只跳过这一次
+        "「跳过本次」这次先不扫，下次启动还会再问一遍。",
+    ).joinToString("\n")
+}
 
 @Composable
 fun AppRoot(container: AppContainer, widthClass: WindowWidthSizeClass) {
@@ -194,6 +366,7 @@ fun AppRoot(container: AppContainer, widthClass: WindowWidthSizeClass) {
     }
 }
 
+@OptIn(FlowPreview::class)
 @Composable
 private fun MainScaffold(container: AppContainer, widthClass: WindowWidthSizeClass, initialPage: String) {
     val navController = rememberNavController()
@@ -206,6 +379,28 @@ private fun MainScaffold(container: AppContainer, widthClass: WindowWidthSizeCla
     // 媒体库页隐藏导航栏（rail/bottomBar 都藏），全屏更有沉浸感；
     // 媒体库页自己的海报墙/详情浮层盖在它上面，返回也逐层退，不依赖导航栏
     val immersiveMedia = currentRoute == "media"
+
+    // 三类后台任务的"忙"状态（导航栏红点）+ 跑完的提示/通知。
+    // 防抖的理由见 SCAN_BUSY_DEBOUNCE_MS：队列换任务的空档会被当成"跑完了"。
+    val scanBusy by rememberBusyEdge(
+        busy = combine(container.mediaScanner.progress, container.mediaScanner.pending) { p, queue ->
+            p.running || queue.isNotEmpty()
+        },
+    ) { notifyScanFinished(context, container, snackbarHostState) }
+    val renameBusy by rememberBusyEdge(
+        busy = container.renameWorker.activeTaskId.map { it != null },
+    ) { notifyRenameFinished(context, container, snackbarHostState) }
+    val organizeBusy by rememberBusyEdge(
+        busy = container.fileOrganizer.progress.map { it.running },
+    ) { notifyOrganizeFinished(context, container, snackbarHostState) }
+
+    /** 某个导航入口上要不要挂"任务在跑"的红点（route 现算：手机底栏把重命名收在「更多」里） */
+    fun destBusy(route: String): Boolean = when (route) {
+        "files" -> organizeBusy
+        "rename", "more" -> renameBusy
+        MEDIA_ROUTE -> scanBusy
+        else -> false
+    }
 
     fun navigateRoute(route: String) {
         navController.navigate(route) {
@@ -347,22 +542,59 @@ private fun MainScaffold(container: AppContainer, widthClass: WindowWidthSizeCla
                     PlayerActivity.intent(
                         context, pc, item.fn, playlist, index,
                         opLogCid = opLogCid, opLogPath = opLogPath,
+                        // 预览图上传目标：当前目录就是视频所在目录（opLogCid 同时充当来源目录）
+                        sourceCid = opLogCid,
                     )
                 )
             }
         }
 
     // ---------------- 大图画廊（应用根层级渲染，才能盖住侧栏） ----------------
-    var imageGallery by remember { mutableStateOf<Pair<List<ImageMediaItem>, Int>?>(null) }
+    var imageGallery by remember { mutableStateOf<Triple<List<ImageMediaItem>, Int, String>?>(null) }
     /** 文本预览：与画廊一样在根层级全屏渲染，才能盖住侧栏 */
     var textPreview by remember { mutableStateOf<FileItem?>(null) }
     /** 批量重命名：面板渲染在内容区之内（左侧导航栏保持可见），状态由文件页触发 */
     var batchRename by remember { mutableStateOf<BatchRenameRequest?>(null) }
+    /** 查找重复文件：同上 —— 从文件页发起，面板与批量重命名同层 */
+    var dupRequest by remember { mutableStateOf<DupScanRequest?>(null) }
+
+    /** 批量生成视频预览图的请求（面板与查重同层渲染，见下面 PreviewPanel） */
+    var previewRequest by remember { mutableStateOf<PreviewRequest?>(null) }
     /** 云下载页点任务跳转：待打开的目录 (cid, name)，文件页进页时消费（openByCid） */
     var pendingCloudJump by remember { mutableStateOf<Pair<String, String>?>(null) }
     val jumpToCloudDir: (String, String) -> Unit = { cid, name ->
         pendingCloudJump = cid to name
         navigateRoute("files")
+    }
+
+    // ---------------- 上次没跑完的扫描：问一次要不要接着扫 ----------------
+    // 扫描器在爬取途中会把"扫到哪儿了"落盘（见 MediaScanner.ScanResume）：进程被杀、
+    // 撞频控、网络断开都会留下这份现场，重启登录后在这里问一句 —— 答"继续"就从断点接着扫
+    // （已扫完的目录靠 scan_state 跳过），答"忽略"这次中断就作罢（同一个中断只问一次）。
+    // 挂在根层级而不是媒体库页里：启动首页可能是文件页，用户不一定马上进媒体库。
+    //
+    // **先探活再问**（用户要求）：中断的原因多半就是接口被 ban / 网络不通，那时弹窗是白弹 ——
+    // 用户点「继续扫描」只会立刻再失败一次。所以扫描器先把问题以 checking = true 挂起来
+    // （这时什么都不显示），探到接口通才翻成 false 放出来（见 MediaScanner.raiseResumeProposal）
+    val resumeProposal by container.mediaScanner.resumeProposal.collectAsState()
+    resumeProposal?.takeIf { !it.checking }?.let { proposal ->
+        AlertDialog(
+            onDismissRequest = { container.mediaScanner.dismissResume() },
+            title = { Text("上次扫描未完成") },
+            text = { Text(resumeScanText(proposal)) },
+            confirmButton = {
+                TextButton(onClick = { container.mediaScanner.acceptResume() }) { Text("继续扫描") }
+            },
+            // 两个"不扫"的答复并排：区别在**现场留不留** ——
+            // 跳过本次留（下次启动再问，见 MediaScanner.deferResume），
+            // 不再询问不留（这次中断就此作罢，见 MediaScanner.dismissResume）
+            dismissButton = {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    TextButton(onClick = { container.mediaScanner.deferResume() }) { Text("跳过本次") }
+                    TextButton(onClick = { container.mediaScanner.dismissResume() }) { Text("不再询问") }
+                }
+            },
+        )
     }
 
     // ---------------- 剪贴板识别 / 外部 App 唤起的下载链接 ----------------
@@ -443,6 +675,9 @@ private fun MainScaffold(container: AppContainer, widthClass: WindowWidthSizeCla
         // 原内容再补一个圆，波面状态变化只触发重绘、不触发重组；尺寸顺手量给波循环
         modifier = Modifier
             .fillMaxSize()
+            // 预览浮层（图片画廊/文本预览）进场时从点击位置放大 —— 在根部以 Initial pass
+            // 只观察不消费地记下每次按压点，对子组件手势零影响
+            .observeLastTapPoint()
             .onSizeChanged { waveAreaSize = it }
             .drawWithContent {
                 drawContent()
@@ -479,8 +714,7 @@ private fun MainScaffold(container: AppContainer, widthClass: WindowWidthSizeCla
                             modifier = Modifier.onGloballyPositioned {
                                 navCenters[dest.route] = it.boundsInRoot().center
                             },
-                            icon = { Icon(dest.icon, contentDescription = dest.label) },
-                            label = { Text(dest.label) },
+                            icon = { BusyDestIcon(dest.icon, dest.label, destBusy(dest.route)) },
                         )
                     }
                 }
@@ -509,7 +743,7 @@ private fun MainScaffold(container: AppContainer, widthClass: WindowWidthSizeCla
                             modifier = Modifier.onGloballyPositioned {
                                 navCenters[dest.route] = it.boundsInRoot().center
                             },
-                            icon = { Icon(dest.icon, contentDescription = dest.label) },
+                            icon = { BusyDestIcon(dest.icon, dest.label, destBusy(dest.route)) },
                             label = { Text(dest.label) },
                         )
                     }
@@ -539,7 +773,7 @@ private fun MainScaffold(container: AppContainer, widthClass: WindowWidthSizeCla
                                 .onGloballyPositioned {
                                     navCenters[media.route] = it.boundsInRoot().center
                                 },
-                            icon = { Icon(media.icon, contentDescription = media.label) },
+                            icon = { BusyDestIcon(media.icon, media.label, scanBusy) },
                             label = { Text(media.label) },
                         )
                     }
@@ -573,6 +807,11 @@ private fun MainScaffold(container: AppContainer, widthClass: WindowWidthSizeCla
                                 invalidateMediaDir = { cid ->
                                     container.mediaDatabase.mediaDao().invalidateScanState(cid)
                                 },
+                                // 目录栈存档：进播放器后 MainActivity 被系统回收、回来重建时
+                                // 靠它回到原来那一层，而不是被打回根目录（见该构造参数的说明）
+                                savedState = createSavedStateHandle(),
+                                // 回收站/云下载删除的目录内容广播：文件页同步移除对应条目
+                                dirRemovals = container.dirRemovals,
                             )
                         })
                         FilesScreen(
@@ -580,9 +819,11 @@ private fun MainScaffold(container: AppContainer, widthClass: WindowWidthSizeCla
                             expanded,
                             snackbarHostState,
                             onPlayVideo,
-                            onOpenGallery = { items, idx -> imageGallery = items to idx },
+                            onOpenGallery = { items, idx, path -> imageGallery = Triple(items, idx, path) },
                             onPreviewText = { item -> textPreview = item },
                             onBatchRename = { batchRename = it },
+                            onFindDuplicates = { dupRequest = it },
+                            onGeneratePreviews = { previewRequest = it },
                             onOpenFilterRules = {
                                 destinations.firstOrNull { it.route == "filter" }?.let { navigate(it) }
                             },
@@ -624,12 +865,19 @@ private fun MainScaffold(container: AppContainer, widthClass: WindowWidthSizeCla
                     }
                     composable("offline") {
                         val vm: OfflineViewModel = viewModel(initializer = {
-                            OfflineViewModel(container.openApi, container.downloadPrefs)
+                            OfflineViewModel(
+                                container.openApi,
+                                container.downloadPrefs,
+                                container.dirCache,
+                                container.dirRemovals,
+                            )
                         })
                         OfflineScreen(vm, expanded, snackbarHostState, onJump = jumpToCloudDir)
                     }
                     composable("recycle") {
-                        val vm: RecycleViewModel = viewModel(initializer = { RecycleViewModel(container.openApi) })
+                        val vm: RecycleViewModel = viewModel(initializer = {
+                            RecycleViewModel(container.openApi, container.dirCache, container.dirRemovals, container.videoPreviews)
+                        })
                         RecycleScreen(vm, expanded, snackbarHostState)
                     }
                     composable(
@@ -664,7 +912,10 @@ private fun MainScaffold(container: AppContainer, widthClass: WindowWidthSizeCla
                 composable("more") {
                     com.open115.pad.ui.more.MoreScreen(
                         entries = destinations.filter { it.route in moreRoutes }.map {
-                            com.open115.pad.ui.more.MoreEntry(it.route, it.label, it.icon)
+                            com.open115.pad.ui.more.MoreEntry(
+                                it.route, it.label, it.icon,
+                                busy = destBusy(it.route),
+                            )
                         },
                         onOpen = { route -> navController.navigate(route) { launchSingleTop = true } },
                     )
@@ -686,18 +937,63 @@ private fun MainScaffold(container: AppContainer, widthClass: WindowWidthSizeCla
                         onDismiss = { batchRename = null },
                     )
                 }
+
+                // 查找重复文件面板：同一层（盖内容区、不盖导航栏）。判重是只读的，删除走 115 回收站。
+                dupRequest?.let { req ->
+                    DuplicatePanel(
+                        request = req,
+                        finder = container.duplicateFinder,
+                        versionFinder = container.versionFinder,
+                        api = container.openApi,
+                        frames = container.videoFrames,
+                        opLog = container.opLog,
+                        // 候选条目试播：单条起播（不带连播队列），目录信息照记操作记录
+                        onPlay = { item, dirCid, dirPath ->
+                            val pc = item.pc
+                            if (pc.isNullOrBlank()) {
+                                scope.launch { snackbarHostState.showSnackbar("该文件缺少提取码，无法播放") }
+                            } else {
+                                scope.launch {
+                                    container.opLog.log(OpType.VIDEO_PLAY, item.fn, "重复文件面板试播", dirCid, dirPath)
+                                }
+                                context.startActivity(
+                                    PlayerActivity.intent(
+                                        context, pc, item.fn,
+                                        listOf(PlaylistEntry(pc, item.fn, item.fid)), 0,
+                                        opLogCid = dirCid, opLogPath = dirPath, sourceCid = dirCid,
+                                    )
+                                )
+                            }
+                        },
+                        onDismiss = { dupRequest = null },
+                        onMessage = { msg -> msg?.let { scope.launch { snackbarHostState.showSnackbar(it) } } },
+                    )
+                }
+
+                // 批量生成视频预览图面板：同一层，只读（抓帧落本机缓存，不动云端）
+                previewRequest?.let { req ->
+                    PreviewPanel(
+                        request = req,
+                        builder = container.previewBuilder,
+                        store = container.videoPreviews,
+                        onDismiss = { previewRequest = null },
+                    )
+                }
             }
         }
     }
 
     // 大图画廊：根层级全屏遮罩（Dialog 会被侧栏宽度内缩，盖不住左侧导航）
-    imageGallery?.let { (items, idx) ->
-        ImageGalleryDialog(
-            items = items,
-            initialIndex = idx,
-            resolver = container.imageUrlResolver,
-            onDismiss = { imageGallery = null },
-        )
+    imageGallery?.let { (items, idx, path) ->
+        PreviewZoomHost(onDismissed = { imageGallery = null }) { requestClose ->
+            ImageGalleryDialog(
+                items = items,
+                initialIndex = idx,
+                resolver = container.imageUrlResolver,
+                onDismiss = requestClose,
+                sourcePath = path,
+            )
+        }
     }
 
     // 文本预览：同一套根层级全屏遮罩；缺提取码的文件直接提示并关闭
@@ -709,18 +1005,20 @@ private fun MainScaffold(container: AppContainer, widthClass: WindowWidthSizeCla
                 textPreview = null
             }
         } else {
-            TextPreviewHost(
-                name = item.fn,
-                pickCode = pc,
-                sizeText = Format.size(item.fs),
-                resolver = container.imageUrlResolver,
-                client = container.okHttpClient,
-                onDownload = { url, name ->
-                    runCatching { Downloader.enqueue(context, url, name) }
-                    scope.launch { snackbarHostState.showSnackbar("已加入系统下载队列") }
-                },
-                onDismiss = { textPreview = null },
-            )
+            PreviewZoomHost(onDismissed = { textPreview = null }) { requestClose ->
+                TextPreviewHost(
+                    name = item.fn,
+                    pickCode = pc,
+                    sizeText = Format.size(item.fs),
+                    resolver = container.imageUrlResolver,
+                    client = container.okHttpClient,
+                    onDownload = { url, name ->
+                        runCatching { Downloader.enqueue(context, url, name) }
+                        scope.launch { snackbarHostState.showSnackbar("已加入系统下载队列") }
+                    },
+                    onDismiss = requestClose,
+                )
+            }
         }
     }
 

@@ -90,6 +90,7 @@ import coil.compose.SubcomposeAsyncImage
 import com.open115.pad.data.media.backgroundSourceOf
 import com.open115.pad.data.media.WorksSort
 import com.open115.pad.data.media.MediaDao
+import com.open115.pad.data.media.MEDIA_NO_LIMIT
 import com.open115.pad.data.media.MediaLibraryEntity
 import com.open115.pad.data.media.WorksFilter
 import com.open115.pad.data.media.facetsOf
@@ -187,7 +188,7 @@ fun PosterWallScreen(
      * 别的库里的同演员作品也搜不到。现在搜出来的就是全库的，卡片、海报、点进去都一样。
      */
     val hits by produceState<List<MovieCard>?>(initialValue = null, query, all, sort) {
-        value = if (query.isBlank()) null else dao.searchAll(query, 200, sort.sql)
+        value = if (query.isBlank()) null else dao.searchAll(query, MEDIA_NO_LIMIT, sort.sql)
     }
     val searching = !hits.isNullOrEmpty() || query.isNotBlank()
     // 筛选（年份/类型·标签/演员，多选）：选项从"这个库实际有的"现算，纯本地过滤
@@ -392,6 +393,7 @@ fun PosterWallScreen(
                         cacheDir = container.cacheDir,
                         mediaKey = target.mediaKey,
                         alsoCloud = alsoCloud,
+                        videoPreviews = container.videoPreviews,
                     )
                     when (r) {
                         MovieDeleteResult.Ok -> onChanged()

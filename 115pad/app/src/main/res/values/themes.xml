@@ -3,4 +3,21 @@
     <style name="Theme.Open115" parent="android:Theme.Material.Light.NoActionBar">
         <item name="android:windowBackground">@android:color/white</item>
     </style>
+
+    <!--
+      播放器窗口动画：进入 = 放大淡入、退出 = 缩小淡出（见 res/anim/player_*.xml）。
+      只定义这两条 —— 进场时主界面的退场、返回时主界面的进场都不配动画，
+      主界面原地不动，播放器在它上面淡入淡出，观感与根层级预览浮层一致。
+    -->
+    <style name="PlayerWindowAnimation">
+        <item name="android:activityOpenEnterAnimation">@anim/player_enter</item>
+        <item name="android:activityCloseExitAnimation">@anim/player_exit</item>
+    </style>
+
+    <style name="Theme.Open115.Player" parent="Theme.Open115">
+        <item name="android:windowAnimationStyle">@style/PlayerWindowAnimation</item>
+        <!-- ⚠️ 不要在这里加 windowFullscreen（FLAG_FULLSCREEN）：状态栏可见性随窗口出现而变化
+             时，系统会跳过本窗口的进场动画、只播状态栏转换（实测复现）。全屏改由
+             PlayerActivity.onCreate 里的 insets hide 负责（生效在首帧之前，动画不受影响）。 -->
+    </style>
 </resources>

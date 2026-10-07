@@ -312,10 +312,10 @@ class WorksFilterTest {
 
     /** 标签与演员都在关联表里：测试里直接给一份"卡片上查不到的那些维度" */
     private val extras = mapOf(
-        "a" to CardFacets(tags = setOf("4K", "中文字幕"), actors = setOf("甲", "乙")),
+        "a" to CardFacets(tags = setOf("4K", "示例标签"), actors = setOf("甲", "乙")),
         "b" to CardFacets(tags = setOf("4K"), actors = setOf("乙")),
         "c" to CardFacets(tags = emptySet(), actors = setOf("丙")),
-        "d" to CardFacets(tags = setOf("中文字幕"), actors = emptySet()),
+        "d" to CardFacets(tags = setOf("示例标签"), actors = emptySet()),
     )
 
     private fun run(f: WorksFilter) =
@@ -348,8 +348,8 @@ class WorksFilterTest {
 
     @Test
     fun `标签命中其一即可`() {
-        assertEquals(listOf("a", "d"), run(WorksFilter(kinds = setOf("中文字幕"))))
-        assertEquals(listOf("a", "b", "d"), run(WorksFilter(kinds = setOf("4K", "中文字幕"))))
+        assertEquals(listOf("a", "d"), run(WorksFilter(kinds = setOf("示例标签"))))
+        assertEquals(listOf("a", "b", "d"), run(WorksFilter(kinds = setOf("4K", "示例标签"))))
     }
 
     @Test
@@ -380,7 +380,7 @@ class WorksFilterTest {
         assertEquals("年份新的在前", listOf(2024, 2023), f.years)
         // 类型/标签按出现次数排序（同次数按字典序）
         // 类型与标签合并后按出现次数排（同次数按字典序）
-        assertEquals(listOf("4K", "中文字幕", "动作", "科幻", "喜剧"), f.kinds)
+        assertEquals(listOf("4K", "动作", "示例标签", "科幻", "喜剧"), f.kinds)
         assertEquals(listOf("乙", "丙", "甲"), f.actors.orEmpty())   // 出现次数多的在前
         assertTrue(facetsOf(emptyList<MovieCard>()) { CardFacets.Empty }.isEmpty)
     }

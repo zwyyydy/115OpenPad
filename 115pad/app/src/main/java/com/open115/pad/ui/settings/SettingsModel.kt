@@ -1,6 +1,7 @@
 package com.open115.pad.ui.settings
 
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.outlined.Backup
 import androidx.compose.material.icons.outlined.Bolt
 import androidx.compose.material.icons.outlined.CloudDownload
 import androidx.compose.material.icons.outlined.FolderOpen
@@ -83,6 +84,24 @@ data class ActionItem(
     val onClick: () -> Unit,
 ) : SettingItem
 
+/**
+ * 单行文本（右侧不显示控件，点整行弹输入框改）。
+ *
+ * 与 [ActionItem] 的区别：动作行点了就执行，这个点了是**改值**。地址类设置（头像源、将来别的
+ * 第三方地址）用它 —— 值通常很长，所以 [ItemShell] 的内容槽里单独占一行显示，不挤在标题右边。
+ */
+data class TextItem(
+    override val id: String,
+    override val title: String,
+    override val subtitle: String,
+    override val detail: String? = null,
+    val value: String,
+    /** 值为空时显示的占位（写在输入框上） */
+    val placeholder: String = "",
+    /** 点"保存"时回一次（不 trim，由调用方决定怎么处理） */
+    val onChange: (String) -> Unit,
+) : SettingItem
+
 /** 只读信息行（版本号、只读状态），不可点 */
 data class InfoItem(
     override val id: String,
@@ -108,6 +127,7 @@ enum class SettingsCategory(
     TASK("后台任务", Icons.Outlined.Bolt, "任务跑完再让系统回收：前台常驻与电池优化白名单"),
     STORAGE("存储与缓存", Icons.Outlined.FolderOpen, "各类本机缓存的开关、上限与清理"),
     PIPELINE("流水线同步", Icons.Outlined.Sync, "服务器刮削完自动更新媒体库"),
+    BACKUP("备份", Icons.Outlined.Backup, "配置、媒体库与操作记录定时备份到云端，换设备不用重来"),
     LAB("实验室", Icons.Outlined.Science, "尝鲜功能，不稳定，随时可以关掉"),
     ACCOUNT("账号", Icons.Outlined.PersonOutline, "授权信息与退出登录"),
     ABOUT("关于", Icons.Outlined.Info, "版本与说明"),
@@ -183,6 +203,18 @@ class SettingsSectionBuilder(private val category: SettingsCategory) {
         onClick: () -> Unit,
     ) {
         current += ActionItem(id, title, subtitle, detail, danger, confirm, confirmText, onClick)
+    }
+
+    fun text(
+        id: String,
+        title: String,
+        subtitle: String,
+        value: String,
+        placeholder: String = "",
+        detail: String? = null,
+        onChange: (String) -> Unit,
+    ) {
+        current += TextItem(id, title, subtitle, detail, value, placeholder, onChange)
     }
 
     fun info(id: String, title: String, subtitle: String, detail: String? = null) {

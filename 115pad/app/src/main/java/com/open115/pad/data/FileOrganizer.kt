@@ -25,6 +25,13 @@ import kotlin.coroutines.coroutineContext
  *    里面的文件已经各就各位，再扫一遍只会把它们又端上来重复移动一遍；
  *  - 找不到 fid 的条目（正常列目录不会出现）直接跳过，留在原地。
  *
+ * 例外机制：[exclusions] 里的 fid 不搬（文件夹连带整个子树）。集合**执行中可改**，
+ * 三个环节（目录出队 / 文件入桶 / 每批移动前）都现读，所以中途勾选也来得及保住没搬的文件。
+ *
+ * 全程跑在应用级协程里（构造传入的 [scope]，App 容器用的是 transferScope）：
+ * UI 只发车和收进度，不参与执行 —— 切页、锁屏都不影响，配合前台服务（taskActivity）
+ * 后台也照跑。请求一律走 [throttle] 分级限速（防 ban）。
+ *
  * 同名冲突不用管：115 不做覆盖写，同名移入服务端自动改名成「xxx（1）」（实测）。
  */
 class FileOrganizer(
@@ -36,7 +43,7 @@ class FileOrganizer(
 ) {
 
     /** 整理进行到哪一步：横幅文案按它分叉 */
-    enum class Phase { SCAN, MOVE }
+    enum class Phase { SCAN, MOVE, CLEANUP }
 
     /**
      * 一次运行的进度快照。
@@ -56,12 +63,28 @@ class FileOrganizer(
         val movedFiles: Int = 0,
         val createdDirs: Int = 0,
         val failed: Int = 0,
+        /** 收尾清理：删掉了多少个空文件夹 */
+        val removedEmptyDirs: Int = 0,
         val summary: String? = null,
         val finishedAt: Long = 0L,
     )
 
     private val _progress = MutableStateFlow(Progress())
     val progress: StateFlow<Progress> = _progress.asStateFlow()
+
+    /**
+     * 例外条目（fid 集合）：勾了的文件不搬、文件夹整个子树跳过。
+     *
+     * **执行中可随时改**（文件页横幅「例外」入口）：每轮目录出队、每个文件入桶、
+     * 每批移动前都现读这份集合 —— 所以扫描过半再把某个文件夹加进来也来得及，
+     * 还没移到它的文件照样保得住。跨运行保留（同一个目录再整理，上次的例外还认）。
+     */
+    private val _exclusions = MutableStateFlow<Set<String>>(emptySet())
+    val exclusions: StateFlow<Set<String>> = _exclusions.asStateFlow()
+
+    fun setExclusions(v: Set<String>) {
+        _exclusions.value = v
+    }
 
     private var job: Job? = null
 
@@ -86,6 +109,22 @@ class FileOrganizer(
         dirCache?.let { c -> touched.forEach(c::invalidateDir) }
     }
 
+    /**
+     * 分级限速（防 ban）：请求间隔按**已扫目录数**分档 ——
+     * 前 10 个目录 300ms，11~20 个 1000ms，20 个往上 2000ms。
+     * 列目录翻页、建文件夹、移文件每一类请求都走它：对 115 来说都是同一把刀。
+     */
+    private suspend fun throttle() {
+        val scanned = _progress.value.scannedDirs
+        delay(
+            when {
+                scanned >= 20 -> THROTTLE_SLOW_MS
+                scanned >= 10 -> THROTTLE_MEDIUM_MS
+                else -> THROTTLE_FAST_MS
+            },
+        )
+    }
+
     private class StopSignal : Exception()
 
     private fun checkStop() {
@@ -106,8 +145,12 @@ class FileOrganizer(
                 coroutineContext.ensureActive()
                 checkStop()
                 val cid = queue.removeFirst()
+                // 例外文件夹：整个子树不碰（不递归、里面的文件一个不搬）。
+                // 执行中勾的也生效 —— 目录是出队时才查的，还没扫到的来得及躲开
+                if (cid in _exclusions.value) continue
                 val items = listAll(cid)
                 touched.add(cid)
+                val excluded = _exclusions.value
                 for (item in items) {
                     if (item.isDir) {
                         // 只在根一层认"分类同名目录"：更深层的同名目录是用户自己的内容，照常递归
@@ -119,29 +162,45 @@ class FileOrganizer(
                             }
                         }
                         item.fid?.let(queue::addLast)
-                    } else {
+                    } else if (item.fid == null || item.fid !in excluded) {
                         byCategory[FileClassifier.indexOf(item.fn)].add(item)
                     }
                 }
                 _progress.value = _progress.value.copy(
                     scannedDirs = _progress.value.scannedDirs + 1,
-                    foundFiles = _progress.value.foundFiles + items.count { !it.isDir },
+                    foundFiles = _progress.value.foundFiles + items.count {
+                        !it.isDir && (it.fid == null || it.fid !in excluded)
+                    },
                 )
-                delay(LIST_INTERVAL_MS)
+                throttle()
             }
 
-            val toMove = byCategory.sumOf { it.size }
+            // 搬运清单：扫描完按**当下**的例外集合再筛一遍 —— 扫描期勾的例外在这里生效，
+            // 之后（移动途中）勾的在每批移动前还会再查一次
+            fun isExcluded(f: FileItem, excluded: Set<String>): Boolean =
+                f.fid == null || f.fid in excluded || f.pid in excluded
+
+            val moveLists: List<List<FileItem>> = byCategory.map { list ->
+                val excluded = _exclusions.value
+                list.filter { !isExcluded(it, excluded) }
+            }
+            val toMove = moveLists.sumOf { it.size }
             if (toMove == 0) {
+                // 没有要搬的文件，也可能有空文件夹等着清（上次整理/手动搬完剩下的）
+                val removed = cleanupEmptyDirs(rootCid, targetCids, touched)
                 releaseCache(touched)
-                finish("目录已经很整洁：没有需要归类的文件")
+                finish(
+                    if (removed > 0) "目录已经很整洁：顺手清掉了 $removed 个空文件夹"
+                    else "目录已经很整洁：没有需要归类的文件",
+                )
                 return
             }
 
             // ---- ② 建缺的分类目录（只为有文件的分类建，空类不建空文件夹）----
-            for (idx in byCategory.indices) {
+            for (idx in moveLists.indices) {
                 coroutineContext.ensureActive()
                 checkStop()
-                if (byCategory[idx].isEmpty() || targetCids[idx] != null) continue
+                if (moveLists[idx].isEmpty() || targetCids[idx] != null) continue
                 val resp = api.addFolder(rootCid, FileClassifier.CATEGORIES[idx])
                 val cid = if (resp.envOk()) resp.envData()?.optStr("file_id") else null
                 if (cid != null) {
@@ -150,20 +209,22 @@ class FileOrganizer(
                     _progress.value = _progress.value.copy(createdDirs = _progress.value.createdDirs + 1)
                 } else {
                     // 建不出来就把这一类整个留在原地：硬塞进别的类才是事故
-                    _progress.value = _progress.value.copy(failed = _progress.value.failed + byCategory[idx].size)
-                    byCategory[idx].clear()
+                    _progress.value = _progress.value.copy(failed = _progress.value.failed + moveLists[idx].size)
                 }
-                delay(WRITE_INTERVAL_MS)
+                throttle()
             }
 
-            // ---- ③ 按类分批移动：一批一次请求，批间限速 ----
+            // ---- ③ 按类分批移动：一批一次请求，批间限速；移动途中勾例外也来得及 ----
             _progress.value = _progress.value.copy(phase = Phase.MOVE, totalToMove = toMove)
-            for (idx in byCategory.indices) {
+            for (idx in moveLists.indices) {
                 val to = targetCids[idx] ?: continue
-                for (batch in byCategory[idx].chunked(MOVE_BATCH)) {
+                for (batch in moveLists[idx].chunked(MOVE_BATCH)) {
                     coroutineContext.ensureActive()
                     checkStop()
-                    val ids = batch.mapNotNull { it.fid }
+                    // 每批现读例外集合：文件夹级例外连带里面的文件（pid 判定），
+                    // 扫描早就过了、但还没轮到搬的文件照样保得住
+                    val excluded = _exclusions.value
+                    val ids = batch.mapNotNull { f -> f.fid?.takeIf { !isExcluded(f, excluded) } }
                     if (ids.isEmpty()) continue
                     val ok = runCatching { api.moveFiles(ids.joinToString(","), to) }
                         .getOrNull()?.envOk() == true
@@ -171,17 +232,22 @@ class FileOrganizer(
                         movedFiles = _progress.value.movedFiles + if (ok) ids.size else 0,
                         failed = _progress.value.failed + if (ok) 0 else ids.size,
                     )
-                    delay(WRITE_INTERVAL_MS)
+                    throttle()
                 }
             }
 
+            // ---- ④ 清理空文件夹：文件搬走后腾空的子目录就地删除 ----
+            _progress.value = _progress.value.copy(phase = Phase.CLEANUP)
+            val removedEmpty = cleanupEmptyDirs(rootCid, targetCids, touched)
+
             releaseCache(touched)
             val p = _progress.value
-            val parts = breakdown(byCategory)
+            val parts = breakdown(moveLists)
             finish(
                 buildString {
                     append("分类整理完成：移动 ${p.movedFiles} 项")
                     if (p.createdDirs > 0) append("，新建 ${p.createdDirs} 个文件夹")
+                    if (removedEmpty > 0) append("，清理空文件夹 $removedEmpty 个")
                     if (p.failed > 0) append("，失败 ${p.failed} 项")
                     if (parts.isNotEmpty()) append("（").append(parts).append("）")
                 },
@@ -217,9 +283,40 @@ class FileOrganizer(
         }
     }
 
+    /**
+     * ④ 清理空文件夹：整理把文件都搬走了，原本装文件的子文件夹常常就空了。
+     * [dirs] 是 BFS 序（父先于子），**倒过来逐个重列一遍**：子孙先删掉，父层此刻再列
+     * 才是准的；内容真空了才删（115 的删除异步生效，父层偶尔因此漏删一两个，下次整理
+     * 会再收掉 —— 宁可漏删，不能误删没空的）。
+     *
+     * 三类不动：根目录（[rootCid]）；七个分类文件夹（[skipCids]，它们是归档目标，
+     * 空着也是结构的一部分）；列不出来/删除失败的一律跳过。[stopRequested] 同样生效。
+     */
+    private suspend fun cleanupEmptyDirs(rootCid: String, skipCids: Array<String?>, dirs: List<String>): Int {
+        val skip = skipCids.mapNotNull { it }.toHashSet() + rootCid
+        var removed = 0
+        for (cid in dirs.asReversed().distinct()) {
+            coroutineContext.ensureActive()
+            checkStop()
+            if (cid in skip) continue
+            // 列出来确认真空了才删；列失败（被删了/网络）当"没空"处理 —— 宁可漏删，不能误删。
+            // 节拍每个目录一次：列目录与删除对 115 是同一把刀，连续空目录也不能放行
+            val empty = runCatching { listAll(cid) }.map { it.isEmpty() }.getOrDefault(false)
+            if (empty) {
+                val ok = runCatching { api.deleteFiles(cid) }.getOrNull()?.envOk() == true
+                if (ok) removed++
+            }
+            throttle()
+        }
+        if (removed > 0) {
+            _progress.value = _progress.value.copy(removedEmptyDirs = removed)
+        }
+        return removed
+    }
+
     /** 按分类下标拼"视频 12 · 图片 3"这样的汇总（空的类不出场）；opLog 与结束文案共用 */
-    private fun breakdown(byCategory: Array<MutableList<FileItem>>): String =
-        byCategory.withIndex()
+    private fun breakdown(moveLists: List<List<FileItem>>): String =
+        moveLists.withIndex()
             .filter { (_, list) -> list.isNotEmpty() }
             .joinToString(" · ") { (idx, list) -> "${FileClassifier.CATEGORIES[idx]} ${list.size}" }
 
@@ -245,7 +342,7 @@ class FileOrganizer(
             offset += page.items.size
             // 防御：单目录异常大（比如误在根目录上整理）时不再无限翻页
             if (offset >= MAX_ITEMS_PER_DIR) break
-            delay(LIST_INTERVAL_MS)
+            throttle()
         }
         return out
     }
@@ -253,9 +350,12 @@ class FileOrganizer(
     companion object {
         private const val PAGE_SIZE = 200
         private const val MAX_ITEMS_PER_DIR = 20_000
-        private const val LIST_INTERVAL_MS = 120L
-        private const val WRITE_INTERVAL_MS = 300L
         private const val MOVE_BATCH = 50
+
+        /** 分级限速（防 ban）：前 10 个目录 300ms，11~20 个 1000ms，20+ 2000ms */
+        private const val THROTTLE_FAST_MS = 300L
+        private const val THROTTLE_MEDIUM_MS = 1000L
+        private const val THROTTLE_SLOW_MS = 2000L
     }
 }
 

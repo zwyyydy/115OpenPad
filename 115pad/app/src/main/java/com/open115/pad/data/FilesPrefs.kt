@@ -28,6 +28,12 @@ class FilesPrefs(private val context: Context) {
     val typeFilter: Flow<Int> = context.filesDataStore.data.map { it[KEY_TYPE] ?: -1 } // -1 = 全部
     val starOnly: Flow<Boolean> = context.filesDataStore.data.map { it[KEY_STAR] ?: false }
 
+    /** 双面板模式（类 MT 管理器，跨栏快速移动）：记住开关，重启恢复 */
+    val dualPane: Flow<Boolean> = context.filesDataStore.data.map { it[KEY_DUAL] ?: false }
+
+    /** 列表里视频行下面那条宽幅预览条（按片长抓的 2~10 帧）。默认开 */
+    val videoStrip: Flow<Boolean> = context.filesDataStore.data.map { it[KEY_VIDEO_STRIP] ?: true }
+
     suspend fun setSort(order: String, asc: Int) = context.filesDataStore.edit {
         it[KEY_ORDER] = order
         it[KEY_ASC] = asc
@@ -36,6 +42,8 @@ class FilesPrefs(private val context: Context) {
     suspend fun setViewMode(v: Int) = context.filesDataStore.edit { it[KEY_VIEW] = v }
     suspend fun setTypeFilter(v: Int?) = context.filesDataStore.edit { it[KEY_TYPE] = v ?: -1 }
     suspend fun setStarOnly(v: Boolean) = context.filesDataStore.edit { it[KEY_STAR] = v }
+    suspend fun setDualPane(v: Boolean) = context.filesDataStore.edit { it[KEY_DUAL] = v }
+    suspend fun setVideoStrip(v: Boolean) = context.filesDataStore.edit { it[KEY_VIDEO_STRIP] = v }
 
     private companion object {
         val KEY_ORDER = stringPreferencesKey("order")
@@ -44,5 +52,7 @@ class FilesPrefs(private val context: Context) {
         val KEY_VIEW = intPreferencesKey("view_mode")
         val KEY_TYPE = intPreferencesKey("type_filter")
         val KEY_STAR = booleanPreferencesKey("star_only")
+        val KEY_DUAL = booleanPreferencesKey("dual_pane")
+        val KEY_VIDEO_STRIP = booleanPreferencesKey("video_strip")
     }
 }

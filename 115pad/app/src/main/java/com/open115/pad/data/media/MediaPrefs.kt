@@ -98,6 +98,41 @@ class MediaPrefs(private val context: Context) {
         it[KEY_PAD_LAST_NOTE] = note
     }
 
+    // ---- 演员头像补全（gfriends 那类头像仓库，见 [ActorAvatarSource]）----
+    //
+    // 地址**不写死**：存在 DataStore 里、可在「实验室」改（第三方地址说变就变）。
+    // 代码里那个常量只当**首次的预填值**，改地址不需要改代码。
+
+    /** 总开关。默认**关**：开着才会去那个第三方地址拉索引、取头像 */
+    val avatarSourceEnabled: Flow<Boolean> =
+        context.mediaDataStore.data.map { it[KEY_AVATAR_ENABLED] ?: false }
+
+    /** 头像源基地址（末尾斜杠会归一化），空 = 没配 */
+    val avatarSourceUrl: Flow<String> =
+        context.mediaDataStore.data.map { it[KEY_AVATAR_URL] ?: ActorAvatarSource.DEFAULT_BASE }
+
+    /** 本地索引的条数与更新时间（实验室状态行） */
+    val avatarIndexCount: Flow<Int> = context.mediaDataStore.data.map { it[KEY_AVATAR_COUNT] ?: 0 }
+    val avatarIndexAt: Flow<Long> = context.mediaDataStore.data.map { it[KEY_AVATAR_AT] ?: 0L }
+
+    /** 覆盖率：更新索引时顺手算的"本库演员能对上多少个"，直接回答"这个源对你有没有用" */
+    val avatarCoverageHit: Flow<Int> = context.mediaDataStore.data.map { it[KEY_AVATAR_HIT] ?: 0 }
+    val avatarCoverageTotal: Flow<Int> = context.mediaDataStore.data.map { it[KEY_AVATAR_TOTAL] ?: 0 }
+
+    suspend fun setAvatarSourceEnabled(enabled: Boolean) =
+        context.mediaDataStore.edit { it[KEY_AVATAR_ENABLED] = enabled }
+
+    suspend fun setAvatarSourceUrl(url: String) =
+        context.mediaDataStore.edit { it[KEY_AVATAR_URL] = url.trim() }
+
+    suspend fun setAvatarIndex(count: Int, at: Long, hit: Int, total: Int) =
+        context.mediaDataStore.edit {
+            it[KEY_AVATAR_COUNT] = count
+            it[KEY_AVATAR_AT] = at
+            it[KEY_AVATAR_HIT] = hit
+            it[KEY_AVATAR_TOTAL] = total
+        }
+
     companion object {
         const val DEFAULT_MAX_MB = 2048L
         const val MIN_MAX_MB = 512L
@@ -120,6 +155,13 @@ class MediaPrefs(private val context: Context) {
         private val KEY_PAD_POLL_MINUTES = intPreferencesKey("pad_poll_minutes")
         private val KEY_PAD_LAST_AT = longPreferencesKey("pad_last_at")
         private val KEY_PAD_LAST_NOTE = stringPreferencesKey("pad_last_note")
+
+        private val KEY_AVATAR_ENABLED = booleanPreferencesKey("avatar_source_enabled")
+        private val KEY_AVATAR_URL = stringPreferencesKey("avatar_source_url")
+        private val KEY_AVATAR_COUNT = intPreferencesKey("avatar_index_count")
+        private val KEY_AVATAR_AT = longPreferencesKey("avatar_index_at")
+        private val KEY_AVATAR_HIT = intPreferencesKey("avatar_coverage_hit")
+        private val KEY_AVATAR_TOTAL = intPreferencesKey("avatar_coverage_total")
 
         /**
          * nfo 文本池从总上限里分到的份额（5%）。

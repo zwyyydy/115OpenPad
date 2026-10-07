@@ -127,6 +127,15 @@ internal fun needsLegacyWritePermission(context: Context): Boolean =
         context.checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE) !=
         PackageManager.PERMISSION_GRANTED
 
+/** 位图 → JPEG 字节（「截图设为预览图」上传用；质量 90 够清晰，1080p 一帧几百 KB） */
+internal fun bitmapToJpegBytes(bitmap: Bitmap, quality: Int = 90): ByteArray? =
+    runCatching {
+        java.io.ByteArrayOutputStream().use { out ->
+            bitmap.compress(Bitmap.CompressFormat.JPEG, quality, out)
+            out.toByteArray()
+        }
+    }.getOrNull()
+
 /**
  * 存进系统相册，返回展示用的位置描述；失败返回 null。
  *

@@ -6,37 +6,58 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.BitmapRegionDecoder
 import android.graphics.Rect
+import android.graphics.drawable.BitmapDrawable
+import android.widget.Toast
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.offset
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Close
+import androidx.compose.material.icons.outlined.Info
+import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
@@ -45,6 +66,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Rect as ComposeRect
 import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.FilterQuality
 import androidx.compose.ui.graphics.Shadow
@@ -67,9 +89,14 @@ import androidx.core.view.WindowInsetsControllerCompat
 import coil.compose.AsyncImage
 import coil.imageLoader
 import coil.request.ImageRequest
+import com.open115.pad.appContainer
 import com.open115.pad.data.ImageMediaItem
 import com.open115.pad.data.ImageUrlResolver
+import com.open115.pad.ui.theme.WallpaperCropFlow
+import com.open115.pad.ui.theme.wallpaperBasePath
+import com.open115.pad.util.Format
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.sample
 import kotlinx.coroutines.withContext
@@ -92,6 +119,9 @@ import kotlin.math.roundToInt
  *
  * 鸟瞰位置图：放大后右下角浮出半透明小图 + 当前视口框（见 [MiniMap]）。
  * 长图/巨图放大到 5x 时最容易"我在图的哪一块"迷失，这个框就是为它做的。
+ *
+ * 底部胶片条：横排缩略图速览/跳页（见 [GalleryStrip]）。单击屏幕随顶栏一起显隐，
+ * 图片放大时让位、缩回 1:1 自动回来；只用列表自带的缩略图，绝不退原图。
  */
 /**
  * 注意：不要用 Dialog 承载。平板（expanded）布局下 Dialog 窗口会被侧栏宽度内缩，
@@ -103,6 +133,8 @@ fun ImageGalleryDialog(
     initialIndex: Int,
     resolver: ImageUrlResolver,
     onDismiss: () -> Unit,
+    /** 当前图片所在目录（文件页面包屑写法）——详情面板的"所在目录"直接用，不为翻祖先再发请求 */
+    sourcePath: String? = null,
 ) {
     if (items.isEmpty()) return
     // 浏览图片时，系统返回键 = 退出浏览（优先级高于文件页的目录返回）
@@ -112,12 +144,19 @@ fun ImageGalleryDialog(
     val pagerState = rememberPagerState(initialPage = startIndex) { items.size }
     var chromeVisible by remember { mutableStateOf(true) }
     var dismissProgress by remember { mutableStateOf(0f) }
+    /** 当前页处于放大状态（双击/双指）：底部胶片条让位，缩回 1:1 再回来 */
+    var pageZoomed by remember { mutableStateOf(false) }
+    /** 详情面板开关（顶栏 ⓘ 键）；[wallpaperCropUri] 非空 = 壁纸裁切浮层开着 */
+    var showDetails by remember { mutableStateOf(false) }
+    var wallpaperCropUri by remember { mutableStateOf<String?>(null) }
+    val scope = rememberCoroutineScope()
 
-    // 进浏览即隐藏状态栏 + 导航栏，退出时恢复。
-    // 用 BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE 而不是"永久隐藏"：
-    // 用户仍可从边缘划出系统栏看时间/电量，划出后会自动收起，不会把画面顶掉。
-    // ⚠️ onDispose 必须无条件 show —— 若在这里判断条件，退出时会漏掉恢复，
-    //    整个 App 的状态栏就再也不回来了（和 VR 那个 DisposableEffect 的坑同源）。
+    // 画廊期间确保系统栏收起。**退出时同样 hide 而不是 show**：
+    // App 的全局策略是沉浸式（MainActivity 在 onCreate 与每次拿到焦点都 hideSystemBars，
+    // 状态栏只在用户下滑时以半透明浮层临时唤出）。早先这里退出时无条件 show ——
+    // 那是主界面还显示状态栏的年代写的；后来全局改成沉浸式这段没跟着改，
+    // 结果退出画廊就把状态栏顶了出来，而且 onWindowFocusChanged 不会因此触发
+    // （焦点本来就在本 Activity），那条状态栏要一直挂到下一次窗口焦点变化才被压回去。
     DisposableEffect(Unit) {
         val window = (context as? Activity)?.window
         val controller = window?.let { WindowCompat.getInsetsController(it, it.decorView) }
@@ -125,10 +164,8 @@ fun ImageGalleryDialog(
             WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
         controller?.hide(WindowInsetsCompat.Type.systemBars())
         onDispose {
-            (context as? Activity)?.window?.let {
-                WindowCompat.getInsetsController(it, it.decorView)
-                    .show(WindowInsetsCompat.Type.systemBars())
-            }
+            // 跟随全局策略再收一遍：万一进画廊时状态栏正被临时唤出，离开时也保证是收起态
+            controller?.hide(WindowInsetsCompat.Type.systemBars())
         }
     }
 
@@ -147,6 +184,7 @@ fun ImageGalleryDialog(
                 resolver = resolver,
                 active = page == pagerState.targetPage,
                 onTap = { chromeVisible = !chromeVisible },
+                onZoomChange = { pageZoomed = it },
                 onDismissRequest = onDismiss,
                 onDismissProgress = { dismissProgress = it },
             )
@@ -198,8 +236,79 @@ fun ImageGalleryDialog(
                         ),
                     )
                 }
+                // 详情键：这张图的完整信息 + 设为应用壁纸（见 [ImageDetailPanel]）
+                IconButton(onClick = { showDetails = !showDetails }) {
+                    Box {
+                        Icon(
+                            Icons.Outlined.Info,
+                            contentDescription = null,
+                            tint = Color.Black.copy(alpha = 0.55f),
+                            modifier = Modifier.offset(0.5.dp, 0.5.dp),
+                        )
+                        Icon(Icons.Outlined.Info, "图片详情", tint = Color.White)
+                    }
+                }
             }
         }
+
+        // 详情面板：贴底卡片。单击屏幕只切顶栏显隐，面板由 ⓘ / 「关闭」按钮开关
+        AnimatedVisibility(
+            visible = showDetails,
+            enter = fadeIn(),
+            exit = fadeOut(),
+            modifier = Modifier.align(Alignment.BottomCenter),
+        ) {
+            items.getOrNull(pagerState.currentPage)?.let { current ->
+                ImageDetailPanel(
+                    item = current,
+                    index = pagerState.currentPage,
+                    total = items.size,
+                    sourcePath = sourcePath,
+                    resolver = resolver,
+                    onSetWallpaper = { url ->
+                        showDetails = false
+                        wallpaperCropUri = url
+                    },
+                    onClose = { showDetails = false },
+                )
+            }
+        }
+
+        // 底部胶片条：缩略图速览 + 跳页（与媒体库剧照浏览的 FanartStrip 同款交互）。
+        // 单击屏幕随顶栏一起显隐；当前页处于放大状态（双击/双击捏合）时让位，缩回 1:1 自动回来；
+        // 详情面板开着时也让位（两者都贴底，叠一起会互相盖）
+        AnimatedVisibility(
+            visible = chromeVisible && !showDetails && !pageZoomed,
+            enter = fadeIn(),
+            exit = fadeOut(),
+            modifier = Modifier.align(Alignment.BottomCenter),
+        ) {
+            GalleryStrip(
+                items = items,
+                current = pagerState.currentPage,
+                onSelect = { i -> scope.launch { pagerState.scrollToPage(i) } },
+            )
+        }
+    }
+
+    // 壁纸裁切浮层：复用设置页那套（横竖各裁一次，全部完成才落偏好；
+    // 直链交给 Coil 解码，画廊刚显示过这张图，缓存直接命中）
+    wallpaperCropUri?.let { url ->
+        WallpaperCropFlow(
+            uri = url,
+            onFinished = {
+                wallpaperCropUri = null
+                scope.launch {
+                    context.appContainer.appPrefs.setWallpaper(wallpaperBasePath(context))
+                    Toast.makeText(
+                        context,
+                        "已设为应用壁纸（遮罩与模糊在设置 → 界面显示里调）",
+                        Toast.LENGTH_LONG,
+                    ).show()
+                }
+            },
+            onCancelled = { wallpaperCropUri = null },
+        )
     }
 
     // 双向预加载：翻到第 N 张时解析并预热 N-1 / N+1 的直链与位图缓存
@@ -264,12 +373,190 @@ private fun previewRequest(context: Context, item: ImageMediaItem): ImageRequest
     return builder.build()
 }
 
+/**
+ * 图片详情面板：把列表响应里能翻的都翻出来 —— 文件名 / 大小 / 像素尺寸与比例 / 格式 /
+ * 所在目录 / 位置 / 文件 ID / 三个时间戳 / pick_code / SHA-1 / 缩略图有无 / 星标，
+ * 外加「设为应用壁纸」。
+ *
+ * 除像素尺寸（Coil 解码，命中画廊缓存）外**全部来自列表响应**，零额外请求；
+ * 所在目录由调用方从文件页面包屑带进来，不为"翻祖先"去反查接口。内容可能超屏，面板内滚动。
+ */
+@Composable
+private fun ImageDetailPanel(
+    item: ImageMediaItem,
+    index: Int,
+    total: Int,
+    sourcePath: String?,
+    resolver: ImageUrlResolver,
+    onSetWallpaper: (String) -> Unit,
+    onClose: () -> Unit,
+) {
+    val context = LocalContext.current
+    var url by remember(item) { mutableStateOf<String?>(null) }
+    var dims by remember(item) { mutableStateOf<IntSize?>(null) }
+    var loading by remember(item) { mutableStateOf(true) }
+
+    LaunchedEffect(item) {
+        loading = true
+        url = runCatching { resolver.resolveOrigin(item) }.getOrNull()
+        dims = withContext(Dispatchers.IO) {
+            runCatching {
+                val u = url ?: return@runCatching null
+                val r = context.imageLoader.execute(
+                    ImageRequest.Builder(context).data(u).allowHardware(false).size(2048).build(),
+                )
+                (r.drawable as? BitmapDrawable)?.bitmap?.let { IntSize(it.width, it.height) }
+            }.getOrNull()
+        }
+        loading = false
+    }
+
+    Surface(
+        color = Color.Black.copy(alpha = 0.85f),
+        shape = RoundedCornerShape(16.dp),
+        modifier = Modifier
+            .padding(horizontal = 16.dp, vertical = 16.dp)
+            .fillMaxWidth()
+            .navigationBarsPadding(),
+    ) {
+        Column(
+            Modifier
+                .padding(16.dp)
+                .heightIn(max = 460.dp)
+                .verticalScroll(rememberScrollState()),
+        ) {
+            Text(
+                item.fileName,
+                color = Color.White,
+                style = MaterialTheme.typography.bodyLarge,
+                maxLines = 3,
+                overflow = TextOverflow.Ellipsis,
+            )
+
+            DetailSection("基本信息")
+            DetailRow("大小", Format.size(item.fileSize) + "（${item.fileSize} 字节）")
+            DetailRow(
+                "像素尺寸",
+                dims?.let { "${it.width} × ${it.height}${ratioLabel(it.width, it.height)}" }
+                    ?: if (loading) "读取中…" else "未知",
+            )
+            DetailRow("格式", formatLabel(item))
+            if (item.starred) DetailRow("星标", "已标星")
+
+            DetailSection("位置")
+            DetailRow("所在目录", sourcePath?.takeIf { it.isNotBlank() } ?: "—")
+            DetailRow("第几张", "第 ${index + 1} / $total 张")
+            DetailRow("文件 ID", item.fileId ?: "—")
+
+            DetailSection("时间")
+            DetailRow("修改时间", timeLabel(item.upt))
+            if (item.uppt > 0 && item.uppt != item.upt) DetailRow("上传时间", timeLabel(item.uppt))
+            if (item.uet > 0 && item.uet != item.upt && item.uet != item.uppt) {
+                DetailRow("uet", timeLabel(item.uet))
+            }
+
+            DetailSection("技术信息")
+            DetailRow("pick_code", item.pickCode ?: "—")
+            DetailRow("SHA-1", item.sha1 ?: "—")
+            DetailRow("缩略图", if (item.thumbnailUrl != null) "有" else "无")
+
+            Spacer(Modifier.height(14.dp))
+            Row(
+                Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                TextButton(onClick = onClose) {
+                    Text("关闭", color = Color.White.copy(alpha = 0.85f))
+                }
+                Button(onClick = { url?.let(onSetWallpaper) }, enabled = url != null) {
+                    Text("设为应用壁纸")
+                }
+            }
+        }
+    }
+}
+
+/** 详情面板的分组标题 */
+@Composable
+private fun DetailSection(title: String) {
+    Spacer(Modifier.height(12.dp))
+    Text(
+        title,
+        color = Color.White.copy(alpha = 0.45f),
+        style = MaterialTheme.typography.labelSmall,
+    )
+    Spacer(Modifier.height(2.dp))
+}
+
+/** 详情面板的一行：左标签 + 右值 */
+@Composable
+private fun DetailRow(label: String, value: String) {
+    Row(Modifier.fillMaxWidth().padding(vertical = 3.dp)) {
+        Text(
+            label,
+            color = Color.White.copy(alpha = 0.6f),
+            style = MaterialTheme.typography.bodySmall,
+            modifier = Modifier.width(76.dp),
+        )
+        Text(
+            value,
+            color = Color.White,
+            style = MaterialTheme.typography.bodySmall,
+            maxLines = 3,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.weight(1f),
+        )
+    }
+}
+
+/** 时间戳 → 显示文本（0/无效给占位） */
+private fun timeLabel(ms: Long): String = if (ms > 0) Format.dateTime(ms) else "—"
+
+/** 扩展名 → 可读格式名 */
+private fun formatLabel(item: ImageMediaItem): String = when (item.ext) {
+    "jpg", "jpeg" -> "JPEG"
+    "png" -> "PNG"
+    "gif" -> "GIF"
+    "bmp" -> "BMP"
+    "webp" -> "WebP"
+    "heic" -> "HEIF"
+    "avif" -> "AVIF"
+    "tiff" -> "TIFF"
+    null, "" -> "未知"
+    else -> item.ext.uppercase()
+}
+
+/** 宽高比：能约成小整数就写 "a:b"，否则写 "x.xx:1" */
+private fun ratioLabel(w: Int, h: Int): String {
+    if (w <= 0 || h <= 0) return ""
+    val g = gcd(w, h)
+    val a = w / g
+    val b = h / g
+    return if (a <= 40 && b <= 40) " · $a:$b"
+    else " · " + String.format(java.util.Locale.US, "%.2f:1", w.toFloat() / h)
+}
+
+/** 最大公约数（比例约分用；0 兜底成 1 免得除零） */
+private fun gcd(a: Int, b: Int): Int {
+    var x = a
+    var y = b
+    while (y != 0) {
+        val t = x % y
+        x = y
+        y = t
+    }
+    return if (x == 0) 1 else x
+}
+
 @Composable
 private fun GalleryPage(
     item: ImageMediaItem,
     resolver: ImageUrlResolver,
     active: Boolean,
     onTap: () -> Unit,
+    /** 放大状态（双击/双指）变化时上报宿主：底部胶片条要让位。只有当前页会上报 */
+    onZoomChange: (Boolean) -> Unit,
     onDismissRequest: () -> Unit,
     onDismissProgress: (Float) -> Unit,
 ) {
@@ -283,6 +570,13 @@ private fun GalleryPage(
     // 只有成为当前页才解析，避免 Pager 预组合相邻页时抢跑打满频控
     LaunchedEffect(item, active) {
         if (active && originUrl == null) originUrl = resolver.resolveOrigin(item)
+    }
+
+    // 放大状态上报。相邻页也会被 Pager 预组合，它们的 zoomState 与"用户正在看的那张"无关，
+    // 所以只有当前页上报；换页后新页的组合会立刻上报一次初值，状态不会跨页残留
+    LaunchedEffect(item, active) {
+        if (!active) return@LaunchedEffect
+        snapshotFlow { zoomState.isZoomed }.collect { onZoomChange(it) }
     }
 
     // 两个请求都挂上稳定磁盘键（见 [diskKeyOf]）：关掉画廊再进来 / 冷启动重进，
@@ -388,6 +682,93 @@ private fun GalleryPage(
 /** 鸟瞰图的最大尺寸：长图 / 全景图都按比例收进这个框，不会顶到屏幕上沿或压成一条线 */
 private val MINIMAP_MAX_W = 88.dp
 private val MINIMAP_MAX_H = 118.dp
+
+/** 胶片条单张的宽度（16:9 框）。与高度一起恒定，选中态只改描边与透明度，滑动时行不会抖 */
+private val STRIP_ITEM_W = 62.dp
+
+/**
+ * 底部胶片条（与媒体库剧照浏览的 FanartStrip 同款交互）：横排缩略图，当前张高亮，
+ * 点一下跳过去；当前张自动滚进视野（`animateScrollToItem(index - 2)` 让它大致落在中间）。
+ *
+ * 图源**只用列表自带的方形缩略图**（[ImageMediaItem.thumbnailUrl]）：
+ * 胶片条一屏可能排几十张，任何一张退回原图都是几 MB 白下，还都是 downurl 之外的白载荷；
+ * 没有 thumb 的文件显示占位底 + 格式名，**绝不解析直链**。磁盘键与大图首帧那份缩略图相同
+ * （`pick_code|thumb`，见 [diskKeyOf]），文件页网格/大图首帧已经拉过的直接命中。
+ *
+ * 半透明：未选中张 0.6 透明度压在一道自下而上的压暗渐变上，选中张全不透明 + 主色描边。
+ */
+@Composable
+private fun GalleryStrip(items: List<ImageMediaItem>, current: Int, onSelect: (Int) -> Unit) {
+    val context = LocalContext.current
+    val listState = rememberLazyListState()
+    LaunchedEffect(current) {
+        listState.animateScrollToItem((current - 2).coerceAtLeast(0))
+    }
+    Box(
+        Modifier
+            .fillMaxWidth()
+            // 很轻的一道自下而上的压暗：未选中张是半透明的，底下画面若很亮，
+            // 相邻两张之间的缝会看不清边界
+            .background(
+                Brush.verticalGradient(listOf(Color.Transparent, Color.Black.copy(alpha = 0.6f))),
+            ),
+    ) {
+        LazyRow(
+            state = listState,
+            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 10.dp),
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            itemsIndexed(items) { i, item ->
+                val selected = i == current
+                val shape = RoundedCornerShape(6.dp)
+                Box(
+                    Modifier
+                        .width(STRIP_ITEM_W)
+                        .aspectRatio(16f / 9f)
+                        .clip(shape)
+                        .background(Color.White.copy(alpha = 0.10f))
+                        .border(
+                            width = if (selected) 2.dp else 1.dp,
+                            color = if (selected) {
+                                MaterialTheme.colorScheme.primary
+                            } else {
+                                Color.White.copy(alpha = 0.28f)
+                            },
+                            shape = shape,
+                        )
+                        .graphicsLayer { alpha = if (selected) 1f else 0.6f }
+                        .clickable { onSelect(i) },
+                ) {
+                    if (item.thumbnailUrl != null) {
+                        AsyncImage(
+                            model = remember(item) { stripThumbRequest(context, item) },
+                            contentDescription = null,
+                            contentScale = ContentScale.Crop,
+                            modifier = Modifier.fillMaxSize(),
+                        )
+                    } else {
+                        Text(
+                            formatLabel(item),
+                            color = Color.White.copy(alpha = 0.5f),
+                            style = MaterialTheme.typography.labelSmall,
+                            modifier = Modifier.align(Alignment.Center),
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+/**
+ * 胶片条的缩略图请求。键与大图首帧那份缩略图相同 —— 同一个磁盘键指向同一份字节，
+ * 已经拉过的缩略图在这里零下载命中（[previewRequest] 与它共用 `pick_code|thumb`）。
+ */
+private fun stripThumbRequest(context: Context, item: ImageMediaItem): ImageRequest {
+    val builder = ImageRequest.Builder(context).data(item.thumbnailUrl)
+    diskKeyOf(item, "thumb")?.let { builder.diskCacheKey(it) }
+    return builder.build()
+}
 
 /**
  * 顶部信息（文件名 / 页码）的字形阴影：去掉半透明黑带之后，

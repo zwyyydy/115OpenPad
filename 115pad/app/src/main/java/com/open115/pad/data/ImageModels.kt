@@ -18,6 +18,21 @@ data class ImageMediaItem(
     val thumbnailUrl: String?,
     /** 列表直接给的原图直链（有则可完全跳过 downurl 解析） */
     val originUrl: String?,
+    // ---- 以下字段只给详情面板用：列表响应本来就带着，转换时保留下来，不额外发请求 ----
+    /** 父目录 cid */
+    val parentId: String? = null,
+    /** 115 的 SHA-1 校验值 */
+    val sha1: String? = null,
+    /** 上传/修改时间（毫秒）——文件页列表显示的日期就是它 */
+    val upt: Long = 0,
+    /** 用户上传时间（115 的 uppt） */
+    val uppt: Long = 0,
+    /** 115 的 uet（文档里与 upt 同写"修改时间"，语义存疑，见 FileItem 字段注释） */
+    val uet: Long = 0,
+    /** 星标（115 的 ism == 1） */
+    val starred: Boolean = false,
+    /** 扩展名（115 的 ico，已转小写） */
+    val ext: String? = null,
 ) {
     /** 网格 / 大图首帧用的地址：有缩略图用缩略图，实在没有退回原图 */
     val preview: String? get() = thumbnailUrl ?: originUrl
@@ -50,4 +65,11 @@ fun FileItem.toImageMediaItem(): ImageMediaItem = ImageMediaItem(
     pickCode = pc,
     thumbnailUrl = thumb,
     originUrl = uo,
+    parentId = pid,
+    sha1 = sha1,
+    upt = upt,
+    uppt = uppt,
+    uet = uet,
+    starred = ism == 1,
+    ext = ico?.lowercase(),
 )

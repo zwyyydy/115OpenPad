@@ -97,7 +97,8 @@
             android:name=".player.PlayerActivity"
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden"
             android:exported="true"
-            android:supportsPictureInPicture="true">
+            android:supportsPictureInPicture="true"
+            android:theme="@style/Theme.Open115.Player">
 
             <!-- 文件管理器 / 浏览器点开视频、音频 -->
             <intent-filter>

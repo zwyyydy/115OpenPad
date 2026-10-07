@@ -30,7 +30,14 @@ private fun decodeLocalResume(raw: String?): Map<String, Long> = runCatching {
 class PlayerPrefs(private val context: Context) {
 
     val cacheEnabled: Flow<Boolean> = context.playerDataStore.data.map { it[KEY_CACHE_ENABLED] ?: true }
-    val cacheMaxMb: Flow<Int> = context.playerDataStore.data.map { it[KEY_CACHE_MB] ?: 1024 }
+
+    /**
+     * 播放缓存上限（MB）。默认给到 2GB —— 1GB 装不下常见的几 GB 片源，
+     * LRU 一边写一边淘汰，看到一半时前半截已被挤掉，往回拖就要重新下载。
+     * 2GB 能覆盖更长的回退距离（真装不下整部时，还有主播放器那段 30 秒内存后退缓冲保底，
+     * 见 PlayerActivity 的 BACK_BUFFER_MS）。
+     */
+    val cacheMaxMb: Flow<Int> = context.playerDataStore.data.map { it[KEY_CACHE_MB] ?: 2048 }
     val speedBoost: Flow<Float> = context.playerDataStore.data.map { it[KEY_SPEED_BOOST] ?: 2.5f }
     val seekSeconds: Flow<Int> = context.playerDataStore.data.map { it[KEY_SEEK_SECONDS] ?: 10 }
     val subtitlesEnabled: Flow<Boolean> = context.playerDataStore.data.map { it[KEY_SUBS_ENABLED] ?: true }

@@ -1,5 +1,8 @@
 package com.open115.pad.player
 
+import android.content.Context
+import android.net.Uri
+import android.provider.OpenableColumns
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -45,6 +48,8 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import okhttp3.OkHttpClient
 import java.net.URLEncoder
+import java.nio.charset.Charset
+import java.nio.charset.CodingErrorAction
 
 data class XunleiSub(
     val name: String,
@@ -103,6 +108,75 @@ fun mimeForSubtitleExt(ext: String): String = when (ext.lowercase()) {
     "ssa", "ass" -> "text/x-ssa"
     else -> "application/x-subrip"
 }
+
+/** 本机字幕文件的体积上限：字幕都是文本，几十 MB 已经是异常值（挡在按整串文本处理之前） */
+const val MAX_LOCAL_SUBTITLE_BYTES = 32L * 1024 * 1024
+
+/**
+ * 猜字幕格式后缀。SAF 选出来的文件常常没有可信后缀（DISPLAY_NAME 缺失、或 provider
+ * 给个占位名），名认不出来时按内容嗅探——反正都是文本，扫一遍不贵。
+ */
+fun guessSubtitleExt(name: String, bytes: ByteArray): String {
+    val byName = name.substringAfterLast('.', "").lowercase()
+    if (byName in SUBTITLE_EXTS) return byName
+    val head = headText(bytes)
+    return when {
+        head.contains("WEBVTT") -> "vtt"
+        head.contains("[Script Info]") || head.contains("Dialogue:") -> "ass"
+        else -> "srt"
+    }
+}
+
+private val SUBTITLE_EXTS = setOf("srt", "vtt", "ass", "ssa")
+
+/**
+ * 内容里是否找得到时间轴标记（srt/vtt 的 `-->`、ass 的 Dialogue、MicroDVD 的 `{起}{止}`）。
+ * 只扫开头：标记一定在最前面，误选进来的大文件不必整串解码。
+ */
+fun looksLikeSubtitle(bytes: ByteArray): Boolean {
+    val text = headText(bytes)
+    return text.contains("-->") ||
+        text.contains("WEBVTT") ||
+        text.contains("[Script Info]") ||
+        text.contains("Dialogue:") ||
+        Regex("\\{\\d+\\}\\{\\d+\\}").containsMatchIn(text)
+}
+
+/** 按 UTF-8 解出开头一小段（截断到多字节字符中间也只是末尾多一个替换符，不影响找标记） */
+private fun headText(bytes: ByteArray, limit: Int = 64 * 1024): String =
+    String(bytes, 0, minOf(bytes.size, limit), Charsets.UTF_8)
+
+/**
+ * 字幕编码归一：统一转成 UTF-8。
+ * 播放器按 UTF-8 解外挂字幕，国产 srt 常见的 GBK/GB18030 不转会整屏乱码；
+ * 带 UTF-16 BOM 的一并转码，这样「时间轴微调」那条按 UTF-8 读写字节的链路也不会读到乱码。
+ * 纯 ASCII 与 UTF-8（含 BOM）原样返回。
+ */
+fun normalizeSubtitleEncoding(bytes: ByteArray): ByteArray {
+    if (bytes.size >= 2 && bytes[0] == 0xFF.toByte() && bytes[1] == 0xFE.toByte()) {
+        return String(bytes, Charsets.UTF_16LE).removePrefix("\uFEFF").toByteArray(Charsets.UTF_8)
+    }
+    if (bytes.size >= 2 && bytes[0] == 0xFE.toByte() && bytes[1] == 0xFF.toByte()) {
+        return String(bytes, Charsets.UTF_16BE).removePrefix("\uFEFF").toByteArray(Charsets.UTF_8)
+    }
+    if (isStrictUtf8(bytes)) return bytes
+    return String(bytes, Charset.forName("GB18030")).toByteArray(Charsets.UTF_8)
+}
+
+/** 严格按 UTF-8 试解一遍（不许替换字符），解不动说明不是 UTF-8 文本 */
+private fun isStrictUtf8(bytes: ByteArray): Boolean = runCatching {
+    Charsets.UTF_8.newDecoder()
+        .onMalformedInput(CodingErrorAction.REPORT)
+        .onUnmappableCharacter(CodingErrorAction.REPORT)
+        .decode(java.nio.ByteBuffer.wrap(bytes))
+    true
+}.getOrDefault(false)
+
+/** SAF 的 uri 经常拿不出文件名，查 DISPLAY_NAME（与上传链路同款做法） */
+fun queryDisplayName(context: Context, uri: Uri): String? = runCatching {
+    context.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)
+        ?.use { c -> if (c.moveToFirst()) c.getString(0)?.takeIf { it.isNotBlank() } else null }
+}.getOrNull()
 
 /** 把字幕时间轴整体平移 offsetMs（支持 srt/vtt 的 --> 行和 ass 的 Dialogue 行），负值提前 */
 fun shiftSubtitleTimestamps(bytes: ByteArray, offsetMs: Long): ByteArray {

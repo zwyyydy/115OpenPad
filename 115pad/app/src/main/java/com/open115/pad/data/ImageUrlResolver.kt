@@ -219,6 +219,45 @@ class ImageUrlResolver(
         return cachedPoster(pickCode, cacheDir)?.absolutePath
     }
 
+    /**
+     * 从一批 pick_code 里挑出**已经在本地**的那些（保序，最多 [limit] 个），返回能直接交给
+     * 图片加载器的本地路径。
+     *
+     * 与逐个调 [cachedPosterIfPresent] 的差别只在"怎么判断在不在本地"：那边每个 pick_code
+     * 一次 stat，这边是把缓存目录**列一遍**、再拿每个 pick_code 的哈希去比对文件名。
+     * 给"库列表页铺背景图 / 铺封面条"用 —— 它的候选是一个库的几千条 fanart，
+     * 逐个 stat 是几千次系统调用；而且探测顺序一旦不巧（缓存里的那几张排在后面）就等于白探，
+     * 随手取前 N 个更是必然漏。这里对全量候选都只是一次集合查找。
+     *
+     * `img_<hashCode>.bin` 是缓存文件命名规则的**唯一来源**（[targetOf]），所以比对就是查这个文件名。
+     *
+     * ★ 只读本地，**绝不解析直链、绝不下载**（同 [cachedPosterIfPresent]）；命中会把 mtime
+     *   顶一下，免得常看的那几张被 LRU 当成最旧的先淘汰。
+     */
+    suspend fun cachedAmong(pickCodes: List<String>, cacheDir: File, limit: Int = 1): List<String> {
+        if (pickCodes.isEmpty() || limit <= 0 || !mediaCacheEnabled()) return emptyList()
+        val dir = File(cacheDir, MEDIA_DIR)
+        return withContext(Dispatchers.IO) {
+            val names = runCatching { dir.list() }.getOrNull()?.toHashSet()
+                ?: return@withContext emptyList()
+            if (names.isEmpty()) return@withContext emptyList()
+            val hits = ArrayList<String>(limit)
+            // 去重：同一个 pick_code 重复出现时不能把同一张海报铺两次
+            val seen = HashSet<String>()
+            for (code in pickCodes) {
+                if (code.isBlank() || !seen.add(code)) continue
+                val file = targetOf(dir, code)
+                if (file.name !in names) continue
+                // 空文件当作没缓存（落盘中途被杀会留下 0 字节的临时文件）
+                if (file.length() <= 0L) continue
+                file.setLastModified(System.currentTimeMillis())
+                hits.add(file.absolutePath)
+                if (hits.size >= limit) break
+            }
+            hits
+        }
+    }
+
     // ---------------- 没海报的片：拿背景图裁一张出来 ----------------
     //
     // 背景图（fanart）是 16:9 横图、海报是竖图。取背景图的**右半部分**就得到一张 0.89

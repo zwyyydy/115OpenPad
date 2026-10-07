@@ -3,6 +3,7 @@ package com.open115.pad.ui.files
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -21,6 +22,7 @@ import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.grid.rememberLazyGridState
 import androidx.compose.foundation.lazy.items as listItems
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.PushPin
@@ -28,6 +30,7 @@ import androidx.compose.material.icons.outlined.Check
 import androidx.compose.material.icons.outlined.Category
 import androidx.compose.material.icons.outlined.ChevronRight
 import androidx.compose.material.icons.outlined.CloudDownload
+import androidx.compose.material.icons.outlined.Collections
 import androidx.compose.material.icons.outlined.ContentCopy
 import androidx.compose.material.icons.outlined.CreateNewFolder
 import androidx.compose.material.icons.outlined.Dashboard
@@ -41,6 +44,7 @@ import androidx.compose.material.icons.outlined.GridView
 import androidx.compose.material.icons.outlined.PushPin
 import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material.icons.outlined.Search
+import androidx.compose.material.icons.outlined.Splitscreen
 import androidx.compose.material.icons.outlined.SelectAll
 import androidx.compose.material.icons.outlined.Star
 import androidx.compose.material.icons.outlined.StarBorder
@@ -136,9 +140,19 @@ fun FilesBrowserPane(
     onOpenFilterRules: () -> Unit,
     /** 分类整理：点顶栏按键，弹确认框（确认与否由 FilesScreen 决定） */
     onOrganize: () -> Unit = {},
+    /** 查找重复文件：点顶栏按键，把"从当前层开始扫"的请求交给上层，面板渲染在内容区之上 */
+    onFindDuplicates: () -> Unit = {},
+    /** 生成视频预览图：同上，把"从当前层开始抓帧"的请求交给上层（只读，不动云端） */
+    onGeneratePreviews: () -> Unit = {},
+    /** 列表里是否显示视频预览条（设置 → 界面可关） */
+    showVideoStrip: Boolean = true,
+    /** 双面板模式开关：开=内容区换成左右两栏（类 MT 管理器，跨栏快速移动） */
+    dualPaneOn: Boolean = false,
+    onToggleDualPane: () -> Unit = {},
     /** 分类整理进行中的进度快照；null 或 running=false 时横幅不显示 */
     organizing: com.open115.pad.data.FileOrganizer.Progress? = null,
-    /** 横幅上的「停止」 */
+    /** 横幅上的「例外」（勾选不整理的文件/夹，执行中随时可改）与「停止」 */
+    onOrganizeExclusions: () -> Unit = {},
     onStopOrganize: () -> Unit = {},
     /** 拖动到快捷目录的会话；null（窄屏没有侧栏）时拖动整体不启用 */
     quickDirDrag: QuickDirDragHost? = null,
@@ -187,105 +201,131 @@ fun FilesBrowserPane(
                     }
                 },
                 actions = {
-                    // 分类整理：递归扫当前目录，把文件按类型移进本目录的六个分类文件夹 + 其他。
-                    // 放最左（漏斗前面），是低频但一用就是"大动作"的入口
-                    IconButton(onClick = onOrganize) {
-                        Icon(Icons.Outlined.Category, contentDescription = "分类整理")
-                    }
-                    // 入口 B：高级过滤总开关（漏斗）。
-                    // 有生效方案 → 点击开/关过滤（开启高亮主色）；
-                    // 没有生效方案 → 点击跳转规则配置中心（而不是做成点不动的死按钮）。
-                    val filterOn by vm.filterOn.collectAsState()
-                    val hasScheme by vm.hasEnabledScheme.collectAsState()
-                    IconButton(
-                        onClick = {
-                            if (hasScheme) vm.setFilterOn(!filterOn) else onOpenFilterRules()
-                        },
+                    // ★ 手机模式下这一排放不下（10 个按键 ×48dp 远超屏宽）：定长的话右边几个
+                    //   （上传/刷新…）被直接裁掉，怎么点都点不到 —— 所以整排**横向可滑**。
+                    //   宽屏下内容比可用宽度窄，摆放位置与原来完全一样（贴右边），没有额外代价；
+                    //   放不下时才滑得动，且**最后一个按键被裁一半**本身就是"还能往右滑"的提示。
+                    Row(
+                        modifier = Modifier.horizontalScroll(rememberScrollState()),
+                        verticalAlignment = Alignment.CenterVertically,
                     ) {
-                        Icon(
-                            Icons.Outlined.FilterAlt,
-                            contentDescription = if (hasScheme) "高级过滤开关" else "高级过滤：去创建规则",
-                            tint = when {
-                                // 过滤生效中：主色高亮（开关开 + 当前目录解析出了方案）
-                                hasScheme && filterOn && ui.activeFilter != null ->
-                                    MaterialTheme.colorScheme.primary
-                                else -> MaterialTheme.colorScheme.onSurfaceVariant
-                            },
-                        )
-                    }
-                    IconButton(onClick = onSearchToggle) {
-                        Icon(Icons.Outlined.Search, contentDescription = "搜索")
-                    }
-                    Box {
-                        IconButton(onClick = { sortMenuOpen = true }) {
-                            Icon(Icons.Outlined.FilterList, contentDescription = "排序")
+                        // 分类整理：递归扫当前目录，把文件按类型移进本目录的六个分类文件夹 + 其他。
+                        // 放最左（漏斗前面），是低频但一用就是"大动作"的入口
+                        IconButton(onClick = onOrganize) {
+                            Icon(Icons.Outlined.Category, contentDescription = "分类整理")
                         }
-                        DropdownMenu(expanded = sortMenuOpen, onDismissRequest = { sortMenuOpen = false }) {
-                            sortOptions.forEach { (key, label) ->
+                        // 查找重复文件：按 sha1 找内容完全相同的副本（同样是"大动作"，紧挨着整理）
+                        IconButton(onClick = onFindDuplicates) {
+                            Icon(Icons.Outlined.ContentCopy, contentDescription = "查找重复")
+                        }
+                        // 生成视频预览图：抓最小转码档的一帧当缩略图（只读，不动云端）
+                        IconButton(onClick = onGeneratePreviews) {
+                            Icon(Icons.Outlined.Collections, contentDescription = "生成视频预览图")
+                        }
+                        // 双面板（类 MT 管理器）：开启高亮主色，再点一次退出
+                        IconButton(onClick = onToggleDualPane) {
+                            Icon(
+                                Icons.Outlined.Splitscreen,
+                                contentDescription = if (dualPaneOn) "退出双面板" else "双面板模式",
+                                tint = if (dualPaneOn) MaterialTheme.colorScheme.primary
+                                else MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                        // 入口 B：高级过滤总开关（漏斗）。
+                        // 有生效方案 → 点击开/关过滤（开启高亮主色）；
+                        // 没有生效方案 → 点击跳转规则配置中心（而不是做成点不动的死按钮）。
+                        val filterOn by vm.filterOn.collectAsState()
+                        val hasScheme by vm.hasEnabledScheme.collectAsState()
+                        IconButton(
+                            onClick = {
+                                if (hasScheme) vm.setFilterOn(!filterOn) else onOpenFilterRules()
+                            },
+                        ) {
+                            Icon(
+                                Icons.Outlined.FilterAlt,
+                                contentDescription = if (hasScheme) "高级过滤开关" else "高级过滤：去创建规则",
+                                tint = when {
+                                    // 过滤生效中：主色高亮（开关开 + 当前目录解析出了方案）
+                                    hasScheme && filterOn && ui.activeFilter != null ->
+                                        MaterialTheme.colorScheme.primary
+                                    else -> MaterialTheme.colorScheme.onSurfaceVariant
+                                },
+                            )
+                        }
+                        IconButton(onClick = onSearchToggle) {
+                            Icon(Icons.Outlined.Search, contentDescription = "搜索")
+                        }
+                        Box {
+                            IconButton(onClick = { sortMenuOpen = true }) {
+                                Icon(Icons.Outlined.FilterList, contentDescription = "排序")
+                            }
+                            DropdownMenu(expanded = sortMenuOpen, onDismissRequest = { sortMenuOpen = false }) {
+                                sortOptions.forEach { (key, label) ->
+                                    DropdownMenuItem(
+                                        text = { Text(label) },
+                                        leadingIcon = {
+                                            if (ui.order == key) {
+                                                Icon(Icons.Outlined.Check, contentDescription = null)
+                                            }
+                                        },
+                                        onClick = {
+                                            vm.setSort(key, ui.asc)
+                                            sortMenuOpen = false
+                                        },
+                                    )
+                                }
+                                HorizontalDivider()
                                 DropdownMenuItem(
-                                    text = { Text(label) },
-                                    leadingIcon = {
-                                        if (ui.order == key) {
-                                            Icon(Icons.Outlined.Check, contentDescription = null)
-                                        }
-                                    },
+                                    text = { Text(if (ui.asc == 1) "改为降序" else "改为升序") },
                                     onClick = {
-                                        vm.setSort(key, ui.asc)
+                                        vm.setSort(ui.order, if (ui.asc == 1) 0 else 1)
                                         sortMenuOpen = false
                                     },
                                 )
                             }
-                            HorizontalDivider()
-                            DropdownMenuItem(
-                                text = { Text(if (ui.asc == 1) "改为降序" else "改为升序") },
-                                onClick = {
-                                    vm.setSort(ui.order, if (ui.asc == 1) 0 else 1)
-                                    sortMenuOpen = false
+                        }
+                        // 视图三态循环：列表 → 小图标 → 大图标。图标显示当前模式
+                        IconButton(onClick = { vm.setViewMode((ui.viewMode + 1) % 3) }) {
+                            Icon(
+                                when (ui.viewMode) {
+                                    0 -> Icons.Outlined.ViewList
+                                    1 -> Icons.Outlined.GridView
+                                    else -> Icons.Outlined.Dashboard
                                 },
+                                contentDescription = "切换视图（列表 / 小图标 / 大图标）",
                             )
                         }
-                    }
-                    // 视图三态循环：列表 → 小图标 → 大图标。图标显示当前模式
-                    IconButton(onClick = { vm.setViewMode((ui.viewMode + 1) % 3) }) {
-                        Icon(
-                            when (ui.viewMode) {
-                                0 -> Icons.Outlined.ViewList
-                                1 -> Icons.Outlined.GridView
-                                else -> Icons.Outlined.Dashboard
-                            },
-                            contentDescription = "切换视图（列表 / 小图标 / 大图标）",
-                        )
-                    }
-                    IconButton(onClick = onCreateFolder) {
-                        Icon(Icons.Outlined.CreateNewFolder, contentDescription = "新建文件夹")
-                    }
-                    // 上传：文件 / 文件夹（SAF 目录树）二选一
-                    var uploadMenuOpen by remember { mutableStateOf(false) }
-                    Box {
-                        IconButton(onClick = { uploadMenuOpen = true }) {
-                            Icon(Icons.Outlined.Upload, contentDescription = "上传")
+                        IconButton(onClick = onCreateFolder) {
+                            Icon(Icons.Outlined.CreateNewFolder, contentDescription = "新建文件夹")
                         }
-                        DropdownMenu(expanded = uploadMenuOpen, onDismissRequest = { uploadMenuOpen = false }) {
-                            DropdownMenuItem(
-                                text = { Text("上传文件") },
-                                leadingIcon = { Icon(Icons.Outlined.Upload, contentDescription = null) },
-                                onClick = {
-                                    uploadMenuOpen = false
-                                    onUpload()
-                                },
-                            )
-                            DropdownMenuItem(
-                                text = { Text("上传文件夹") },
-                                leadingIcon = { Icon(Icons.Outlined.DriveFileMove, contentDescription = null) },
-                                onClick = {
-                                    uploadMenuOpen = false
-                                    onUploadFolder()
-                                },
-                            )
+                        // 上传：文件 / 文件夹（SAF 目录树）二选一
+                        var uploadMenuOpen by remember { mutableStateOf(false) }
+                        Box {
+                            IconButton(onClick = { uploadMenuOpen = true }) {
+                                Icon(Icons.Outlined.Upload, contentDescription = "上传")
+                            }
+                            DropdownMenu(expanded = uploadMenuOpen, onDismissRequest = { uploadMenuOpen = false }) {
+                                DropdownMenuItem(
+                                    text = { Text("上传文件") },
+                                    leadingIcon = { Icon(Icons.Outlined.Upload, contentDescription = null) },
+                                    onClick = {
+                                        uploadMenuOpen = false
+                                        onUpload()
+                                    },
+                                )
+                                DropdownMenuItem(
+                                    text = { Text("上传文件夹") },
+                                    leadingIcon = { Icon(Icons.Outlined.DriveFileMove, contentDescription = null) },
+                                    onClick = {
+                                        uploadMenuOpen = false
+                                        onUploadFolder()
+                                    },
+                                )
+                            }
                         }
-                    }
-                    IconButton(onClick = { vm.refresh() }) {
-                        Icon(Icons.Outlined.Refresh, contentDescription = "刷新")
+                        IconButton(onClick = { vm.refresh() }) {
+                            Icon(Icons.Outlined.Refresh, contentDescription = "刷新")
+                        }
                     }
                 },
             )
@@ -400,17 +440,28 @@ fun FilesBrowserPane(
                         modifier = Modifier.size(14.dp),
                     )
                     Text(
-                        if (p.phase == com.open115.pad.data.FileOrganizer.Phase.MOVE) {
-                            "分类整理中：已移动 ${p.movedFiles}/${p.totalToMove} 项" +
-                                (if (p.failed > 0) "，失败 ${p.failed}" else "")
-                        } else {
-                            "分类整理中：已扫描 ${p.scannedDirs} 个目录，发现 ${p.foundFiles} 个文件"
+                        when (p.phase) {
+                            com.open115.pad.data.FileOrganizer.Phase.MOVE ->
+                                "分类整理中：已移动 ${p.movedFiles}/${p.totalToMove} 项" +
+                                    (if (p.failed > 0) "，失败 ${p.failed}" else "")
+                            com.open115.pad.data.FileOrganizer.Phase.CLEANUP ->
+                                "分类整理中：正在清理空文件夹…"
+                            else ->
+                                "分类整理中：已扫描 ${p.scannedDirs} 个目录，发现 ${p.foundFiles} 个文件"
                         },
                         style = MaterialTheme.typography.labelSmall,
                         color = com.open115.pad.ui.theme.AppColors.TextSecondary,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
                         modifier = Modifier.weight(1f).padding(start = 6.dp),
+                    )
+                    Text(
+                        "例外",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = com.open115.pad.ui.theme.AppColors.AccentDeep,
+                        modifier = Modifier
+                            .clickable { onOrganizeExclusions() }
+                            .padding(horizontal = 6.dp, vertical = 2.dp),
                     )
                     Text(
                         "停止",
@@ -486,37 +537,69 @@ fun FilesBrowserPane(
             return if (i < 0) 0 else i
         }
 
-        // 滚动位置的键：目录用 cid；**搜索结果单独一档**（关键词进键）——
-        // 结果列表与来源目录的列表根本不是一回事，共用一份偏移只会互相串位；
-        // 分开之后"结果 → 点进子目录 → 回到结果"能把结果停在原处。
-        val scrollKey = if (ui.searching) "search:${ui.searchQuery}" else ui.stack.last().cid
-        var lastKey by remember { mutableStateOf(scrollKey) }
-        var pendingRestore by remember { mutableStateOf<String?>(null) }
-
-        // 目录/视图切换：先把上一个位置存下来，并标记待恢复的目标
-        LaunchedEffect(scrollKey) {
-            if (scrollKey == lastKey) return@LaunchedEffect
-            listScroll[lastKey] = listAnchor()
-            gridScroll[lastKey] = gridAnchor()
-            lastKey = scrollKey
-            pendingRestore = scrollKey
+        /** 条目高亮目标在列表里的下标；没有高亮 / 不在当前列表里 = -1 */
+        fun highlightIndex(): Int {
+            val h = ui.highlight ?: return -1
+            return ui.display.indexOfFirst { it.fn == h }
         }
 
-        // 恢复必须等**新目录的数据到位之后**：LazyColumn 是按 item key 记忆位置的，
-        // 数据还是上一级目录时恢复会被随后的整表替换重置回顶部（实测踩过）。
-        // 等的是 display（不是 items）：过滤/置顶重排后的列表才是要定位的那一份。
-        LaunchedEffect(scrollKey, ui.loading, ui.display) {
-            if (ui.loading || pendingRestore != scrollKey) return@LaunchedEffect
-            pendingRestore = null
-            // 只恢复当前显示模式那一个（另一个没在组合里，别去碰它）；没有记录就从顶部开始
+        /** 这一条是不是"从操作记录跳过来要指认的"；是就给出这次请求的序号（当闪烁动画的 key），不是 = null */
+        fun highlightSeqOf(item: FileItem): Long? =
+            ui.highlight?.takeIf { it == item.fn }?.let { ui.highlightSeq }
+
+        // 滚动位置记忆的键 = ui.displayKey（目录 cid；**搜索结果单独一档**，"search:关键词"进键）——
+        // 结果列表与来源目录的列表根本不是一回事，共用一份偏移只会互相串位。
+        //
+        // 为什么不再"键变化那一刻补存旧键的位置"：那一刻 items 可能已经被新目录的数据换掉了
+        // （缓存命中的话还是同步换的），存下去的是新列表的锚点，等于把旧位置记坏 ——
+        // "从子目录返回上级，有很大概率回不到原位置"的真因正是它（新目录的 display 一到、
+        // 待恢复标记已被消费，恢复就再也不会发生了）。改成**实时跟踪**：数据属于哪个视角
+        // （displayKey），锚点就记在哪个键下；键变化的瞬间显示的还是旧数据时，旧键的值根本不动。
+
+        // 【恢复】displayKey 变化 = 新视角的数据连同派生列表真的到了：滚回它自己的旧位置。
+        // 必须声明在【跟踪】前面：同一帧里先恢复、跟踪效果晚一点才开始写，待恢复的值不会被覆写。
+        LaunchedEffect(ui.displayKey) {
+            val key = ui.displayKey ?: return@LaunchedEffect
+            // "从操作记录跳过来指认某个文件"且目标在列表里：滚动交给下面那个效果，
+            // 这里不恢复旧锚点（两者都想动同一个列表，只会互相打架）；
+            // 返回上级的闪烁（scrollToHighlight=false）不在此列，照常恢复位置
+            if (ui.highlight != null && ui.scrollToHighlight && highlightIndex() >= 0) return@LaunchedEffect
+            // 只恢复当前显示模式那一份；没有记录（首次进这个目录）就从顶部开始
+            val saved = if (ui.viewMode != 0) gridScroll[key] else listScroll[key]
+            if (saved == null) return@LaunchedEffect
             runCatching {
                 if (ui.viewMode != 0) {
-                    val (k, o) = gridScroll[scrollKey] ?: (null to 0)
-                    gridState.scrollToItem(anchorIndex(k), o)
+                    gridState.scrollToItem(anchorIndex(saved.first), saved.second)
                 } else {
-                    val (k, o) = listScroll[scrollKey] ?: (null to 0)
-                    listState.scrollToItem(anchorIndex(k), o)
+                    listState.scrollToItem(anchorIndex(saved.first), saved.second)
                 }
+            }
+        }
+
+        // 【跟踪】边看边记：当前显示模式的锚点实时写进当前 displayKey 名下（另一个模式没在
+        // 显示，别去碰它）。恢复那次 scrollToItem 引起的锚点变化也会写回来 —— 写的就是同一位置。
+        LaunchedEffect(ui.displayKey, ui.viewMode) {
+            val key = ui.displayKey ?: return@LaunchedEffect
+            if (ui.viewMode != 0) {
+                snapshotFlow { gridAnchor() }.collect { gridScroll[key] = it }
+            } else {
+                snapshotFlow { listAnchor() }.collect { listScroll[key] = it }
+            }
+        }
+
+        // 高亮的那一条要**滚进视野**（仅限"要滚动"的指认，见 UiState.scrollToHighlight）：
+        // 落在屏幕外的高亮等于没加。同一序号只滚一次（用户之后自己翻页/加载更多都不再动列表）；
+        // 目标暂时不在当前列表里（还在分页路上）就不标记，等 display 变化后重试。
+        var scrolledSeq by remember { mutableStateOf(-1L) }
+        LaunchedEffect(ui.highlightSeq, ui.display, ui.scrollToHighlight) {
+            if (ui.highlight == null || !ui.scrollToHighlight || ui.highlightSeq == scrolledSeq) {
+                return@LaunchedEffect
+            }
+            val i = highlightIndex()
+            if (i < 0) return@LaunchedEffect
+            scrolledSeq = ui.highlightSeq
+            runCatching {
+                if (ui.viewMode != 0) gridState.animateScrollToItem(i) else listState.animateScrollToItem(i)
             }
         }
 
@@ -588,6 +671,7 @@ fun FilesBrowserPane(
                                     selectMode = ui.selectMode,
                                     selected = item.fid in ui.selection,
                                     large = ui.viewMode == 2,
+                                    highlightSeq = highlightSeqOf(item),
                                     onClick = { onActivate(item) },
                                     onLongClick = if (ui.selectMode) null else ({ vm.toggleSelect(item.fid) }),
                                 )
@@ -613,10 +697,12 @@ fun FilesBrowserPane(
                             ) {
                                 FileListRow(
                                     item = item,
+                                    showVideoStrip = showVideoStrip,
                                     pinned = item.fid in pinnedIds,
                                     selectMode = ui.selectMode,
                                     selected = item.fid in ui.selection,
                                     lastViewed = viewTimes["${ui.stack.last().cid}/${item.fn}"] ?: 0L,
+                                    highlightSeq = highlightSeqOf(item),
                                     onClick = { onActivate(item) },
                                     // 多选态长按让位给"拖动"（见 QuickDirDragSource 注释），增删选择走勾选框/点按
                                     onLongClick = if (ui.selectMode) null else ({ vm.toggleSelect(item.fid) }),
@@ -659,40 +745,51 @@ fun FilesBrowserPane(
                         contentDescription = if (allSelected) "取消全选" else "全选",
                     )
                 }
-                Box(Modifier.weight(1f))
-                IconButton(onClick = onDownload, enabled = filesSelected > 0) {
-                    Icon(Icons.Outlined.CloudDownload, contentDescription = "下载")
-                }
-                IconButton(onClick = onMove, enabled = !ui.searching) {
-                    Icon(Icons.Outlined.DriveFileMove, contentDescription = "移动")
-                }
-                IconButton(onClick = onCopy, enabled = !ui.searching) {
-                    Icon(Icons.Outlined.ContentCopy, contentDescription = "复制")
-                }
-                // 重命名：单选走原来的对话框（快、老习惯不变），多选才进批量面板
-                IconButton(
-                    onClick = { if (single != null) onRename(single) else onBatchRename() },
-                    enabled = ui.selection.isNotEmpty(),
+                // ★ 右边这一批动作键在手机模式下放不下（7 个 ×48dp，加上左边那组远超屏宽）：
+                //   定长的话靠右的「星标/置顶/删除」被裁掉、怎么点都点不到 —— 所以让**这一批**
+                //   横向可滑；左边「取消选择 + 已选 N 项 + 全选」钉住不动（多选时最要紧的
+                //   就是这个数与出口，不能跟着滑走）。
+                //   weight(1f) 分到的是"扣掉左边固定项之后剩下的宽度"：宽屏下内容比它窄，
+                //   Arrangement.End 照样把它们贴右边（与改前完全一样），放不下才滑得动。
+                Row(
+                    modifier = Modifier.weight(1f).horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.End,
+                    verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    Icon(Icons.Outlined.Edit, contentDescription = "重命名")
-                }
-                IconButton(onClick = { single?.let(onStar) }, enabled = single != null) {
-                    Icon(Icons.Outlined.StarBorder, contentDescription = "星标")
-                }
-                // 置顶：只对文件夹有意义，所以选择集里至少有一个文件夹时按钮才可用
-                //（夹在里面的文件会被忽略）。这些文件夹若已全部置顶，按钮转为实心态。
-                val pinTargets = ui.items.filter { it.isDir && it.fid in ui.selection }
-                val allPinned = pinTargets.isNotEmpty() && pinTargets.all { it.fid in ui.pinnedIds }
-                IconButton(onClick = { onPin(pinTargets) }, enabled = pinTargets.isNotEmpty()) {
-                    Icon(
-                        if (allPinned) Icons.Filled.PushPin else Icons.Outlined.PushPin,
-                        contentDescription = if (allPinned) "取消置顶" else "置顶",
-                        tint = if (allPinned) com.open115.pad.ui.theme.AppColors.AccentDeep
-                        else androidx.compose.material3.LocalContentColor.current,
-                    )
-                }
-                IconButton(onClick = onDelete) {
-                    Icon(Icons.Outlined.Delete, contentDescription = "删除")
+                    IconButton(onClick = onDownload, enabled = filesSelected > 0) {
+                        Icon(Icons.Outlined.CloudDownload, contentDescription = "下载")
+                    }
+                    IconButton(onClick = onMove, enabled = !ui.searching) {
+                        Icon(Icons.Outlined.DriveFileMove, contentDescription = "移动")
+                    }
+                    IconButton(onClick = onCopy, enabled = !ui.searching) {
+                        Icon(Icons.Outlined.ContentCopy, contentDescription = "复制")
+                    }
+                    // 重命名：单选走原来的对话框（快、老习惯不变），多选才进批量面板
+                    IconButton(
+                        onClick = { if (single != null) onRename(single) else onBatchRename() },
+                        enabled = ui.selection.isNotEmpty(),
+                    ) {
+                        Icon(Icons.Outlined.Edit, contentDescription = "重命名")
+                    }
+                    IconButton(onClick = { single?.let(onStar) }, enabled = single != null) {
+                        Icon(Icons.Outlined.StarBorder, contentDescription = "星标")
+                    }
+                    // 置顶：只对文件夹有意义，所以选择集里至少有一个文件夹时按钮才可用
+                    //（夹在里面的文件会被忽略）。这些文件夹若已全部置顶，按钮转为实心态。
+                    val pinTargets = ui.items.filter { it.isDir && it.fid in ui.selection }
+                    val allPinned = pinTargets.isNotEmpty() && pinTargets.all { it.fid in ui.pinnedIds }
+                    IconButton(onClick = { onPin(pinTargets) }, enabled = pinTargets.isNotEmpty()) {
+                        Icon(
+                            if (allPinned) Icons.Filled.PushPin else Icons.Outlined.PushPin,
+                            contentDescription = if (allPinned) "取消置顶" else "置顶",
+                            tint = if (allPinned) com.open115.pad.ui.theme.AppColors.AccentDeep
+                            else androidx.compose.material3.LocalContentColor.current,
+                        )
+                    }
+                    IconButton(onClick = onDelete) {
+                        Icon(Icons.Outlined.Delete, contentDescription = "删除")
+                    }
                 }
             }
         }

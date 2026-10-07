@@ -27,6 +27,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.ArrowBack
 import androidx.compose.material.icons.outlined.ChevronRight
+import androidx.compose.material.icons.outlined.Edit
 import androidx.compose.material.icons.outlined.ExpandLess
 import androidx.compose.material.icons.outlined.Info
 import androidx.compose.material3.Card
@@ -34,6 +35,9 @@ import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
+import androidx.compose.material3.TextButton
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Switch
@@ -65,10 +69,14 @@ import coil.compose.SubcomposeAsyncImage
 import com.open115.pad.AppContainer
 import com.open115.pad.data.ImageUrlResolver
 import com.open115.pad.data.OpenApi
+import com.open115.pad.data.BackupKind
+import com.open115.pad.data.BackupManager
+import com.open115.pad.data.BackupPrefs
 import com.open115.pad.data.StartPage
 import com.open115.pad.data.ThemeMode
 import com.open115.pad.data.UserInfo
 import com.open115.pad.data.media.PadSync
+import com.open115.pad.data.media.ActorAvatarSource
 import com.open115.pad.ui.components.ConfirmDialog
 import com.open115.pad.ui.components.FolderPickerDialog
 import com.open115.pad.ui.components.TextEntryDialog
@@ -77,7 +85,9 @@ import com.open115.pad.ui.theme.AppColors
 import com.open115.pad.ui.theme.AppSlider
 import com.open115.pad.ui.theme.SectionHeader
 import com.open115.pad.util.Format
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlin.math.roundToInt
@@ -211,11 +221,15 @@ fun SettingsScreen(container: AppContainer) {
     val seekSeconds by container.playerPrefs.seekSeconds.collectAsState(initial = 10)
     val miniProgress by container.playerPrefs.alwaysShowMiniProgress.collectAsState(initial = true)
     val playerCacheEnabled by container.playerPrefs.cacheEnabled.collectAsState(initial = true)
-    val playerCacheMaxMb by container.playerPrefs.cacheMaxMb.collectAsState(initial = 1024)
+    val playerCacheMaxMb by container.playerPrefs.cacheMaxMb.collectAsState(initial = 2048)
+    val previewCacheMaxMb by container.previewPrefs.maxMb
+        .collectAsState(initial = com.open115.pad.data.PreviewPrefs.DEFAULT_MAX_MB)
     val showClock by container.playerPrefs.showClock.collectAsState(initial = true)
     val showBattery by container.playerPrefs.showBattery.collectAsState(initial = true)
     val showNetSpeed by container.playerPrefs.showNetSpeed.collectAsState(initial = true)
     val showSpecBadge by container.playerPrefs.showSpecBadge.collectAsState(initial = true)
+    /** 列表里的视频预览条开关（文件页那套缓存照旧，只是显示与否） */
+    val videoStrip by container.filesPrefs.videoStrip.collectAsState(initial = true)
     val subtitleTextSize by container.playerPrefs.subtitleTextSize.collectAsState(initial = 18f)
     val subtitleBottomPercent by container.playerPrefs.subtitleBottomPercent.collectAsState(initial = 0)
     val softwareDecode by container.playerPrefs.softwareDecode.collectAsState(initial = false)
@@ -248,8 +262,52 @@ fun SettingsScreen(container: AppContainer) {
     val padDirName by container.mediaPrefs.padSignalName.collectAsState(initial = "")
     val padPollMinutes by container.mediaPrefs.padPollMinutes.collectAsState(initial = 10)
     val padLastAt by container.mediaPrefs.padLastAt.collectAsState(initial = 0L)
+    // ---- 演员头像源（实验室）----
+    val avatarSourceEnabled by container.mediaPrefs.avatarSourceEnabled.collectAsState(initial = false)
+    val avatarSourceUrl by container.mediaPrefs.avatarSourceUrl.collectAsState(initial = ActorAvatarSource.DEFAULT_BASE)
+    val avatarIndexCount by container.mediaPrefs.avatarIndexCount.collectAsState(initial = 0)
+    val avatarIndexAt by container.mediaPrefs.avatarIndexAt.collectAsState(initial = 0L)
+    val avatarCoverageHit by container.mediaPrefs.avatarCoverageHit.collectAsState(initial = 0)
+    val avatarCoverageTotal by container.mediaPrefs.avatarCoverageTotal.collectAsState(initial = 0)
+    var avatarRefreshing by remember { mutableStateOf(false) }
+    var avatarError by remember { mutableStateOf("") }
+
+    /**
+     * 拉头像索引 + 建本地紧凑索引 + 算覆盖率。
+     *
+     * ★ 用 container.okHttpClient（**不带 115 限速那个**）：限速拦截器是给 115 接口用的，
+     *   第三方 CDN 不该被它拖慢，更不该去占 115 的节流额度。
+     */
+    fun refreshAvatarIndex() {
+        if (avatarRefreshing) return
+        avatarRefreshing = true
+        avatarError = ""
+        scope.launch {
+            runCatching {
+                ActorAvatarSource.refresh(
+                    client = container.okHttpClient,
+                    base = avatarSourceUrl.ifBlank { ActorAvatarSource.DEFAULT_BASE },
+                    filesDir = context.filesDir,
+                    libraryNames = container.mediaDatabase.mediaDao().allActorNames(),
+                )
+            }.onSuccess { res ->
+                container.mediaPrefs.setAvatarIndex(res.count, System.currentTimeMillis(), res.hit, res.total)
+                android.widget.Toast.makeText(
+                    context,
+                    "索引 ${res.count} 条，本库 ${res.hit}/${res.total} 个演员能对上",
+                    android.widget.Toast.LENGTH_LONG,
+                ).show()
+            }.onFailure {
+                avatarError = "更新失败：${it.message ?: it.javaClass.simpleName}"
+                android.widget.Toast.makeText(context, avatarError, android.widget.Toast.LENGTH_LONG).show()
+            }
+            avatarRefreshing = false
+        }
+    }
     val padNote by container.mediaPrefs.padLastNote.collectAsState(initial = "")
     var showPadPickDir by remember { mutableStateOf(false) }
+    /** 「手动同步文件」对话框（挑一份信号、比对、按需排同步） */
+    var showManualSync by remember { mutableStateOf(false) }
     /** 手动同步在跑（「立即同步」那行顺便当进度提示用） */
     var padSyncing by remember { mutableStateOf(false) }
 
@@ -264,6 +322,7 @@ fun SettingsScreen(container: AppContainer) {
             mediaTextBytes = container.mediaCache.sizeBytes(),
             mediaPosterBytes = ImageUrlResolver.mediaCacheSizeBytes(container.cacheDir),
             hugeBytes = ImageUrlResolver.hugeCacheSizeBytes(context.cacheDir),
+            previewBytes = container.videoPreviews.sizeBytes(),
             imageBytes = withContext(Dispatchers.IO) { coilCacheBytes(context) },
         )
     }
@@ -271,6 +330,8 @@ fun SettingsScreen(container: AppContainer) {
 
     // ---- 后台任务（防止被杀）----
     val keepAlive by container.appPrefs.keepAlive.collectAsState(initial = false)
+    val apiRateMs by container.appPrefs.apiRateIntervalMs
+        .collectAsState(initial = com.open115.pad.data.AppPrefs.DEFAULT_API_RATE_MS)
     /**
      * 电池优化白名单**在系统那边**，不是本应用的状态：进页面读一次，回到前台再读一次
      * （用户很可能刚去系统设置里加完就切回来）。
@@ -369,6 +430,8 @@ fun SettingsScreen(container: AppContainer) {
             onShowBattery = { v -> scope.launch { container.playerPrefs.setShowBattery(v) } },
             onShowNetSpeed = { v -> scope.launch { container.playerPrefs.setShowNetSpeed(v) } },
             onShowSpecBadge = { v -> scope.launch { container.playerPrefs.setShowSpecBadge(v) } },
+            videoStrip = videoStrip,
+            onVideoStrip = { v -> scope.launch { container.filesPrefs.setVideoStrip(v) } },
         ),
         downloadSection(
             autoSubmitClipboard = autoSubmitClipboard,
@@ -377,6 +440,8 @@ fun SettingsScreen(container: AppContainer) {
         taskSection(
             keepAlive = keepAlive,
             batteryWhitelisted = batteryWhitelisted,
+            apiRateMs = apiRateMs,
+            onApiRate = { ms -> scope.launch { container.appPrefs.setApiRateIntervalMs(ms) } },
             onKeepAlive = { v ->
                 scope.launch { container.appPrefs.setKeepAlive(v) }
                 // 打开时顺手把两件"系统侧"的事要下来：通知权限（不然常驻通知看不见）与
@@ -400,6 +465,7 @@ fun SettingsScreen(container: AppContainer) {
         storageSection(
             playerCacheEnabled = playerCacheEnabled,
             playerCacheMaxMb = playerCacheMaxMb,
+            previewCacheMaxMb = previewCacheMaxMb,
             mediaCacheEnabled = mediaCacheEnabled,
             mediaCacheMaxMb = mediaCacheMaxMb,
             unlimitedPos = mp.MAX_MAX_MB + mp.STEP_MB,
@@ -419,6 +485,11 @@ fun SettingsScreen(container: AppContainer) {
                 ImageUrlResolver.clearHugeCache(context.cacheDir)
                 cacheUsageKey++
             },
+            onPreviewCacheMaxMb = { v -> scope.launch { container.previewPrefs.setMaxMb(v) } },
+            onClearPreview = {
+                container.videoPreviews.clear()
+                cacheUsageKey++
+            },
             onClearImage = {
                 scope.launch {
                     clearCoilCache(context)
@@ -435,6 +506,7 @@ fun SettingsScreen(container: AppContainer) {
             onEnabled = { v -> scope.launch { container.mediaPrefs.setPadSyncEnabled(v) } },
             onPollMinutes = { m -> scope.launch { container.mediaPrefs.setPadPollMinutes(m) } },
             onPickDir = { showPadPickDir = true },
+            onManualSync = { showManualSync = true },
             onSyncNow = {
                 if (!padSyncing) {
                     padSyncing = true
@@ -444,6 +516,11 @@ fun SettingsScreen(container: AppContainer) {
                     }
                 }
             },
+        ),
+        backupSection(
+            backup = container.backupManager,
+            backupPrefs = container.backupPrefs,
+            scope = scope,
         ),
         labSection(
             labFilterEnabled = labFilterEnabled,
@@ -466,6 +543,22 @@ fun SettingsScreen(container: AppContainer) {
             onLabDanmuCacheDays = { v -> scope.launch { container.playerPrefs.setLabDanmuCacheDays(v.toInt()) } },
             onEditDanmuApi = { showEditDanmuApi = true },
             onEditDanmuBlocklist = { showEditDanmuBlocklist = true },
+            avatarSourceEnabled = avatarSourceEnabled,
+            avatarSourceUrl = avatarSourceUrl,
+            avatarIndexNote = when {
+                avatarRefreshing -> "正在下载并建索引…"
+                avatarError.isNotBlank() -> avatarError
+                avatarIndexCount > 0 -> "索引 $avatarIndexCount 条 · 更新于 ${Format.ago(avatarIndexAt)}"
+                else -> "还没下载（约十几 MB，只在你点这里时下）"
+            },
+            avatarCoverageNote = if (avatarCoverageTotal > 0) {
+                "本库 $avatarCoverageHit/$avatarCoverageTotal 个演员能对上（对不上的保持首字母圆底）"
+            } else {
+                ""
+            },
+            onAvatarSourceEnabled = { v -> scope.launch { container.mediaPrefs.setAvatarSourceEnabled(v) } },
+            onAvatarSourceUrl = { v -> scope.launch { container.mediaPrefs.setAvatarSourceUrl(v) } },
+            onRefreshAvatarIndex = { refreshAvatarIndex() },
         ),
         accountSection(
             clientId = clientId,
@@ -569,6 +662,19 @@ fun SettingsScreen(container: AppContainer) {
             onPick = { cid, name ->
                 showPadPickDir = false
                 scope.launch { container.mediaPrefs.setPadSignalDir(cid, name) }
+            },
+        )
+    }
+
+    if (showManualSync) {
+        // 手动同步：挑一份信号文件 → 跟库比对 → 按需排同步（见 ManualSignalSyncDialog）
+        ManualSignalSyncDialog(
+            padSync = container.padSync,
+            onDismiss = { showManualSync = false },
+            onDone = { report ->
+                showManualSync = false
+                // 与头像索引那条一样用 Toast：设置页没有自己的 SnackbarHost
+                android.widget.Toast.makeText(context, report.note, android.widget.Toast.LENGTH_LONG).show()
             },
         )
     }
@@ -702,7 +808,70 @@ private fun SettingItemRow(item: SettingItem) {
         is SliderItem -> SliderRow(item)
         is ChoiceItem<*> -> ChoiceRow(item)
         is ActionItem -> ActionRow(item)
+        is TextItem -> TextRow(item)
         is InfoItem -> ItemShell(item)
+    }
+}
+
+/**
+ * 文本行：整行可点，点开弹输入框改。
+ *
+ * 值**单独占一行**（用 [ItemShell] 的内容槽，在说明下方），不挤在标题右边 ——
+ * 地址类设置动辄几十个字符，放右边只会剩下一个看不出区别的前缀。
+ * 留空 = 用默认值（见 ActorAvatarSource.DEFAULT_BASE），所以不需要"恢复默认"按钮。
+ */
+@Composable
+private fun TextRow(item: TextItem) {
+    var editing by remember(item.id) { mutableStateOf(false) }
+    var draft by remember(item.id) { mutableStateOf(item.value) }
+    ItemShell(
+        item = item,
+        onClick = {
+            draft = item.value
+            editing = true
+        },
+        trailing = {
+            Icon(
+                Icons.Outlined.Edit,
+                contentDescription = "修改",
+                tint = AppColors.TextTertiary,
+                modifier = Modifier.size(18.dp),
+            )
+        },
+    ) {
+        Text(
+            item.value.ifBlank { item.placeholder.ifBlank { "未设置" } },
+            fontSize = 12.sp,
+            color = if (item.value.isBlank()) AppColors.TextTertiary else AppColors.TextSecondary,
+            maxLines = 2,
+            overflow = TextOverflow.Ellipsis,
+        )
+    }
+    if (editing) {
+        AlertDialog(
+            onDismissRequest = { editing = false },
+            title = { Text(item.title) },
+            text = {
+                Column {
+                    Text(item.subtitle, fontSize = 13.sp, color = AppColors.TextSecondary)
+                    Spacer(Modifier.height(10.dp))
+                    OutlinedTextField(
+                        value = draft,
+                        onValueChange = { draft = it },
+                        placeholder = { Text(item.placeholder.ifBlank { "填地址" }) },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    item.onChange(draft.trim())
+                    editing = false
+                }) { Text("保存") }
+            },
+            dismissButton = { TextButton(onClick = { editing = false }) { Text("取消") } },
+        )
     }
 }
 
@@ -988,6 +1157,8 @@ private fun uiSection(
     onShowBattery: (Boolean) -> Unit,
     onShowNetSpeed: (Boolean) -> Unit,
     onShowSpecBadge: (Boolean) -> Unit,
+    videoStrip: Boolean,
+    onVideoStrip: (Boolean) -> Unit,
 ): SettingsSection = section(SettingsCategory.UI) {
     choice(
         id = "theme",
@@ -1007,6 +1178,16 @@ private fun uiSection(
         options = listOf("文件" to StartPage.FILES, "媒体库" to StartPage.MEDIA),
         selected = startPage,
         onSelect = onStartPage,
+    )
+
+    switch(
+        id = "video_strip",
+        title = "列表里显示视频预览条",
+        subtitle = "视频行下面横排 2~10 帧（按片长），可横向滑动",
+        detail = "帧取自 115 最小转码档的分片头，抓的时候每帧约 376KB 流量，缓存里只占约 12KB。" +
+            "关掉只是不显示，已经抓好的帧还在（可在「存储与缓存」里清掉）。",
+        checked = videoStrip,
+        onChange = onVideoStrip,
     )
 
     group("壁纸（仅明亮模式显示）")
@@ -1115,9 +1296,31 @@ private fun downloadSection(
 private fun taskSection(
     keepAlive: Boolean,
     batteryWhitelisted: Boolean,
+    apiRateMs: Long,
     onKeepAlive: (Boolean) -> Unit,
     onRequestBattery: () -> Unit,
+    onApiRate: (Long) -> Unit,
 ): SettingsSection = section(SettingsCategory.TASK) {
+    group("请求限速（防 115 频控）")
+    choice(
+        id = "api_rate",
+        title = "全局请求间隔",
+        subtitle = if (apiRateMs <= 0) {
+            "已关闭：请求有多快发多快"
+        } else {
+            "相邻两次请求至少隔 ${apiRateMs}ms，连续快点会被拉平"
+        },
+        detail = "115 对同一个账号有频率限制，短时间密集请求会被临时挡下（提示操作频繁）。" +
+            "这里给日常操作保个底：浏览文件、搜索、查看图片/视频、改名、删除等。" +
+            "间隔只在“距上次请求不足这么久”时才等 —— 正常点击的间隔通常远大于几百毫秒，" +
+            "所以基本感觉不到，只有连点、或一次动作触发一串请求时才会被拉平。\n\n" +
+            "下面这些不受它影响：图片与缩略图字节、视频播放与缓冲、大文件上传分片 —— " +
+            "它们跟接口不是同一条通道，限速只会白白拖慢它们。\n\n" +
+            "媒体库扫描与分类整理各自有分档限速，用它们自己的档位，不叠加。",
+        options = com.open115.pad.data.AppPrefs.API_RATE_OPTIONS,
+        selected = apiRateMs,
+        onSelect = onApiRate,
+    )
     group("保持运行")
     switch(
         id = "keep_alive",
@@ -1156,9 +1359,131 @@ private fun taskSection(
     )
 }
 
+/**
+ * 备份分类：四类数据（配置 / 媒体库数据 / 文件操作记录 / 媒体库记录）各自
+ * 开关 + 间隔 + 立即备份 + 恢复最近一份。数据来源与实现见 data/BackupManager.kt。
+ *
+ * 结果提示用 Toast：设置页没有 snackbar 宿主，而 lastAt 更新会自动把各行副标题刷成
+ * "上次：刚刚" —— 成功走行内反馈，失败/需要重启的动作用 Toast 兜底。
+ */
+@Composable
+private fun backupSection(
+    backup: BackupManager,
+    backupPrefs: BackupPrefs,
+    scope: CoroutineScope,
+): SettingsSection {
+    val context = LocalContext.current
+    var backingUp by remember { mutableStateOf<BackupKind?>(null) }
+    var restoring by remember { mutableStateOf<BackupKind?>(null) }
+
+    val configState by backupPrefs.state(BackupKind.CONFIG).collectAsState(BackupPrefs.KindState(false, 24, 0))
+    val oplogState by backupPrefs.state(BackupKind.OPLOG).collectAsState(BackupPrefs.KindState(false, 24, 0))
+    val mediaState by backupPrefs.state(BackupKind.MEDIA).collectAsState(BackupPrefs.KindState(false, 0, 0))
+    val states = mapOf(
+        BackupKind.CONFIG to configState,
+        BackupKind.OPLOG to oplogState,
+        BackupKind.MEDIA to mediaState,
+    )
+
+    fun toast(text: String) {
+        android.widget.Toast.makeText(context, text, android.widget.Toast.LENGTH_LONG).show()
+    }
+
+    suspend fun doRestore(kind: BackupKind) {
+        restoring = kind
+        val r = backup.restoreLatest(kind)
+        restoring = null
+        when (r) {
+            is BackupManager.RestoreResult.Ok -> {
+                if (r.needsRestart) {
+                    // 配置类是 DataStore 文件覆盖：进程内存里还是旧值，必须重启才不会
+                    // 被旧值覆盖回去 —— 提示后由用户点「退出应用」杀进程，重开即生效
+                    toast(r.message)
+                    delay(1200)
+                    Runtime.getRuntime().exit(0)
+                } else {
+                    toast(r.message)
+                }
+            }
+            is BackupManager.RestoreResult.Failed -> toast(r.message)
+        }
+    }
+
+    return section(SettingsCategory.BACKUP) {
+        info(
+            id = "backup_dir",
+            title = "备份目录",
+            subtitle = "云端根目录下的「115Pad备份」，首次备份自动创建；每类保留最近 ${BackupManager.KEEP} 份",
+        )
+        for (kind in BackupKind.entries) {
+            val st = states.getValue(kind)
+            group(kind.label)
+            switch(
+                id = "backup_auto_${kind.key}",
+                title = "自动备份",
+                subtitle = "开启后按下方间隔自动备份到云端",
+                checked = st.enabled,
+                onChange = { v -> scope.launch { backupPrefs.setEnabled(kind, v) } },
+            )
+            choice(
+                id = "backup_interval_${kind.key}",
+                title = "自动备份间隔",
+                subtitle = if (st.lastAt > 0) "上次备份：" + Format.ago(st.lastAt) else "尚未备份过",
+                // 媒体库含几百 MB 图片缓存，默认"仅手动"（一般只在换机/恢复时用）
+                options = if (kind == BackupKind.MEDIA) {
+                    listOf("仅手动" to 0, "12 小时" to 12, "24 小时" to 24, "3 天" to 72, "7 天" to 168)
+                } else {
+                    listOf("12 小时" to 12, "24 小时" to 24, "3 天" to 72, "7 天" to 168)
+                },
+                selected = st.intervalHours,
+                onSelect = { v -> scope.launch { backupPrefs.setIntervalHours(kind, v) } },
+            )
+            action(
+                id = "backup_now_${kind.key}",
+                title = "立即备份${kind.label}",
+                subtitle = when {
+                    backingUp == kind -> "正在备份…"
+                    st.lastAt > 0 -> "上次：" + Format.ago(st.lastAt)
+                    else -> "从未备份"
+                },
+                onClick = {
+                    if (backingUp == null) {
+                        backingUp = kind
+                        scope.launch {
+                            val r = backup.backup(kind)
+                            backingUp = null
+                            toast("「${kind.label}」$r")
+                        }
+                    }
+                },
+            )
+            action(
+                id = "backup_restore_${kind.key}",
+                title = "恢复${kind.label}",
+                subtitle = "用云端最新一份备份" + when (kind) {
+                    BackupKind.CONFIG, BackupKind.OPLOG -> "覆盖本机（恢复后需重启 App）"
+                    BackupKind.MEDIA -> "覆盖库数据与记录，图片合并（已有图片保留）"
+                    else -> "覆盖本机"
+                },
+                confirm = if (kind == BackupKind.MEDIA) {
+                    "将用云端最新一份「${kind.label}」备份覆盖本机的库数据与记录，并合并图片缓存（不清现有图片），确定继续？"
+                } else {
+                    "将用云端最新一份「${kind.label}」备份覆盖本机数据，确定继续？"
+                },
+                onClick = {
+                    if (restoring == null) {
+                        scope.launch { doRestore(kind) }
+                    }
+                },
+            )
+        }
+    }
+}
+
 private fun storageSection(
     playerCacheEnabled: Boolean,
     playerCacheMaxMb: Int,
+    previewCacheMaxMb: Int,
     mediaCacheEnabled: Boolean,
     mediaCacheMaxMb: Long,
     unlimitedPos: Long,
@@ -1169,9 +1494,14 @@ private fun storageSection(
     onMediaCacheMaxMb: (Long) -> Unit,
     onClearMedia: () -> Unit,
     onClearHuge: () -> Unit,
+    /** 预览图缓存上限（MB）改了就存，调小会立刻淘汰一次 */
+    onPreviewCacheMaxMb: (Int) -> Unit,
+    /** 清空视频预览图缓存（文件页视频缩略图用的那套） */
+    onClearPreview: () -> Unit,
     onClearImage: () -> Unit,
 ): SettingsSection {
     val mp = com.open115.pad.data.media.MediaPrefs
+    val pp = com.open115.pad.data.PreviewPrefs
     return section(SettingsCategory.STORAGE) {
         // 播放缓存没有「占用 / 清除」行是刻意的：它只在单次播放会话内有效，退出播放器就清空，
         // 占用永远接近 0，显示出来只会让人以为没生效。开关与上限留着（会话内的回退、切档预载要用）
@@ -1192,7 +1522,7 @@ private fun storageSection(
             value = playerCacheMaxMb.toFloat(),
             range = 256f..4096f,
             steps = 14,
-            subtitle = "单次播放最多占用多少本机空间",
+            subtitle = "单次播放最多占用多少本机空间；小于片长时，往回拖到更早的位置仍需重新下载",
             onChange = { v -> onPlayerCacheMaxMb((v / 256).toInt() * 256) },
         )
 
@@ -1232,6 +1562,31 @@ private fun storageSection(
         )
 
         group("图片")
+        // 上限滑块放在「清除」上面：先设上限（自动淘汰最久没看的），不够再手动清空。
+        // 滑块只走 STEP_MB 的整数倍，所以 onChange 里先取整再存（跟播放缓存上限同一套）
+        slider(
+            id = "preview_cache_max",
+            title = "预览缓存上限",
+            valueText = "$previewCacheMaxMb MB",
+            value = previewCacheMaxMb.toFloat(),
+            range = pp.MIN_MAX_MB.toFloat()..pp.MAX_MAX_MB.toFloat(),
+            steps = (pp.MAX_MAX_MB - pp.MIN_MAX_MB) / pp.STEP_MB - 1,
+            subtitle = "超过上限就按「最久没看」把最早的清掉，封面与预览条一起算",
+            detail = "清的是最久没打开过的那批片（看到的算「看过」，所以常看的不会被新抓的挤掉）。" +
+                "调小上限后立刻淘汰一次，不用等下次抓帧。" +
+                "上限越大，翻列表越不容易因为缓存没命中而重新抓帧（每帧约 376KB 流量）。",
+            onChange = { v -> onPreviewCacheMaxMb((v / pp.STEP_MB).toInt() * pp.STEP_MB) },
+        )
+        action(
+            id = "preview_clear",
+            title = "清除视频预览缓存",
+            subtitle = if (usage.ready) "列表缩略图 + 预览条，当前 ${fmtBytes(usage.previewBytes)}" else "计算中…",
+            detail = "115 不给视频缩略图：这些帧是打开视频时自动抓的、也能按目录批量抓。" +
+                "一张封面（长边 640）加 2~10 帧预览条（长边 320，按片长定），抓的时候每帧约 376KB 流量。" +
+                "缓存下来后翻列表不再请求。清掉后下次进列表会重新抓。",
+            confirm = "将清掉已缓存的视频预览图。再看列表会重新抓取。",
+            onClick = onClearPreview,
+        )
         action(
             id = "huge_clear",
             title = "清除超大图缓存",
@@ -1265,6 +1620,7 @@ private fun pipelineSection(
     onEnabled: (Boolean) -> Unit,
     onPollMinutes: (Int) -> Unit,
     onPickDir: () -> Unit,
+    onManualSync: () -> Unit,
     onSyncNow: () -> Unit,
 ): SettingsSection = section(SettingsCategory.PIPELINE) {
     group("流水线同步")
@@ -1302,6 +1658,15 @@ private fun pipelineSection(
         detail = "不等下一轮，马上读一次信号目录。服务器刚跑完刮削、想立刻看到结果时用它。" +
             "同步本身不扫目录，它只是把变动的目录排进扫描队列（进度看媒体库页的扫描卡片）。",
         onClick = onSyncNow,
+    )
+    action(
+        id = "pad_manual_sync",
+        title = "手动同步文件…",
+        subtitle = "挑一份信号，先比对库里同步过没有",
+        detail = "自动同步失败（限流/网络抖动）、或者想指定服务器某一轮的结果时用。" +
+            "选一份信号文件后会先跟本地库比对：库里已有条目的目录标「已同步」，没有的标「未同步」——" +
+            "可以只同步没同步的，也可以全部重新同步。这条路不受轮询游标影响，也不会推进它。",
+        onClick = onManualSync,
     )
     info(
         id = "pad_last",
@@ -1351,6 +1716,15 @@ private fun labSection(
     onLabDanmuCacheDays: (Float) -> Unit,
     onEditDanmuApi: () -> Unit,
     onEditDanmuBlocklist: () -> Unit,
+    avatarSourceEnabled: Boolean,
+    avatarSourceUrl: String,
+    /** 动作行的副标题：索引状态 / 出错信息 */
+    avatarIndexNote: String,
+    /** 覆盖率一句话（空 = 还没算过） */
+    avatarCoverageNote: String,
+    onAvatarSourceEnabled: (Boolean) -> Unit,
+    onAvatarSourceUrl: (String) -> Unit,
+    onRefreshAvatarIndex: () -> Unit,
 ): SettingsSection = section(SettingsCategory.LAB) {
     switch(
         id = "video_filter",
@@ -1442,6 +1816,37 @@ private fun labSection(
             "在那边改完会连本条目的弹幕缓存一起作废、立刻按新源重新匹配。",
         onClick = onEditDanmuApi,
     )
+    group("演员头像")
+    switch(
+        id = "avatar_source",
+        title = "演员头像补全（头像仓库）",
+        subtitle = "没有本地 .actors 头像的演员，按名字去头像仓库取一张",
+        detail = "只在点「更新头像索引」时联网一次（下载十几 MB 的索引，之后查名字是纯本地的）；" +
+            "头像图交给图片库加载并落盘缓存，同一张只下一次。**名字对不上就保持首字母圆底** —— " +
+            "不猜、不会配错脸。注意这类仓库以日文原名为主，中文译名不一定能对上，覆盖情况看下面两行。",
+        checked = avatarSourceEnabled,
+        onChange = onAvatarSourceEnabled,
+    )
+    text(
+        id = "avatar_source_url",
+        title = "头像源地址",
+        subtitle = "留空即用默认镜像；地址说变就变时可自行替换（改完记得重新更新索引）",
+        value = avatarSourceUrl,
+        placeholder = ActorAvatarSource.DEFAULT_BASE,
+        onChange = onAvatarSourceUrl,
+    )
+    action(
+        id = "avatar_source_refresh",
+        title = "更新头像索引",
+        subtitle = avatarIndexNote,
+        detail = "从上面的地址下载索引并在本机建一份紧凑索引，只在你点这里时发生，" +
+            "扫描媒体库、进详情页都不会自己联网。",
+        onClick = onRefreshAvatarIndex,
+    )
+    if (avatarCoverageNote.isNotBlank()) {
+        info(id = "avatar_source_coverage", title = "本库覆盖情况", subtitle = avatarCoverageNote)
+    }
+    group()
 }
 
 private fun accountSection(
@@ -1505,8 +1910,11 @@ private data class CacheUsage(
     val mediaPosterBytes: Long = -1,
     val hugeBytes: Long = -1,
     val imageBytes: Long = -1,
+    /** 视频预览图缓存（文件页视频缩略图） */
+    val previewBytes: Long = -1,
 ) {
-    val ready: Boolean get() = mediaTextBytes >= 0 && mediaPosterBytes >= 0 && hugeBytes >= 0 && imageBytes >= 0
+    val ready: Boolean get() = mediaTextBytes >= 0 && mediaPosterBytes >= 0 && hugeBytes >= 0 &&
+        imageBytes >= 0 && previewBytes >= 0
 }
 
 /** Coil 自己的图片磁盘缓存（画廊原图/缩略图落在这里，见 ImageGalleryDialog 的 diskKeyOf） */

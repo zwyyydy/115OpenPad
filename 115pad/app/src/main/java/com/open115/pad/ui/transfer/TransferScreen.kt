@@ -438,14 +438,18 @@ fun TransferScreen(
                     // ViewModel 懒建——切到对应分页才创建，与原独立路由的进入即拉取一致。
                     tab == 2 -> {
                         val vm: OfflineViewModel = viewModel(initializer = {
-                            context.appContainer.let { OfflineViewModel(it.openApi, it.downloadPrefs) }
+                            context.appContainer.let {
+                                OfflineViewModel(it.openApi, it.downloadPrefs, it.dirCache, it.dirRemovals)
+                            }
                         })
                         OfflineEmbedded(vm, snackbarHostState, onJump = onCloudJump)
                     }
 
                     tab == 3 -> {
                         val vm: RecycleViewModel = viewModel(initializer = {
-                            RecycleViewModel(context.appContainer.openApi)
+                            context.appContainer.let {
+                                RecycleViewModel(it.openApi, it.dirCache, it.dirRemovals, it.videoPreviews)
+                            }
                         })
                         RecycleEmbedded(vm, snackbarHostState)
                     }

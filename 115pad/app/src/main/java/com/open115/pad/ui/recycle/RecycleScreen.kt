@@ -54,21 +54,37 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import coil.compose.SubcomposeAsyncImage
-import com.open115.pad.data.JsonNull
 import com.open115.pad.data.JsonObject
-import com.open115.pad.data.JsonPrimitive
+import com.open115.pad.data.DirCache
 import com.open115.pad.data.OpenApi
 import com.open115.pad.data.RecycleItem
+import com.open115.pad.data.VideoPreviewStore
 import com.open115.pad.data.envData
 import com.open115.pad.data.envMsg
 import com.open115.pad.data.envOk
+import com.open115.pad.data.parseRecycleList
 import com.open115.pad.util.Format
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 
-class RecycleViewModel(private val api: OpenApi) : ViewModel() {
+class RecycleViewModel(
+    private val api: OpenApi,
+    /** 目录列表缓存：删除/还原后把原目录的缓存作废，文件页回到那里才不会显示旧内容 */
+    private val dirCache: DirCache? = null,
+    /** 目录内容变更广播（见 [com.open115.pad.App115.dirRemovals]），未注入则只作废缓存 */
+    private val dirRemovals: MutableSharedFlow<Map<String, Set<String>>>? = null,
+    /**
+     * 视频预览图缓存（文件页缩略图 + 预览条那套）。
+     *
+     * **只在「彻底删除 / 清空」时清**（这里就是那种场合）：文件真没了，按 pick_code 存的预览
+     * 再也没人引用。**「还原」与文件页的「移入回收站」都不清** —— 还能回来，回来要重新抓帧。
+     */
+    private val videoPreviews: VideoPreviewStore? = null,
+) : ViewModel() {
 
     data class UiState(
         val items: List<RecycleItem> = emptyList(),
@@ -82,6 +98,16 @@ class RecycleViewModel(private val api: OpenApi) : ViewModel() {
     private val _ui = MutableStateFlow(UiState())
     val ui = _ui.asStateFlow()
 
+    /**
+     * 已请求彻底删除、但服务端可能还没删完的条目 id。115 的回收站删除是**异步生效**的：
+     * 刚删完立即拉列表经常还能拉回来，等于"删了还在上面"。乐观移除之后，复核刷新
+     * 里仍把这些 id 过滤掉，直到服务端返回的列表里真的没有它们为止。
+     */
+    private var pendingGoneIds: Set<String> = emptySet()
+
+    /** 复核刷新的连续次数上限：服务端一直没删完就放弃过滤，以服务端状态为准 */
+    private var confirmCount = 0
+
     init {
         refresh()
     }
@@ -92,31 +118,71 @@ class RecycleViewModel(private val api: OpenApi) : ViewModel() {
             try {
                 val root = api.recycleList(limit = 200, offset = 0)
                 if (!root.envOk()) error(root.envMsg() ?: "获取回收站列表失败")
-                val data = root.envData() ?: JsonObject(emptyMap())
-                val items = data.entries
-                    .filter { it.key.toLongOrNull() != null }
-                    .mapNotNull { (id, value) ->
-                        val o = value as? JsonObject ?: return@mapNotNull null
-                        fun s(k: String) = (o[k] as? JsonPrimitive)?.takeIf { it !is JsonNull }?.content
-                        RecycleItem(
-                            id = id,
-                            name = s("file_name") ?: "",
-                            isDir = s("type") == "2",
-                            size = s("file_size")?.toLongOrNull() ?: 0,
-                            dtime = s("dtime")?.toLongOrNull() ?: 0,
-                            thumbUrl = s("thumb_url"),
-                            cid = s("cid"),
-                            parentName = s("parent_name"),
-                            pickCode = s("pick_code"),
-                            status = s("status")?.toIntOrNull() ?: 0,
-                        )
+                val items = parseRecycleList(root.envData() ?: JsonObject(emptyMap()))
+                val gone = pendingGoneIds
+                val visible = if (gone.isEmpty()) items else items.filter { it.id !in gone }
+                _ui.update { it.copy(items = visible, error = null) }
+                if (visible.size == items.size) {
+                    // 服务端返回里已经没有待删条目 = 删除全部生效，解除过滤
+                    pendingGoneIds = emptySet()
+                    confirmCount = 0
+                } else {
+                    // 还有没删完的：再等一轮复核（有上限）
+                    confirmCount++
+                    if (confirmCount < 3) scheduleConfirmRefresh() else {
+                        pendingGoneIds = emptySet()
+                        confirmCount = 0
                     }
-                _ui.update { it.copy(items = items, error = null) }
+                }
             } catch (e: Exception) {
                 _ui.update { it.copy(error = e.message ?: e.toString()) }
             } finally {
                 _ui.update { it.copy(loading = false) }
             }
+        }
+    }
+
+    /** 延迟复核：删除/还原后等服务端生效了再拉一次，把列表校准成服务端的真实状态 */
+    private fun scheduleConfirmRefresh() {
+        viewModelScope.launch {
+            delay(2_000)
+            refresh()
+        }
+    }
+
+    /**
+     * 彻底删掉的那些条目，把它们的视频预览图缓存也清掉（封面 + 预览条）。
+     *
+     * 按 pick_code 认：回收站条目里带 `pick_code`，与预览缓存的键同为视频的 pick_code。
+     * 拿不到 pick_code 的条目（不该有）跳过，剩下的交给上限淘汰。
+     * **注意这里只覆盖"已经列出来的那些"**：列表只取第一页 200 条，更深的那批要等下次进页面
+     * 拉出来、或由缓存上限淘汰 —— 清空回收站不额外翻页拉全（那几个 KB 不值得多打请求）。
+     */
+    private fun dropPreviews(ids: Collection<String>) {
+        val store = videoPreviews ?: return
+        val idSet = ids.toSet()
+        val pcs = _ui.value.items.filter { it.id in idSet }.mapNotNull { it.pickCode?.takeIf(String::isNotBlank) }
+        if (pcs.isEmpty()) return
+        val n = store.deleteFor(pcs)
+        if (n > 0) android.util.Log.i("VPreview", "回收站彻底删除：清掉 ${pcs.size} 个 pick_code 的预览图 $n 个文件")
+    }
+
+    /**
+     * 乐观收尾：把已请求删除/还原的条目立刻从列表里拿掉（不等刷新 —— 115 异步生效，
+     * 立即刷新会"删了还在"），同时按原目录作废缓存并广播给文件页（删除方向才有移除语义）。
+     */
+    private fun afterItemsGone(ids: Collection<String>, broadcast: Boolean) {
+        val idSet = ids.toSet()
+        val removed = _ui.value.items.filter { it.id in idSet }
+        _ui.update { s ->
+            s.copy(items = s.items.filter { it.id !in idSet }, selection = s.selection - idSet)
+        }
+        val byCid = removed.mapNotNull { item -> item.cid?.let { it to item.name } }
+            .groupBy({ it.first }, { it.second })
+            .mapValues { (_, names) -> names.toSet() }
+        if (byCid.isNotEmpty()) {
+            dirCache?.let { c -> byCid.keys.forEach(c::invalidateDir) }
+            if (broadcast) dirRemovals?.tryEmit(byCid)
         }
     }
 
@@ -139,8 +205,10 @@ class RecycleViewModel(private val api: OpenApi) : ViewModel() {
             val resp = api.recycleRevert(ids.joinToString(","))
             val ok = resp.envOk()
             if (ok) {
-                clearSelection()
-                refresh()
+                // 还原是把文件放回原目录：只作废缓存让文件页下次进入真实请求，
+                // 不发移除广播（那是删除的语义）
+                afterItemsGone(ids, broadcast = false)
+                scheduleConfirmRefresh()
             }
             ok to (if (ok) "已还原 ${ids.size} 项" else resp.envMsg() ?: "还原失败")
         }
@@ -153,8 +221,10 @@ class RecycleViewModel(private val api: OpenApi) : ViewModel() {
             val resp = api.recycleDelete(ids.joinToString(","))
             val ok = resp.envOk()
             if (ok) {
-                clearSelection()
-                refresh()
+                pendingGoneIds = pendingGoneIds + ids
+                dropPreviews(ids)
+                afterItemsGone(ids, broadcast = true)
+                scheduleConfirmRefresh()
             }
             ok to (if (ok) "已彻底删除 ${ids.size} 项" else resp.envMsg() ?: "删除失败")
         }
@@ -164,8 +234,10 @@ class RecycleViewModel(private val api: OpenApi) : ViewModel() {
         val resp = api.recycleDelete(null)
         val ok = resp.envOk()
         if (ok) {
-            clearSelection()
-            refresh()
+            pendingGoneIds = pendingGoneIds + _ui.value.items.map { it.id }
+            dropPreviews(_ui.value.items.map { it.id })
+            afterItemsGone(_ui.value.items.map { it.id }, broadcast = true)
+            scheduleConfirmRefresh()
         }
         ok to (if (ok) "回收站已清空" else resp.envMsg() ?: "清空失败")
     }

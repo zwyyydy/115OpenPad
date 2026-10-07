@@ -417,108 +417,93 @@ internal fun DanmuMenu(
     onDismiss: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    Surface(
-        color = Color.Black.copy(alpha = 0.8f),
-        shape = RoundedCornerShape(14.dp),
-        modifier = modifier.padding(start = 12.dp, end = 12.dp, bottom = 6.dp),
+    PlayerSheet(
+        title = "弹幕",
+        subtitle = statusText,
+        onDismiss = onDismiss,
+        modifier = modifier,
     ) {
-        Column(modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)) {
-            Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
-                Text(
-                    statusText,
-                    color = Color.White.copy(alpha = 0.75f),
-                    style = MaterialTheme.typography.labelMedium,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.weight(1f),
-                )
-                IconButton(onClick = onDismiss, modifier = Modifier.size(30.dp)) {
-                    Icon(
-                        Icons.Outlined.Close,
-                        contentDescription = "收起弹幕面板",
-                        tint = Color.White,
-                        modifier = Modifier.size(16.dp),
-                    )
+        // 低分辨率横屏下这几排都可能超宽，允许横向滚动兜底（同 VR / 滤镜菜单）
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.horizontalScroll(rememberScrollState()),
+        ) {
+            VrChip(if (displayOn) "显示弹幕 ✓" else "显示弹幕（关）", displayOn) { onToggleDisplay() }
+            VrChip("重新匹配", false) { onRematch() }
+            VrChip(if (blockCount > 0) "屏蔽词 $blockCount" else "屏蔽词", false) {
+                onEditBlocklist()
+            }
+            VrChip("弹幕源", false) { onEditApi() }
+        }
+        Spacer(Modifier.height(2.dp))
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.horizontalScroll(rememberScrollState()),
+        ) {
+            DanmuGroupLabel("显示区域")
+            DanmuAreas.forEach { (label, v) ->
+                VrChip(label, tuning.area == v) {
+                    onTuning(tuning.copy(area = v))
+                    onTuningCommit()
                 }
             }
-            // 低分辨率横屏下这几排都可能超宽，允许横向滚动兜底（同 VR / 滤镜菜单）
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                modifier = Modifier.horizontalScroll(rememberScrollState()),
-            ) {
-                VrChip(if (displayOn) "显示弹幕 ✓" else "显示弹幕（关）", displayOn) { onToggleDisplay() }
-                VrChip("重新匹配…", false) { onRematch() }
-                VrChip(if (blockCount > 0) "屏蔽词 $blockCount" else "屏蔽词…", false) {
-                    onEditBlocklist()
-                }
-                VrChip("弹幕源…", false) { onEditApi() }
-            }
-            Spacer(Modifier.height(2.dp))
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                modifier = Modifier.horizontalScroll(rememberScrollState()),
-            ) {
-                DanmuGroupLabel("显示区域")
-                DanmuAreas.forEach { (label, v) ->
-                    VrChip(label, tuning.area == v) {
-                        onTuning(tuning.copy(area = v))
-                        onTuningCommit()
-                    }
-                }
-                Spacer(Modifier.width(12.dp))
-                DanmuGroupLabel("密度")
-                DanmuDensities.forEach { (label, v) ->
-                    VrChip(label, tuning.density == v) {
-                        onTuning(tuning.copy(density = v))
-                        onTuningCommit()
-                    }
+            Spacer(Modifier.width(12.dp))
+            DanmuGroupLabel("密度")
+            DanmuDensities.forEach { (label, v) ->
+                VrChip(label, tuning.density == v) {
+                    onTuning(tuning.copy(density = v))
+                    onTuningCommit()
                 }
             }
-            // 两列两行：跟滤镜面板同规格，平板横屏下不至于挡掉大半画面
-            Row(Modifier.fillMaxWidth()) {
-                DanmuSliderCell(
-                    label = "字号",
-                    valueText = "${tuning.textSize.toInt()} sp",
-                    value = tuning.textSize,
-                    range = 12f..28f,
-                    steps = 7,
-                    onChange = { v -> onTuning(tuning.copy(textSize = v)) },
-                    onCommit = onTuningCommit,
-                    modifier = Modifier.weight(1f).padding(horizontal = 4.dp),
-                )
-                DanmuSliderCell(
-                    label = "不透明度",
-                    valueText = "${(tuning.opacity * 100).toInt()}%",
-                    value = tuning.opacity,
-                    range = 0.3f..1f,
-                    steps = 6,
-                    onChange = { v -> onTuning(tuning.copy(opacity = v)) },
-                    onCommit = onTuningCommit,
-                    modifier = Modifier.weight(1f).padding(horizontal = 4.dp),
-                )
-            }
-            Row(Modifier.fillMaxWidth()) {
-                DanmuSliderCell(
-                    label = "速度",
-                    valueText = "%.2f×".format(tuning.scroll),
-                    value = tuning.scroll,
-                    range = 0.5f..2f,
-                    steps = 5,
-                    onChange = { v -> onTuning(tuning.copy(scroll = v)) },
-                    onCommit = onTuningCommit,
-                    modifier = Modifier.weight(1f).padding(horizontal = 4.dp),
-                )
-                DanmuSliderCell(
-                    label = "缓存时效",
-                    valueText = "${tuning.cacheDays} 天",
-                    value = tuning.cacheDays.toFloat(),
-                    range = 1f..30f,
-                    steps = 29,
-                    onChange = { v -> onTuning(tuning.copy(cacheDays = v.toInt().coerceIn(1, 30))) },
-                    onCommit = onTuningCommit,
-                    modifier = Modifier.weight(1f).padding(horizontal = 4.dp),
-                )
-            }
+        }
+        // 两列两行：跟滤镜面板同规格，平板横屏下不至于挡掉大半画面
+        Row(Modifier.fillMaxWidth()) {
+            PlayerSliderCell(
+                label = "字号",
+                valueText = "${tuning.textSize.toInt()} sp",
+                value = tuning.textSize,
+                range = 12f..28f,
+                steps = 7,
+                defaultValue = DanmuTuning().textSize,
+                onChange = { v -> onTuning(tuning.copy(textSize = v)) },
+                onCommit = onTuningCommit,
+                modifier = Modifier.weight(1f).padding(horizontal = 4.dp),
+            )
+            PlayerSliderCell(
+                label = "不透明度",
+                valueText = "${(tuning.opacity * 100).toInt()}%",
+                value = tuning.opacity,
+                range = 0.3f..1f,
+                steps = 6,
+                defaultValue = DanmuTuning().opacity,
+                onChange = { v -> onTuning(tuning.copy(opacity = v)) },
+                onCommit = onTuningCommit,
+                modifier = Modifier.weight(1f).padding(horizontal = 4.dp),
+            )
+        }
+        Row(Modifier.fillMaxWidth()) {
+            PlayerSliderCell(
+                label = "速度",
+                valueText = "%.2f×".format(tuning.scroll),
+                value = tuning.scroll,
+                range = 0.5f..2f,
+                steps = 5,
+                defaultValue = DanmuTuning().scroll,
+                onChange = { v -> onTuning(tuning.copy(scroll = v)) },
+                onCommit = onTuningCommit,
+                modifier = Modifier.weight(1f).padding(horizontal = 4.dp),
+            )
+            PlayerSliderCell(
+                label = "缓存时效",
+                valueText = "${tuning.cacheDays} 天",
+                value = tuning.cacheDays.toFloat(),
+                range = 1f..30f,
+                steps = 29,
+                defaultValue = DanmuTuning().cacheDays.toFloat(),
+                onChange = { v -> onTuning(tuning.copy(cacheDays = v.toInt().coerceIn(1, 30))) },
+                onCommit = onTuningCommit,
+                modifier = Modifier.weight(1f).padding(horizontal = 4.dp),
+            )
         }
     }
 }
@@ -528,52 +513,11 @@ internal fun DanmuMenu(
 private fun DanmuGroupLabel(text: String) {
     Text(
         text,
-        color = Color.White.copy(alpha = 0.75f),
+        color = Color.White.copy(alpha = 0.68f),
         style = MaterialTheme.typography.labelMedium,
         maxLines = 1,
         modifier = Modifier.padding(start = 6.dp, end = 4.dp),
     )
-}
-
-/** 面板里的一格滑块：标题 + 数值 + 滑杆（样式与滤镜面板的滑块格一致） */
-@Composable
-private fun DanmuSliderCell(
-    label: String,
-    valueText: String,
-    value: Float,
-    range: ClosedFloatingPointRange<Float>,
-    steps: Int,
-    /** 拖动中：立刻上屏（不落盘） */
-    onChange: (Float) -> Unit,
-    /** 抬手：落盘 */
-    onCommit: () -> Unit,
-    modifier: Modifier = Modifier,
-) {
-    Column(modifier) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Text(
-                label,
-                color = Color.White.copy(alpha = 0.75f),
-                style = MaterialTheme.typography.labelMedium,
-                maxLines = 1,
-            )
-            Spacer(Modifier.width(6.dp))
-            Text(
-                valueText,
-                color = Color.White,
-                style = MaterialTheme.typography.labelMedium,
-                maxLines = 1,
-            )
-        }
-        Slider(
-            value = value,
-            onValueChange = onChange,
-            onValueChangeFinished = onCommit,
-            valueRange = range,
-            steps = steps,
-            modifier = Modifier.fillMaxWidth(),
-        )
-    }
 }
 
 /**

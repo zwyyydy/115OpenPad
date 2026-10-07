@@ -26,13 +26,13 @@ class PadSyncTest {
             {
               "v": 1, "ts": "2026-09-28T10:31:38", "source": "pipeline", "run": "20260928-103138",
               "codes": ["ABC-123"], "actors": ["演员名"],
-              "dirs": ["/媒体库根/JAV_output/演员名/ABC-123 演员名", "/媒体库根/failed"],
+              "dirs": ["/媒体库根/子目录/演员名/ABC-123 演员名", "/媒体库根/failed"],
               "gone": ["/媒体库根/ABC-123"]
             }
             """.trimIndent(),
         )!!
         assertEquals("20260928-103138", s.run)
-        assertEquals(listOf("/媒体库根/JAV_output/演员名/ABC-123 演员名", "/媒体库根/failed"), s.dirs)
+        assertEquals(listOf("/媒体库根/子目录/演员名/ABC-123 演员名", "/媒体库根/failed"), s.dirs)
         assertEquals(listOf("/媒体库根/ABC-123"), s.gone)
         assertEquals(listOf("ABC-123"), s.codes)
     }
@@ -93,19 +93,19 @@ class PadSyncTest {
 
     @Test
     fun `库根嵌套时认最长的那个`() {
-        val libs = listOf(library(1, "/媒体库根"), library(2, "/媒体库根/JAV_output"))
-        assertEquals(2L, libraryForPath("/媒体库根/JAV_output/演员/番号 演员", libs)?.library?.id)
+        val libs = listOf(library(1, "/媒体库根"), library(2, "/媒体库根/子目录"))
+        assertEquals(2L, libraryForPath("/媒体库根/子目录/演员/番号 演员", libs)?.library?.id)
         assertEquals(1L, libraryForPath("/媒体库根/failed", libs)?.library?.id)
     }
 
     @Test
     fun `不在任何库根下的路径丢掉`() {
-        val libs = listOf(library(1, "/媒体库根/JAV_output"))
+        val libs = listOf(library(1, "/媒体库根/子目录"))
         assertNull(libraryForPath("/别的目录/x", libs))
-        // 前缀相同但不是一个目录：`/媒体库根/JAV_output2` 不属于 `/媒体库根/JAV_output`
-        assertNull(libraryForPath("/媒体库根/JAV_output2/x", libs))
+        // 前缀相同但不是一个目录：`/媒体库根/子目录2` 不属于 `/媒体库根/子目录`
+        assertNull(libraryForPath("/媒体库根/子目录2/x", libs))
         // 库根自己也算（多根库里它就是一根）
-        assertEquals(1L, libraryForPath("/媒体库根/JAV_output", libs)?.library?.id)
+        assertEquals(1L, libraryForPath("/媒体库根/子目录", libs)?.library?.id)
     }
 
     @Test
@@ -113,24 +113,24 @@ class PadSyncTest {
         val lib = MediaLibraryEntity(
             id = 1, name = "库1",
             rootCid = "c1\nc2",
-            rootPath = "/媒体库根/JAV_output\n/另一棵树",
+            rootPath = "/媒体库根/子目录\n/另一棵树",
         )
         assertEquals(1L, libraryForPath("/另一棵树/演员/番号", listOf(lib))?.library?.id)
-        assertEquals(1L, libraryForPath("/媒体库根/JAV_output/演员/番号", listOf(lib))?.library?.id)
+        assertEquals(1L, libraryForPath("/媒体库根/子目录/演员/番号", listOf(lib))?.library?.id)
     }
 
     @Test
     fun `库根不带前导斜杠也能匹配_并换算成该库的写法`() {
         // 实测同一个账号下两种写法都有：`媒体库/子目录/...` 与 `/另一个库`。
-        // 服务器写的永远是 `/媒体库/子目录/JAV_output/...` 这种带斜杠的绝对路径 ——
+        // 服务器写的永远是 `/媒体库/子目录/子目录/...` 这种带斜杠的绝对路径 ——
         // 只比字符串的话，不带斜杠的那个库整库匹配不上。
-        val lib = library(3, "媒体库/子目录/示例演员/JAV_output/示例演员")
+        val lib = library(3, "媒体库/子目录/示例演员/子目录/示例演员")
         val m = libraryForPath(
-            "/媒体库/子目录/示例演员/JAV_output/示例演员/ABC-123-4K-C 示例演员", listOf(lib),
+            "/媒体库/子目录/示例演员/子目录/示例演员/ABC-123-4K-C 示例演员", listOf(lib),
         )!!
         assertEquals(3L, m.library.id)
         // 换写成库自己的写法：写进 dirPath 的形式必须跟历史行一致，否则同一目录会出现两份索引
-        assertEquals("媒体库/子目录/示例演员/JAV_output/示例演员/ABC-123-4K-C 示例演员", m.path)
+        assertEquals("媒体库/子目录/示例演员/子目录/示例演员/ABC-123-4K-C 示例演员", m.path)
     }
 
     @Test
@@ -145,15 +145,80 @@ class PadSyncTest {
     @Test
     fun `上溯候选从最深的父目录开始_到库根为止`() {
         assertEquals(
-            listOf("/媒体库根/JAV_output/演员", "/媒体库根/JAV_output", "/媒体库根"),
-            ancestorPaths("/媒体库根/JAV_output/演员/番号 演员", floor = "/媒体库根"),
+            listOf("/媒体库根/子目录/演员", "/媒体库根/子目录", "/媒体库根"),
+            ancestorPaths("/媒体库根/子目录/演员/番号 演员", floor = "/媒体库根"),
         )
     }
 
     @Test
     fun `上溯不会越过库根`() {
         // 越过库根就等于去问别的树，白花请求还可能撞上同名的目录
-        assertEquals(listOf("/媒体库根/JAV_output"), ancestorPaths("/媒体库根/JAV_output/x", floor = "/媒体库根/JAV_output"))
+        assertEquals(listOf("/媒体库根/子目录"), ancestorPaths("/媒体库根/子目录/x", floor = "/媒体库根/子目录"))
         assertTrue(ancestorPaths("/媒体库根/x", floor = "/媒体库根/x").isEmpty())
+    }
+
+    // ---- 手动同步：文件名文案 ----
+
+    @Test
+    fun `信号文件名解析成可读时间`() {
+        assertEquals("2026-09-28 10:31:38", signalFileLabel("20260928-103138.json"))
+    }
+
+    @Test
+    fun `认不出来的文件名原样返回_不编一个时间出来`() {
+        assertEquals("weird.json", signalFileLabel("weird.json"))
+        assertEquals("20260928.json", signalFileLabel("20260928.json"))
+        assertEquals("20260928-1031.json", signalFileLabel("20260928-1031.json"))
+    }
+
+    // ---- 手动同步：路径归一化（挑目录时的比较键）----
+
+    @Test
+    fun `路径归一化把两种写法归到一起`() {
+        // 库里 `/媒体库根/x` 与 `媒体库根/x` 都可能出现，挑目录时两边必须对上
+        assertEquals(normSignalPath("/媒体库根/x"), normSignalPath("媒体库根/x"))
+        assertEquals(normSignalPath("/媒体库根/x/"), normSignalPath("媒体库根/x"))
+        // 不同目录不能被归一化混起来
+        assertTrue(normSignalPath("/媒体库根/x") != normSignalPath("/媒体库根/x/y"))
+    }
+
+    // ---- 手动同步：比对模型 ----
+
+    @Test
+    fun `比对结果区分已同步_未同步_库外`() {
+        val insp = SignalInspection(
+            name = "20260928-103138.json",
+            dirs = listOf(
+                SignalDirStatus(raw = "/媒体库根/a", path = "/媒体库根/a", libraryName = "库1", existing = 3),
+                SignalDirStatus(raw = "/媒体库根/b", path = "/媒体库根/b", libraryName = "库1", existing = 0),
+                SignalDirStatus(raw = "/别的树/c", path = "/别的树/c", libraryName = "", existing = 0),
+            ),
+        )
+        assertEquals(1, insp.syncedCount)
+        // 只需要同步"在库内、但库里还没条目"的那个；库外的点不了（同步会被忽略）
+        assertEquals(listOf("/媒体库根/b"), insp.pending.map { it.raw })
+        assertEquals(1, insp.outsideCount)
+        assertTrue(!insp.allSynced)
+    }
+
+    @Test
+    fun `全部同步过时没有待同步项`() {
+        val insp = SignalInspection(
+            name = "x.json",
+            dirs = listOf(
+                SignalDirStatus(raw = "/a", path = "/a", libraryName = "库1", existing = 2),
+                SignalDirStatus(raw = "/b", path = "/b", libraryName = "库1", existing = 40),
+            ),
+        )
+        assertTrue(insp.pending.isEmpty())
+        assertTrue(insp.allSynced)
+    }
+
+    @Test
+    fun `空信号不算已同步_免得提示一个假结论`() {
+        val insp = SignalInspection(name = "x.json", dirs = emptyList())
+        assertTrue(insp.pending.isEmpty())
+        // 没有目录可同步 ≠ 已同步：对话框据此提示"这份信号里没有目录"，而不是"都已同步"
+        assertTrue(!insp.allSynced)
     }
 }

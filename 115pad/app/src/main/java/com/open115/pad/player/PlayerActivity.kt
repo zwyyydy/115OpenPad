@@ -114,6 +114,7 @@ import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
@@ -137,6 +138,7 @@ import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.exoplayer.util.EventLogger
 import androidx.media3.ui.CaptionStyleCompat
 import androidx.media3.ui.PlayerView
+import com.open115.pad.R
 import com.open115.pad.AppContainer
 import com.open115.pad.appContainer
 import com.open115.pad.data.JsonArray
@@ -145,10 +147,13 @@ import com.open115.pad.data.JsonObject
 import com.open115.pad.data.JsonPrimitive
 import com.open115.pad.data.OpType
 import com.open115.pad.data.PlaylistEntry
+import com.open115.pad.data.Uploader
 import com.open115.pad.data.VideoPlayData
 import com.open115.pad.data.envData
 import com.open115.pad.data.parseVideoHistoryTime
 import com.open115.pad.data.envMsg
+import com.open115.pad.data.parseFilesResponse
+import com.open115.pad.ui.files.videoPreviewFileName
 import com.open115.pad.data.envOk
 import com.open115.pad.data.parseVideoPlayResponse
 import com.open115.pad.data.parseFileDownloadUrl
@@ -177,6 +182,14 @@ import androidx.media3.common.VideoSize
 import androidx.media3.common.text.Cue
 
 internal data class SubtitleCfg(val url: String, val mime: String, val language: String?, val title: String?)
+
+/** 外挂字幕的来源，用于在字幕菜单里交代"现在挂的是哪一路字幕" */
+internal enum class SubOrigin(val label: String) {
+    /** 115 官方字幕转成本地副本（时间轴微调会把官方字幕落到本地再平移） */
+    OFFICIAL("115 官方字幕"),
+    ONLINE("在线搜索字幕"),
+    LOCAL("本地字幕"),
+}
 
 /** 播放模式：顺序（播完下一集，末集停止）/ 单片循环 / 随机（剩余未播条目随机） */
 enum class PlayMode(val label: String) {
@@ -231,6 +244,45 @@ private const val EPISODE_SWITCH_THROTTLE_MS = 500L
  * 缺的那部分它自己会接着下，不需要预载先备满 50 秒。
  */
 private const val PRELOAD_BUFFER_MS = 15_000L
+
+/**
+ * 主播放器的**后退缓冲**时长：往回拖这一点距离不用重新加载。
+ *
+ * ExoPlayer 默认 backBuffer = 0，"播过的就丢"—— 漏看了几句往回拖十几秒，也要重新
+ * 从缓存/网络填一遍缓冲，观感就是"重加载"。保留 30 秒既播过的数据在内存里，
+ * 这段距离内的回退零等待（`setBackBuffer(.., true)` = 允许从最近关键帧起保留）。
+ * 代价是内存占用（1080p 转码流约 10~30MB），换的是"回退像翻书一样"。
+ */
+private const val BACK_BUFFER_MS = 30_000L
+
+/**
+ * seek 之后"填够多少数据才恢复播放"的门槛（毫秒）。
+ *
+ * 默认 2500ms —— "明明这段已经缓存过、+10 秒还是要顿一下显示缓冲"的直接原因：
+ * seek 会重新加载目标分片（HLS 必然如此，哪怕字节命中磁盘缓存），然后**必须**攒够
+ * 这个门槛的数据才把播放从 BUFFERING 拉回 READY。降到 1.2 秒：命中缓存时几乎立刻够，
+ * 未命中时也少等一半时间；足以防住"刚开播就断"。
+ */
+private const val BUFFER_FOR_PLAYBACK_MS = 1_200
+
+/** 播放中断流后再恢复的门槛（默认 5000）。3 秒：比默认快，又不至于在慢链路上来回抖 */
+private const val BUFFER_FOR_REBUFFER_MS = 3_000
+
+/**
+ * 前向缓冲的**时间上限**（media3 默认 50 秒 → 90 秒）。
+ *
+ * 为什么加深：+10 秒快进"有时瞬间到、有时要等" —— 分片约 10 秒/6MB，**缓冲条末端那个分片
+ * 往往是半成品**（内存队列有、磁盘只写了前半），seek 目标落进它就必须等下载完，
+ * 于是出现"缓冲中"。缓冲越深，末端离播放点越远，+10 秒撞上未完成分片的概率越小。
+ */
+private const val BUFFER_MAX_MS = 90_000
+
+/**
+ * 前向缓冲的**字节上限**（与 [BUFFER_MAX_MS] 取先到者）。
+ * 90 秒 × 原盘 100 Mbps ≈ 1.1GB，必须封顶：1080p 转码流（几 Mbps）能吃满 90 秒，
+ * 原盘自动收缩到 ~15 秒，内存不会失控。
+ */
+private const val BUFFER_BYTES_CAP = 192 * 1024 * 1024
 
 /** 预载等待的轮询间隔（同时是进度提示的刷新间隔） */
 private const val PRELOAD_POLL_MS = 500L
@@ -384,6 +436,65 @@ private fun nextTierBelow(current: Int, available: List<Int>, deviceSafe: Boolea
  */
 private data class ScreenHint(val text: String, val compact: Boolean)
 
+/**
+ * 开播时顺手生成一张本机预览图（文件页视频缩略图用），已经有了就不重复生成。
+ *
+ * 为什么不"播放中抓当前帧"：那样只能拿到随机位置的画面，预览图要的是**按时长取样**的
+ * 稳定一帧（见 data/VideoFrameGrab.kt）；从最小转码档只拉 376KB 分片头就解出来了，
+ * 不用把片子播到那个位置。挂在 transferScope 上：退出播放器也让它跑完。
+ *
+ * [fromFilePage] = 这次播放是不是**文件页**那条链路（见 PlayerScreen 的 recordHistory）。
+ * 宽幅预览条按它 + 库里有没有**剧照**两件事决定：
+ *  - 文件页：照抓（列表里那条横排就是它）；
+ *  - 媒体库：库里**已有剧照**（详情页那排「剧照（N）」）就不抓 —— 同一部片的画面再存一份是重复；
+ *    没有剧照的片才抓，抓出来的帧反过来充当这部片的剧照（详情页兜底剧照读的就是它）。
+ * 封面不分链路照抓 —— 那是文件页列表的缩略图，与媒体库的图不冲突。
+ */
+private fun ensurePreviewThumb(
+    container: AppContainer,
+    pickCode: String,
+    durationSec: Long,
+    fromFilePage: Boolean,
+) {
+    if (pickCode.isBlank()) return
+    container.transferScope.launch {
+        // 查库失败就按"要抓"兜底：抓多一条只是浪费一点流量，不抓会让这部片连一张剧照都没有
+        val libraryHasFanart = if (fromFilePage) {
+            false
+        } else {
+            runCatching {
+                container.mediaDatabase.mediaDao().hasFanartForVideo(pickCode)
+            }.getOrDefault(false)
+        }
+        val withStrip = fromFilePage || !libraryHasFanart
+        val count = if (withStrip) com.open115.pad.data.stripFrameCount(durationSec) else 0
+        // 封面和预览条**各查各的**：老数据只有封面、或上次预览条没抓全（张数对不上）都要补。
+        // 不要预览条的那条链路里，判定只剩封面（否则"有预览条的老数据"会每播一次都重抓一遍封面）
+        val coverOk = container.videoPreviews.has(pickCode)
+        val stripOk = !withStrip || container.videoPreviews.stripCount(pickCode) == count
+        if (coverOk && stripOk) return@launch
+        val set = runCatching { container.videoFrames.grabPreviewSet(pickCode, count) }.getOrNull().orEmpty()
+        if (set.isEmpty()) {
+            android.util.Log.i("VPreview", "自动生成预览失败（多半是没转码档）pc=$pickCode")
+            return@launch
+        }
+        set.firstOrNull()?.let { container.videoPreviews.put(pickCode, it) }
+        // 空列表千万别喂给 putStrip：它会把这组之外的尾巴全删掉，等于把别处抓好的预览条清空
+        val written = if (withStrip) container.videoPreviews.putStrip(pickCode, set.drop(1)) else 0
+        // 上限的淘汰由 store 自己管（写在 put/putStrip 里），这里不再显式 prune
+        android.util.Log.i(
+            "VPreview",
+            "自动生成预览 pc=$pickCode 封面=${set.firstOrNull()?.size ?: 0}B" +
+                if (withStrip) {
+                    " 预览条=$written/$count 张（" +
+                        (if (fromFilePage) "文件页播放" else "库里没有画面素材") + "）"
+                } else {
+                    " 预览条=按需跳过（库里已有剧照）"
+                },
+        )
+    }
+}
+
 class PlayerActivity : ComponentActivity() {
     companion object {
         private const val EXTRA_PICK_CODE = "pick_code"
@@ -395,6 +506,14 @@ class PlayerActivity : ComponentActivity() {
         private const val EXTRA_RECORD_HISTORY = "record_history"
         private const val EXTRA_OP_LOG_CID = "op_log_cid"
         private const val EXTRA_OP_LOG_PATH = "op_log_path"
+
+        /**
+         * 视频所在的云端目录 cid —— 长按「截图」设为预览图时，图上传到这里。
+         *
+         * 与 [EXTRA_OP_LOG_CID] **分开**：媒体库那条链路也要传它（但不该写文件页的操作记录），
+         * 合成一个 extra 会让"要不要记操作记录"的依据变含糊。
+         */
+        private const val EXTRA_SOURCE_CID = "source_cid"
 
         /**
          * @param playlist 当前视图的播放列表（可为空：此时上一集/下一集均置灰）。
@@ -421,6 +540,8 @@ class PlayerActivity : ComponentActivity() {
             recordHistory: Boolean = false,
             opLogCid: String? = null,
             opLogPath: String? = null,
+            /** 视频所在目录 cid（见 [EXTRA_SOURCE_CID]）——「截图设为预览图」上传到这里 */
+            sourceCid: String? = null,
         ): Intent {
             val json = runCatching {
                 Json.encodeToString(ListSerializer(PlaylistEntry.serializer()), playlist)
@@ -434,6 +555,7 @@ class PlayerActivity : ComponentActivity() {
                 .putExtra(EXTRA_RECORD_HISTORY, recordHistory)
                 .putExtra(EXTRA_OP_LOG_CID, opLogCid)
                 .putExtra(EXTRA_OP_LOG_PATH, opLogPath)
+                .putExtra(EXTRA_SOURCE_CID, sourceCid)
         }
 
         /**
@@ -474,6 +596,22 @@ class PlayerActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // 进场动画期间就得是全屏：藏系统栏如果等 Compose 首帧（下面 PlayerScreen 里的
+        // DisposableEffect）才做，窗口动画的前几百毫秒状态栏还挂在画面顶端 —— 动画越慢越显眼。
+        // 在 onCreate 里藏，窗口 attach 到 WM 时（首帧之前）生效；Compose 那条继续兜底横竖屏切换。
+        // ⚠️ MIUI 实测（小米平板）：窗口 attach 时请求藏系统栏（systemBars 或只藏 statusBars
+        // 都一样、主题 windowFullscreen 也一样），系统会丢弃主题里的进场动画（硬切 + 先出黑帧；
+        // 退场动画不受影响）。绕过办法是下面的 overridePendingTransition 显式指定动画。
+        WindowCompat.getInsetsController(window, window.decorView).apply {
+            systemBarsBehavior =
+                WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+            hide(WindowInsetsCompat.Type.statusBars())
+        }
+        // ⚠️ 见上：MIUI 在 attach 期藏栏会丢主题进场动画，显式 override 才稳（全版本可用，
+        // API 34+ 标记 deprecated 但仍生效；它只管"打开"这一次过渡，返回方向由主题的
+        // activityCloseExitAnimation 兜底 —— 退场没有系统栏变化，不会被丢）。
+        @Suppress("DEPRECATION")
+        overridePendingTransition(R.anim.player_enter, R.anim.player_exit)
         // 两种来源二选一：云盘（pick_code）或本地/外部（Uri）。都没有才退出 ——
         // 以前只看 pick_code，外部应用传 Uri 进来会被直接 finish 掉。
         val sourceUri = intent.sourceUriOrNull()
@@ -494,6 +632,7 @@ class PlayerActivity : ComponentActivity() {
         val recordHistory = intent.getBooleanExtra(EXTRA_RECORD_HISTORY, false)
         val opLogCid = intent.getStringExtra(EXTRA_OP_LOG_CID)
         val opLogPath = intent.getStringExtra(EXTRA_OP_LOG_PATH)
+        val sourceCid = intent.getStringExtra(EXTRA_SOURCE_CID)
         setContent {
             Open115Theme {
                 PlayerScreen(
@@ -507,6 +646,7 @@ class PlayerActivity : ComponentActivity() {
                     recordHistory = recordHistory,
                     opLogCid = opLogCid,
                     opLogPath = opLogPath,
+                    sourceCid = sourceCid,
                     onBack = { finish() },
                 )
             }
@@ -601,6 +741,8 @@ fun PlayerScreen(
      */
     opLogCid: String? = null,
     opLogPath: String? = null,
+    /** 视频所在目录 cid（见 [EXTRA_SOURCE_CID]）：「截图设为预览图」上传到这里；拿不到则该功能提示不可用 */
+    sourceCid: String? = null,
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
@@ -684,10 +826,30 @@ fun PlayerScreen(
     var onlineSubOriginal by remember { mutableStateOf<ByteArray?>(null) }
     var onlineSubCfg by remember { mutableStateOf<SubtitleCfg?>(null) }
     var onlineSubExt by remember { mutableStateOf("srt") }
+    /** [onlineSubs] 非空时表示它来自哪儿（在线搜索 / 本地文件 / 官方字幕转的本地副本） */
+    var subOrigin by remember { mutableStateOf(SubOrigin.OFFICIAL) }
     var subOffsetMs by remember { mutableStateOf(0L) }
     var showSubSearch by remember { mutableStateOf(false) }
     var subsEnabled by androidx.compose.runtime.saveable.rememberSaveable { mutableStateOf(true) }
     var subsMenuOpen by remember { mutableStateOf(false) }
+
+    /**
+     * 字幕菜单顶部「当前字幕」的文案：交代现在挂的是哪一路字幕。
+     * 官方列表挂在 mediaItem 上时才知道有几条/什么语言，外挂那一路看 [onlineSubCfg] 的标题。
+     */
+    val currentSubDesc: String = when {
+        onlineSubs.isNotEmpty() -> subOrigin.label +
+            (onlineSubCfg?.title?.takeIf { it.isNotBlank() }?.let { " · $it" } ?: "")
+        subtitles.isNotEmpty() -> "115 官方字幕" + run {
+            val langs = subtitles.mapNotNull { it.language?.takeIf(String::isNotBlank) }.distinct()
+            when {
+                langs.isNotEmpty() -> " · " + langs.joinToString("/")
+                subtitles.size > 1 -> " · 共 ${subtitles.size} 条"
+                else -> ""
+            }
+        }
+        else -> "无（本片没有可用字幕）"
+    }
 
     // 右下角控制排：交互后显示 4 秒自动淡出
     var controlRowVisible by androidx.compose.runtime.saveable.rememberSaveable { mutableStateOf(true) }
@@ -746,6 +908,15 @@ fun PlayerScreen(
      * 而视图的创建/销毁发生在组合里。
      */
     val vrViewRef = remember { java.util.concurrent.atomic.AtomicReference<VrViewportView?>(null) }
+    /**
+     * "下一帧首帧要做一次视角归位" —— 只有真正的**装载**才置位（onMediaItemTransition 与下面那个
+     * 进片 effect），seek 一处都不碰。
+     *
+     * ★ 为什么需要它：ExoPlayer 在 **seek 之后也会重发 `onRenderedFirstFrame`**（解码器 flush、
+     *   渲染器重新出第一帧），早先那里无条件归位视角，于是"拖进度条 / 双击快进"这类赶进度操作
+     *   会把用户调好的视角掰回正前方（用户实测报的 bug）。初值 true：冷启动进 VR 时首帧兜一次底。
+     */
+    val vrCenterPending = remember { java.util.concurrent.atomic.AtomicBoolean(true) }
     val vrGyro = remember { VrGyroController(context) }
     var vrGyroOn by remember { mutableStateOf(false) }
     var vrHudText by remember { mutableStateOf<String?>(null) }
@@ -851,6 +1022,8 @@ fun PlayerScreen(
         vrState.resetView()
         vrGyro.recenter()
         pushVrParams()
+        // 首帧兜底：这次归位可能早于 GL 视图 / 视频流就绪，让下一帧首帧再归位一次
+        vrCenterPending.set(true)
     }
 
     // 陀螺仪生命周期：只在 VR 模式 + 开关打开 + 设备确实有传感器时才注册。
@@ -1202,7 +1375,7 @@ fun PlayerScreen(
      * 让人以为是没搜到，其实是压根没配源（默认值就是空的）。
      */
     val danmuStatusText = if (danmuApi.isBlank()) {
-        "当前：未配置弹幕源 —— 点「弹幕源…」填一个兼容弹弹play 协议的地址"
+        "当前：未配置弹幕源 —— 点「弹幕源」填一个兼容弹弹play 协议的地址"
     } else when (val s = danmuStatus) {
         is DanmuStatus.Matched ->
             "当前：${s.animeTitle} · ${s.episodeTitle}（${danmuComments?.size ?: 0} 条）"
@@ -1241,6 +1414,26 @@ fun PlayerScreen(
                 CacheDataSource.Factory()
                     .setCache(PlayerCache.get(context, prefs.cacheMaxMb.toLong() * 1024L * 1024L))
                     .setUpstreamDataSourceFactory(upstream)
+                    // 诊断（debug 级）：把"seek 后到底命中没命中缓存"变得可观测 ——
+                    // 排查过"缓冲条已加载一段、快进 10 秒仍偶尔出现缓冲提示"：
+                    // ⚠️ cacheKey 打印的是**请求 URL（含签名）**，两次请求同一分片若 URL 不同
+                    //    （播放列表刷新导致分片签名换新）就必然 miss，靠这行看出来。
+                    .setCacheKeyFactory { dataSpec ->
+                        android.util.Log.d("PlayerCacheIO", "请求 ${dataSpec.uri}")
+                        dataSpec.key ?: dataSpec.uri.toString()
+                    }
+                    .setEventListener(object : CacheDataSource.EventListener {
+                        override fun onCachedBytesRead(cacheSizeBytes: Long, bytesRead: Long) {
+                            android.util.Log.d(
+                                "PlayerCacheIO",
+                                "命中缓存 ${bytesRead}B（缓存共 ${cacheSizeBytes / 1024 / 1024}MB）",
+                            )
+                        }
+
+                        override fun onCacheIgnored(reason: Int) {
+                            android.util.Log.w("PlayerCacheIO", "缓存被忽略 reason=$reason")
+                        }
+                    })
                     // 刻意【不】改写缓存 key。
                     // 早期为"同一会话内回退零秒播"把 query 里的签名参数去掉，代价是 HLS 播放列表
                     // 也命中旧缓存：换地址拿到的新列表因 key 相同而读不到，缓存继续吐出带【过期签名】
@@ -1260,10 +1453,23 @@ fun PlayerScreen(
         val renderersFactory = SdrOutputRenderersFactory(context)
             .setEnableDecoderFallback(true)
             .apply { if (prefs.softwareDecode) setMediaCodecSelector(SOFTWARE_FIRST_DECODER) }
+        // 主播放器：前向缓冲 90 秒 / 192MB 上限（见 BUFFER_MAX_MS / BUFFER_BYTES_CAP）、
+        // 30 秒后退缓冲（BACK_BUFFER_MS）、seek 后恢复门槛 1.2 秒（BUFFER_FOR_PLAYBACK_MS）。
+        val loadControl = DefaultLoadControl.Builder()
+            .setBackBuffer(BACK_BUFFER_MS.toInt(), true)
+            .setBufferDurationsMs(
+                DefaultLoadControl.DEFAULT_MIN_BUFFER_MS,
+                BUFFER_MAX_MS,
+                BUFFER_FOR_PLAYBACK_MS,
+                BUFFER_FOR_REBUFFER_MS,
+            )
+            .setTargetBufferBytes(BUFFER_BYTES_CAP)
+            .build()
         ExoPlayer.Builder(context)
             .setRenderersFactory(renderersFactory)
             .setMediaSourceFactory(mediaFactory)
             .setBandwidthMeter(bandwidthMeter)
+            .setLoadControl(loadControl)
             .build()
     }
 
@@ -1412,6 +1618,61 @@ fun PlayerScreen(
         return entry.definition to buildMediaItem(trackUrl, MimeTypes.APPLICATION_M3U8)
     }
 
+    /** 拉 115 官方字幕列表。失败返回空列表——字幕拿不到不该影响播放（起播与「还原官方字幕」共用） */
+    suspend fun fetchOfficialSubs(): List<SubtitleCfg> = runCatching {
+        val sub = container.openApi.videoSubtitles(currentPickCode)
+        val list = sub.envData()?.get("list") as? JsonArray ?: return@runCatching emptyList()
+        list.mapNotNull { el ->
+            val o = el as? JsonObject ?: return@mapNotNull null
+            fun s(k: String) = (o[k] as? JsonPrimitive)?.takeIf { it !is JsonNull }?.content
+            val url = s("url") ?: return@mapNotNull null
+            val type = s("type")?.lowercase()
+            SubtitleCfg(
+                url = url,
+                mime = if (type == "srt") "application/x-subrip" else "text/vtt",
+                language = s("language"),
+                title = s("title"),
+            )
+        }
+    }.getOrDefault(emptyList())
+
+    // 本机文件专用的媒体源工厂：与主播放器同一套上游参数但不挂缓存——文件本来就在
+    // 本地，往 video_cache 拷一份纯属浪费 IO（回退进度直接读原文件不比读缓存慢）。
+    // 上游参数与 prefs 无关，独立 remember 即可，不随软/硬解重建。
+    val noCacheMediaFactory = remember {
+        val httpFactory = DefaultHttpDataSource.Factory()
+            .setUserAgent(APP_USER_AGENT)
+            .setAllowCrossProtocolRedirects(true)
+            .setConnectTimeoutMs(15000)
+            .setReadTimeoutMs(30000)
+        DefaultMediaSourceFactory(DefaultDataSource.Factory(context, httpFactory))
+    }
+
+    /**
+     * 用当前档位与字幕设置重建媒体并回到原位置（字幕显隐、换外挂字幕、时间轴微调、
+     * 坏字幕降级重试共用）。
+     *
+     * 本机文件必须走 [noCacheMediaFactory]：那条路的数据源是分开建的，混用会让本地文件
+     * 平白多一份缓存拷贝。云盘源且 data 还没到（起播中）时返回 false，调用方自己决定提示。
+     * 必须排在 DisposableEffect(player) 之前——下面的播放错误回调要用到它，而局部函数不能前向引用。
+     */
+    suspend fun rebuildCurrentMedia(): Boolean {
+        val pos = resumePos(player.currentPosition)
+        val uri = localUri
+        if (uri != null) {
+            player.setMediaSource(
+                noCacheMediaFactory.createMediaSource(buildMediaItem(uri, mimeOfFileName(currentName))),
+                pos,
+            )
+        } else {
+            val built = buildItem(currentDef) ?: return false
+            player.setMediaItem(built.second, pos)
+        }
+        player.prepare()
+        player.playWhenReady = true
+        return true
+    }
+
     // ⚠️ key 必须是 player 而不是 Unit：切换软/硬解会换掉整个播放器实例（解码器是
     //    构造期注入 RenderersFactory 的，换不掉只能重建），key 用 Unit 的话新实例
     //    拿不到任何监听、旧实例也永远不会 release。
@@ -1429,16 +1690,29 @@ fun PlayerScreen(
                 vsVideoSize = videoSize
             }
 
+            override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
+                // 换片 / 换档：下一帧首帧归位一次（seek 不走这里，见 vrCenterPending 的注释）
+                vrCenterPending.set(true)
+            }
+
             override fun onRenderedFirstFrame() {
-                // 播放 VR 视频时，每次"进片"（首帧真正渲染出来的时刻）默认就处于
-                // 复位视角（正前方 + 默认视场角，陀螺仪基准一并重置），
-                // 免得用户每次都要先按一次复位键。
+                // 播放 VR 视频时，"进片"（首帧真正渲染出来的时刻）默认处于复位视角
+                // （正前方 + 默认视场角，陀螺仪基准一并重置），免得用户每次都要先按一次复位键。
+                //
+                // ★ 只归位**装载后的第一次**首帧（vrCenterPending）：**seek 也会重发这个回调**
+                //   （解码器 flush 后渲染器重新出第一帧）—— 无条件归位的话，拖进度条 / 双击快进
+                //   就会把用户调好的视角掰回正前方（用户实测报的 bug：赶进度视角就丢）。
+                //   置位点只有 onMediaItemTransition 与进片 effect，seek 一处都不碰。
                 //
                 // 挂在首帧而不是 (itemKey, vrMode) 变化上：VR 模式要等解码出分辨率才
                 // 判定/重建 GL 视图，那里归位推参数可能早于 GL 视图与视频流就绪，
-                // 首帧时序 100% 覆盖所有路径（首次进入 / 切集 / 手动开 VR / 切清晰度）。
+                // 首帧时序覆盖所有装载路径（首次进入 / 切集 / 手动开 VR / 切清晰度）。
                 // 只在 VR 模式生效，普通模式不受影响。
-                if (vrMode != null) {
+                android.util.Log.d(
+                    "PlayerVr",
+                    "首帧 vrMode=${vrMode?.name} 等待归位=${vrCenterPending.get()}",
+                )
+                if (vrMode != null && vrCenterPending.getAndSet(false)) {
                     vrState.resetView()
                     vrGyro.recenter()
                     pushVrParams()
@@ -1538,18 +1812,13 @@ fun PlayerScreen(
                     }
                 }
                 // 预算用完（或非 403 错误）→ 走原有的字幕降级 → 终态报错链路
-                if (useSubs && subtitles.isNotEmpty()) {
+                // 外挂字幕（在线/本地）也算：挂上去的坏字幕同样会把媒体准备带崩
+                if (useSubs && (subtitles.isNotEmpty() || onlineSubs.isNotEmpty())) {
                     useSubs = false
+                    toast("字幕把播放带崩了，已关掉字幕重试")
                     scope.launch {
-                        val pos = resumePos(player.currentPosition)
-                        val built = buildItem(currentDef)
-                        if (built != null) {
-                            player.setMediaItem(built.second, pos)
-                            player.prepare()
-                            player.playWhenReady = true
-                        } else {
-                            error = "播放失败（${err.errorCodeName}）"
-                        }
+                        // 本机文件也走这条路：原先只认 buildItem，本地片挂坏字幕就只剩报错页
+                        if (!rebuildCurrentMedia()) error = "播放失败（${err.errorCodeName}）"
                     }
                 } else {
                     val cause = err.cause?.message?.let { " / $it" } ?: ""
@@ -1582,16 +1851,8 @@ fun PlayerScreen(
     fun setSubsEnabled(v: Boolean) {
         subsEnabled = v
         scope.launch { container.playerPrefs.setSubtitlesEnabled(v) }
-        // 重建媒体应用字幕显隐（记住进度）
-        scope.launch {
-            val pos = resumePos(player.currentPosition)
-            val built = buildItem(currentDef)
-            if (built != null) {
-                player.setMediaItem(built.second, pos)
-                player.prepare()
-                player.playWhenReady = true
-            }
-        }
+        // 重建媒体应用字幕显隐（记住进度）；本机文件也走这条路（原先只认云盘源，本地片按开关没反应）
+        scope.launch { rebuildCurrentMedia() }
     }
 
     fun pulseControlRow() {
@@ -1617,15 +1878,13 @@ fun PlayerScreen(
     }
 
     /**
-     * 抓当前画面存相册。
+     * 抓当前画面（含字幕），交给 [deliver]。三条渲染路径分别处理：普通模式是 TextureView
+     * （可直接读位图，旋转自己补），VR 与滤镜模式是 GLSurfaceView（只能 PixelCopy，但拷出来
+     * 就是所见即所得的画面：反投影/调色与旋转都已经在着色器里做完，字幕整层叠上去即可）。
      *
-     * 三条渲染路径要分别处理：普通模式是 TextureView（可直接读位图，旋转自己补），
-     * VR 与滤镜模式是 GLSurfaceView（只能 PixelCopy，但拷出来就是所见即所得的画面：
-     * 反投影/调色与旋转都已经在着色器里做完，字幕整层叠上去即可）。
-     * 字幕层单独叠上去 —— 位图里没有它，不叠的话带字幕的片子截出来是干净的原文。
+     * 「存相册」与「设为预览图」共用它 —— 两条路只差结果怎么处置。
      */
-    fun takeScreenshot() {
-        pulseControlRow()
+    fun captureFrame(deliver: (android.graphics.Bitmap?) -> Unit) {
         // 走 GL 的那两条路径都只能 PixelCopy；滤镜视图的 ref 只在滤镜分支存在时非空
         val gl = when {
             vrMode != null -> vrViewRef.get()
@@ -1642,14 +1901,76 @@ fun PlayerScreen(
             }.getOrDefault(0)
             if (gl != null) {
                 captureSurfaceFrame(gl) { bmp ->
-                    deliverShot(bmp?.let { overlaySubtitle(it, frameRefs.subtitle, bottomPercent) })
+                    deliver(bmp?.let { overlaySubtitle(it, frameRefs.subtitle, bottomPercent) })
                 }
             } else {
-                deliverShot(
+                deliver(
                     frameRefs.texture?.let {
                         captureTextureFrame(it, videoRotation, frameRefs.subtitle, bottomPercent)
                     },
                 )
+            }
+        }
+    }
+
+    /** 抓当前画面存相册（截图键单击） */
+    fun takeScreenshot() {
+        pulseControlRow()
+        captureFrame { bmp -> deliverShot(bmp) }
+    }
+
+    /**
+     * 抓当前画面存成这个视频的「预览图」、上传到视频所在目录（截图键**长按**）。
+     *
+     * 115 不给视频缩略图，文件页的视频条目只有类型图标 —— 这张图上传后，列表会把它
+     * 当作该视频的缩略图显示、同时把图片本身从列表隐藏（见 ui/files/VideoPreview.kt）。
+     * 同名旧图先删再传：115 上传同名会生成「（1）」副本，留着旧图就配不上对了。
+     */
+    fun takeScreenshotAsPreview() {
+        val cid = sourceCid
+        if (cid.isNullOrBlank()) {
+            toast("这个入口拿不到视频目录，无法设置预览图")
+            return
+        }
+        pulseControlRow()
+        captureFrame { bmp ->
+            if (bmp == null) {
+                toast("截图失败：画面未就绪")
+                return@captureFrame
+            }
+            val name = videoPreviewFileName(currentName)
+            scope.launch {
+                val bytes = withContext(Dispatchers.IO) { bitmapToJpegBytes(bmp) }
+                if (bytes == null) {
+                    toast("截图编码失败")
+                    return@launch
+                }
+                // 本届画面同时写进本机预览图缓存：列表里的缩略图优先读本地那张，
+                // 不写的话"刚设的预览图"要等云端那张解析回来才显示（甚至被本地旧帧压住）。
+                val pc = currentPickCode
+                withContext(Dispatchers.IO) {
+                    if (pc.isNotBlank()) container.videoPreviews.put(pc, bytes)
+                }
+                val ok = withContext(Dispatchers.IO) {
+                    runCatching {
+                        val existing = parseFilesResponse(container.openApi.files(cid = cid, limit = 1000))
+                            .items.firstOrNull { !it.isDir && it.fn == name }?.fid
+                        if (existing != null) container.openApi.deleteFiles(existing, cid)
+                        Uploader.uploadSmallLogged(
+                            log = container.transferLog,
+                            api = container.openApi,
+                            fileName = name,
+                            bytes = bytes,
+                            targetCid = cid,
+                            targetName = null,
+                        )
+                        true
+                    }.getOrElse {
+                        android.util.Log.w("PlayerShot", "预览图上传失败: ${it.message}")
+                        false
+                    }
+                }
+                toast(if (ok) "已设为预览图：$name" else "预览图上传失败")
             }
         }
     }
@@ -1721,6 +2042,7 @@ fun PlayerScreen(
         onlineSubs = emptyList()
         onlineSubOriginal = null
         onlineSubCfg = null
+        subOrigin = SubOrigin.OFFICIAL
         subOffsetMs = 0L
         subsMenuOpen = false
         // 各集音轨数量不同，沿用旧下标可能拼出无效的 audio_track，回到默认音轨
@@ -1767,17 +2089,6 @@ fun PlayerScreen(
     // 首次进入与切集共用同一条加载链路：itemKey 一变就整套重载。
     // key 用 player 而不是 prefs：播放器实例一换（切换软/硬解）新实例上还没有媒体，
     // 必须重挂一遍，等价于原来的 prefs key。
-    // 本机文件专用的媒体源工厂：与主播放器同一套上游参数但不挂缓存——文件本来就在
-    // 本地，往 video_cache 拷一份纯属浪费 IO（回退进度直接读原文件不比读缓存慢）。
-    // 上游参数与 prefs 无关，独立 remember 即可，不随软/硬解重建。
-    val noCacheMediaFactory = remember {
-        val httpFactory = DefaultHttpDataSource.Factory()
-            .setUserAgent(APP_USER_AGENT)
-            .setAllowCrossProtocolRedirects(true)
-            .setConnectTimeoutMs(15000)
-            .setReadTimeoutMs(30000)
-        DefaultMediaSourceFactory(DefaultDataSource.Factory(context, httpFactory))
-    }
     LaunchedEffect(itemKey, player) {
         // ---- 本地/外部源：整条绕开 115 接口 ----
         // 播放地址、字幕列表、观看记录全都要 pick_code，本地文件一个都拿不到，
@@ -1813,23 +2124,12 @@ fun PlayerScreen(
         try {
             val parsed = parseVideoPlayResponse(container.openApi.videoPlay(currentPickCode))
             data = parsed
-            // 字幕列表（失败不影响播放）
-            runCatching {
-                val sub = container.openApi.videoSubtitles(currentPickCode)
-                val list = sub.envData()?.get("list") as? JsonArray ?: return@runCatching
-                subtitles = list.mapNotNull { el ->
-                    val o = el as? JsonObject ?: return@mapNotNull null
-                    fun s(k: String) = (o[k] as? JsonPrimitive)?.takeIf { it !is JsonNull }?.content
-                    val url = s("url") ?: return@mapNotNull null
-                    val type = s("type")?.lowercase()
-                    SubtitleCfg(
-                        url = url,
-                        mime = if (type == "srt") "application/x-subrip" else "text/vtt",
-                        language = s("language"),
-                        title = s("title"),
-                    )
-                }
-            }
+            // 宽幅预览条：文件页播放照抓；媒体库播放只在**库里没有剧照/背景图**时才抓
+            // （有的话详情页那排剧照就是"这部片长什么样"，再抓一条是重复）
+            ensurePreviewThumb(container, currentPickCode, parsed.playLong, fromFilePage = !recordHistory)
+            // 字幕列表（失败不影响播放）。已经手动挂了外挂字幕就别把官方列表重新挂回来——
+            // 两份字幕会同时渲染；切软/硬解会重建播放器并重跑这段，所以这个分支是真会走到的
+            if (onlineSubs.isEmpty()) subtitles = fetchOfficialSubs()
             // 起播位置：切集时由 pendingStartMs 强制为 0（需求：进度归零）；
             // 否则沿用观看记录续播。无观看记录时接口返回 data:[]，由解析器归一为 0
             val forcedStart = pendingStartMs
@@ -2217,29 +2517,104 @@ fun PlayerScreen(
         setIndicator("倍速 x$s")
     }
 
-    /** 加载在线搜索的字幕：下载到本地缓存后作为外挂字幕重建媒体，记住进度 */
-    fun loadOnlineSub(cfg: SubtitleCfg, bytes: ByteArray, ext: String) {
+    /**
+     * 挂一路外挂字幕（在线搜索 / 本地文件共用）：字节落到应用缓存目录后重建媒体，记住进度。
+     * [origin] 只用于字幕菜单里交代来源。
+     */
+    fun loadExternalSub(cfg: SubtitleCfg, bytes: ByteArray, ext: String, origin: SubOrigin) {
+        // 统一转 UTF-8：播放器按 UTF-8 解外挂字幕，GBK 的国产 srt 不转会整屏乱码
+        val data = normalizeSubtitleEncoding(bytes)
+        val subExt = ext.ifBlank { "srt" }
         scope.launch {
             try {
-                onlineSubOriginal = bytes
+                onlineSubOriginal = data
                 onlineSubCfg = cfg
-                onlineSubExt = ext.ifBlank { "srt" }
+                onlineSubExt = subExt
+                subOrigin = origin
                 subOffsetMs = 0
                 val dir = java.io.File(context.cacheDir, "online_subs").apply { mkdirs() }
-                val file = java.io.File(dir, "sub_${System.currentTimeMillis()}.${onlineSubExt}")
-                withContext(Dispatchers.IO) { file.writeBytes(bytes) }
+                val file = java.io.File(dir, "sub_${System.currentTimeMillis()}.$subExt")
+                withContext(Dispatchers.IO) { file.writeBytes(data) }
                 subsEnabled = true
                 scope.launch { container.playerPrefs.setSubtitlesEnabled(true) }
                 onlineSubs = listOf(cfg.copy(url = android.net.Uri.fromFile(file).toString()))
+                // 官方列表同时挂着会渲染两份字幕，这一路接手（菜单里有「还原 115 官方字幕」退回）
+                subtitles = emptyList()
                 useSubs = true
-                val pos = resumePos(player.currentPosition)
-                val built = buildItem(currentDef) ?: return@launch
-                player.setMediaItem(built.second, pos)
-                player.prepare()
-                player.playWhenReady = true
-                // 重建媒体会触发 PlayerView 自动弹控制器，压掉微调按钮，这里主动收起
+                rebuildCurrentMedia()
+                // 重建媒体时界面会被播放器抢占一瞬，给个回执说明到底挂上了哪一路
+                setIndicator(
+                    "已加载" + origin.label +
+                        (cfg.title?.takeIf { it.isNotBlank() }?.let { "：" + it.take(20) } ?: ""),
+                )
             } catch (e: Exception) {
-                error = "字幕加载失败：${e.message}"
+                // 只影响字幕，不该用 error 把整块播放界面换成报错页——视频还在正常播
+                toast("字幕加载失败：${e.message}")
+            }
+        }
+    }
+
+    /** 卸掉在线/本地外挂字幕，重新挂回 115 官方字幕（菜单里「还原 115 官方字幕」） */
+    fun restoreOfficialSubs() {
+        scope.launch {
+            onlineSubs = emptyList()
+            onlineSubOriginal = null
+            onlineSubCfg = null
+            subOrigin = SubOrigin.OFFICIAL
+            subOffsetMs = 0L
+            useSubs = true
+            subsEnabled = true
+            scope.launch { container.playerPrefs.setSubtitlesEnabled(true) }
+            val official = if (localUri == null) fetchOfficialSubs() else emptyList()
+            subtitles = official
+            rebuildCurrentMedia()
+            toast(if (official.isEmpty()) "已卸下外挂字幕，本片没有官方字幕" else "已还原 115 官方字幕")
+        }
+    }
+
+    /**
+     * 本地字幕：SAF 选文件 → 读字节 → 走与在线字幕同一条外挂链路（来源记作本地字幕）。
+     * 定义必须排在 [loadExternalSub] 之后——局部函数不能前向引用。
+     */
+    val localSubPicker = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument(),
+    ) { uri ->
+        if (uri == null) return@rememberLauncherForActivityResult
+        subsMenuOpen = false
+        scope.launch {
+            try {
+                val (raw, name) = withContext(Dispatchers.IO) {
+                    val size = runCatching {
+                        context.contentResolver.openFileDescriptor(uri, "r")?.use { it.statSize } ?: -1L
+                    }.getOrDefault(-1L)
+                    if (size > MAX_LOCAL_SUBTITLE_BYTES) {
+                        // 用 throw 而非 error(...)：本函数作用域里的 error 是播放错误的状态变量
+                        throw IllegalArgumentException("文件过大（${Format.size(size)}），不像是字幕")
+                    }
+                    val bytes = context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
+                        ?: throw IllegalArgumentException("无法读取所选文件")
+                    bytes to (
+                        queryDisplayName(context, uri)
+                            ?: uri.lastPathSegment?.substringAfterLast('/')?.substringAfterLast(':')
+                            ?: "本地字幕"
+                        )
+                }
+                // 编码先归一再看内容：UTF-16 的字幕按 UTF-8 解出来是乱码，会认不出时间轴
+                val prepared = normalizeSubtitleEncoding(raw)
+                if (!looksLikeSubtitle(prepared)) {
+                    toast("所选文件里没有字幕时间轴，请确认是 .srt/.ass/.vtt")
+                    return@launch
+                }
+                val ext = guessSubtitleExt(name, prepared)
+                loadExternalSub(
+                    // 文件名的后缀不进标题：菜单里一行就放得下，格式单列也没必要（解析器自己认内容）
+                    SubtitleCfg("", mimeForSubtitleExt(ext), null, name.removeSuffix(".$ext")),
+                    prepared,
+                    ext,
+                    SubOrigin.LOCAL,
+                )
+            } catch (e: Exception) {
+                toast("本地字幕加载失败：${e.message}")
             }
         }
     }
@@ -2455,9 +2830,11 @@ fun PlayerScreen(
                     val bytes = withContext(Dispatchers.IO) {
                         downloadSubtitleBytes(container.okHttpClient, first.url)
                     }
-                    onlineSubOriginal = bytes
+                    // 编码归一，与在线/本地外挂字幕同一条链路（官方 srt 也可能是 GBK）
+                    onlineSubOriginal = normalizeSubtitleEncoding(bytes)
                     onlineSubCfg = first
                     onlineSubExt = if (first.mime == "text/vtt") "vtt" else "srt"
+                    subOrigin = SubOrigin.OFFICIAL
                     subOffsetMs = 0L
                     // 官方字幕改走本地副本，避免原链接与副本同时挂载显示两份字幕
                     subtitles = emptyList()
@@ -2476,16 +2853,13 @@ fun PlayerScreen(
                     (onlineSubCfg ?: SubtitleCfg("", mimeForSubtitleExt(onlineSubExt), null, null))
                         .copy(url = android.net.Uri.fromFile(file).toString()),
                 )
-                val pos = resumePos(player.currentPosition)
-                val built = buildItem(currentDef) ?: return@launch
-                player.setMediaItem(built.second, pos)
-                player.prepare()
-                player.playWhenReady = true
+                rebuildCurrentMedia()
                 setIndicator(
                     "字幕偏移 " + (if (subOffsetMs >= 0) "+" else "") + subOffsetMs / 1000.0 + "s",
                 )
             } catch (e: Exception) {
-                error = "字幕调整失败：${e.message}"
+                // 同上：调字幕失败不该把播放界面换成报错页
+                toast("字幕调整失败：${e.message}")
             }
         }
     }
@@ -2895,6 +3269,8 @@ fun PlayerScreen(
                         CircleIconButton(
                             icon = Icons.Outlined.PhotoCamera,
                             description = "截图",
+                            // 长按 = 设为预览图（截当前画面、上传到视频目录，见 takeScreenshotAsPreview）
+                            onLongClick = { takeScreenshotAsPreview() },
                             onClick = {
                                 // API 28 及以下存公共相册要先拿写权限；拿到/拒绝都继续截
                                 if (needsLegacyWritePermission(context)) {
@@ -3124,6 +3500,7 @@ fun PlayerScreen(
                     if (vrMenuOpen) {
                         VrModeMenu(
                             current = vrMode,
+                            onDismiss = { vrMenuOpen = false },
                             autoMode = vrStoredMode.isNullOrEmpty(),
                             rightEye = vrStoredEye,
                             gyroOn = vrGyroOn,
@@ -3471,7 +3848,7 @@ fun PlayerScreen(
                                         }
                                     }
                                 }
-                                // 字幕：搜索在线字幕 / 显示开关
+                                // 字幕：当前来源 / 加载本地字幕 / 搜索在线字幕 / 显示开关 / 时间轴微调
                                 Box {
                                     IconButton(onClick = { subsMenuOpen = true }) {
                                         Icon(
@@ -3481,6 +3858,29 @@ fun PlayerScreen(
                                         )
                                     }
                                     DropdownMenu(expanded = subsMenuOpen, onDismissRequest = { subsMenuOpen = false }) {
+                                        // 当前挂在播放器上的是哪一路字幕（纯信息行，不做成菜单项：
+                                        // 它没动作，做成可点项反而让人以为能点）
+                                        Column(Modifier.padding(horizontal = 12.dp, vertical = 6.dp)) {
+                                            Text(
+                                                "当前字幕",
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                            )
+                                            Text(
+                                                currentSubDesc + if (subsEnabled) "" else "（显示已关闭）",
+                                                style = MaterialTheme.typography.bodyMedium,
+                                            )
+                                        }
+                                        HorizontalDivider()
+                                        DropdownMenuItem(
+                                            text = { Text("加载本地字幕…") },
+                                            onClick = {
+                                                subsMenuOpen = false
+                                                // 不过滤 mime：不少文件管理器把 .srt/.ass 报成
+                                                // application/octet-stream，过滤了会直接选不中
+                                                localSubPicker.launch(arrayOf("*/*"))
+                                            },
+                                        )
                                         // 在线字幕搜索是按 pick_code 去 115 搜的，本地源没有这个身份，
                                         // 留着点了必然失败，干脆不显示（显示开关仍然保留）
                                         if (localUri == null) {
@@ -3499,6 +3899,15 @@ fun PlayerScreen(
                                                 setSubsEnabled(!subsEnabled)
                                             },
                                         )
+                                        if (onlineSubs.isNotEmpty()) {
+                                            DropdownMenuItem(
+                                                text = { Text("卸下外挂字幕，还原 115 官方") },
+                                                onClick = {
+                                                    subsMenuOpen = false
+                                                    restoreOfficialSubs()
+                                                },
+                                            )
+                                        }
                                         HorizontalDivider()
                                         // 时间轴微调：整行点击不关闭菜单，方便连续点按 ±0.5s 找准对齐点
                                         DropdownMenuItem(
@@ -3997,7 +4406,7 @@ fun PlayerScreen(
             uploadBaseName = (data?.fileName ?: currentName).substringBeforeLast('.'),
             onLoad = { cfg, bytes, ext ->
                 showSubSearch = false
-                loadOnlineSub(cfg, bytes, ext)
+                loadExternalSub(cfg, bytes, ext, SubOrigin.ONLINE)
             },
             onDismiss = { showSubSearch = false },
         )
@@ -4108,21 +4517,25 @@ fun PlayerScreen(
  * 画面上的圆形半透明功能键（与锁屏键、复位键同规格：44dp 圆形 + 20dp 图标）。
  * 无 Ripple、无点击态：播放页要的是"按下去不闪"，视觉上不能干扰画面。
  */
+@OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
 @Composable
 private fun CircleIconButton(
     icon: androidx.compose.ui.graphics.vector.ImageVector,
     description: String,
     onClick: () -> Unit,
+    /** 非空时长按也响应（目前只有「截图」用：长按 = 设为预览图） */
+    onLongClick: (() -> Unit)? = null,
     color: Color = Color.Black.copy(alpha = 0.55f),
 ) {
     Surface(color = color, shape = CircleShape) {
         Box(
             modifier = Modifier
                 .size(44.dp)
-                .clickable(
+                .combinedClickable(
                     interactionSource = remember { MutableInteractionSource() },
                     indication = null,
                     onClick = onClick,
+                    onLongClick = onLongClick,
                 ),
             contentAlignment = Alignment.Center,
         ) {
@@ -4393,93 +4806,71 @@ internal fun FilterMenu(
     onParamCommit: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    Surface(
-        color = Color.Black.copy(alpha = 0.8f),
-        shape = RoundedCornerShape(14.dp),
-        modifier = modifier.padding(start = 12.dp, end = 12.dp, bottom = 6.dp),
+    PlayerSheet(
+        title = "滤镜",
+        subtitle = when {
+            presetIndex >= 0 && presetIndex < FilterPresets.all.size ->
+                "预设 · ${FilterPresets.all[presetIndex].name}"
+            selectedCustomIndex >= 0 && selectedCustomIndex < customPresets.size ->
+                "模板 · ${customPresets[selectedCustomIndex].name}"
+            else -> "自定义"
+        },
+        onDismiss = onDismiss,
+        modifier = modifier,
     ) {
-        Column(modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)) {
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                modifier = Modifier.fillMaxWidth(),
-            ) {
-                Text(
-                    when {
-                        presetIndex >= 0 -> "预设"
-                        selectedCustomIndex >= 0 -> "模板"
-                        else -> "自定义"
-                    },
-                    color = Color.White.copy(alpha = 0.75f),
-                    style = MaterialTheme.typography.labelMedium,
-                    maxLines = 1,
-                    modifier = Modifier.padding(end = 6.dp),
+        // 低分辨率横屏下胶囊可能超宽，允许横向滚动兜底（同 VR 菜单）
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.horizontalScroll(rememberScrollState()),
+        ) {
+            FilterPresets.all.forEachIndexed { i, preset ->
+                VrChip(
+                    preset.name,
+                    selected = i == presetIndex,
+                    onClick = { onPickPreset(i) },
                 )
-                // 低分辨率横屏下胶囊可能超宽，允许横向滚动兜底（同 VR 菜单）
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    modifier = Modifier.weight(1f).horizontalScroll(rememberScrollState()),
-                ) {
-                    FilterPresets.all.forEachIndexed { i, preset ->
-                        VrChip(
-                            preset.name,
-                            selected = i == presetIndex,
-                            onClick = { onPickPreset(i) },
-                        )
-                    }
-                    // 自定义模板：点一下整组参数回到存档那一刻；长按删除（toast 兜底说明）
-                    customPresets.forEachIndexed { i, custom ->
-                        VrChip(
-                            custom.name,
-                            selected = presetIndex < 0 && i == selectedCustomIndex,
-                            onClick = { onPickCustom(i) },
-                            onLongClick = { onDeleteCustom(i) },
-                        )
-                    }
-                    // 存模板 = 把当前参数起个名字收进上面那排；原图没存的价值，置灰
-                    VrChip(
-                        "存模板",
-                        selected = false,
-                        enabled = canSaveTemplate,
-                        onClick = onSaveTemplate,
-                    )
-                    // 重置 = 回到原图（中性参数），渲染路径也随之退回 TextureView
-                    VrChip("重置", selected = false, onClick = { onPickPreset(0) })
-                    // 对比：左半原图、右半滤镜。参数是原图时没走 GL，置灰不可点
-                    VrChip(
-                        "对比",
-                        selected = compareOn,
-                        enabled = compareAvailable,
-                        onClick = onToggleCompare,
-                    )
-                }
-                IconButton(
-                    onClick = onDismiss,
-                    modifier = Modifier.size(30.dp),
-                ) {
-                    Icon(
-                        Icons.Outlined.Close,
-                        contentDescription = "收起滤镜面板",
-                        tint = Color.White,
-                        modifier = Modifier.size(16.dp),
-                    )
-                }
             }
-            Spacer(Modifier.height(4.dp))
-            // 两列三行：平板横屏下不至于挡掉大半画面，竖屏窄屏也还能用
-            FILTER_SLIDERS.chunked(2).forEach { row ->
-                Row(Modifier.fillMaxWidth()) {
-                    row.forEach { slider ->
-                        FilterSliderCell(
-                            slider = slider,
-                            params = params,
-                            onParam = onParam,
-                            onParamCommit = onParamCommit,
-                            modifier = Modifier.weight(1f).padding(horizontal = 4.dp),
-                        )
-                    }
-                    // 奇数个时补空位（当前固定 6 个；留着防以后加参数时右列被拉宽）
-                    repeat(2 - row.size) { Spacer(Modifier.weight(1f)) }
+            // 自定义模板：点一下整组参数回到存档那一刻；长按删除（toast 兜底说明）
+            customPresets.forEachIndexed { i, custom ->
+                VrChip(
+                    custom.name,
+                    selected = presetIndex < 0 && i == selectedCustomIndex,
+                    onClick = { onPickCustom(i) },
+                    onLongClick = { onDeleteCustom(i) },
+                )
+            }
+            // 存模板 = 把当前参数起个名字收进上面那排；原图没存的价值，置灰
+            VrChip(
+                "存模板",
+                selected = false,
+                enabled = canSaveTemplate,
+                onClick = onSaveTemplate,
+            )
+            // 重置 = 回到原图（中性参数），渲染路径也随之退回 TextureView
+            VrChip("重置", selected = false, onClick = { onPickPreset(0) })
+            // 对比：左半原图、右半滤镜。参数是原图时没走 GL，置灰不可点
+            VrChip(
+                "对比",
+                selected = compareOn,
+                enabled = compareAvailable,
+                onClick = onToggleCompare,
+            )
+        }
+        Spacer(Modifier.height(4.dp))
+        // 两列三行：平板横屏下不至于挡掉大半画面，竖屏窄屏也还能用
+        FILTER_SLIDERS.chunked(2).forEach { row ->
+            Row(Modifier.fillMaxWidth()) {
+                row.forEach { slider ->
+                    FilterSliderCell(
+                        slider = slider,
+                        params = params,
+                        onParam = onParam,
+                        onParamCommit = onParamCommit,
+                        modifier = Modifier.weight(1f).padding(horizontal = 4.dp),
+                    )
                 }
+                // 奇数个时补空位（当前固定 6 个；留着防以后加参数时右列被拉宽）
+                repeat(2 - row.size) { Spacer(Modifier.weight(1f)) }
             }
         }
     }
@@ -4493,37 +4884,23 @@ private fun FilterSliderCell(
     onParamCommit: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    val value = slider.get(params)
-    Column(modifier) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Text(
-                slider.label,
-                color = Color.White.copy(alpha = 0.75f),
-                style = MaterialTheme.typography.labelMedium,
-                maxLines = 1,
-            )
-            Spacer(Modifier.width(6.dp))
-            Text(
-                slider.format(value),
-                color = Color.White,
-                style = MaterialTheme.typography.labelMedium,
-                maxLines = 1,
-            )
-        }
-        Slider(
-            value = value,
-            onValueChange = { v ->
-                // ⚠️ 必须 copy 出新实例：参数是普通 data class，原地改字段 Compose 不会重组，
-                //    表现是"滑块能拖、数值与画面都不动"
-                val next = params.copy()
-                slider.set(next, v)
-                onParam(next)
-            },
-            onValueChangeFinished = onParamCommit,
-            valueRange = slider.range,
-            modifier = Modifier.fillMaxWidth(),
-        )
-    }
+    PlayerSliderCell(
+        label = slider.label,
+        valueText = slider.format(slider.get(params)),
+        value = slider.get(params),
+        range = slider.range,
+        // 双击回默认 = 回到该参数的中性值（原图）
+        defaultValue = slider.get(FilterParams()),
+        onChange = { v ->
+            // ⚠️ 必须 copy 出新实例：参数是普通 data class，原地改字段 Compose 不会重组，
+            //    表现是"滑块能拖、数值与画面都不动"
+            val next = params.copy()
+            slider.set(next, v)
+            onParam(next)
+        },
+        onCommit = onParamCommit,
+        modifier = modifier,
+    )
 }
 
 /**
@@ -4554,101 +4931,88 @@ internal fun VrModeMenu(
     onPannini: (Float) -> Unit,
     onPanniniCommit: (Float) -> Unit,
     onWindow: (VrWindow) -> Unit,
+    /** 收起菜单（标题行关闭键）：与滤镜/弹幕面板同一交互 */
+    onDismiss: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    Surface(
-        color = Color.Black.copy(alpha = 0.8f),
-        shape = RoundedCornerShape(14.dp),
-        modifier = modifier.padding(start = 12.dp, end = 12.dp, bottom = 6.dp),
+    PlayerSheet(
+        title = "VR",
+        onDismiss = onDismiss,
+        modifier = modifier,
+        // 框按内容收窄（chips 行多宽框多宽），靠调用处的 align 居中 ——
+        // 全宽长框包几行小胶囊太空
+        fillWidth = false,
     ) {
-        Column(modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)) {
-            // 低分辨率横屏下 8 个胶囊可能超宽，允许横向滚动兜底
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                modifier = Modifier.horizontalScroll(rememberScrollState()),
-            ) {
-                // 「自动」必须单独给一个入口：否则用户一旦选过「关闭」，
-                // 自动识别就被永久关掉、没有任何回头的路。
-                VrChip("自动", autoMode) { onAuto() }
-                VrChip("关闭", !autoMode && current == null) { onPick(null) }
-                // 顺序即日常使用频率：VR180 远多于 360
-                VrMode.entries.forEach { m ->
-                    VrChip(m.label, current == m) { onPick(m) }
-                }
-                VrChip(if (rightEye) "右眼" else "左眼", false) { onToggleEye() }
-                VrChip(
-                    label = when {
-                        !gyroAvailable -> "无陀螺仪"
-                        gyroOn -> "陀螺仪开"
-                        else -> "陀螺仪关"
-                    },
-                    selected = gyroOn && gyroAvailable,
-                    enabled = gyroAvailable,
-                    onClick = onToggleGyro,
-                )
-                VrChip("复位", false) { onRecenter() }
+        // 低分辨率横屏下 8 个胶囊可能超宽，允许横向滚动兜底
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.horizontalScroll(rememberScrollState()),
+        ) {
+            // 「自动」必须单独给一个入口：否则用户一旦选过「关闭」，
+            // 自动识别就被永久关掉、没有任何回头的路。
+            VrChip("自动", autoMode) { onAuto() }
+            VrChip("关闭", !autoMode && current == null) { onPick(null) }
+            // 顺序即日常使用频率：VR180 远多于 360
+            VrMode.entries.forEach { m ->
+                VrChip(m.label, current == m) { onPick(m) }
             }
-            Spacer(Modifier.height(4.dp))
-            // 边缘畸变抑制：0 = 直线透视，1 = 标准 Pannini，越大越接近柱面。
-            // 纵向不随它变，所以拖的时候画面中心大小不动，只改边缘 —— 好判断。
-            // 整行在菜单里居中：此前贴左 + 滑杆只有 160dp，右侧大片空白，
-            // 整个菜单的视觉重心被推向一侧，看起来就像整体没居中。
+            VrChip(if (rightEye) "右眼" else "左眼", false) { onToggleEye() }
+            VrChip(
+                label = when {
+                    !gyroAvailable -> "无陀螺仪"
+                    gyroOn -> "陀螺仪开"
+                    else -> "陀螺仪关"
+                },
+                selected = gyroOn && gyroAvailable,
+                enabled = gyroAvailable,
+                onClick = onToggleGyro,
+            )
+            VrChip("复位", false) { onRecenter() }
+        }
+        Spacer(Modifier.height(2.dp))
+        // 边缘畸变抑制：0 = 直线透视，1 = 标准 Pannini，越大越接近柱面。
+        // 纵向不随它变，所以拖的时候画面中心大小不动，只改边缘 —— 好判断。
+        // 排版照原版 VR 面板：标签+滑条+数值整组**居中**（不拉满整行），轻而紧凑；
+        // 滑条本体用新样式（细轨圆点，见 PlayerSliderCore），与另外两块面板同一套皮肤。
+        PlayerSliderRow(
+            label = "边缘畸变抑制",
+            valueText = if (panniniD < 0.05f) "关" else String.format(java.util.Locale.US, "%.1f", panniniD),
+            value = panniniD,
+            range = 0f..VrViewState.MAX_PANNINI,
+            defaultValue = 1.0f,
+            onChange = onPannini,
+            onCommit = { onPanniniCommit(panniniD) },
+            modifier = Modifier.align(Alignment.CenterHorizontally),
+        )
+        // 视窗档位（仅竖屏）：收窄长边把 Pannini 压不到的垂直畸变压下来。
+        // 横屏不显示 —— 横屏的长宽比不是瓶颈（实测 4:3~21:9 最差拉伸都锁在
+        // 1.65~1.70×），收窄只会白丢画面宽度，放一个在当前方向下不起作用的
+        // 开关比不放更糟。放在单独一行而不是并进上面那排：竖屏屏窄，
+        // 11 个胶囊必然横向溢出，得滚动才够得着。
+        if (showWindowOptions) {
+            Spacer(Modifier.height(2.dp))
             Row(
                 verticalAlignment = Alignment.CenterVertically,
                 modifier = Modifier.align(Alignment.CenterHorizontally),
             ) {
                 Text(
-                    "边缘畸变抑制",
-                    color = Color.White.copy(alpha = 0.75f),
+                    "视窗",
+                    color = Color.White.copy(alpha = 0.68f),
                     style = MaterialTheme.typography.labelMedium,
                     maxLines = 1,
                 )
                 Spacer(Modifier.width(6.dp))
-                Slider(
-                    value = panniniD,
-                    onValueChange = onPannini,
-                    onValueChangeFinished = { onPanniniCommit(panniniD) },
-                    valueRange = 0f..VrViewState.MAX_PANNINI,
-                    modifier = Modifier.width(300.dp),
-                )
-                Spacer(Modifier.width(6.dp))
-                Text(
-                    if (panniniD < 0.05f) "关"
-                    else String.format(java.util.Locale.US, "%.1f", panniniD),
-                    color = Color.White,
-                    style = MaterialTheme.typography.labelMedium,
-                    maxLines = 1,
-                    modifier = Modifier.width(26.dp),
-                )
-            }
-            // 视窗档位（仅竖屏）：收窄长边把 Pannini 压不到的垂直畸变压下来。
-            // 横屏不显示 —— 横屏的长宽比不是瓶颈（实测 4:3~21:9 最差拉伸都锁在
-            // 1.65~1.70×），收窄只会白丢画面宽度，放一个在当前方向下不起作用的
-            // 开关比不放更糟。放在单独一行而不是并进上面那排：竖屏屏窄，
-            // 11 个胶囊必然横向溢出，得滚动才够得着。
-            if (showWindowOptions) {
-                Spacer(Modifier.height(4.dp))
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    modifier = Modifier.align(Alignment.CenterHorizontally),
-                ) {
-                    Text(
-                        "视窗",
-                        color = Color.White.copy(alpha = 0.75f),
-                        style = MaterialTheme.typography.labelMedium,
-                        maxLines = 1,
-                    )
-                    Spacer(Modifier.width(6.dp))
-                    VrWindow.entries.forEach { w ->
-                        VrChip(w.label, windowMode == w) { onWindow(w) }
-                    }
+                VrWindow.entries.forEach { w ->
+                    VrChip(w.label, windowMode == w) { onWindow(w) }
                 }
             }
         }
     }
 }
 
-/** 面板/菜单共用的小胶囊（VR 模式、滤镜预设、弹幕档位都是它） */
+/** 面板/菜单共用的小胶囊（VR 模式、滤镜预设、弹幕档位都是它）。
+ *  统一视觉：未选中 = 透明底 + 白描边；选中 = 主色浅底 + 主色描边 + 主色字；
+ *  禁用 = 极淡底 + 弱字。不再用白/灰实心块 —— 暗色视频背景上实心块太抢。 */
 @Composable
 @OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
 internal fun VrChip(
@@ -4661,10 +5025,18 @@ internal fun VrChip(
     onClick: () -> Unit,
 ) {    Surface(
         color = when {
-            !enabled -> Color.White.copy(alpha = 0.10f)
-            selected -> Color.White
-            else -> Color.White.copy(alpha = 0.15f)
+            !enabled -> Color.White.copy(alpha = 0.06f)
+            selected -> PlayerAccent.copy(alpha = 0.18f)
+            else -> Color.Transparent
         },
+        border = androidx.compose.foundation.BorderStroke(
+            1.dp,
+            when {
+                !enabled -> Color.Transparent
+                selected -> PlayerAccent.copy(alpha = 0.75f)
+                else -> Color.White.copy(alpha = 0.26f)
+            },
+        ),
         shape = RoundedCornerShape(50),
         modifier = Modifier
             .padding(horizontal = 3.dp)
@@ -4680,10 +5052,12 @@ internal fun VrChip(
             label,
             color = when {
                 !enabled -> Color.White.copy(alpha = 0.35f)
-                selected -> Color(0xFF1B1B1B)
-                else -> Color.White
+                selected -> PlayerAccent
+                else -> Color.White.copy(alpha = 0.92f)
             },
-            style = MaterialTheme.typography.labelMedium,
+            // labelMedium 默认 16sp 行高装不下 12sp 的汉字下延（字形超出行盒被裁掉
+            // 下缘，透明底+描边后格外显眼），行高放到 18sp 才完整
+            style = MaterialTheme.typography.labelMedium.copy(lineHeight = 18.sp),
             maxLines = 1,
             modifier = Modifier.padding(horizontal = 11.dp, vertical = 7.dp),
         )

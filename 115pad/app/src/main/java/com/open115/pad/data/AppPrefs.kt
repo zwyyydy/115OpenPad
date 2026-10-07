@@ -121,16 +121,49 @@ class AppPrefs(private val context: Context) {
 
     suspend fun setKeepAlive(on: Boolean) = context.appDataStore.edit { it[KEY_KEEP_ALIVE] = on }
 
-    private companion object {
-        val KEY_START_PAGE = stringPreferencesKey("start_page")
-        val KEY_THEME = stringPreferencesKey("theme_mode")
-        val KEY_WALLPAPER = stringPreferencesKey("wallpaper_uri")
-        val KEY_WALLPAPER_STAMP = longPreferencesKey("wallpaper_stamp")
-        val KEY_WALLPAPER_MASK = intPreferencesKey("wallpaper_mask")
-        val KEY_WALLPAPER_BLUR = intPreferencesKey("wallpaper_blur")
-        val KEY_GLASS_ALPHA = intPreferencesKey("glass_card_alpha")
-        val KEY_GLASS_GAP = intPreferencesKey("glass_gap_dp")
-        val KEY_GLASS_RADIUS = intPreferencesKey("glass_radius_dp")
-        val KEY_KEEP_ALIVE = booleanPreferencesKey("keep_alive")
+    // ---- 防频控：日常操作的全局请求间隔（设置 → 后台任务） ----
+
+    /**
+     * 相邻两次 115 资源接口请求的最小间隔（毫秒，0 = 关闭）。
+     *
+     * 115 对同一个账号有频率限制，密集请求会被临时挡下（"操作频繁"）。媒体库扫描与分类整理
+     * 各自有分档限速，但**日常操作**（浏览文件、搜索、打开图/视频、改名、删除……）以前一个
+     * 间隔都没有 —— 这一项就是给它们兜底。默认 300ms：只在"距上次请求不足 300ms"时才等，
+     * 正常点击基本无感，但连点/一串请求会被拉平。
+     *
+     * 图片字节、上传分片、视频流不走这条通道（见 RateLimitInterceptor 的说明），不受它影响。
+     */
+    val apiRateIntervalMs: Flow<Long> = context.appDataStore.data.map {
+        val v = it[KEY_API_RATE] ?: DEFAULT_API_RATE_MS
+        // 只认选项里的值：存档里出现别的数（旧版本/手改）就当默认，别让限速变成随机行为
+        if (v in API_RATE_OPTIONS.map { o -> o.second }) v else DEFAULT_API_RATE_MS
+    }
+
+    suspend fun setApiRateIntervalMs(ms: Long) = context.appDataStore.edit { it[KEY_API_RATE] = ms }
+
+    companion object {
+        /** 「全局请求间隔」的档位（设置页直接渲染这一份） */
+        val API_RATE_OPTIONS = listOf(
+            "关闭" to 0L,
+            "200ms" to 200L,
+            "300ms（推荐）" to 300L,
+            "500ms" to 500L,
+            "800ms" to 800L,
+            "1200ms" to 1200L,
+        )
+
+        const val DEFAULT_API_RATE_MS = 300L
+
+        private val KEY_START_PAGE = stringPreferencesKey("start_page")
+        private val KEY_THEME = stringPreferencesKey("theme_mode")
+        private val KEY_WALLPAPER = stringPreferencesKey("wallpaper_uri")
+        private val KEY_WALLPAPER_STAMP = longPreferencesKey("wallpaper_stamp")
+        private val KEY_WALLPAPER_MASK = intPreferencesKey("wallpaper_mask")
+        private val KEY_WALLPAPER_BLUR = intPreferencesKey("wallpaper_blur")
+        private val KEY_GLASS_ALPHA = intPreferencesKey("glass_card_alpha")
+        private val KEY_GLASS_GAP = intPreferencesKey("glass_gap_dp")
+        private val KEY_GLASS_RADIUS = intPreferencesKey("glass_radius_dp")
+        private val KEY_KEEP_ALIVE = booleanPreferencesKey("keep_alive")
+        private val KEY_API_RATE = longPreferencesKey("api_rate_interval_ms")
     }
 }

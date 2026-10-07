@@ -68,6 +68,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.open115.pad.data.DownloadSubmitter
 import com.open115.pad.data.DownloadPrefs
+import com.open115.pad.data.DirCache
 import com.open115.pad.data.OpenApi
 import com.open115.pad.data.OfflineTask
 import com.open115.pad.data.envMsg
@@ -79,6 +80,7 @@ import com.open115.pad.util.Format
 import com.open115.pad.util.Torrent
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.stateIn
@@ -98,6 +100,10 @@ class OfflineViewModel(
     val api: OpenApi,
     /** 云下载保存位置持久化：设置一次，后续提交都落到这里 */
     private val downloadPrefs: DownloadPrefs? = null,
+    /** 目录列表缓存：删任务且删了源文件后把保存位置目录的缓存作废，文件页不再显示已删产物 */
+    private val dirCache: DirCache? = null,
+    /** 目录内容变更广播（见 [com.open115.pad.App115.dirRemovals]），未注入则只作废缓存 */
+    private val dirRemovals: MutableSharedFlow<Map<String, Set<String>>>? = null,
     /** 提交入口（与剪贴板/外部唤起共用同一套语义与错误提示） */
     private val submitter: DownloadSubmitter? = null,
 ) : ViewModel() {
@@ -242,9 +248,32 @@ class OfflineViewModel(
         return err
     }
 
+    /**
+     * 删除成功后的乐观收尾：立刻把任务从列表里拿掉（之前只做静默刷新 —— 翻过页后
+     * mergeRefresh 只做替换与新增、从不清本地已删项，任务会一直挂在列表上），
+     * 勾了删源文件时再把保存位置目录的缓存作废并广播给文件页。
+     */
+    private fun removeTaskLocally(infoHash: String, delSourceFile: Boolean) {
+        val task = _ui.value.tasks.firstOrNull { it.infoHash == infoHash } ?: return
+        _ui.update { s -> s.copy(tasks = s.tasks.filter { it.infoHash != infoHash }) }
+        if (!delSourceFile) return
+        // 被删的产物在保存位置目录下，名字就是任务名；file_id 是产物本身（BT 任务=目录），
+        // 也一并作废 —— 用户可能正停在产物目录里
+        val changes = mutableMapOf<String, MutableSet<String>>()
+        task.wpPathId?.takeIf { it.isNotBlank() }?.let { cid ->
+            task.name?.let { changes.getOrPut(cid) { mutableSetOf() }.add(it) }
+        }
+        task.fileId?.takeIf { it.isNotBlank() && it != "0" }?.let { changes.putIfAbsent(it, mutableSetOf()) }
+        if (changes.isNotEmpty()) {
+            dirCache?.let { c -> changes.keys.forEach(c::invalidateDir) }
+            dirRemovals?.tryEmit(changes)
+        }
+    }
+
     suspend fun delete(infoHash: String, delSourceFile: Boolean): String? = try {
         val resp = api.offlineDelete(infoHash, if (delSourceFile) 1 else 0)
         if (resp.envOk()) {
+            removeTaskLocally(infoHash, delSourceFile)
             refresh(silent = true)
             null
         } else {
@@ -256,8 +285,8 @@ class OfflineViewModel(
 
     /**
      * 批量删除：逐个调 del_task（轻接口，条间 150ms 防频控），返回 (成功, 失败) 条数。
-     * 收尾做**全量**刷新（replace）而不是静默合并 —— 合并只对第一页生效，
-     * 跨页已删的任务清不掉。
+     * 每删成功一条就乐观移除一条（界面上即时消失），收尾再做**全量**刷新（replace）
+     * 而不是静默合并 —— 合并只对第一页生效，跨页已删的任务清不掉。
      */
     suspend fun deleteBatch(infoHashes: List<String>, delSourceFile: Boolean): Pair<Int, Int> {
         var ok = 0
@@ -265,7 +294,10 @@ class OfflineViewModel(
         for (h in infoHashes) {
             try {
                 val resp = api.offlineDelete(h, if (delSourceFile) 1 else 0)
-                if (resp.envOk()) ok++ else failed++
+                if (resp.envOk()) {
+                    ok++
+                    removeTaskLocally(h, delSourceFile)
+                } else failed++
             } catch (_: Exception) {
                 failed++
             }

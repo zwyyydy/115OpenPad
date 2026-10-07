@@ -26,6 +26,15 @@ class DirCache(
         val items: List<FileItem>,
         val count: Long,
         val at: Long,
+        /**
+         * 这一层的真实祖先链（列目录响应里的 `path[]`，见 [PathNode]）。
+         *
+         * 存它是因为：按 cid 跳转（操作记录 / 快捷目录 / 云下载 / 离线任务）时只有一个 cid，
+         * 祖先只能从响应里拿；而**命中新鲜缓存时根本不会发请求**，不存这里就会"跳回去只有两级、
+         * 跳一次新的才有完整链"——时好时坏比不做还难解释。
+         * 老条目 / 搜索没有它就是空的，调用方按"没有祖先信息"处理即可。
+         */
+        val path: List<PathNode> = emptyList(),
     )
 
     // accessOrder = true：连读取也会把条目挪到队尾，淘汰时先丢最久没用过的

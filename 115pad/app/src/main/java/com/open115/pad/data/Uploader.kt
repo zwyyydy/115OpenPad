@@ -708,6 +708,10 @@ object Uploader {
                             eTags.add(n to doneEtag)
                             continue
                         }
+                        // 先把这一片的文件内容读进缓冲：下面 PUT 发的就是 partBuf 本身，
+                        // 不填它 → 传上去的是全零（尺寸对、内容空）。读放在重试循环外，
+                        // 重试沿用同一份内容，不必重读
+                        fillFromChannel(ch, partBuf, offset, len)
                         // 逐片 PUT：partNumber/uploadId 都是签名子资源（字典序在前）。
                         // 重试只针对传输异常（IOException 类）；非 2xx 是会话级错误，
                         // 重试无意义，直接失败——唯一例外 PartAlreadyExist（顺序分片

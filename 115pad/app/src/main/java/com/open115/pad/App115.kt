@@ -1,7 +1,9 @@
 package com.open115.pad
 
+import android.app.Activity
 import android.app.Application
 import android.content.Context
+import android.os.Bundle
 import android.util.Log
 import com.open115.pad.data.AuthApi
 import com.open115.pad.data.AuthInterceptor
@@ -11,12 +13,13 @@ import com.open115.pad.data.OpenApi
 import com.open115.pad.data.QrApi
 import com.open115.pad.data.Session
 import com.open115.pad.data.TokenAuthenticator
-import com.open115.pad.data.media.ScanMode
 import com.open115.pad.data.media.autoScanDue
+import com.open115.pad.data.media.autoScanModeOrDefault
 import kotlinx.serialization.json.Json
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.combine
@@ -37,9 +40,33 @@ class App115 : Application() {
     lateinit var container: AppContainer
         private set
 
+    /**
+     * 主界面（MainActivity）在前台吗 —— 任务完成的通知只在它**不可见**时发（见 ui/AppRoot 的 finishNotice）。
+     *
+     * 用 started 计数而不是"Application 在前台"：播放器是**另一个 Activity**，用户在播放器里时
+     * 主界面已经 stopped —— 那种时候也该发通知（Snackbar 挂在主界面上，他看不到）。
+     */
+    private var mainUiStarted = 0
+    val isMainUiVisible: Boolean get() = mainUiStarted > 0
+
     override fun onCreate() {
         super.onCreate()
         container = AppContainer(this)
+        registerActivityLifecycleCallbacks(object : ActivityLifecycleCallbacks {
+            override fun onActivityStarted(activity: Activity) {
+                if (activity is MainActivity) mainUiStarted++
+            }
+
+            override fun onActivityStopped(activity: Activity) {
+                if (activity is MainActivity) mainUiStarted--
+            }
+
+            override fun onActivityCreated(activity: Activity, savedInstanceState: Bundle?) = Unit
+            override fun onActivityResumed(activity: Activity) = Unit
+            override fun onActivityPaused(activity: Activity) = Unit
+            override fun onActivitySaveInstanceState(activity: Activity, outState: Bundle) = Unit
+            override fun onActivityDestroyed(activity: Activity) = Unit
+        })
     }
 }
 
@@ -73,6 +100,18 @@ class AppContainer(context: Context) {
      */
     val dirCache = com.open115.pad.data.DirCache()
 
+    /**
+     * 目录内容被移除了某些条目的广播：cid → 被移除条目名集合（同目录内名字唯一，按名认不会错）。
+     * 发送方：回收站（彻底删除/清空）、云下载（删任务且勾了删源文件）。
+     * 接收方：文件页 —— 作废这些目录的 [dirCache] 条目（持久，下次进入必然真实请求）；
+     * 正停在受影响目录时把这些条目**就地**从列表里拿掉，而不是整页重拉 ——
+     * 115 的删除是异步生效的，删完立即重拉很可能把"还没删完"的旧状态写回缓存，
+     * 界面上反而一直是"删了还在"。值允许空集合 = 该目录内容整体变了，只作废缓存。
+     */
+    val dirRemovals = kotlinx.coroutines.flow.MutableSharedFlow<Map<String, Set<String>>>(
+        extraBufferCapacity = 16,
+    )
+
     /** 只用于极少数与 UI 无关的长期观察（目前只有"登出后清缓存"） */
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
@@ -94,30 +133,74 @@ class AppContainer(context: Context) {
     /** 剪贴板 / 外部唤起的下载链接汇聚点，由 MainActivity 投递、AppRoot 消费 */
     val downloadLinks = com.open115.pad.data.DownloadLinkBus(context, downloadPrefs)
 
-    val okHttpClient: OkHttpClient = OkHttpClient.Builder()
-        .addInterceptor { chain ->
-            chain.proceed(
-                chain.request().newBuilder()
-                    .header("User-Agent", com.open115.pad.util.APP_USER_AGENT)
-                    .build()
-            )
-        }
-        .addInterceptor(com.open115.pad.data.Logical401Interceptor(session))
-        .addInterceptor(AuthInterceptor(session))
-        .authenticator(TokenAuthenticator(session))
-        .connectTimeout(20, TimeUnit.SECONDS)
-        .readTimeout(120, TimeUnit.SECONDS) // 二维码状态接口是长轮询
-        .build()
+    /**
+     * 「请求限速」的内存镜像（毫秒，0 = 关闭）。
+     *
+     * 和媒体库缓存上限那两份镜像同一个套路：DataStore → 内存，设置里改完立刻生效、不用重启。
+     * 只有 OkHttp 的工作线程读它，用 @Volatile 保证可见性。
+     */
+    @Volatile
+    var apiRateIntervalMs: Long = com.open115.pad.data.AppPrefs.DEFAULT_API_RATE_MS
+        private set
 
-    private fun retrofit(baseUrl: String): Retrofit = Retrofit.Builder()
+    /** 全局限速的节拍器：只挂在 [apiOkHttpClient] 上（理由见 [com.open115.pad.data.RateLimitInterceptor]） */
+    private val apiPacer = com.open115.pad.data.ApiPacer(intervalMs = { apiRateIntervalMs })
+
+    /**
+     * 通用 client：**不限速**。
+     *
+     * 图片字节（Coil 用的就是它）、第三方弹幕源、登录/二维码接口、备份包的传输都走它 ——
+     * 这些要么不是 115 的 open 接口，要么是 CDN/OSS 字节流，跟"接口被频控"不是一回事。
+     */
+    val okHttpClient: OkHttpClient = newHttpClient(rateLimited = false)
+
+    /**
+     * 打 115 资源接口（proapi）的 client：比上面多一层全局限速。
+     *
+     * 为什么不让两者共用一个 client：那会把图片加载与 OSS 上传一起限速 ——
+     * 海报墙会明显变慢、上传会掉速，而它们本来就不占接口额度。
+     */
+    private val apiOkHttpClient: OkHttpClient = newHttpClient(rateLimited = true)
+
+    private fun newHttpClient(rateLimited: Boolean): OkHttpClient {
+        val builder = OkHttpClient.Builder()
+        if (rateLimited) builder.addInterceptor(com.open115.pad.data.RateLimitInterceptor(apiPacer))
+        return builder
+            .addInterceptor { chain ->
+                chain.proceed(
+                    chain.request().newBuilder()
+                        .header("User-Agent", com.open115.pad.util.APP_USER_AGENT)
+                        .build()
+                )
+            }
+            .addInterceptor(com.open115.pad.data.Logical401Interceptor(session))
+            .addInterceptor(AuthInterceptor(session))
+            .authenticator(TokenAuthenticator(session))
+            .connectTimeout(20, TimeUnit.SECONDS)
+            .readTimeout(120, TimeUnit.SECONDS) // 二维码状态接口是长轮询
+            .build()
+    }
+
+    private fun retrofit(baseUrl: String, client: OkHttpClient = okHttpClient): Retrofit = Retrofit.Builder()
         .baseUrl(baseUrl)
-        .client(okHttpClient)
+        .client(client)
         .addConverterFactory(json.asConverterFactory("application/json".toMediaType()))
         .build()
 
     val authApi: AuthApi = retrofit("https://passportapi.115.com/").create(AuthApi::class.java)
     val qrApi: QrApi = retrofit("https://qrcodeapi.115.com/").create(QrApi::class.java)
-    val openApi: OpenApi = retrofit("https://proapi.115.com/").create(OpenApi::class.java)
+
+    /** 115 资源接口：**受限速保护**（文件浏览/搜索、直链解析、各类写操作都走它） */
+    val openApi: OpenApi =
+        retrofit("https://proapi.115.com/", apiOkHttpClient).create(OpenApi::class.java)
+
+    /**
+     * 同一套 115 资源接口的**不限速**版本，只给"自己已经管着节流"的后台任务用
+     * （媒体库扫描、分类整理）：它们那套"按目录数选档"的间隔是专门调过的，
+     * 再叠一层全局间隔就是两套时钟互相顶 —— 见 [com.open115.pad.data.RateLimitInterceptor]。
+     */
+    private val bulkOpenApi: OpenApi =
+        retrofit("https://proapi.115.com/").create(OpenApi::class.java)
 
     /**
      * 图片直链三级解析链（uo → downurl → thumb）+ downurl 防频控缓存。
@@ -132,9 +215,34 @@ class AppContainer(context: Context) {
         mediaCacheEnabled = { mediaCacheEnabled },
     )
 
+    /**
+     * 视频预览图缓存的设置（上限，MB）。
+     * 上限存的是"偏好值"，运行时生效的那份是下面的 [previewCacheMaxBytes] 镜像。
+     */
+    val previewPrefs = com.open115.pad.data.PreviewPrefs(context)
+
+    /**
+     * 预览图缓存上限的内存镜像（字节）。由下面的 collect 从 DataStore 灌进来，
+     * 写入路径（播放器/批量/截图）是普通函数、不是协程，只能读这个镜像。
+     */
+    @Volatile
+    var previewCacheMaxBytes: Long = com.open115.pad.data.VideoPreviewStore.DEFAULT_MAX_BYTES
+        private set
+
+    /**
+     * 视频预览图：本地缓存（按 pick_code 落盘）+ 抽帧器（115 最小转码档的 HLS 分片）。
+     * 文件页列表读缓存显示（零请求），播放时与批量任务负责生成，见 VideoFrameGrab/VideoPreviewStore。
+     * 上限到顶由 store 自己在写入后淘汰最久没看的那批（见 VideoPreviewStore.prune）。
+     */
+    val videoPreviews = com.open115.pad.data.VideoPreviewStore(
+        root = cacheDir,
+        maxBytes = { previewCacheMaxBytes },
+    )
+    val videoFrames = com.open115.pad.data.VideoFrameGrabber(openApi, okHttpClient, cacheDir)
+
+
     /** 批量重命名的持久化任务队列：任务逐条落库，进程被杀后重启能精确续跑 */
     val renameQueue = com.open115.pad.data.RenameQueue(context)
-
     /**
      * 队列执行器：一条常驻协程把队列里的任务**顺序**跑完。挂在容器上（而不是面板或
      * ViewModel 里）—— 关面板、切页、切任务页都不该中断它，跟上传一样由 [transferScope] 承载。
@@ -181,7 +289,9 @@ class AppContainer(context: Context) {
     )
 
     val mediaScanner = com.open115.pad.data.media.MediaScanner(
-        openApi, okHttpClient, mediaDatabase.mediaDao(), mediaCache,
+        // ★ 用**不限速**的那一份接口：扫描器自己有按目录数选档的阶梯限速，
+        //   再叠一层全局间隔就是两套时钟互相顶（见 RateLimitInterceptor）
+        bulkOpenApi, okHttpClient, mediaDatabase.mediaDao(), mediaCache,
         // 扫描期顺手把海报字节取到本地：扫完进海报墙/详情页不必再等图
         // （缓存命中时是纯文件判断，不占限速等待；缓存关掉时什么都不做）
         imageUrlResolver = imageUrlResolver,
@@ -210,7 +320,41 @@ class AppContainer(context: Context) {
      * taskActivity 让前台服务跟着亮），切页不停、进程死了就断（断点无从谈起，纯云端移动）。
      */
     val fileOrganizer = com.open115.pad.data.FileOrganizer(
-        openApi, opLog, dirCache, transferScope,
+        // 同理：整理自己有 300/1000/2000ms 的分级限速，走不限速的那一份接口
+        bulkOpenApi, opLog, dirCache, transferScope,
+    )
+
+    /**
+     * 重复文件查找（文件页「查找重复」）：按列表响应自带的 sha1 分组，只读不写。
+     *
+     * 同样走 `bulkOpenApi` + 自己的分级限速（它要把目录一层层列一遍，属于后台批量）；
+     * 跑在 transferScope 上，切页不断 —— 下面把它接进 taskActivity，任务期间前台服务会保命。
+     */
+    val duplicateFinder = com.open115.pad.data.DuplicateFinder(
+        bulkOpenApi, dirCache, transferScope,
+    )
+
+    /**
+     * "同片多版本"预筛（A 段）：只按时长（±3 秒）找候选，零额外请求（时长/体积都是列表自带的）。
+     * 与 [duplicateFinder] 同一套骨架（bulkOpenApi + 自己的分级限速 + 可停），只是分组判据不同。
+     */
+    val versionFinder = com.open115.pad.data.VersionFinder(bulkOpenApi, transferScope)
+
+    /**
+     * 视频预览图批量生成（只读：抽帧落本机缓存，不动云端）。
+     * 走 bulkOpenApi + 自己的分级限速，与查重/多版本同一套骨架。
+     */
+    val previewBuilder = com.open115.pad.data.PreviewBuilder(
+        bulkOpenApi, videoFrames, videoPreviews, transferScope,
+    )
+
+    /** 备份：配置 / 媒体库（数据+记录+图片缓存）/ 操作记录 → 云端（实现见 data/BackupManager.kt） */
+    val backupPrefs = com.open115.pad.data.BackupPrefs(context)
+
+    val backupManager = com.open115.pad.data.BackupManager(
+        context, openApi, backupPrefs, imageUrlResolver,
+        mediaDatabase, okHttpClient, transferLog,
+        cacheDir,
     )
 
     /**
@@ -224,7 +368,12 @@ class AppContainer(context: Context) {
      *  - 分类整理：进程内协程（纯云端移动，进程死了剩下的文件留在原地，重跑一遍即可）
      * 不包括云下载（在 115 服务端跑）和本机下载（系统 DownloadManager 扛着，App 死了也照下）。
      */
-    val taskActivity: StateFlow<String?> = combine(
+    /**
+     * "除了查重之外的任务在跑什么"：原来的五路合并原样留着（那段逻辑调过很多次，不动它）。
+     * `combine` 的类型化重载只到 5 路，第 6 路（查重）在下面套一层 —— 比改成 vararg
+     * 数组形式（要统一成 `Flow<Any?>`，可读性反而差）清楚。
+     */
+    private val baseTaskActivity: StateFlow<String?> = combine(
         mediaScanner.progress,
         mediaScanner.pending,
         transferLog.uploads,
@@ -238,6 +387,8 @@ class AppContainer(context: Context) {
                     else "正在扫描媒体库",
                 )
                 if (scanning.totalDirs > 0) add("${scanning.doneDirs}/${scanning.totalDirs} 个目录")
+                // 防频控休息时进度一动不动，通知/前台服务上要说一句，不然看着像卡死
+                if (scanning.restingUntil > System.currentTimeMillis()) add("休息中（防频控）")
             }
             if (pending.isNotEmpty()) add("${pending.size} 个扫描排队")
             val uploading = uploads.count { it.finishedAt == null && !it.paused }
@@ -246,6 +397,21 @@ class AppContainer(context: Context) {
             if (organizing.running) add("正在分类整理文件")
         }
         bits.takeIf { it.isNotEmpty() }?.joinToString(" · ")
+    }.stateIn(scope, SharingStarted.Eagerly, null)
+
+    val taskActivity: StateFlow<String?> = combine(
+        baseTaskActivity,
+        duplicateFinder.progress,
+        versionFinder.progress,
+        previewBuilder.progress,
+    ) { base, deduping, versioning, previewing ->
+        val extra = when {
+            deduping.running -> "正在查找重复文件"
+            versioning.running -> "正在预筛同片多版本"
+            previewing.running -> "正在生成视频预览图"
+            else -> null
+        }
+        if (extra == null) base else listOfNotNull(base, extra).joinToString(" · ")
     }.stateIn(scope, SharingStarted.Eagerly, null)
 
     /**
@@ -326,6 +492,29 @@ class AppContainer(context: Context) {
         scope.launch {
             mediaPrefs.cacheEnabled.collect { mediaCacheEnabled = it }
         }
+
+        // 预览图缓存上限 → 内存镜像。阈值调小同样**立刻**淘汰一次：用户把它从 2GB 拉到 256MB
+        // 就是想马上腾出空间，等"下次抓帧才生效"等于没生效。
+        scope.launch {
+            previewPrefs.maxMb.collect { mb ->
+                val oldBytes = previewCacheMaxBytes
+                previewCacheMaxBytes = mb.coerceAtLeast(0) * 1024L * 1024
+                android.util.Log.i(
+                    "VPreview",
+                    "预览缓存上限 → ${previewCacheMaxBytes / 1024 / 1024} MB" +
+                        if (previewCacheMaxBytes < oldBytes) "（调小，立刻淘汰一次）" else "",
+                )
+                if (previewCacheMaxBytes < oldBytes) {
+                    withContext(Dispatchers.IO) { videoPreviews.prune() }
+                }
+            }
+        }
+
+        // 「请求限速」设置 → 内存镜像：改完立刻生效（OkHttp 工作线程读的就是它）
+        scope.launch {
+            appPrefs.apiRateIntervalMs.collect { apiRateIntervalMs = it }
+        }
+
         scope.launch {
             mediaPrefs.cacheMaxMb.collect { mb ->
                 val oldBytes = mediaCacheMaxBytes
@@ -352,9 +541,23 @@ class AppContainer(context: Context) {
                     renameWorker.start(transferScope)
                     // 流水线同步：轮询服务器写在 115 里的信号文件（幂等，重复发 true 不会起第二个循环）
                     padSync.start()
+                    // 云端备份的定时检查：先避让 30 秒（不与扫描/登录抢带宽），之后每小时复查一次。
+                    // 每类只查自己的开关与间隔，到点才真的打包上传（见 BackupManager.autoBackupIfDue）。
+                    scope.launch {
+                        delay(30_000L)
+                        runCatching { backupManager.autoBackupIfDue() }
+                        while (true) {
+                            delay(3_600_000L)
+                            runCatching { backupManager.autoBackupIfDue() }
+                        }
+                    }
                 } else {
                     renameWorker.stop()
                     padSync.stop()
+                    // 查重也在列目录：登出后 token 没了，继续跑只会一路失败、白耗频控额度
+                    duplicateFinder.stop()
+                    versionFinder.stop()
+                    previewBuilder.stop()
                     // 媒体库扫描同理，而且队列化之后更明显：登出时排着 5 个库，
                     // 不撤的话它们会一个一个跑下去，每个目录都请求失败 —— 白占频控额度。
                     // stopAll 的语义正是要的：停当前那轮 + 清空队列（队列也一并落盘清掉，
@@ -366,8 +569,8 @@ class AppContainer(context: Context) {
             }
         }
 
-        // 开关打开的库：登录后自动跑一轮**增量**扫描（upt 未变的目录全部跳过，
-        // 代价只有每目录一次列表请求；未登录不跑）。开关是**每库各自**的设置。
+        // 开关打开的库：登录后自动跑一轮扫描（**方式由库自己选**：快速/增量，见
+        // MediaLibraryEntity.autoScanMode；未登录不跑）。开关是**每库各自**的设置。
         //
         // 几个库一起到点时不在这里串着跑，而是**排进 mediaScanner 的队列顺序执行**：
         // 这样界面上能看见"还有谁在等"，用户在启动扫描期间手动点的扫描也不会像早先那样
@@ -375,7 +578,9 @@ class AppContainer(context: Context) {
         //
         // **先把上次留下的队列捡回来**（进程被杀 / 被系统清掉时剩下的任务）：顺序上它排在
         // 自动扫描前面 —— 那是用户更早的意图。restoreQueue 自带一次性开关，这条流重复发 true
-        // 也不会重复捡（token 刷新也会让 DataStore 重新发一次）。
+        // 也不会重复捡（token 刷新也会让 DataStore 重新发一次）；它也会把"上次没扫完"的那一轮
+        // 交给界面问一句（见 MediaScanner.resumeProposal）—— **且问之前先探活**：
+        // 接口/网络还不通就先不问（问了也白扫），通了才弹。
         //
         // 「间隔多少小时」也在这里判：**距上次扫描不足就把这个库跳过**（纯本地比较，零请求）。
         // 间隔 0 = 不限 → 每次启动都扫，与这个开关原来的行为一致（老库升级上来不会突变）。
@@ -398,12 +603,21 @@ class AppContainer(context: Context) {
                             return@forEach
                         }
                         // 已经在扫 / 已经排着队（比如刚从落盘里捡回来的那条）就不排第二次：
-                        // enqueue 对同库是**就地替换**，拿自动扫描的增量版盖掉用户要的全量版，
-                        // 会让他"重启前特意排的全量"变成增量
+                        // enqueue 对同库是**就地替换**，拿自动扫描的任务盖掉用户要的，
+                        // 会让他"重启前特意排的那一轮"变了样
                         if (mediaScanner.isBusy(lib.id)) return@forEach
-                        // 自动扫描仍然走**增量**（原行为）：快速扫描先在库菜单里手动跑，
-                        // 验证几轮没问题再把它切过来也不迟 —— 它剪掉的目录下一轮才复核。
-                        mediaScanner.enqueue(lib, ScanMode.Incremental)
+                        // ★ 流水线同步刚刚关照过这个库（排了定向任务，或正在跑）→ **忽略这次定时任务**：
+                        // 定向任务拿的是服务器刚刮完的那批变动，这时再整库扫一遍纯属重复，
+                        // 而 115 的频控额度是稀缺的。反向的那一半在 PadSync 里（它会撤掉已排队的定时任务）
+                        if (padSync.hasRecentWork(lib.id, now)) {
+                            Log.i(
+                                "App115",
+                                "忽略定时扫描「${lib.name}」：流水线同步刚同步过这个库",
+                            )
+                            return@forEach
+                        }
+                        // 方式取库自己的设置（老库没有这一列 → 增量，与升级前一致）
+                        mediaScanner.enqueue(lib, lib.autoScanModeOrDefault, auto = true)
                     }
             }
         }
@@ -412,6 +626,14 @@ class AppContainer(context: Context) {
 
 val Context.appContainer: AppContainer
     get() = (applicationContext as App115).container
+
+/**
+ * 主界面（MainActivity）现在可见吗 —— 任务完成通知只在它**不可见**时发（见 ui/AppRoot 的 finishNotice）。
+ *
+ * 取不到 App 实例时按"可见"处理：宁可少发一条通知，也不在用户正看着屏幕时多响一声。
+ */
+val Context.mainUiVisible: Boolean
+    get() = (applicationContext as? App115)?.isMainUiVisible ?: true
 
 /** 防杀服务的防抖时长（见 [AppContainer.watchTasksForKeepAlive]）*/
 private const val KEEP_ALIVE_DEBOUNCE_MS = 1200L

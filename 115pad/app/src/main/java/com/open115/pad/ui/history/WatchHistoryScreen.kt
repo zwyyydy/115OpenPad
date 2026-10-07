@@ -1,11 +1,11 @@
 package com.open115.pad.ui.history
 
-import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
-import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -17,6 +17,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.ArrowBack
@@ -45,13 +46,18 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.open115.pad.AppContainer
 import com.open115.pad.data.media.WatchHistoryRow
 import com.open115.pad.player.PlayerActivity
+import com.open115.pad.ui.components.GlassCard
+import com.open115.pad.ui.components.MetaChip
+import com.open115.pad.ui.components.auroraBackdrop
 import com.open115.pad.ui.media.PickCodeImage
+import com.open115.pad.ui.theme.AdaptiveBody
 import com.open115.pad.util.Format
 import kotlinx.coroutines.launch
 
@@ -70,6 +76,10 @@ private const val NEAR_END_MS = 15_000L
  * 两处各记一份是重复。数据来源见 [com.open115.pad.data.media.WatchHistoryEntity]：
  * 115 没有"列出看过的片"的接口，所以这份是本机自己记的。
  * 库内条目的海报/标题在查询时 join `movies` 现取 —— 库里换了海报、改了名，这一页立刻跟着变。
+ *
+ * 排版上与库列表页**共用同一套**（[AdaptiveBody] 收窄 + [GlassCard] + [MetaChip]）：
+ * 早先每行是"裸行 + 通栏铺满"，宽屏上标题在最左、播放箭头孤零零挂在最右（隔着 1500dp），
+ * 行与行之间也没有卡片边界。
  *
  * 交互：
  *  - 点一行 → 从记录的位置续播（已看完的从头播）
@@ -120,7 +130,13 @@ fun WatchHistoryScreen(
         context.startActivity(intent)
     }
 
-    Scaffold(snackbarHost = { SnackbarHost(snackbarHostState) }) { scrim ->
+    Scaffold(
+        // 背景交给下面的极光底（与库列表页/扫描记录同一套）
+        containerColor = Color.Transparent,
+        snackbarHost = { SnackbarHost(snackbarHostState) },
+    ) { scrim ->
+    Box(Modifier.fillMaxSize().auroraBackdrop()) {
+    AdaptiveBody(modifier = Modifier.fillMaxSize()) {
     Column(Modifier.fillMaxSize().padding(scrim)) {
         Row(
             Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
@@ -162,6 +178,12 @@ fun WatchHistoryScreen(
                 horizontalAlignment = Alignment.CenterHorizontally,
                 verticalArrangement = Arrangement.Center,
             ) {
+                Icon(
+                    Icons.Outlined.History,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Spacer(Modifier.height(10.dp))
                 Text(
                     if (rows.isEmpty()) {
                         "还没有观看记录。\n在媒体库里播一部片，这里就会出现它 —— 下次点一下直接接着看。"
@@ -176,7 +198,7 @@ fun WatchHistoryScreen(
             LazyColumn(
                 Modifier.fillMaxSize(),
                 contentPadding = PaddingValues(horizontal = 16.dp, vertical = 4.dp),
-                verticalArrangement = Arrangement.spacedBy(8.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp),
             ) {
                 items(shown, key = { it.itemKey }) { row ->
                     HistoryRow(
@@ -187,6 +209,9 @@ fun WatchHistoryScreen(
                 }
             }
         }
+    }
+    }
+    }
     }
 
     pendingDelete?.let { row ->
@@ -230,7 +255,6 @@ fun WatchHistoryScreen(
             dismissButton = { TextButton(onClick = { confirmClear = false }) { Text("取消") } },
         )
     }
-    }
 }
 
 /**
@@ -258,7 +282,16 @@ fun displaySubtitle(row: WatchHistoryRow): String {
 fun isFinished(row: WatchHistoryRow): Boolean =
     row.durationMs > 0L && row.positionMs >= row.durationMs - NEAR_END_MS
 
-@OptIn(ExperimentalFoundationApi::class)
+/**
+ * 一行＝一张玻璃卡：封面 + 标题/副标题 + 进度胶囊 + 右侧播放圆钮。
+ *
+ * - 进度条压在封面上（整条宽度），比单看文字更快
+ * - 「已看多少 / 还剩多久」拆成两枚胶囊（同库卡上那套），不再是一行灰字
+ * - 右侧那个 ▶ 之前是一个**裸图标**挂在通栏最右边，看着像掉在外面；现在收进一颗
+ *   主色底的圆钮里，既是"能点"的提示，也把这一行的右边收住了
+ * - 长按 = 删这一条（与海报墙同一套手势：combinedClickable，叠加两个 clickable 会互相吃手势）
+ */
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun HistoryRow(
     row: WatchHistoryRow,
@@ -276,82 +309,92 @@ private fun HistoryRow(
     } else {
         0L
     }
+    val accent = MaterialTheme.colorScheme.primary
 
-    Row(
-        Modifier
-            .fillMaxWidth()
-            // 长按：与海报墙同一套手势（combinedClickable，叠加两个 clickable 会互相吃手势）
-            .combinedClickable(onClick = onClick, onLongClick = onLongClick)
-            .padding(horizontal = 8.dp, vertical = 6.dp),
-        verticalAlignment = Alignment.CenterVertically,
+    GlassCard(
+        modifier = Modifier.fillMaxWidth(),
+        onClick = onClick,
+        onLongClick = onLongClick,
+        // 一屏十几行，光晕叠起来很重：比库卡收敛一点
+        elevation = 8.dp,
     ) {
-        Box(
-            Modifier
-                .width(84.dp)
-                .height(118.dp)
-                .clip(RoundedCornerShape(10.dp))
-                .background(MaterialTheme.colorScheme.surfaceVariant),
+        Row(
+            Modifier.fillMaxWidth().padding(14.dp),
+            verticalAlignment = Alignment.CenterVertically,
         ) {
-            // 兜底图标在下层：海报没加载出来/本来就没有（本机文件、库外文件）时不会剩一块空白
-            Icon(
-                Icons.Outlined.Movie,
-                contentDescription = null,
-                tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                modifier = Modifier.align(Alignment.Center).size(30.dp),
-            )
-            PickCodeImage(row.posterPickCode, Modifier.fillMaxSize())
-            if (fraction > 0f) {
-                LinearProgressIndicator(
-                    progress = { fraction },
-                    modifier = Modifier.align(Alignment.BottomCenter).fillMaxWidth().height(4.dp),
+            Box(
+                Modifier
+                    .width(84.dp)
+                    .height(118.dp)
+                    .clip(RoundedCornerShape(12.dp))
+                    .background(MaterialTheme.colorScheme.surfaceVariant),
+            ) {
+                // 兜底图标在下层：海报没加载出来/本来就没有（本机文件、库外文件）时不会剩一块空白
+                Icon(
+                    Icons.Outlined.Movie,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.align(Alignment.Center).size(30.dp),
                 )
+                PickCodeImage(row.posterPickCode, Modifier.fillMaxSize())
+                if (fraction > 0f) {
+                    LinearProgressIndicator(
+                        progress = { fraction },
+                        modifier = Modifier.align(Alignment.BottomCenter).fillMaxWidth().height(4.dp),
+                    )
+                }
             }
-        }
-        Spacer(Modifier.width(12.dp))
-        Column(Modifier.weight(1f)) {
-            Text(
-                displayTitle(row),
-                style = MaterialTheme.typography.titleMedium,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
-            val sub = displaySubtitle(row)
-            if (sub.isNotBlank()) {
+            Spacer(Modifier.width(14.dp))
+            Column(Modifier.weight(1f)) {
                 Text(
-                    sub,
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    maxLines = 1,
+                    displayTitle(row),
+                    style = MaterialTheme.typography.titleMedium,
+                    maxLines = 2,
                     overflow = TextOverflow.Ellipsis,
                 )
+                val sub = displaySubtitle(row)
+                if (sub.isNotBlank()) {
+                    Text(
+                        sub,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+                Spacer(Modifier.height(6.dp))
+                FlowRow(
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalArrangement = Arrangement.spacedBy(4.dp),
+                ) {
+                    when {
+                        finished -> MetaChip("已看完 · 点击从头再看")
+                        row.durationMs > 0L && remaining > 0L -> {
+                            MetaChip("已看 ${(fraction * 100).toInt()}%", tint = accent, bold = true)
+                            MetaChip("还剩 ${Format.duration(remaining)}")
+                        }
+                        row.positionMs > 0L -> MetaChip("看到 " + Format.playTime(row.positionMs))
+                        else -> MetaChip("还没开始看")
+                    }
+                    MetaChip(Format.ago(row.updatedAt))
+                    if (row.local) MetaChip("本机文件")
+                }
             }
-            Spacer(Modifier.height(4.dp))
-            Text(
-                when {
-                    finished -> "已看完 · 点击从头再看"
-                    row.durationMs > 0L && remaining > 0L ->
-                        "已看 ${(fraction * 100).toInt()}% · 还剩 ${Format.duration(remaining)}"
-                    row.positionMs > 0L -> "看到 " + Format.playTime(row.positionMs)
-                    else -> "还没开始看"
-                },
-                style = MaterialTheme.typography.bodySmall,
-                color = if (finished) {
-                    MaterialTheme.colorScheme.onSurfaceVariant
-                } else {
-                    MaterialTheme.colorScheme.primary
-                },
-            )
-            Text(
-                Format.ago(row.updatedAt) + if (row.local) " · 本机文件" else "",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
+            Spacer(Modifier.width(14.dp))
+            Box(
+                Modifier
+                    .size(40.dp)
+                    .clip(CircleShape)
+                    .background(accent.copy(alpha = 0.16f)),
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(
+                    Icons.Outlined.PlayArrow,
+                    contentDescription = "继续观看",
+                    tint = accent,
+                    modifier = Modifier.size(22.dp),
+                )
+            }
         }
-        Spacer(Modifier.width(8.dp))
-        Icon(
-            Icons.Outlined.PlayArrow,
-            contentDescription = "继续观看",
-            tint = MaterialTheme.colorScheme.primary,
-        )
     }
 }

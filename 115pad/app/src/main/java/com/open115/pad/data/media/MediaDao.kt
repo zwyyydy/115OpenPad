@@ -39,6 +39,15 @@ data class MovieCard(
     val videoName: String? = null,
 )
 
+/**
+ * 给 `LIMIT :limit` 传这个值 = **不限制**（SQLite 把负的 LIMIT 当"全都要"）。
+ *
+ * 海报墙要列**整个库**，不能再落在默认的 200 上 —— 那正是"库里有 2000 部、
+ * 界面上只显示 200 部"的老 bug。显式传 [MEDIA_NO_LIMIT] 比改默认值更清楚：
+ * 读代码的人一眼知道这里是有意要全量，而不是忘了传。
+ */
+const val MEDIA_NO_LIMIT = -1
+
 /** 删库前收集的 pick_code：清该库对应的海报与 nfo 落盘缓存用 */
 data class MediaPickCodes(
     val nfoPickCode: String?,
@@ -50,6 +59,64 @@ data class MediaPickCodes(
 
 /** 一条"作品 → 名字"（标签名 / 演员名，给列表筛选批量取用，见 [MediaDao.tagNamesOf] / [MediaDao.actorNamesOf]） */
 data class MovieNameRow(val mediaKey: String, val name: String)
+
+/** 一条标签盖住多少张卡片：覆盖率的分子（见 [MediaDao.tagCardCounts]） */
+data class NameCountRow(val name: String, val tagCount: Int)
+
+/**
+ * 推荐候选：卡片字段 + **两路演员命中数**。
+ *
+ * ★ **标签命中不在这里**：标签要按覆盖率降权（见 [MovieRecommender.tagFactor]），那就得先知道
+ * "命中的是哪条标签"，所以走 [MediaDao.matchedTagsForCards] 取回名字后在 Kotlin 里算
+ * （候选上百张、每张几条，一次查询就够）。SQL 里那两个标签计数**只用于粗排**（决定谁进候选池），
+ * 不参与最终打分。
+ */
+data class MovieRecommendation(
+    val mediaKey: String,
+    val title: String,
+    val year: Int?,
+    val rating: Double?,
+    val posterPickCode: String?,
+    val fanartPickCode: String?,
+    val extraFanartPickCodes: String?,
+    val isEpisodeLike: Boolean,
+    val videoPickCode: String?,
+    val genre: String?,
+    val videoName: String?,
+    /** 同库加成用（与自身 dirPath 前缀比对） */
+    val dirPath: String? = null,
+    /** `COALESCE(dateAdded, scannedAt)`：近期入库加成用 */
+    val addedAt: Long? = null,
+    val selfActorHits: Int = 0,
+    val tasteActorHits: Int = 0,
+) {
+    /** 转成界面/播放列表用的卡片（与 [MovieCard] 同口径，推荐理由不进卡片） */
+    fun toCard(): MovieCard = MovieCard(
+        mediaKey = mediaKey,
+        title = title,
+        year = year,
+        rating = rating,
+        posterPickCode = posterPickCode,
+        fanartPickCode = fanartPickCode,
+        extraFanartPickCodes = extraFanartPickCodes,
+        isEpisodeLike = isEpisodeLike,
+        videoPickCode = videoPickCode,
+        genre = genre,
+        videoName = videoName,
+    )
+}
+
+/**
+ * 观影画像的一行：看过的那张**卡**（分集归到系列）+ 进度，用来判"看完没有"。
+ *
+ * `cardKey` 用 COALESCE(seriesKey, mediaKey)：历史记的是分集的 pick_code，
+ * 而口味画像要的是作品本身。
+ */
+data class WatchedCardRow(
+    val cardKey: String,
+    val positionMs: Long = 0,
+    val durationMs: Long = 0,
+)
 
 /**
  * 删单个条目时要用的文件信息（**这条 + 它名下的分集**）。
@@ -273,7 +340,7 @@ interface MediaDao {
             "WHERE seriesKey IS NULL " +
             "ORDER BY rating IS NULL, rating DESC LIMIT :limit",
     )
-    fun byRating(limit: Int = 200): Flow<List<MovieCard>>
+    fun byRating(limit: Int = MEDIA_NO_LIMIT): Flow<List<MovieCard>>
 
     @Query(
         "SELECT mediaKey, title, year, rating, posterPickCode, fanartPickCode, extraFanartPickCodes, isEpisodeLike, videoPickCode, genre, videoName FROM movies " +
@@ -300,7 +367,7 @@ interface MediaDao {
                 "CASE WHEN :sort = 4 THEN RANDOM() END, " +
                 "title ASC LIMIT :limit",
     )
-    fun byLibraryPath(prefix: String, limit: Int = 200, sort: Int = 0): Flow<List<MovieCard>>
+    fun byLibraryPath(prefix: String, limit: Int = MEDIA_NO_LIMIT, sort: Int = 0): Flow<List<MovieCard>>
 
     /**
      * 多根媒体库：任一路径匹配（精确等于或以其为前缀）即纳入。
@@ -340,7 +407,7 @@ interface MediaDao {
     )
     fun byLibraryPaths(
         p0: String, p1: String, p2: String, p3: String, p4: String,
-        limit: Int = 200,
+        limit: Int = MEDIA_NO_LIMIT,
         sort: Int = 0,
     ): Flow<List<MovieCard>>
 
@@ -485,6 +552,145 @@ interface MediaDao {
     )
     suspend fun byTag(name: String, sort: Int = 0): List<MovieCard>
 
+    /**
+     * 推荐候选：与这部片（或近期的观影口味）**有共同演员/标签**的作品，带演员命中数（标签命中只用于粗排）。
+     *
+     * 几个刻意的口径，改动前先看这里：
+     *
+     * ① **按 `COALESCE(seriesKey, mediaKey)` 归并**，和 [byTag] / [byActor] 完全一致。
+     *    剧集的演员、标签挂在**分集行**上，系列卡自己往往是空的 —— 只读系列卡会得到
+     *    空画像，推荐直接瘫痪。所以分集也参与命中计算，最后归到系列卡那一组。
+     * ② **五个 `IN (:…Names)` 的列表都不许为空**：Room 会把空集合拼成 `IN ()`，
+     *    调用方必须用哨兵（见 [MovieRecommender]）。同理 `:selfActors` 与 `:tasteActors`
+     *    要分别传，别合并 —— 两者权重不同（3.0 vs 1.5）。
+     * ③ 标签名要**先滤掉两类**再传进来：画质/编码（[TagSignals.isNoise]，`1080P` 一进来大半个库都"命中"）
+     *    和**覆盖率归零的宽标签**（[MovieRecommender.tagFactor]，盖住九成片的那类也是同理）。这里只按名字匹配，
+     *    自己判不了这两种。`:seriesLike` 传 [TagSignals.SERIES_LIKE]，系列命中在粗排里单独吃更高权重。
+     * ④ 匹配走**名字**而不是 id：`actors.name` / `tags.name` 都是 unique 索引，
+     *    省掉"把名字换成 id"那一圈查询；而 `movie_actors(actorId)` / `movie_tags(tagId)`
+     *    也有索引，所以整条是索引扫描，不是全表对全表。
+     * ⑤ 只出**顶层条目**（`seriesKey IS NULL`）—— 候选天然排掉了"同一部剧的其它集"。
+     * ⑥ 排序只做到"粗排"就截断（LIMIT）：**按命中个数**（不按覆盖率加权）先挑出前 120 名，
+     *    再在 Kotlin 里精确打分与加权抽样。所以这里的权重只是那边常量的副本、且**刻意只做到近似**。
+     */
+    @Query(
+        "WITH scored AS (" +
+            "  SELECT COALESCE(m.seriesKey, m.mediaKey) AS cardKey, " +
+            "    (SELECT COUNT(*) FROM movie_actors ma JOIN actors a ON a.id = ma.actorId " +
+            "      WHERE ma.mediaKey = m.mediaKey AND a.name IN (:selfActors)) AS selfActor, " +
+            "    (SELECT COUNT(*) FROM movie_tags mt JOIN tags t ON t.id = mt.tagId " +
+            "      WHERE mt.mediaKey = m.mediaKey AND t.name IN (:selfTags)) AS selfTag, " +
+            "    (SELECT COUNT(*) FROM movie_tags mt JOIN tags t ON t.id = mt.tagId " +
+            "      WHERE mt.mediaKey = m.mediaKey AND t.name IN (:selfTags) AND t.name LIKE :seriesLike) AS selfSeriesTag, " +
+            "    (SELECT COUNT(*) FROM movie_actors ma JOIN actors a ON a.id = ma.actorId " +
+            "      WHERE ma.mediaKey = m.mediaKey AND a.name IN (:tasteActors)) AS tasteActor, " +
+            "    (SELECT COUNT(*) FROM movie_tags mt JOIN tags t ON t.id = mt.tagId " +
+            "      WHERE mt.mediaKey = m.mediaKey AND t.name IN (:tasteTags)) AS tasteTag, " +
+            "    (SELECT COUNT(*) FROM movie_tags mt JOIN tags t ON t.id = mt.tagId " +
+            "      WHERE mt.mediaKey = m.mediaKey AND t.name IN (:tasteTags) AND t.name LIKE :seriesLike) AS tasteSeriesTag " +
+            "  FROM movies m " +
+            "  WHERE EXISTS (SELECT 1 FROM movie_actors ma JOIN actors a ON a.id = ma.actorId " +
+            "      WHERE ma.mediaKey = m.mediaKey AND (a.name IN (:selfActors) OR a.name IN (:tasteActors))) " +
+            "    OR EXISTS (SELECT 1 FROM movie_tags mt JOIN tags t ON t.id = mt.tagId " +
+            "      WHERE mt.mediaKey = m.mediaKey AND (t.name IN (:selfTags) OR t.name IN (:tasteTags)))" +
+            ") " +
+            "SELECT c.mediaKey, c.title, c.year, c.rating, c.posterPickCode, c.fanartPickCode, " +
+            "  c.extraFanartPickCodes, c.isEpisodeLike, c.videoPickCode, c.genre, c.videoName, " +
+            "  c.dirPath, COALESCE(c.dateAdded, c.scannedAt) AS addedAt, " +
+            "  SUM(s.selfActor) AS selfActorHits, SUM(s.tasteActor) AS tasteActorHits " +
+            "FROM scored s JOIN movies c ON c.mediaKey = s.cardKey " +
+            "WHERE c.seriesKey IS NULL AND s.cardKey <> :self " +
+            "GROUP BY s.cardKey " +
+            "ORDER BY (SUM(s.selfActor) * 3.0 + " +
+            "          (SUM(s.selfTag) - SUM(s.selfSeriesTag)) + SUM(s.selfSeriesTag) * 2.5 + " +
+            "          SUM(s.tasteActor) * 1.5 + " +
+            "          (SUM(s.tasteTag) - SUM(s.tasteSeriesTag)) * 0.4 + SUM(s.tasteSeriesTag) * 1.2) DESC, " +
+            "  c.rating IS NULL, c.rating DESC " +
+            "LIMIT :limit",
+    )
+    suspend fun recommendCandidates(
+        self: String,
+        selfActors: List<String>,
+        selfTags: List<String>,
+        tasteActors: List<String>,
+        tasteTags: List<String>,
+        seriesLike: String,
+        limit: Int = 120,
+    ): List<MovieRecommendation>
+
+    /**
+     * 近期看过的**作品卡**（分集归到系列）+ 进度：观影口味画像的原料。
+     *
+     * 历史里记的是分集的 pick_code，所以按 `movies.videoPickCode` 反查 —— 查不到的行
+     * （库外文件、本机文件）被 JOIN 自然丢掉，参与画像的只有媒体库里的片。
+     */
+    @Query(
+        "SELECT COALESCE(m.seriesKey, m.mediaKey) AS cardKey, " +
+            "  h.positionMs AS positionMs, h.durationMs AS durationMs " +
+            "FROM watch_history h JOIN movies m ON m.videoPickCode = h.itemKey " +
+            "ORDER BY h.updatedAt DESC LIMIT :limit",
+    )
+    suspend fun recentWatchedCards(limit: Int = 30): List<WatchedCardRow>
+
+    /**
+     * 这几张卡（**含它们名下的分集**）用到的演员名，按 `COALESCE(seriesKey, mediaKey)` 归组。
+     *
+     * 返回的 `mediaKey` 其实是**卡键**（不是演员挂在哪一行上），因为推荐要的就是"这张卡有哪些演员"。
+     * 必须带分集一起查：剧集的演员挂在分集行上，系列卡自己往往是空的。
+     *
+     * 给推荐的两处用：① 当前这部片自己的画像；② 近期看过的片的画像（口味）。
+     * 与 [actorNamesOf] 的分工：那个按 key 原样查（筛选用，键就是卡键），这个会把分集卷上来。
+     */
+    @Query(
+        "SELECT DISTINCT COALESCE(m.seriesKey, m.mediaKey) AS mediaKey, a.name AS name " +
+            "FROM movies m JOIN movie_actors ma ON ma.mediaKey = m.mediaKey " +
+            "JOIN actors a ON a.id = ma.actorId " +
+            "WHERE m.mediaKey IN (:keys) OR m.seriesKey IN (:keys)",
+    )
+    suspend fun actorNamesForCards(keys: List<String>): List<MovieNameRow>
+
+    /** 标签版 [actorNamesForCards]（含分集归并），口径完全一致 */
+    @Query(
+        "SELECT DISTINCT COALESCE(m.seriesKey, m.mediaKey) AS mediaKey, t.name AS name " +
+            "FROM movies m JOIN movie_tags mt ON mt.mediaKey = m.mediaKey " +
+            "JOIN tags t ON t.id = mt.tagId " +
+            "WHERE m.mediaKey IN (:keys) OR m.seriesKey IN (:keys)",
+    )
+    suspend fun tagNamesForCards(keys: List<String>): List<MovieNameRow>
+
+    /**
+     * 全库**顶层卡片数**：覆盖率的分母（海报墙上有多少张卡，就是多少）。
+     *
+     * 和候选查询同一个宇宙 —— 分集不算独立卡片（只有 `seriesKey IS NULL` 才是卡片）。
+     */
+    @Query("SELECT COUNT(*) FROM movies WHERE seriesKey IS NULL")
+    suspend fun topLevelCardCount(): Int
+
+    /**
+     * 这几条标签**各盖住多少张卡片**（覆盖率的分子）。
+     *
+     * 分集折进它所属的系列卡，与 [recommendCandidates] 同口径 —— 不然"标签挂在分集行上"的剧集
+     * 会被严重低估。查不到的标签不会出现在结果里（调用方按 0 张处理）。
+     */
+    @Query(
+        "SELECT t.name AS name, COUNT(DISTINCT COALESCE(m.seriesKey, m.mediaKey)) AS tagCount " +
+            "FROM tags t JOIN movie_tags mt ON mt.tagId = t.id JOIN movies m ON m.mediaKey = mt.mediaKey " +
+            "WHERE t.name IN (:names) GROUP BY t.name",
+    )
+    suspend fun tagCardCounts(names: List<String>): List<NameCountRow>
+
+    /**
+     * 这批卡片（含各自的分集）命中了 [names] 里的**哪几条**标签 —— 推荐打分与理由都要"命中的是谁"。
+     *
+     * 只回关心的那几条：候选上百张、每张自己就带十几条标签，全取回来大半是白取。
+     */
+    @Query(
+        "SELECT DISTINCT COALESCE(m.seriesKey, m.mediaKey) AS mediaKey, t.name AS name " +
+            "FROM movies m JOIN movie_tags mt ON mt.mediaKey = m.mediaKey JOIN tags t ON t.id = mt.tagId " +
+            "WHERE (m.mediaKey IN (:keys) OR m.seriesKey IN (:keys)) AND t.name IN (:names)",
+    )
+    suspend fun matchedTagsForCards(keys: List<String>, names: List<String>): List<MovieNameRow>
+
     /** 系列下的分集（海报墙上点进系列卡后用）。排序交给调用方按集号排（见 episodeSortKey） */
     @Query(
         "SELECT mediaKey, title, year, rating, posterPickCode, fanartPickCode, extraFanartPickCodes, isEpisodeLike, videoPickCode, genre, videoName FROM movies " +
@@ -509,6 +715,28 @@ interface MediaDao {
 
     @Query("SELECT * FROM movies WHERE mediaKey = :mediaKey")
     suspend fun movie(mediaKey: String): MovieEntity?
+
+    /** 影片所在目录 cid —— 播放器「截图设为预览图」要上传到那里（见 PlayerActivity.EXTRA_SOURCE_CID） */
+    @Query("SELECT dirCid FROM movies WHERE mediaKey = :key LIMIT 1")
+    suspend fun dirCidOf(key: String): String?
+
+    /**
+     * 这部片（按**播的那个文件**的 pick_code 反查）库里有没有**剧照**（`extrafanart/`）。
+     *
+     * 播放器用它决定"要不要抓宽幅预览条"：媒体库那条播放链路里，库里已经有剧照的片再抓一条
+     * 就是重复（详情页那排剧照就是"这部片长什么样"）；**没有剧照的才抓**，抓出来的帧反过来
+     * 当它的剧照（见 MediaDetailScreen 的兜底剧照 + VideoPreviewStore.stripFiles）。
+     *
+     * 判据只认 `extraFanartPickCodes`：详情页那排「剧照（N）」读的就是它。**不算 fanartPickCode**
+     * （单张背景图）——实测有片只有 fanart.jpg 没有 extrafanart，那种片详情页根本没有剧照行，
+     * 按"有背景图就算有"会永远不抓、那部片也就永远没有剧照；也不算 poster（竖版封面不是剧照）。
+     * 分集/多 CD 的每一行都挂着同一份目录素材（扫描时按目录挂），按任意一个视频 pick_code 都问得到。
+     */
+    @Query(
+        "SELECT EXISTS(SELECT 1 FROM movies WHERE videoPickCode = :pc " +
+            "AND IFNULL(extraFanartPickCodes, '') <> '')",
+    )
+    suspend fun hasFanartForVideo(pc: String): Boolean
 
     /**
      * 某个目录里那条"系列/影片"行（分集归属 + 海报继承都靠它）。
@@ -561,6 +789,8 @@ interface MediaDao {
     /** 删除一个库根下的全部索引（影片 + 演员/标签关联 + 分集 + 扫描状态）。多根库对每根各调一次 */
     @Transaction
     suspend fun deleteLibraryContent(prefix: String) {
+        // ★ 顺序要紧：观影历史按视频 pick_code 反查 movies，得在删 movies 之前清
+        deleteWatchHistoryInPath(prefix)
         unlinkActorsInPath(prefix)
         unlinkTagsInPath(prefix)
         deleteEpisodesInPath(prefix)
@@ -604,6 +834,26 @@ interface MediaDao {
         deleteMovieRows(keys)
     }
 
+    /**
+     * 清掉这些条目在**衍生记录**里的痕迹：观影历史（「继续观看」用它）与扫描记录的
+     * 「新增影片」列表。**必须在 [deleteMovies] 之前调** —— 两条查询都靠 movies 表反查
+     * 视频 pick_code，删完表就查不到了。
+     *
+     * 为什么非清不可：观影历史是按视频 pick_code 存的、扫描记录里存的是 mediaKey 字符串，
+     * 两者都不带外键。片删了它们照样留着，于是「继续观看」里挂着一张点开必然失败的卡、
+     * 「最近新增」的计数里也还数着已经被删掉的片（2026-10-06 用户报的就是这两处）。
+     *
+     * 分块：一部剧几百集时 keys 能到几百个，SQLite 的变量上限是 999 —— 两个 `IN` 一起拼
+     * 会撞上，所以按 300 一批走。
+     */
+    @Transaction
+    suspend fun purgeMovieTraces(keys: List<String>) {
+        if (keys.isEmpty()) return
+        val codes = keys.chunked(300).flatMap { videoPickCodesOfMovies(it) }.distinct()
+        codes.chunked(300).forEach { deleteWatchHistoryByKeys(it) }
+        removeScanLogKeys(keys.toSet())
+    }
+
     @Query("SELECT * FROM episodes WHERE mediaKey = :mediaKey ORDER BY season, episode")
     suspend fun episodesOf(mediaKey: String): List<EpisodeEntity>
 
@@ -619,6 +869,10 @@ interface MediaDao {
             "WHERE movie_actors.mediaKey = :mediaKey ORDER BY actors.id",
     )
     suspend fun actorCardsOf(mediaKey: String): List<ActorCard>
+
+    /** 库里出现过的全部演员名（去重）。给"头像源覆盖率"统计用：拉一次索引就能知道能对上多少 */
+    @Query("SELECT DISTINCT name FROM actors")
+    suspend fun allActorNames(): List<String>
 
     /**
      * 这些影片用到的演员里**有头像的**那些（删影片时逐个判断头像还能不能删）。
@@ -825,7 +1079,8 @@ interface MediaDao {
     @Query(
         "UPDATE libraries SET name = :name, rootCid = :rootCid, rootPath = :rootPath, " +
             "rateLimitMs = :rateLimitMs, autoScanOnStart = :autoScanOnStart, minVideoSizeMb = :minVideoSizeMb, " +
-            "autoScanIntervalHours = :autoScanIntervalHours " +
+            "autoScanIntervalHours = :autoScanIntervalHours, autoScanMode = :autoScanMode, " +
+            "rateTiered = :rateTiered, tierRestMinutes = :tierRestMinutes " +
             "WHERE id = :id",
     )
     suspend fun updateLibrary(
@@ -837,6 +1092,9 @@ interface MediaDao {
         autoScanOnStart: Boolean,
         minVideoSizeMb: Int,
         autoScanIntervalHours: Int,
+        autoScanMode: String,
+        rateTiered: Boolean,
+        tierRestMinutes: Int,
     )
 
     /**
@@ -848,8 +1106,29 @@ interface MediaDao {
     @Query("UPDATE libraries SET lastScanAt = :at WHERE id = :id")
     suspend fun markLibraryScanned(id: Long, at: Long)
 
-    @Query("SELECT * FROM libraries ORDER BY createdAt DESC")
+    /**
+     * 库列表，按用户拖动的顺序排。
+     *
+     * 第二判据 `createdAt DESC` 不是凑数：**没拖过的库全是 `sortOrder = 0`**（老库升级上来也是 0），
+     * 这时整列退化成"新建的在最前"，与本功能之前一模一样。用户拖过一次之后序号被整体重写，
+     * 之后新建的库（0）就插在最前 —— 与那条老规矩也一致。
+     */
+    @Query("SELECT * FROM libraries ORDER BY sortOrder ASC, createdAt DESC")
     fun libraries(): Flow<List<MediaLibraryEntity>>
+
+    /**
+     * 按给定顺序整体重写序号（拖动排序落盘）。
+     *
+     * 整表重写而不是"只改两张"：序号是一个连续序列，只动两张会留下空洞（比如两条都变成 1），
+     * 下次按 `sortOrder` 取出来的相对顺序就不确定了。库的数量是几个到几十个，整写代价可以忽略。
+     */
+    @Transaction
+    suspend fun reorderLibraries(idsInOrder: List<Long>) {
+        idsInOrder.forEachIndexed { index, id -> setLibrarySortOrder(id, index.toLong()) }
+    }
+
+    @Query("UPDATE libraries SET sortOrder = :order WHERE id = :id")
+    suspend fun setLibrarySortOrder(id: Long, order: Long)
 
     @Query("SELECT * FROM libraries WHERE id = :id")
     suspend fun library(id: Long): MediaLibraryEntity?
@@ -928,6 +1207,39 @@ interface MediaDao {
 
     @Query("DELETE FROM watch_history WHERE itemKey = :key")
     suspend fun deleteWatchHistory(key: String)
+
+    /** 一批 itemKey（= 视频 pick_code）的观影历史。走 [[purgeMovieTraces]] 分块调用，别直接传太大的表 */
+    @Query("DELETE FROM watch_history WHERE itemKey IN (:keys)")
+    suspend fun deleteWatchHistoryByKeys(keys: List<String>)
+
+    /**
+     * 这些条目（影片或系列，系列会连它名下的分集一起）的**视频 pick_code**。
+     *
+     * 删片时用它把"继续观看"里的对应记录找出来 —— 观影历史的 key 是播放时的视频 pick_code，
+     * 不是 mediaKey，所以只能绕这一道。
+     */
+    @Query(
+        "SELECT videoPickCode FROM movies " +
+            "WHERE (mediaKey IN (:keys) OR seriesKey IN (:keys)) AND videoPickCode IS NOT NULL",
+    )
+    suspend fun videoPickCodesOfMovies(keys: List<String>): List<String>
+
+    /**
+     * 一个目录下的全部视频 pick_code（删库时清"继续观看"用）。
+     *
+     * **必须在删 movies 行之前调**：子查询读的就是那张表，删完就查不到了。
+     */
+    @Query(
+        "SELECT videoPickCode FROM movies " +
+            "WHERE (dirPath = :prefix OR dirPath LIKE :prefix || '/%') AND videoPickCode IS NOT NULL",
+    )
+    suspend fun videoPickCodesInPath(prefix: String): List<String>
+
+    /** 删库/清目录时把"继续观看"里这些片的历史一并清掉（云端没了的片不该还留在继续观看里） */
+    @Transaction
+    suspend fun deleteWatchHistoryInPath(prefix: String) {
+        videoPickCodesInPath(prefix).chunked(300).forEach { deleteWatchHistoryByKeys(it) }
+    }
 
     @Query("DELETE FROM watch_history")
     suspend fun clearWatchHistory()
@@ -1023,8 +1335,45 @@ interface MediaDao {
     )
     suspend fun trimScanLogs(keep: Int)
 
-    @Query("SELECT * FROM scan_log ORDER BY at DESC LIMIT :limit")
+    /**
+     * 扫描记录列表（「媒体库 → 扫描记录」/ 首页「最近新增」都用它）。
+     *
+     * **只列还活着的库的记录**：删库时已把它的记录删掉（见 [deleteScanLogsForLibrary]），
+     * 但历史上删过的库留下的孤儿记录得靠这条查询兜底自愈 —— 它们指向的库已经没了，
+     * 界面上不该再出现（实测踩过：删库后「扫描记录」里还挂着它的行）。
+     * `libraryId = 0` 是"不属于任何库"的记录（直接调 runScan 的场合），照常显示。
+     */
+    @Query(
+        "SELECT * FROM scan_log WHERE libraryId = 0 OR libraryId IN (SELECT id FROM libraries) " +
+            "ORDER BY at DESC LIMIT :limit",
+    )
     fun scanLogs(limit: Int = 200): Flow<List<ScanLogEntity>>
+
+    /** 删库时连它的扫描记录一起删：库都没了，记录里那份"新增了哪些片"也不再可点 */
+    @Query("DELETE FROM scan_log WHERE libraryId = :libraryId")
+    suspend fun deleteScanLogsForLibrary(libraryId: Long)
+
+    @Query("SELECT * FROM scan_log")
+    suspend fun allScanLogs(): List<ScanLogEntity>
+
+    @Query("UPDATE scan_log SET newKeys = :keys WHERE id = :id")
+    suspend fun updateScanLogKeys(id: Long, keys: String)
+
+    /**
+     * 从扫描记录的「新增影片」里摘掉这些键（片子被删之后）。
+     *
+     * `newKeys` 是一列 `\n` 连接的字符串、**没有外键**，所以 SQL 里摘不动，只能整表读回来
+     * 在内存里过滤再写回。表最多 [SCAN_LOG_KEEP] 条（默认 200），这个代价可以忽略。
+     * 一列都没变的记录不写回（避免无谓的 UPDATE 与 Flow 重发）。
+     */
+    @Transaction
+    suspend fun removeScanLogKeys(keys: Set<String>) {
+        if (keys.isEmpty()) return
+        for (row in allScanLogs()) {
+            val kept = row.newKeyList.filterNot { it in keys }
+            if (kept.size != row.newKeyList.size) updateScanLogKeys(row.id, kept.joinToString("\n"))
+        }
+    }
 
     @Query("DELETE FROM scan_log")
     suspend fun clearScanLogs()

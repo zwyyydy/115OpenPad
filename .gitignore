@@ -24,6 +24,9 @@ ssh_run.py
 *.png
 *.jpg
 
+# 本地临时工作目录（adb 拉下来的数据库副本、界面 dump、调试脚本 —— 里面是真实数据）
+tmp/
+
 # IDE
 .idea/
 *.iml

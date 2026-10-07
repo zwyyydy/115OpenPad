@@ -1,6 +1,7 @@
 package com.open115.pad.data.media
 
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -58,5 +59,32 @@ class AutoScanDueTest {
     fun `负数间隔当成 0 处理_不能变成永远不扫`() {
         // 界面上输入框只收数字，但库是 DB 来的、也可能被旧版本写脏；当 0 = 每次启动都扫
         assertTrue(lib(hours = -3, lastScanAt = 999_999L).autoScanDue(now = 1_000_000L))
+    }
+
+    // ---- 定时扫描的方式（快速 / 增量；"不选" = 关掉 autoScanOnStart 那个开关） ----
+
+    private fun libOfMode(mode: String) = MediaLibraryEntity(
+        name = "库",
+        rootCid = "1",
+        rootPath = "p",
+        autoScanOnStart = true,
+        autoScanMode = mode,
+    )
+
+    @Test
+    fun `老库没有这一列_落回增量`() {
+        // 升级上来的库 autoScanMode 是空串：行为必须与"定时扫描只有增量"那会儿一致 ——
+        // 谁也不能被悄悄改成快速扫描（那条路更省请求，但有"目录内改名漏一轮"的已知盲区）
+        assertSame(ScanMode.Incremental, libOfMode("").autoScanModeOrDefault)
+    }
+
+    @Test
+    fun `选了快速就是快速_认不出的值一律当增量`() {
+        assertSame(ScanMode.Fast, libOfMode("Fast").autoScanModeOrDefault)
+        assertSame(ScanMode.Incremental, libOfMode("Incremental").autoScanModeOrDefault)
+        // 定时扫描**不提供全量**（每次启动重新索引整个库既慢又费频控额度，要全量去库菜单手动点），
+        // 所以将来真被写进 Full 也当增量处理
+        assertSame(ScanMode.Incremental, libOfMode("Full").autoScanModeOrDefault)
+        assertSame(ScanMode.Incremental, libOfMode("乱写的").autoScanModeOrDefault)
     }
 }

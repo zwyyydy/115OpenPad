@@ -21,7 +21,7 @@ import androidx.sqlite.db.SupportSQLiteDatabase
         ScanLogEntity::class,
         DanmuCacheEntity::class,
     ],
-    version = 16,
+    version = 19,
     exportSchema = false,
 )
 abstract class MediaDatabase : RoomDatabase() {
@@ -252,13 +252,47 @@ abstract class MediaDatabase : RoomDatabase() {
         }
     }
 
+    /**
+     * DB v17：定时扫描可选方式（`libraries.autoScanMode`）。
+     *
+     * 默认空串 = 老库 → 一律落回**增量**（见 `autoScanModeOrDefault`），升级后行为一字不变：
+     * 谁也没被悄悄改成快速扫描。用户去库里选"快速"才走那条路。
+     * 是否启用定时扫描仍是原来的 `autoScanOnStart`（不选 = 关掉它）。
+     */
+    private val MIGRATION_16_17 = object : Migration(16, 17) {
+        override fun migrate(db: SupportSQLiteDatabase) {
+            db.execSQL("ALTER TABLE libraries ADD COLUMN autoScanMode TEXT NOT NULL DEFAULT ''")
+        }
+    }
+
+    /**
+     * DB v18：阶梯限速与"每 100 个目录休息"（`libraries.rateTiered` / `tierRestMinutes`）。
+     *
+     * 两列默认都是"关"→ 老库行为完全不变（还是那个定死的 `rateLimitMs`），
+     * 用户在库编辑框里打开才生效。
+     */
+    private val MIGRATION_17_18 = object : Migration(17, 18) {
+        override fun migrate(db: SupportSQLiteDatabase) {
+            db.execSQL("ALTER TABLE libraries ADD COLUMN rateTiered INTEGER NOT NULL DEFAULT 0")
+            db.execSQL("ALTER TABLE libraries ADD COLUMN tierRestMinutes INTEGER NOT NULL DEFAULT 0")
+        }
+    }
+
+    /** 媒体库可拖动排序：加一列序号。老库全是 0 → 排序退化成"新建的在最前"，顺序不变 */
+    private val MIGRATION_18_19 = object : Migration(18, 19) {
+        override fun migrate(db: SupportSQLiteDatabase) {
+            db.execSQL("ALTER TABLE libraries ADD COLUMN sortOrder INTEGER NOT NULL DEFAULT 0")
+        }
+    }
+
     fun build(context: Context): MediaDatabase =
         Room.databaseBuilder(context, MediaDatabase::class.java, "media.db")
             .addMigrations(
                 MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5,
                 MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9,
                 MIGRATION_9_10, MIGRATION_10_11, MIGRATION_11_12, MIGRATION_12_13,
-                MIGRATION_13_14, MIGRATION_14_15, MIGRATION_15_16,
+                MIGRATION_13_14, MIGRATION_14_15, MIGRATION_15_16, MIGRATION_16_17,
+                MIGRATION_17_18, MIGRATION_18_19,
             )
             .fallbackToDestructiveMigration()
             .build()

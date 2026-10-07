@@ -285,18 +285,20 @@ internal fun VrGestureLayer(
     Box(layer)
 }
 
-/** VR 手势提示（顶部居中）：拖动显示角度，捏合显示视场角 */
+/** VR 手势提示（顶部居中）：拖动显示角度，捏合显示视场角。
+ *  刻意做淡：观看中频繁浮现的字样是沉浸感的敌人，能看清就行 ——
+ *  半透明字 + 低透明度底，不与画面抢注意力。 */
 @Composable
 internal fun VrHud(text: String?, modifier: Modifier) {
     if (text == null) return
     Box(modifier) {
         Text(
             text,
-            color = Color.White,
-            style = MaterialTheme.typography.labelLarge,
+            color = Color.White.copy(alpha = 0.70f),
+            style = MaterialTheme.typography.labelMedium,
             modifier = Modifier
-                .background(Color.Black.copy(alpha = 0.6f), RoundedCornerShape(50))
-                .padding(horizontal = 14.dp, vertical = 7.dp),
+                .background(Color.Black.copy(alpha = 0.30f), RoundedCornerShape(50))
+                .padding(horizontal = 12.dp, vertical = 6.dp),
         )
     }
 }

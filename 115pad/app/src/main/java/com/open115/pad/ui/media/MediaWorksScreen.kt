@@ -271,6 +271,7 @@ fun MediaWorksScreen(
                         cacheDir = container.cacheDir,
                         mediaKey = target.mediaKey,
                         alsoCloud = alsoCloud,
+                        videoPreviews = container.videoPreviews,
                     )
                     when (r) {
                         MovieDeleteResult.Ok -> onChanged()

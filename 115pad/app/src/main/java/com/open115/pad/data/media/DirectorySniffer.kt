@@ -385,7 +385,7 @@ fun isArtImageFile(name: String): Boolean {
 //   `.actors/<演员名>.jpg`                     演员头像（TinyMediaManager 那套）
 // 它们**不是**独立条目：文件本身没有视频也没有 nfo，聚类天然聚不出东西来，
 // 所以是"挂在影片目录上的附属素材"。这两个目录的清单在扫描期**本来就会列到**
-// （collectDirs 递归列全部子目录），取它们零额外请求。
+// （扫描时递归列全部子目录），取它们零额外请求。
 
 /** 剧照目录名（不区分大小写匹配目录项） */
 val EXTRAFANART_DIR_NAMES = listOf("extrafanart")

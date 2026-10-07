@@ -254,10 +254,47 @@ data class MediaLibraryEntity(
     /** 云盘根目录完整路径，多根时以 \n 分隔（路径里不会出现换行） */
     val rootPath: String,
     val createdAt: Long = 0,
-    /** 扫描限速：相邻两次 115 API 请求的最小间隔（毫秒），0 = 不限 */
+    /**
+     * 手动拖动排的序号（升序在前）。**默认 0 = 没排过**：老库升级上来全是 0，
+     * 排序就退化成 [MediaDao.libraries] 的第二判据（`createdAt DESC`，即"新建的在最前"），
+     * 与这个功能加进来之前完全一致 —— 升级不会让谁的库顺序突变。
+     *
+     * 只在用户真拖过一次时整体重写（见 [MediaDao.reorderLibraries]），所以之后新建的库
+     * （0）会插在最前，而不是被扔到末尾：与"新建的在最前"这条老规矩一致。
+     */
+    val sortOrder: Int = 0,
+    /** 扫描限速：相邻两次 115 API 请求的最小间隔（毫秒），0 = 不限。**阶梯限速打开时忽略它** */
     val rateLimitMs: Long = 0,
-    /** 程序启动时对这个库自动跑增量扫描 */
+    /**
+     * **阶梯限速**（防 ban）：请求间隔按"这一轮扫到第几个目录"分档自动加长，见 [tierRateLimitMs] ——
+     * 前 10 个 500ms、11~20 个 1000ms、21~50 个 1500ms、51~100 个 2000ms、100 以上 2500ms。
+     *
+     * 为什么要有它：定死一个值只有两种选择 —— 按小库设（大库后半程太猛、容易被 ban）
+     * 或按大库设（小库白等）。实测被 ban 的风险是**累计请求量**堆出来的，所以越往后越慢才是对的。
+     *
+     * 打开时 [rateLimitMs] 不再参与（两套规则同时生效只会互相打架）。
+     */
+    val rateTiered: Boolean = false,
+    /**
+     * 每扫 [TIER_REST_EVERY] 个目录**休息几分钟**（0 = 不休息）。可选设置。
+     *
+     * 与阶梯限速是两件事（可以只开休息）：阶梯限速是"每个请求慢一点"，休息是"连着问了几百次之后
+     * 停一会儿" —— 大库一轮扫描几千次请求时，后者才是真正让 115 那边"看不出这是脚本"的那道闸。
+     * 界面给 3/4/5 分钟三档（用户要求的就是 3~5 分钟）。
+     */
+    val tierRestMinutes: Int = 0,
+    /** 程序启动时对这个库自动扫描（**开关**；关掉 = 定时扫描"不选"） */
     val autoScanOnStart: Boolean = false,
+    /**
+     * 自动扫描的**方式**：存 `ScanMode` 的枚举名（`Fast` / `Incremental`），空串 = 老库。
+     *
+     * 老库（这一列是空的）按 [autoScanModeOrDefault] 落到**增量** —— 与这个功能加进来之前
+     * 完全一致的行为，升级不会让谁的库突然改走快速扫描（那条路的判据更多、更省请求，
+     * 但有"目录内改名漏一轮"的已知盲区，得让用户自己选）。
+     *
+     * 存名字不存序号：枚举顺序以后可能调整（见 [WorksSort] 同一套理由）。
+     */
+    val autoScanMode: String = "",
     /**
      * 自动扫描的**最小间隔（小时）**：距上次扫描不到这么久就跳过，0 = 不限（每次启动都扫）。
      *
@@ -293,8 +330,37 @@ data class MediaLibraryEntity(
         fun joinRoots(cids: List<String>, paths: List<String>): Pair<String, String> =
             cids.filter { it.isNotBlank() }.joinToString("\n") to
                 paths.filter { it.isNotBlank() }.joinToString("\n")
+
+        /**
+         * 拖动排序：把 [from] 那张挪到 [hover] 那一格（两侧下标都是**拖动前**的下标）。
+         *
+         * 语义是"插到落点那张的位置上"：落点后面的整体往后让一格、落点那张自己往前挪一格。
+         * 于是"扔到第一张"= 排最前、"扔到最后一张"= 排最后，两个方向同一套规则，不用分情况。
+         *
+         * ★ 两处边界都在这里挡掉，别让调用方各自判：下标越界直接原样返回（拖动中断、列表在拖动
+         *   期间被扫描任务改了都可能给出野下标），同下标（拖回原位）也原样返回 —— 否则会白写一次库。
+         */
+        fun reorderIds(ids: List<Long>, from: Int, hover: Int): List<Long> {
+            if (ids.size < 2) return ids
+            if (from !in ids.indices || hover !in ids.indices || from == hover) return ids
+            val moved = ids.toMutableList()
+            val item = moved.removeAt(from)
+            moved.add(hover, item)
+            return moved
+        }
     }
 }
+
+/**
+ * 这个库的定时扫描方式。**老库（[MediaLibraryEntity.autoScanMode] 是空串）落到增量** ——
+ * 行为与"定时扫描只能选增量"那会儿一模一样，升级不改变任何人的库。
+ *
+ * 只有 [ScanMode.Fast] 会被认出来，别的值（含未来版本写的全量）一律当增量：
+ * 定时扫描**不提供全量** —— 每次启动都重新索引整个库既慢又费频控额度，
+ * 真需要全量时用户在库菜单里手动点一次就行。
+ */
+val MediaLibraryEntity.autoScanModeOrDefault: ScanMode
+    get() = if (autoScanMode == ScanMode.Fast.name) ScanMode.Fast else ScanMode.Incremental
 
 /**
  * 这次启动该不该自动扫这个库。判据纯本地（只比时间戳），零请求。

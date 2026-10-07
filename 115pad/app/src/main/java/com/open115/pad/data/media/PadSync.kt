@@ -51,6 +51,51 @@ data class PadSyncReport(
     val note: String,
 )
 
+/** 信号目录里的一份信号文件。手动同步让用户先挑一份（[pickCode] 读正文要用） */
+data class SignalFileChoice(val name: String, val pickCode: String)
+
+/** 列信号目录的结果。[error] 非空 = 没列成（信号目录没找到 / 网络），[files] 按文件名倒序（新的在前） */
+data class SignalFileList(val files: List<SignalFileChoice>, val error: String?)
+
+/**
+ * 一份信号里某个目录**跟本地库比对**的结果（手动同步先给用户看"同步过没有"）。
+ *
+ * 判据是"库里这个目录下有没有条目"（[existing]，零请求：只查已索引的数据）。
+ * ★ 只回答"有没有"，不回答"新不新" —— 重刮过的老片库里本来就有条目，也会显示已同步；
+ *   想强制重扫就用对话框里的「全部重新同步」，那条路不看这个判据。
+ */
+data class SignalDirStatus(
+    /**
+     * 信号文件里的**原始路径**。
+     *
+     * 挑目录得按它来（[PadSync.applySignal] 的 onlyPaths 对照的就是信号里的原始字符串）：
+     * 库根的写法不统一（`/媒体库根` 与 `媒体库根` 都可能），[path] 是换算成库里那套写法之后的，
+     * 两者不一定相等 —— 拿 [path] 去挑会一个都挑不中。
+     */
+    val raw: String,
+    /** 落在库里的写法（与库里行一致）；不在任何库根下时是原样路径 */
+    val path: String,
+    /** 归属的库名。空 = 这个路径不在任何媒体库里，同步会被忽略 */
+    val libraryName: String,
+    /** 库里这个目录下现有的影片数（顶层条目） */
+    val existing: Int,
+) {
+    val inLibrary: Boolean get() = libraryName.isNotEmpty()
+    val synced: Boolean get() = inLibrary && existing > 0
+}
+
+/** 手动同步的比对结果：这份信号里的目录各自同步过没有 */
+data class SignalInspection(
+    val name: String,
+    val dirs: List<SignalDirStatus>,
+) {
+    /** 需要同步的（在库内、但库里还没条目） */
+    val pending: List<SignalDirStatus> get() = dirs.filter { it.inLibrary && !it.synced }
+    val syncedCount: Int get() = dirs.count { it.synced }
+    val outsideCount: Int get() = dirs.count { !it.inLibrary }
+    val allSynced: Boolean get() = dirs.isNotEmpty() && pending.isEmpty()
+}
+
 internal val padSignalJson = Json { ignoreUnknownKeys = true }
 
 /** 读一份信号。格式不对返回 null（调用方会退化成整库快速扫描，见 [PadSync.pollInner]） */
@@ -67,6 +112,24 @@ internal fun newSignalNames(cursor: String, names: List<String>): List<String> =
     names.filter { it.endsWith(".json") && it > cursor }.sorted()
 
 /**
+ * 信号文件名 → 给人看的时间文案。名字是服务器写的时间戳（`20260928-103138.json`），
+ * 解析不出来就**原样返回**（不猜、不编一个时间出来）。
+ */
+internal fun signalFileLabel(name: String): String {
+    val m = Regex("""^(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})\.json$""").find(name) ?: return name
+    return "${m.groupValues[1]}-${m.groupValues[2]}-${m.groupValues[3]} " +
+        "${m.groupValues[4]}:${m.groupValues[5]}:${m.groupValues[6]}"
+}
+
+/**
+ * 路径的**归一化比较键**：去掉首尾斜杠。
+ *
+ * 115 里同一个目录的写法不统一（`/媒体库根/x` 与 `媒体库根/x` 都有），而信号里是服务器那套写法、
+ * 库里存的是用户建库时那套 —— 挑目录时只按字符串比会静默挑不中。纯函数，单测直接打。
+ */
+internal fun normSignalPath(path: String): String = path.trim().trim('/', ' ')
+
+/**
  * 一条 115 路径落在哪个库里，以及**换算成那个库的路径写法**。
  *
  * ★ 为什么要换算：库里存的路径写法不统一 —— 实测同一个账号下有 `媒体库/子目录/...`（不带前导斜杠）
@@ -78,7 +141,7 @@ internal data class PathMatch(val library: MediaLibraryEntity, val path: String)
 
 /**
  * 按"去掉前导斜杠再比"的规则找**最长**匹配的库根（库根可能嵌套，
- * 比如 `/媒体库根` 与 `/媒体库根/JAV_output` 同时存在时，后者才是对的），
+ * 比如 `/媒体库根` 与 `/媒体库根/子目录` 同时存在时，后者才是对的），
  * 并把路径改写成该库根自己的写法。返回 null = 这条路径不在任何库根下（扫不进任何库，丢掉）。
  */
 internal fun libraryForPath(path: String, libraries: List<MediaLibraryEntity>): PathMatch? {
@@ -138,7 +201,13 @@ internal fun ancestorPaths(path: String, floor: String): List<String> {
  *
  * ★ 请求量：一轮正常同步就是"列信号目录 1 次 + 每个变动目录几次"，很小；**只有**积压太多时
  *   会退化成快速扫描，那一轮的量由库自己的限速（`MediaLibraryEntity.rateLimitMs`）决定 ——
- *   库没设限速时建议补一个（500~1000ms），否则大库的一轮快速扫描会把 115 的访问上限打满。
+ *   库没设限速时建议补一个（500~1000ms），或者直接开库里的**阶梯限速**（按目录数自动加长间隔，
+ *   见 `MediaLibraryEntity.rateTiered`）—— 否则大库的一轮快速扫描会把 115 的访问上限打满。
+ *
+ * ★ 与**定时扫描**的互斥：两者可能同时触发（都在登录后跑起来），而它们要做的事重叠 ——
+ *   定向任务拿的是服务器刚刮完的那批变动，再整库扫一遍纯属重复。规则是**忽略定时任务**：
+ *   这边排下定向任务时记一笔 [targetedAt]（[hasRecentWork] 供启动块判断），
+ *   并把已经排队的定时任务撤掉（[MediaScanner.dropAutoQueued]）。
  */
 class PadSync(
     private val api: OpenApi,
@@ -173,6 +242,36 @@ class PadSync(
          * 但万一是文件真坏了，不能让后面所有信号永远堵着 —— 到次数就跳过并提示。
          */
         private const val MAX_READ_RETRIES = 5
+
+        /**
+         * "刚排过定向扫描"的**避让窗口**（见 [hasRecentWork]）。
+         *
+         * 取 30 分钟：定时扫描是**每次启动**判一次的，而这个窗口要能把"启动时两边撞上"和
+         * "启动后登录流又发了一次 true（token 刷新）"这两种情况都盖住 ——
+         * 前者的间隔是秒级，后者可能隔几分钟。再长就会把"用户隔了很久重启、该扫的定时任务"
+         * 也一并吃掉，那就变成"自动扫描时灵时不灵"了。
+         */
+        private const val SUPPRESS_WINDOW_MS = 30 * 60_000L
+    }
+
+    /**
+     * 本进程里**刚给哪个库排过定向扫描**（libraryId → 时刻）。
+     *
+     * 定时扫描（启动时那条）据此避让：两边同时触发时，定向任务拿的是服务器刚刮完的那批变动，
+     * 这时再整库扫一遍纯属重复劳动，而 115 的频控额度是稀缺的。
+     */
+    private val targetedAt = java.util.concurrent.ConcurrentHashMap<Long, Long>()
+
+    /**
+     * 这个库**刚刚**被流水线同步排过定向扫描吗（[SUPPRESS_WINDOW_MS] 之内）。
+     *
+     * 定时扫描启动前问这一句 —— 是的话这一轮就**忽略定时任务**（用户明确要求的规则）。
+     * 反向也有一道：[MediaScanner.dropAutoQueued] 会把已经排队的定时任务撤掉，
+     * 两边一起才能盖住"谁先谁后都行"。
+     */
+    fun hasRecentWork(libraryId: Long, now: Long = System.currentTimeMillis()): Boolean {
+        val at = targetedAt[libraryId] ?: return false
+        return now - at <= SUPPRESS_WINDOW_MS
     }
 
     private val mutex = Mutex()
@@ -271,7 +370,12 @@ class PadSync(
         if (signals.size > MAX_TARGETED_SIGNALS || dirs.size > MAX_TARGETED_DIRS) {
             val owners = dirs.mapNotNull { libraryForPath(it, libraries)?.library?.id }.distinct()
             owners.mapNotNull { id -> libraries.firstOrNull { it.id == id } }
-                .forEach { scanner.enqueue(it, ScanMode.Fast) }
+                .forEach { lib ->
+                    scanner.enqueue(lib, ScanMode.Fast)
+                    // 退化成整库扫描也是"流水线同步干了活"：同样让定时扫描避开这个库
+                    targetedAt[lib.id] = System.currentTimeMillis()
+                    scanner.dropAutoQueued(lib.id)
+                }
             prefs.setPadCursor(newest)
             return PadSyncReport(
                 signals = signals.size,
@@ -280,10 +384,155 @@ class PadSync(
         }
 
         // dirs 落到库：不在任何库根下的路径本来也不会入库，丢掉（日志里记个数）。
-        // 落库时**同时把路径改写成该库的写法**（见 libraryForPath），后面查 cid、写 dirPath 都用它。
+        val queued = queueDirs(dirs, libraries)
+        // gone：同样按库的写法换算，才能删到历史行（换算不出来就按原样删）
+        applyGone(gone, libraries)
+        prefs.setPadCursor(newest)
+
+        val note = buildString {
+            append("同步 ${signals.size} 个信号")
+            if (queued.resolved > 0) append("，排了 ${queued.resolved} 个目录（${queued.libraries} 个库）")
+            if (gone.isNotEmpty()) append("，清掉 ${gone.size} 个已移走目录")
+            if (queued.outside > 0) append("，${queued.outside} 个目录不在任何库内")
+        }
+        return PadSyncReport(signals = signals.size, dirs = queued.resolved, gone = gone.size, note = note)
+    }
+
+    // ---- 手动同步：指定一份信号文件，先跟库比对再排 ----
+
+    /**
+     * 列信号目录里的信号文件（新的在前），供设置页「手动同步文件」挑一份。
+     *
+     * 与自动轮询共用信号目录的查找（[signalDir]）；手动操作会**重置"找过没找到"的记忆**，
+     * 让用户刚把信号目录挪到别处时不必重启 App。
+     */
+    suspend fun listSignalFiles(): SignalFileList = mutex.withLock {
+        discoverTried = false
+        val dir = signalDir() ?: return@withLock SignalFileList(
+            emptyList(),
+            lastListError?.let { "列目录失败：$it" } ?: "没找到信号目录 $SIGNAL_DIR_NAME",
+        )
+        val page = listFiles(dir.cid)
+            ?: return@withLock SignalFileList(emptyList(), "列信号目录失败：${lastListError ?: "网络异常"}")
+        val files = page.items
+            .filter { !it.isDir && it.fn.endsWith(".json") }
+            .mapNotNull { item -> item.pc?.takeIf { it.isNotEmpty() }?.let { SignalFileChoice(item.fn, it) } }
+            .sortedByDescending { it.name }
+        SignalFileList(files, null)
+    }
+
+    /**
+     * 读一份信号并跟**本地库**比对：每个目录在不在库里、库里已经有几部。
+     *
+     * 这一步只查本地索引（零接口请求，读文件本身那是 1~2 次），所以可以放心在对话框里跑。
+     * 返回 null = 读不到/格式不对/找不到信号目录，界面据此提示。
+     */
+    suspend fun inspectSignal(name: String): SignalInspection? = mutex.withLock {
+        discoverTried = false
+        val dir = signalDir() ?: return@withLock null
+        val page = listFiles(dir.cid) ?: return@withLock null
+        val file = page.items.firstOrNull { !it.isDir && it.fn == name } ?: return@withLock null
+        val text = readText(file.pc) ?: return@withLock null
+        val signal = parseSignal(text) ?: return@withLock null
+        val libraries = dao.libraries().first()
+        val dirs = signal.dirs.map { it.trimEnd('/') }.filter { it.isNotEmpty() }.distinct()
+        SignalInspection(
+            name = name,
+            dirs = dirs.map { raw ->
+                val match = libraryForPath(raw, libraries)
+                SignalDirStatus(
+                    raw = raw,
+                    path = match?.path ?: raw,
+                    libraryName = match?.library?.name.orEmpty(),
+                    existing = match?.let { runCatching { dao.movieCountIn(it.path) }.getOrDefault(0) } ?: 0,
+                )
+            },
+        )
+    }
+
+    /**
+     * 手动排一份信号文件（**不看游标、也不推进它**）。
+     *
+     * 自动轮询失败时的兜底：用户明确挑了这份文件，就按它 [SignalInspection] 里的目录排队列。
+     * [onlyPaths] 非空 = 只排这些（对话框里「同步未同步的 N 个」传的就是 pending 那批）；
+     * 空/null = 全部目录都排（「全部重新同步」）。
+     *
+     * ★ **不推进游标**：手动只处理这一份，跳过中间那些信号就等于把它们永远丢了
+     *   （游标是"处理到哪儿"的水位线，只有顺序消费它的自动轮询才有资格推）。
+     *   代价是下次自动轮询会把这批目录**再**排一遍 —— 定向扫描是幂等的，多扫一次只是多几次请求。
+     * ★ **不动 `gone`**：用户可能挑的是一份**旧**信号，而它的 `gone` 说的是"当时那个目录没了" ——
+     *   后来重新刮好、新信号里又在 `dirs` 里出现过的目录，拿旧 gone 去删就是把好的索引删掉。
+     *   gone 的语义依赖"按时间顺序消费"，只有自动轮询那条路成立，所以这里一律跳过：
+     *   游标没动，下一轮自动同步会按顺序把 gone 处理掉，不漏。
+     * ★ 不看 [prefs.padSyncEnabled]：关掉自动同步的人正是最需要手动的（他不想后台轮询，
+     *   但想按需搬一次）。
+     */
+    suspend fun applySignal(name: String, onlyPaths: List<String>? = null): PadSyncReport {
+        val report = try {
+            mutex.withLock { applySignalInner(name, onlyPaths) }
+        } catch (e: Exception) {
+            Log.w(TAG, "手动同步失败: ${e.message}")
+            PadSyncReport(note = "手动同步失败：${e.message ?: "未知错误"}")
+        }
+        runCatching { prefs.setPadLast(System.currentTimeMillis(), report.note) }
+        Log.i(TAG, "手动同步「$name」：${report.note}")
+        return report
+    }
+
+    private suspend fun applySignalInner(name: String, onlyPaths: List<String>?): PadSyncReport {
+        discoverTried = false
+        val dir = signalDir() ?: return PadSyncReport(note = "没找到信号目录 $SIGNAL_DIR_NAME")
+        val page = listFiles(dir.cid)
+            ?: return PadSyncReport(note = "列信号目录失败：${lastListError ?: "网络异常"}")
+        val file = page.items.firstOrNull { !it.isDir && it.fn == name }
+            ?: return PadSyncReport(note = "信号目录里没有 $name")
+        val text = readText(file.pc) ?: return PadSyncReport(signals = 1, note = "$name 读不出来，稍后再试")
+        val signal = parseSignal(text) ?: return PadSyncReport(signals = 1, note = "$name 不是有效的信号文件")
+
+        val libraries = dao.libraries().first()
+        val all = signal.dirs.map { it.trimEnd('/') }.filter { it.isNotEmpty() }.distinct()
+        // ★ 挑选按**归一化后**比较（去掉前导/尾随斜杠）：库里路径的写法不统一
+        //（`/媒体库根/x` 与 `媒体库根/x` 都可能），而 onlyPaths 的调用方传的是
+        // 信号里的原始写法、也可能传换算成库写法的那个 —— 只按字符串比会静默挑不中
+        //（对话框显示"未同步 3 个"、点下去却提示"没有要同步的目录"）。
+        val wanted = if (onlyPaths.isNullOrEmpty()) {
+            all
+        } else {
+            val want = onlyPaths.map { normSignalPath(it) }.toSet()
+            all.filter { normSignalPath(it) in want }
+        }
+        if (wanted.isEmpty()) return PadSyncReport(signals = 1, note = "这份信号里没有要同步的目录")
+
+        val queued = queueDirs(wanted, libraries)
+        // gone 不在这里处理（见 applySignal 的说明）：旧信号里的 gone 可能指向后来重新刮好的目录
+        val gone = signal.gone.map { it.trimEnd('/') }.filter { it.isNotEmpty() }.distinct()
+
+        val note = buildString {
+            append("手动同步 $name")
+            if (queued.resolved > 0) append("：排了 ${queued.resolved} 个目录（${queued.libraries} 个库）")
+            else append("：没排出目录")
+            if (gone.isNotEmpty()) append("，${gone.size} 个已移走目录留给自动同步清理")
+            if (queued.outside > 0) append("，${queued.outside} 个目录不在任何库内")
+        }
+        return PadSyncReport(signals = 1, dirs = queued.resolved, gone = 0, note = note)
+    }
+
+    /** [queueDirs] 的结果：排进了几个目录、涉及几个库、几个路径不属于任何库 */
+    private data class DirsQueued(val resolved: Int, val libraries: Int, val outside: Int)
+
+    /**
+     * 把这些目录落到扫描队列（自动轮询与手动同步共用）。
+     *
+     * 落库时**同时把路径改写成该库的写法**（见 [libraryForPath]），后面查 cid、写 dirPath 都用它。
+     * 先失效缓存再入队：扫描是队列串行执行的，等它开跑时缓存已经被清掉了。
+     * 排下定向任务时顺手记"这个库刚被关照过"（定时扫描据此避让）并撤掉已排队的定时任务。
+     */
+    private suspend fun queueDirs(
+        dirs: List<String>,
+        libraries: List<MediaLibraryEntity>,
+    ): DirsQueued {
         val matches = dirs.mapNotNull { p -> libraryForPath(p, libraries)?.let { it.library.id to it } }
         val grouped = matches.groupBy({ it.first }, { it.second.path })
-        val outside = dirs.size - matches.size
         var queued = 0
         var resolvedCount = 0
         grouped.forEach { (libId, paths) ->
@@ -291,26 +540,21 @@ class PadSync(
             val resolved = paths.mapNotNull { p -> resolveDirCid(library, p)?.let { it to p } }
             resolvedCount += resolved.size
             if (resolved.isNotEmpty()) {
-                // 先失效缓存再入队：扫描是队列串行执行的，等它开跑时缓存已经被清掉了
                 resolved.forEach { (_, p) -> dropCaches(p) }
                 scanner.enqueueTargeted(library, resolved)
+                targetedAt[library.id] = System.currentTimeMillis()
+                scanner.dropAutoQueued(library.id)
                 queued++
             } else {
                 Log.i(TAG, "「${library.name}」这几个目录没解析出 cid（跳过）：$paths")
             }
         }
+        return DirsQueued(resolvedCount, queued, dirs.size - matches.size)
+    }
 
-        // gone：同样按库的写法换算，才能删到历史行（换算不出来就按原样删）
+    /** gone：按库的写法换算后清索引（换算不出来就按原样清）。[deleteGone] 里连带清缓存与索引 */
+    private suspend fun applyGone(gone: List<String>, libraries: List<MediaLibraryEntity>) {
         gone.forEach { raw -> deleteGone(libraryForPath(raw, libraries)?.path ?: raw) }
-        prefs.setPadCursor(newest)
-
-        val note = buildString {
-            append("同步 ${signals.size} 个信号")
-            if (resolvedCount > 0) append("，排了 $resolvedCount 个目录（$queued 个库）")
-            if (gone.isNotEmpty()) append("，清掉 ${gone.size} 个已移走目录")
-            if (outside > 0) append("，${outside} 个目录不在任何库内")
-        }
-        return PadSyncReport(signals = signals.size, dirs = resolvedCount, gone = gone.size, note = note)
     }
 
     // ---- 信号目录：先用手里的 cid，没有就自己找（媒体库根下面的 .pad_signal）----

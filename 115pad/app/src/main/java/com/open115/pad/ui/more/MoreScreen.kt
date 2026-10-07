@@ -18,6 +18,8 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.ChevronRight
+import androidx.compose.material3.Badge
+import androidx.compose.material3.BadgedBox
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
@@ -41,6 +43,11 @@ data class MoreEntry(
     val icon: ImageVector,
     /** 一行说明，让入口自解释（也为以后新增的低频功能预留） */
     val desc: String = "",
+    /**
+     * 该入口对应的任务是否正在跑（红点）。
+     * 手机模式下「重命名」收纳在这里 —— 底栏「更多」tab 亮红点后进来，这里要能对上是谁在跑。
+     */
+    val busy: Boolean = false,
 )
 
 private val entryDesc: Map<String, String> = mapOf(
@@ -71,19 +78,21 @@ fun MoreScreen(
                         Modifier.padding(horizontal = 14.dp, vertical = 12.dp),
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
-                        Box(
-                            Modifier
-                                .size(40.dp)
-                                .clip(RoundedCornerShape(10.dp))
-                                .background(AppColors.BlueBg),
-                            contentAlignment = Alignment.Center,
-                        ) {
-                            Icon(
-                                entry.icon,
-                                contentDescription = null,
-                                tint = AppColors.AccentDeep,
-                                modifier = Modifier.size(20.dp),
-                            )
+                        BadgedBox(badge = { if (entry.busy) Badge() }) {
+                            Box(
+                                Modifier
+                                    .size(40.dp)
+                                    .clip(RoundedCornerShape(10.dp))
+                                    .background(AppColors.BlueBg),
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                Icon(
+                                    entry.icon,
+                                    contentDescription = null,
+                                    tint = AppColors.AccentDeep,
+                                    modifier = Modifier.size(20.dp),
+                                )
+                            }
                         }
                         Spacer(Modifier.width(12.dp))
                         Column(Modifier.weight(1f)) {

@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  播放器进场：整窗从 85% 放大到全屏并淡入（alpha 先走完，画面立起来后继续放大就位），
+  与预览浮层（PreviewZoomHost）的进出场同一手感。
+  窗口动画做不了逐点的 pivot，这里统一中心缩放。
+-->
+<set xmlns:android="http://schemas.android.com/apk/res/android"
+    android:interpolator="@android:interpolator/decelerate_cubic">
+    <scale
+        android:fromXScale="0.85"
+        android:toXScale="1.0"
+        android:fromYScale="0.85"
+        android:toYScale="1.0"
+        android:pivotX="50%"
+        android:pivotY="50%"
+        android:duration="450" />
+    <alpha
+        android:fromAlpha="0.0"
+        android:toAlpha="1.0"
+        android:duration="300" />
+</set>
