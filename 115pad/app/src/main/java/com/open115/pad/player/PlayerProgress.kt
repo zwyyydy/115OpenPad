@@ -36,6 +36,9 @@ import com.open115.pad.util.Format
 private val ProgressAccent = Color(0xFF6FA8FF)
 private val TrackColor = Color.White.copy(alpha = 0.24f)
 private val BufferedInBar = Color.White.copy(alpha = 0.40f)
+
+/** 「已缓存到本机」那层：淡蓝，夹在灰轨与白色缓冲之间，一眼看出预下载到哪了 */
+private val CachedInBar = ProgressAccent.copy(alpha = 0.32f)
 private val PanelScrim = Color.Black.copy(alpha = 0.45f)
 
 // 形态 A：视觉条高 4dp、Thumb 半径 7dp
@@ -54,12 +57,15 @@ internal val MiniBarHeight = 3.dp
 /**
  * 形态 A：交互式进度条（Interactive SeekBar）。
  *
- * 四层结构：总时长背景轨 → 缓冲轨 → 已播轨 → 圆形 Thumb。
+ * 五层结构：总时长背景轨 → **已缓存轨（预下载/上次会话留下的）** → 缓冲轨 → 已播轨 → 圆形 Thumb。
  * 手势契约：
  * - **按下即预览**该位置，拖动实时跟随，但**不**调用 seekTo；
  * - **抬手才回调一次** [onSeekFinished]，由调用方执行唯一一次 seekTo，
  *   从根本上避免"手指还在拖、播放器进度又往回跑"的左右拉扯；
  * - 拖拽期间时间槽切换为高亮的「位置 / 总时长」预览提示。
+ *
+ * [cachedRangesMs] 是**磁盘缓存**里的时间区间（含预下载），与 [bufferedMs]（内存缓冲窗口）分开画：
+ * 前者决定"拖回去要不要重新下载"，后者只说明"快进这一小段不用等"。
  *
  * 尺寸全部用 dp，1080p 手机与 4K 平板上厚度、热区一致。
  */
@@ -71,6 +77,7 @@ internal fun InteractiveSeekBar(
     onSeekStart: () -> Unit,
     onSeekFinished: (Long) -> Unit,
     modifier: Modifier = Modifier,
+    cachedRangesMs: List<LongRange> = emptyList(),
 ) {
     val total = durationMs.coerceAtLeast(0L)
     val interactive = total > 0L
@@ -170,6 +177,19 @@ internal fun InteractiveSeekBar(
                 val w = size.width
 
                 drawRoundRect(TrackColor, Offset(0f, cy - radius), Size(w, trackH), corner)
+                if (interactive) {
+                    for (r in cachedRangesMs) {
+                        val from = (r.first.toFloat() / total).coerceIn(0f, 1f)
+                        val to = (r.last.toFloat() / total).coerceIn(0f, 1f)
+                        if (to <= from) continue
+                        drawRoundRect(
+                            CachedInBar,
+                            Offset(w * from, cy - radius),
+                            Size(w * (to - from), trackH),
+                            corner,
+                        )
+                    }
+                }
                 if (bufferFraction > 0f) {
                     drawRoundRect(
                         BufferedInBar,
@@ -200,7 +220,7 @@ internal fun InteractiveSeekBar(
  * 形态 B：常驻底部迷你进度条（Mini Progress Bar）。
  *
  * 极简半透明细条，紧贴播放器最底部，**没有 Thumb、也不挂任何 pointerInput**，
- * 因此不会拦截全屏手势，也不影响观看。仅由缓冲轨与已播轨两层构成。
+ * 因此不会拦截全屏手势，也不影响观看。由背景轨、已缓存轨（预下载）、缓冲轨与已播轨四层构成。
  */
 @Composable
 internal fun MiniProgressBar(
@@ -208,6 +228,7 @@ internal fun MiniProgressBar(
     durationMs: Long,
     bufferedMs: Long,
     modifier: Modifier = Modifier,
+    cachedRangesMs: List<LongRange> = emptyList(),
 ) {
     val total = durationMs.coerceAtLeast(0L)
     val played = if (total > 0L) (positionMs.toFloat() / total).coerceIn(0f, 1f) else 0f
@@ -217,6 +238,14 @@ internal fun MiniProgressBar(
         val w = size.width
         val h = size.height
         drawRect(Color.White.copy(alpha = 0.16f), size = Size(w, h))
+        if (total > 0L) {
+            for (r in cachedRangesMs) {
+                val from = (r.first.toFloat() / total).coerceIn(0f, 1f)
+                val to = (r.last.toFloat() / total).coerceIn(0f, 1f)
+                if (to <= from) continue
+                drawRect(CachedInBar, size = Size(w * (to - from), h), topLeft = Offset(w * from, 0f))
+            }
+        }
         if (buffered > played) {
             drawRect(Color.White.copy(alpha = 0.34f), size = Size(w * buffered, h))
         }

@@ -25,7 +25,6 @@ import androidx.compose.material.icons.outlined.Delete
 import androidx.compose.material.icons.outlined.History
 import androidx.compose.material.icons.outlined.Movie
 import androidx.compose.material.icons.outlined.PlayArrow
-import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -60,6 +59,7 @@ import com.open115.pad.ui.media.PickCodeImage
 import com.open115.pad.ui.theme.AdaptiveBody
 import com.open115.pad.util.Format
 import kotlinx.coroutines.launch
+import com.open115.pad.ui.components.FadeAlertDialog
 
 /**
  * 差值不到这么多毫秒就算"已经看完"：点击从头播、不显示百分比。
@@ -215,7 +215,7 @@ fun WatchHistoryScreen(
     }
 
     pendingDelete?.let { row ->
-        AlertDialog(
+        FadeAlertDialog(
             onDismissRequest = { pendingDelete = null },
             title = { Text("从观影历史里删除") },
             text = {
@@ -239,7 +239,7 @@ fun WatchHistoryScreen(
     }
 
     if (confirmClear) {
-        AlertDialog(
+        FadeAlertDialog(
             onDismissRequest = { confirmClear = false },
             title = { Text("清空观影历史？") },
             text = { Text("${rows.size} 条记录会全部删除。播放进度不受影响，只是这份列表清空。") },

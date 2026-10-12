@@ -23,7 +23,6 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Close
-import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -49,6 +48,7 @@ import androidx.compose.ui.viewinterop.AndroidView
 import kotlinx.coroutines.launch
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.random.Random
+import com.open115.pad.ui.components.FadeAlertDialog
 
 /**
  * 弹幕渲染视图（实验室：弹幕）。
@@ -538,7 +538,7 @@ internal fun PlayerTextEditDialog(
     onDismiss: () -> Unit,
 ) {
     var text by remember { mutableStateOf(initial) }
-    AlertDialog(
+    FadeAlertDialog(
         onDismissRequest = onDismiss,
         title = { Text(title) },
         text = {
@@ -596,7 +596,7 @@ internal fun DanmuMatchDialog(
         }
     }
 
-    AlertDialog(
+    FadeAlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("匹配弹幕") },
         text = {

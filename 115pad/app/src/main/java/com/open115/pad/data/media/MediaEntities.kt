@@ -496,6 +496,12 @@ data class WatchHistoryRow(
     val libraryTitle: String?,
     /** 这条视频自己那行的标题（分集就是集名）；不在库里为 null */
     val ownTitle: String?,
+    /**
+     * 这条视频**现在**还在某个媒体库里吗（join 上 movies 才 true）。
+     * 观影历史页故意连孤儿行也显示（退回用文件名认），「继续观看」横排只要在库的 ——
+     * 片删了（详情页删、扫描陈旧清理）它就得从横排里消失。
+     */
+    val inLibrary: Boolean,
 )
 
 /**

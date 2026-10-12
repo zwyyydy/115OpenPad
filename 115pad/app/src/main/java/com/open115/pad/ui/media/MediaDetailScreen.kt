@@ -28,6 +28,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.ArrowBack
+import androidx.compose.material.icons.outlined.AutoFixHigh
 import androidx.compose.material.icons.outlined.Delete
 import androidx.compose.material.icons.outlined.Movie
 import androidx.compose.material.icons.outlined.PlayArrow
@@ -65,12 +66,14 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import com.open115.pad.data.PlaylistEntry
 import com.open115.pad.data.media.backgroundSourceOf
 import com.open115.pad.data.media.ActorCard
 import com.open115.pad.data.media.EpisodeEntity
 import com.open115.pad.data.media.MediaDao
 import com.open115.pad.data.media.ActorAvatarSource
+import com.open115.pad.data.media.EpisodeRow
 import com.open115.pad.data.media.MovieCard
 import com.open115.pad.data.media.MovieRecommender
 import com.open115.pad.data.media.RecommendationSeed
@@ -81,6 +84,7 @@ import com.open115.pad.data.media.MovieDeleteResult
 import com.open115.pad.data.media.deleteMovie
 import com.open115.pad.data.media.episodeSortKey
 import com.open115.pad.player.PlayerActivity
+import com.open115.pad.ui.components.FadeIn
 import com.open115.pad.ui.components.PreviewZoomHost
 import com.open115.pad.ui.components.dissolve
 import com.open115.pad.ui.theme.AdaptiveBody
@@ -100,7 +104,7 @@ private data class MediaDetailData(
      * 分集就在这里列出来选集 —— 所以详情页有两种分集来源：
      * 系列卡用 [seriesEpisodes]，番号式/多视频影片用它自己的 [episodes]。
      */
-    val seriesEpisodes: List<MovieCard>,
+    val seriesEpisodes: List<EpisodeRow>,
     /**
      * 剧照（`extrafanart/fanart1.jpg…`）的 pick_code，已按自然序排好。
      * 只在扫描时记了 pick_code，**字节是进这个页面才开始缓存的**（见下面的 LaunchedEffect）。
@@ -139,6 +143,11 @@ fun MediaDetailScreen(
      * [list] 传的是这一批推荐（不是进来的那个列表）—— 这样"播完自动接下一部"就在推荐里走。
      */
     onOpenMovie: (MovieCard, List<MovieCard>, Int) -> Unit = { _, _, _ -> },
+    /**
+     * 刮削写回成功：把新键（可能已从文件前缀变成 `tmdb-<id>`）交给外层 ——
+     * 详情页拿的是旧卡，键一变这条就得由外面重新解析（见 MediaLibraryScreen 的替换逻辑）。
+     */
+    onScraped: (newKey: String?) -> Unit = {},
     onBack: () -> Unit,
 ) {
     val context = LocalContext.current
@@ -146,6 +155,7 @@ fun MediaDetailScreen(
     val snackbarHostState = remember { SnackbarHostState() }
     val container = (context.applicationContext as com.open115.pad.App115).container
     var showDelete by remember { mutableStateOf(false) }
+    var showScrape by remember { mutableStateOf(false) }
 
     val data by produceState<MediaDetailData?>(initialValue = null, card.mediaKey) {
         val movie = dao.movie(card.mediaKey)
@@ -165,7 +175,7 @@ fun MediaDetailScreen(
                 actors = dao.actorCardsOf(card.mediaKey),
                 tags = dao.tagsOf(card.mediaKey),
                 episodes = dao.episodesOf(card.mediaKey),
-                seriesEpisodes = dao.episodesOfSeries(card.mediaKey),
+                seriesEpisodes = dao.episodeDetailsOfSeries(card.mediaKey),
                 fanarts = updated.extraFanartList,
                 nfo = updated.nfoJson?.let {
                     runCatching { nfoJson.decodeFromString<NfoMeta>(it) }.getOrNull()
@@ -249,23 +259,29 @@ fun MediaDetailScreen(
     //
     // ★ 集号取自**文件名**而不是标题：刮削过的包标题是剧集名（示例剧集三那包是「示例剧集标题二」），
     //   里面没有 S01E07，拿它排序等于按中文标题乱排。文件名一定带集号（示例剧集三 - S01E07 - 第7集.mp4）。
-    val epList: List<Pair<String, String?>> = remember(data) {
+    val epList: List<EpisodeRow> = remember(data) {
         val d = data ?: return@remember emptyList()
         if (d.seriesEpisodes.isNotEmpty()) {
-            d.seriesEpisodes
-                .sortedWith(
-                    compareBy(
-                        { episodeSortKey(it.videoName ?: it.title) },
-                        { it.videoName ?: it.title },
-                    ),
-                )
-                .map { it.title to it.videoPickCode }
+            d.seriesEpisodes.sortedWith(
+                // 有季/集号（刮过分集 nfo）就按号排；没有退回按文件名的集号
+                compareBy(
+                    { it.season ?: Int.MAX_VALUE },
+                    { it.episode ?: Int.MAX_VALUE },
+                    { episodeSortKey(it.videoName ?: it.title) },
+                ),
+            )
         } else {
-            d.episodes.map { it.episodeKey to it.videoPickCode }
+            d.episodes.map {
+                EpisodeRow(
+                    mediaKey = it.mediaKey, title = it.episodeKey, plot = null, premiered = null,
+                    season = it.season, episode = it.episode, videoPickCode = it.videoPickCode,
+                    videoName = it.videoName,
+                )
+            }
         }
     }
     val epEntries = remember(epList) {
-        epList.mapNotNull { (label, pc) -> pc?.let { PlaylistEntry(it, label) } }
+        epList.mapNotNull { r -> r.videoPickCode?.let { PlaylistEntry(it, r.title) } }
     }
     // 库内播放列表（播完一部自动接下一部）
     val movieEntries = remember(playlist) {
@@ -310,12 +326,13 @@ fun MediaDetailScreen(
 
     /** 播第 i 集：用 pickCode 在播放列表里反查下标 —— 有集缺 pickCode 时下标会错位，不能直接用 i */
     fun playEpisode(i: Int) {
-        val (label, pc) = epList.getOrNull(i) ?: return
+        val row = epList.getOrNull(i) ?: return
+        val pc = row.videoPickCode
         if (pc.isNullOrBlank()) {
             scope.launch { snackbarHostState.showSnackbar("这一集没有提取码，无法播放") }
             return
         }
-        play(pc, label, epEntries, epEntries.indexOfFirst { it.pc == pc })
+        play(pc, row.title, epEntries, epEntries.indexOfFirst { it.pc == pc })
     }
 
     // 系统返回键 = 顶栏返回键：退回海报墙
@@ -379,6 +396,8 @@ fun MediaDetailScreen(
             }
 
             // 内容层：长文本在平板上不该横跨整屏，收进 960dp 居中栏；整页可滚
+            // 数据到齐的那一帧从转圈整页淡入接上，别硬切（底色/背景此刻已经就位）
+            FadeIn(Modifier.fillMaxSize(), durationMillis = 300) {
             AdaptiveBody(modifier = Modifier.fillMaxSize().padding(padding)) {
                 Column(
                     Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp),
@@ -396,11 +415,21 @@ fun MediaDetailScreen(
                             overflow = TextOverflow.Ellipsis,
                             modifier = Modifier.weight(1f),
                         )
+                        // 刮削：搜元数据 → 写回云端该片目录（nfo + 海报）。
+                        // 没有视频文件名的行（剧集根、CD 合成行）连 nfo 名都生成不了，不给这个入口
+                        if (!current.movie.videoName.isNullOrBlank()) {
+                            IconButton(onClick = { showScrape = true }) {
+                                Icon(
+                                    Icons.Outlined.AutoFixHigh,
+                                    contentDescription = "刮削元数据",
+                                    tint = Color.White,
+                                )
+                            }
+                        }
                         IconButton(onClick = { showDelete = true }) {
                             Icon(Icons.Outlined.Delete, contentDescription = "删除", tint = Color.White)
                         }
                     }
-
                     Row(Modifier.padding(top = 8.dp)) {
                         // 海报：竖版 2:3，宽度按可用宽度的比例约束（大屏不甩成半屏宽，窄屏不挤成一指宽），
                         // 高度由 2:3 自动推导，无硬编码宽高。
@@ -591,19 +620,35 @@ fun MediaDetailScreen(
                         Spacer(Modifier.height(16.dp))
                         Text("分集（${epList.size}）", style = MaterialTheme.typography.titleSmall, color = Color.White)
                         Spacer(Modifier.height(4.dp))
-                        epList.forEachIndexed { i, (label, _) ->
+                        epList.forEachIndexed { i, row ->
                             Row(
-                                Modifier.fillMaxWidth().padding(vertical = 2.dp),
-                                verticalAlignment = Alignment.CenterVertically,
+                                Modifier.fillMaxWidth().padding(vertical = 8.dp),
+                                verticalAlignment = Alignment.Top,
                             ) {
-                                Text(
-                                    label,
-                                    color = Color.White.copy(alpha = 0.9f),
-                                    style = MaterialTheme.typography.bodyMedium,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis,
-                                    modifier = Modifier.weight(1f),
-                                )
+                                Column(Modifier.weight(1f)) {
+                                    Text(
+                                        row.title,
+                                        color = Color.White.copy(alpha = 0.92f),
+                                        style = MaterialTheme.typography.bodyMedium,
+                                        maxLines = 2,
+                                        overflow = TextOverflow.Ellipsis,
+                                    )
+                                    episodeSubtitle(row)?.let { sub ->
+                                        Spacer(Modifier.height(2.dp))
+                                        Text(sub, fontSize = 12.sp, color = Color.White.copy(alpha = 0.5f))
+                                    }
+                                    row.plot?.takeIf { it.isNotBlank() }?.let { p ->
+                                        Spacer(Modifier.height(3.dp))
+                                        Text(
+                                            p,
+                                            fontSize = 12.sp,
+                                            color = Color.White.copy(alpha = 0.62f),
+                                            maxLines = 2,
+                                            overflow = TextOverflow.Ellipsis,
+                                            lineHeight = 16.sp,
+                                        )
+                                    }
+                                }
                                 IconButton(onClick = { playEpisode(i) }) {
                                     Icon(Icons.Outlined.PlayArrow, contentDescription = "播放", tint = Color.White)
                                 }
@@ -664,7 +709,26 @@ fun MediaDetailScreen(
                     )
                 }
             }
+            } // FadeIn
         }
+    }
+
+    // 刮削对话框：搜 TMDB → 选候选 → 写回云端（nfo + 海报）。
+    // 写完由外层按新键重解析这条片（键会从文件前缀变成 tmdb-<id>，旧卡已经指不到行了）
+    val scrapeMovie = data?.movie
+    if (showScrape && scrapeMovie != null) {
+        MediaScrapeDialog(
+            plan = com.open115.pad.data.media.scrape.scrapePlanOfMovie(scrapeMovie),
+            scraper = container.metadataScraper,
+            aiClient = container.aiQueryClient,
+            mediaPrefs = container.mediaPrefs,
+            registry = container.scrapeSourceRegistry,
+            onDismiss = { showScrape = false },
+            onWritten = { newKey ->
+                showScrape = false
+                onScraped(newKey)
+            },
+        )
     }
 
     if (showDelete) {
@@ -955,4 +1019,16 @@ private fun RecommendTile(rec: MovieRecommender.Recommendation, onClick: () -> U
             )
         }
     }
+}
+
+/** 分集行的副标题：季/集号 + 首播日期（缺哪个省哪个），全空返回 null 不占行 */
+private fun episodeSubtitle(row: EpisodeRow): String? {
+    val parts = buildList {
+        when {
+            row.season != null && row.episode != null -> add("第${row.season}季 · 第${row.episode}集")
+            row.episode != null -> add("第${row.episode}集")
+        }
+        row.premiered?.takeIf { it.isNotBlank() }?.let { add(it.take(10)) }
+    }
+    return parts.joinToString("  ·  ").takeIf { it.isNotBlank() }
 }

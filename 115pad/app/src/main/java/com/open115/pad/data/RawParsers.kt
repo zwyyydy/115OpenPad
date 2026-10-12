@@ -182,6 +182,17 @@ fun parseVideoPlayResponse(root: JsonObject): VideoPlayData {
  */
 fun parseFileDownloadUrl(root: JsonObject): String? {
     val data = root.envData() ?: return null
+    // 诊断：这个响应的**结构**（几份地址、各自长度）—— 115 的下载通道是不是按切片给多条地址，
+    // 决定"预下载能不能多连接并行"（同一份地址开第二条连接会被饿死，实测）
+    android.util.Log.i(
+        "PlayerPreload",
+        "downurl 响应结构：data 键=${data.keys.size} 个 " +
+            data.entries.joinToString(" | ") { (k, v) ->
+                val o = v as? JsonObject
+                val u = (o?.get("url") as? JsonPrimitive)?.content
+                "$k(url=${u?.length ?: -1}, file_name=${o?.get("file_name") != null})"
+            },
+    )
     val entry = data.values.firstOrNull() as? JsonObject ?: return null
     return when (val el = entry["url"]) {
         is JsonObject -> el.optStr("url")?.takeIf { it.isNotBlank() }

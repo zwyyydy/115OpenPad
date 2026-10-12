@@ -1,5 +1,7 @@
 package com.open115.pad.data.media
 
+import com.open115.pad.data.FileItem
+
 /**
  * 目录嗅探：把一个目录里的文件按「公共前缀」聚成影视条目。
  * 覆盖两种实测结构：
@@ -99,6 +101,39 @@ fun dirFingerprintOf(files: List<FileRef>): String {
 }
 
 /**
+ * 一个文件的**聚类前缀**：去扩展名、去语言后缀（`.zh-CN`）与装饰后缀（`-poster` 等），
+ * 剩下的就是它在 [clusterFiles] 里的组名。
+ *
+ * 从 `clusterFiles` 里的局部函数提出来（刮削写回也要用它生成 `<前缀>.nfo` /
+ * `<前缀>-poster.jpg`）—— 两边必须**同一份规则**：前缀对不上，写出去的文件就聚不进这条片。
+ * 只对视频/图片/nfo/srt 有前缀概念，别的扩展名返回 null。
+ */
+fun fileBasePrefix(name: String): String? {
+    val dot = name.lastIndexOf('.')
+    if (dot <= 0) return null
+    val ext = name.substring(dot + 1).lowercase()
+    if (ext !in VIDEO_EXTS && ext !in IMAGE_EXTS && ext != "nfo" && ext != "srt") return null
+    var stem = name.substring(0, dot)
+    // 去掉语言后缀（.zh-CN 在去扩展名后残留）
+    stem = stem.replace(Regex("""\.[a-zA-Z]{2}(-[a-zA-Z]{2})?$"""), "")
+    // 去掉装饰后缀
+    for (s in DECOR_SUFFIXES) {
+        if (stem.lowercase().endsWith(s)) {
+            stem = stem.substring(0, stem.length - s.length)
+            break
+        }
+    }
+    return stem.trim()
+}
+
+/** 这个文件名是不是视频（扩展名判据与聚类同一份 [VIDEO_EXTS]） */
+fun isVideoFileName(name: String): Boolean {
+    val dot = name.lastIndexOf('.')
+    if (dot <= 0) return false
+    return name.substring(dot + 1).lowercase() in VIDEO_EXTS
+}
+
+/**
  * 纯逻辑聚类（对文件名列表）。folder.jpg 是无前缀海报的兜底，归到唯一视频组。
  *
  * [minVideoBytes] > 0 时做**体积过滤**：小于它的视频当它不存在（预告/花絮/样本不该占卡片位）。
@@ -123,23 +158,6 @@ fun clusterFiles(files: List<FileRef>, minVideoBytes: Long = 0L): List<Cluster> 
     var dirFanart: FileRef? = null
     var dirThumb: FileRef? = null
 
-    fun basePrefix(name: String): String? {
-        val dot = name.lastIndexOf('.')
-        if (dot <= 0) return null
-        val ext = name.substring(dot + 1).lowercase()
-        if (ext !in VIDEO_EXTS && ext !in IMAGE_EXTS && ext != "nfo" && ext != "srt") return null
-        var stem = name.substring(0, dot)
-        // 去掉语言后缀（.zh-CN 在去扩展名后残留）
-        stem = stem.replace(Regex("""\.[a-zA-Z]{2}(-[a-zA-Z]{2})?$"""), "")
-        // 去掉装饰后缀
-        for (s in DECOR_SUFFIXES) {
-            if (stem.lowercase().endsWith(s)) {
-                stem = stem.substring(0, stem.length - s.length)
-                break
-            }
-        }
-        return stem.trim()
-    }
 
     for (f in files) {
         val ext = f.name.substringAfterLast('.', "").lowercase()
@@ -153,7 +171,7 @@ fun clusterFiles(files: List<FileRef>, minVideoBytes: Long = 0L): List<Cluster> 
                 in DIR_OTHER_NAMES -> continue
             }
         }
-        val prefix = basePrefix(f.name) ?: continue
+        val prefix = fileBasePrefix(f.name) ?: continue
         val decor = DECOR_SUFFIXES.firstOrNull { stem.lowercase().endsWith(it) }
         val c = byPrefix.getOrPut(prefix) { MutableCluster(prefix) }
         when {
@@ -390,6 +408,37 @@ fun isArtImageFile(name: String): Boolean {
 /** 剧照目录名（不区分大小写匹配目录项） */
 val EXTRAFANART_DIR_NAMES = listOf("extrafanart")
 
+/** 每片专属剧照目录的尾巴：`<片名前缀>-extrafanart/` */
+const val PER_MOVIE_FANART_SUFFIX = "-extrafanart"
+
+/**
+ * 是不是"每片专属"的剧照目录？是就返回片名前缀（保留原大小写，只去尾巴）。
+ *
+ * 存在的理由：`extrafanart/` 是**整个目录共享**的（扫描器把同一份剧照挂到目录里每一条行上），
+ * 一个目录放多部片时剧照会串到别的片上。App 的刮削器因此改传 `<片名前缀>-extrafanart/`，
+ * 按前缀归属、各挂各的；共享目录继续认（MDCx/Emby 一部一片目录的布局，一字不变）。
+ */
+fun perMovieFanartPrefix(name: String): String? {
+    val n = name.lowercase()
+    if (!n.endsWith(PER_MOVIE_FANART_SUFFIX)) return null
+    return name.substring(0, name.length - PER_MOVIE_FANART_SUFFIX.length).trim().takeIf { it.isNotEmpty() }
+}
+
+/**
+ * 一个文件/目录条目属于**哪一部片**（分 CD 的算同一部）—— 认不出返回 null。
+ *
+ * 「一部一目录」归位与「多片目录让你选」都靠它分组：
+ *  - 视频/装饰图/nfo 用 [fileBasePrefix] 取基名，再剥 CD 尾巴（`X-cd1` 与 `X-cd2` 归成 `X`）；
+ *  - 专属剧照目录 `<基名>-extrafanart` 归到它前缀那部片。
+ * 这样"搬一部片"会把它的正片（含各张盘）+ 同名 nfo/海报/背景 + 专属剧照目录一起带走，
+ * 不会把分 CD 的一部片拆成两半、也不会漏搬它的图。
+ */
+fun movieGroupOf(item: FileItem): String? {
+    val base = if (item.isDir) perMovieFanartPrefix(item.fn) else fileBasePrefix(item.fn) ?: return null
+    if (base == null) return null
+    return base.replace(CD_SUFFIX, "").trim().ifEmpty { base }
+}
+
 /** 演员头像目录名：TMM 写 `.actors`，也有刮削器写不带点的 `actors` */
 val ACTORS_DIR_NAMES = listOf(".actors", "actors")
 
@@ -473,7 +522,67 @@ fun compareNatural(a: String, b: String): Int {
  */
 fun isSideArtDirName(name: String): Boolean {
     val n = name.lowercase()
-    return n in EXTRAFANART_DIR_NAMES || n in ACTORS_DIR_NAMES
+    return n in EXTRAFANART_DIR_NAMES || n in ACTORS_DIR_NAMES || n.endsWith(PER_MOVIE_FANART_SUFFIX)
+}
+
+// ---------------- 剧集目录识别（刮削入口用） ----------------
+
+/** `S01E02` 式分集名（大小写不限） */
+private val EPISODE_SE = Regex("""s\d{1,2}e\d{1,3}""")
+
+/** `1x05` 式分集名：前后都不能是数字，否则 `1080x720` 会被误判 */
+private val EPISODE_NXN = Regex("""(^|[^0-9])\d{1,2}x\d{1,3}([^0-9]|$)""")
+
+/** 这个文件名像不像一集（SxxExx 或 季x集） */
+fun isEpisodeFileName(name: String): Boolean {
+    val n = name.lowercase()
+    return EPISODE_SE.containsMatchIn(n) || EPISODE_NXN.containsMatchIn(n)
+}
+
+/** `S01E02` → (1,2) */
+private val EPISODE_SE_NUM = Regex("""(?i)s(\d{1,2})e(\d{1,3})""")
+
+/** `1x05` → (1,5)：前后都不能是数字（避开 1080x720） */
+private val EPISODE_NXN_NUM = Regex("""(?:(?:^|[^0-9])(\d{1,2})x(\d{1,3})(?:[^0-9]|$))""")
+
+/**
+ * 从文件名抽 (季, 集)。认 `SxxExx`（优先）与 `季x集` 两种，认不出返回 null。
+ *
+ * 分集写 nfo 靠它把本地文件对到 TMDB 的某一集。`SxxExx` 先试：一部片同时有 `S01E02` 和
+ * 分辨率 `1080x720` 时，后者被数字边界挡掉、且前者已先命中，不会串。
+ */
+fun parseEpisodeNumber(name: String): Pair<Int, Int>? {
+    EPISODE_SE_NUM.find(name)?.let { m ->
+        val s = m.groupValues[1].toIntOrNull()
+        val e = m.groupValues[2].toIntOrNull()
+        if (s != null && e != null) return s to e
+    }
+    EPISODE_NXN_NUM.find(name)?.let { m ->
+        val s = m.groupValues[1].toIntOrNull()
+        val e = m.groupValues[2].toIntOrNull()
+        if (s != null && e != null) return s to e
+    }
+    return null
+}
+
+/** `Season 1` / `第2季` 式季目录名 */
+private val SEASON_DIR = Regex("""(?i)^(season[ _-]?\d+|第\s*\d+\s*季)""")
+
+fun isSeasonDirName(name: String): Boolean = SEASON_DIR.matches(name.trim())
+
+/**
+ * 这个目录像不像"一部剧集"（该走剧级刮削、而不是"多片让你选"）：
+ *  - 直接放着一堆分集文件（≥2 且多数是 `SxxExx`/`季x集`）；或
+ *  - 本级没视频、但有 `Season N` 季目录（系列根）。
+ *
+ * 判据刻意保守：一部片的 `X.1080p.x264` 不会被认成分集（没有 SxxExx，分辨率的 `x` 也被前后数字边界挡掉）。
+ */
+fun looksLikeTvDirectory(items: List<FileItem>): Boolean {
+    val videos = items.filter { !it.isDir && isVideoFileName(it.fn) }
+    if (videos.size >= 2 && videos.count { isEpisodeFileName(it.fn) }.let { it >= 2 && it.toLong() * 5 >= videos.size.toLong() * 3 }) {
+        return true
+    }
+    return videos.isEmpty() && items.any { it.isDir && isSeasonDirName(it.fn) }
 }
 
 // ---------------- 屏蔽的子目录：花絮 / 预告 / 访谈 ----------------

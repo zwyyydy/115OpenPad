@@ -15,6 +15,7 @@ enum class RenameMode(val label: String) {
     INSERT("插入内容"),
     AUTO_NUMBER("自动编号"),
     MANUAL("手动编辑"),
+    AI("AI 重命名"),
 }
 
 /**
@@ -174,11 +175,22 @@ fun computeNewNames(items: List<FileItem>, config: RenameConfig): List<RenamePre
             // 整个主体名换成序号，扩展名保留（截图里 1.txt→1.txt、ip.py→2.py 就是这个行为）
             RenameMode.AUTO_NUMBER -> numberText(config.number, index) + splitExt(old).second
 
-            RenameMode.MANUAL ->
+            RenameMode.MANUAL, RenameMode.AI ->
                 config.manualByFid[item.fid].orEmpty().takeIf { it.isNotBlank() } ?: old
         }
         RenamePreview(item, old, newName)
     }
+
+/**
+ * 把 AI 给的名字配回原扩展名：扩展名不该被改名动到（改了会破坏可播放性/关联）。
+ * AI 若已带了正确扩展名就原样返回，否则用原文件的扩展名兜上。
+ */
+fun keepExt(original: String, proposed: String): String {
+    val (_, ext) = splitExt(original)
+    if (ext.isEmpty()) return proposed
+    val (pbase, pext) = splitExt(proposed)
+    return if (pext.equals(ext, ignoreCase = true)) proposed else pbase + ext
+}
 
 /**
  * 拆成「主体 + 扩展名」。扩展名带点，且只认最后一段。

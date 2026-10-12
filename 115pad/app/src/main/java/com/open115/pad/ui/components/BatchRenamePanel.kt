@@ -1,5 +1,11 @@
 package com.open115.pad.ui.components
 
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.expandVertically
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -69,6 +75,7 @@ import com.open115.pad.ui.files.RenameConfig
 import com.open115.pad.ui.files.RenameMode
 import com.open115.pad.ui.files.RenameRule
 import com.open115.pad.ui.files.computeNewNames
+import com.open115.pad.ui.files.keepExt
 import com.open115.pad.ui.files.duplicateIndices
 import com.open115.pad.ui.files.nameError
 import com.open115.pad.ui.theme.AppColors
@@ -95,6 +102,9 @@ fun BatchRenamePanel(
     request: BatchRenameRequest,
     queue: RenameQueue,
     scope: CoroutineScope,
+    aiClient: com.open115.pad.data.media.scrape.AiQueryClient,
+    aiTemplates: List<com.open115.pad.data.media.scrape.AiPromptTemplate>,
+    aiDefaultTpl: String,
     onGotoTasks: () -> Unit,
     onDismiss: () -> Unit,
 ) {
@@ -110,6 +120,33 @@ fun BatchRenamePanel(
     var expandedToDir by remember(selected) { mutableStateOf(false) }
     /** 已入队的任务 id：非空即进入"已提交"状态 */
     var queuedTaskId by remember { mutableStateOf<Long?>(null) }
+
+    // ---- AI 重命名 ----
+    val aiReady = aiClient.configured()
+    var aiTpl by remember { mutableStateOf(aiDefaultTpl) }
+    var aiBusy by remember { mutableStateOf(false) }
+    var aiStop by remember { mutableStateOf(false) }
+    var aiProgress by remember { mutableStateOf(0 to 0) }
+    /** 逐文件调 AI 生成新名，结果写进 manualByFid（于是每行都成了可编辑框，用户可再改） */
+    fun runAiRename() {
+        val prompt = aiTemplates.firstOrNull { it.id == aiTpl }?.prompt ?: return
+        val targets = rows.filter { !it.fid.isNullOrEmpty() }
+        if (targets.isEmpty()) return
+        aiBusy = true
+        aiStop = false
+        aiProgress = 0 to targets.size
+        scope.launch {
+            val out = HashMap(config.manualByFid)
+            targets.forEachIndexed { i, item ->
+                if (aiStop) return@forEachIndexed
+                val r = runCatching { aiClient.suggest(item.fn, prompt) }.getOrNull()
+                if (!r.isNullOrBlank()) out[item.fid!!] = keepExt(item.fn, r)
+                aiProgress = (i + 1) to targets.size
+            }
+            config = config.copy(manualByFid = out)
+            aiBusy = false
+        }
+    }
 
     val previews = remember(rows, config) { computeNewNames(rows, config) }
     val errors = remember(previews) { previews.map { nameError(it.newName) } }
@@ -141,7 +178,21 @@ fun BatchRenamePanel(
                 Modifier.weight(1f).fillMaxWidth(),
                 contentPadding = PaddingValues(bottom = 12.dp),
             ) {
-                item { ModeChips(config) { config = config.copy(mode = it) } }
+                item { ModeChips(config, aiAvailable = aiReady) { config = config.copy(mode = it) } }
+                if (config.mode == RenameMode.AI) {
+                    item {
+                        AiForm(
+                            templates = aiTemplates,
+                            selectedTpl = aiTpl,
+                            onTpl = { aiTpl = it },
+                            ready = aiReady,
+                            busy = aiBusy,
+                            progress = aiProgress,
+                            onGenerate = { runAiRename() },
+                            onStop = { aiStop = true },
+                        )
+                    }
+                }
                 item { FormArea(config, rows.size) { config = it } }
                 item {
                     PreviewHeader(
@@ -165,8 +216,8 @@ fun BatchRenamePanel(
                         isDir = p.item.isDir,
                         changed = p.changed,
                         error = errors.getOrNull(index) ?: if (index in dups) "与批内其他行重名" else null,
-                        // 手动编辑模式下这一行本身就是输入框
-                        manual = if (config.mode == RenameMode.MANUAL) {
+                        // 手动编辑 / AI 生成后：这一行本身就是输入框（AI 结果也能逐条改）
+                        manual = if (config.mode == RenameMode.MANUAL || config.mode == RenameMode.AI) {
                             {
                                 val key = p.item.fid.orEmpty()
                                 ManualField(
@@ -240,7 +291,7 @@ private fun TopBar(onDismiss: () -> Unit) {
 }
 
 @Composable
-private fun ModeChips(config: RenameConfig, onPick: (RenameMode) -> Unit) {
+private fun ModeChips(config: RenameConfig, aiAvailable: Boolean, onPick: (RenameMode) -> Unit) {
     Row(
         Modifier
             .fillMaxWidth()
@@ -249,6 +300,8 @@ private fun ModeChips(config: RenameConfig, onPick: (RenameMode) -> Unit) {
         horizontalArrangement = Arrangement.spacedBy(6.dp),
     ) {
         RenameMode.entries.forEach { mode ->
+            // 没配 AI 服务时不显示"AI 重命名"这个模式
+            if (mode == RenameMode.AI && !aiAvailable) return@forEach
             AppChip(mode.label, config.mode == mode, onClick = { onPick(mode) })
         }
     }
@@ -267,6 +320,65 @@ private fun FormArea(config: RenameConfig, rowCount: Int, onChange: (RenameConfi
                 color = AppColors.TextTertiary,
                 modifier = Modifier.padding(vertical = 4.dp),
             )
+            // AI 模式的控件（模板选择 + 生成按钮）在上方 AiForm 里，这里只留一行提示
+            RenameMode.AI -> Text(
+                "生成后每行都可直接改；确认无误再点底部「执行」。扩展名会保持原样。",
+                style = MaterialTheme.typography.bodySmall,
+                color = AppColors.TextTertiary,
+                modifier = Modifier.padding(vertical = 4.dp),
+            )
+        }
+    }
+}
+
+// ---------------- AI 重命名 ----------------
+
+@Composable
+private fun AiForm(
+    templates: List<com.open115.pad.data.media.scrape.AiPromptTemplate>,
+    selectedTpl: String,
+    onTpl: (String) -> Unit,
+    ready: Boolean,
+    busy: Boolean,
+    progress: Pair<Int, Int>,
+    onGenerate: () -> Unit,
+    onStop: () -> Unit,
+) {
+    Column(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 6.dp)) {
+        if (!ready) {
+            Text(
+                "先在 设置 → 实验室 → AI 填好「服务地址 / API Key / 模型」",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.error,
+            )
+            return@Column
+        }
+        var menu by remember { mutableStateOf(false) }
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text("模板", style = MaterialTheme.typography.bodyMedium)
+            Box {
+                TextButton(onClick = { menu = true }) {
+                    Text(templates.firstOrNull { it.id == selectedTpl }?.name ?: "选择模板")
+                }
+                DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+                    templates.forEach { t ->
+                        DropdownMenuItem(
+                            text = { Text(if (t.id == selectedTpl) "✓ ${t.name}" else t.name) },
+                            onClick = { onTpl(t.id); menu = false },
+                        )
+                    }
+                }
+            }
+            Spacer(Modifier.weight(1f))
+            if (busy) {
+                CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp)
+                Spacer(Modifier.size(6.dp))
+                Text("${progress.first}/${progress.second}", style = MaterialTheme.typography.bodySmall)
+                Spacer(Modifier.size(6.dp))
+                TextButton(onClick = onStop) { Text("停止") }
+            } else {
+                Button(onClick = onGenerate) { Text("AI 生成") }
+            }
         }
     }
 }
@@ -274,8 +386,7 @@ private fun FormArea(config: RenameConfig, rowCount: Int, onChange: (RenameConfi
 // ---------------- 查找替换 ----------------
 
 @Composable
-private fun FindReplaceForm(config: RenameConfig, onChange: (RenameConfig) -> Unit) {
-    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+private fun FindReplaceForm(config: RenameConfig, onChange: (RenameConfig) -> Unit) {    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         config.rules.forEachIndexed { i, rule ->
             RuleEditor(
                 rule = rule,
@@ -658,7 +769,11 @@ private fun BottomBar(
                         color = if (queued.failed > 0) AppColors.RedFg else AppColors.TextPrimary,
                     )
                 }
-                if (!done) {
+                AnimatedVisibility(
+                    visible = !done,
+                    enter = fadeIn(tween(150)) + expandVertically(tween(150)),
+                    exit = fadeOut(tween(120)) + shrinkVertically(tween(120)),
+                ) {
                     Text(
                         "${queued.doneCount}/${queued.total} · 成功 ${queued.succeeded} 失败 ${queued.failed}",
                         style = MaterialTheme.typography.bodySmall,

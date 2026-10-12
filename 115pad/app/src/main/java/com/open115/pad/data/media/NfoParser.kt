@@ -320,7 +320,7 @@ object NfoParser {
                             val text = readText()?.trim()
                             if (num != null && !text.isNullOrBlank()) namedSeasons[num] = text
                         }
-                        "premiered", "releasedate", "aired" -> {
+                        "premiered", "releasedate", "aired", "firstaired" -> {
                             val v = readText()?.trim()
                             if (v != null) {
                                 if (premiered == null) premiered = v

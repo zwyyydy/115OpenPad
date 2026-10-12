@@ -181,6 +181,61 @@ class AppContainer(context: Context) {
             .build()
     }
 
+    /**
+     * 纯第三方的 OkHttpClient（TMDB 搜索 / 海报与缩略图下载）：**绝不挂 115 的鉴权拦截器**。
+     *
+     * `okHttpClient` 的 AuthInterceptor 现在只对 115 自家域加 Bearer（见 Session.kt 的
+     * is115Host 白名单），但这里还是用干净的 client —— 第三方 401 不该触发 115 的
+     * token 刷新（TokenAuthenticator 同样按白名单收口了），代理/超时也各是各的策略。
+     *
+     * 超时比 115 那份短：这是"搜一部片"的交互请求，不该让用户对着转圈等两分钟。
+     *
+     * **代理走 [java.net.ProxySelector] 而不是 build 时写死**：它是每次建连接时现调用的，
+     * 所以设置里改代理立刻生效、不用重建 client（TMDB 直连不通，这一步是能不能用的关键）。
+     */
+    /** 局域网/内网/回环主机名（这些不走代理，直连）：10./127./192.168./169.254./172.16-31. 或 localhost/::1 */
+    private fun isPrivateHost(host: String): Boolean {
+        if (host.isBlank()) return true
+        if (host.equals("localhost", true) || host == "::1") return true
+        // IPv4 私有段
+        if (host.startsWith("10.") || host.startsWith("127.") || host.startsWith("192.168.") || host.startsWith("169.254.")) return true
+        if (host.startsWith("172.")) {
+            val second = host.substringAfter('.').substringBefore('.').toIntOrNull()
+            if (second != null && second in 16..31) return true
+        }
+        return false
+    }
+
+    private fun newThirdPartyClient(): OkHttpClient = OkHttpClient.Builder()
+        .proxySelector(object : java.net.ProxySelector() {
+            // 代理只为"出不了国"的第三方站点（TMDB/JS 源抓海外站）服务；
+            // 局域网/内网/回环地址（如自建的内网服务）必须直连——走海外代理连不上。
+            override fun select(uri: java.net.URI): List<java.net.Proxy> {
+                val host = uri.host.orEmpty()
+                val p = thirdPartyProxy
+                return if (p != null && !isPrivateHost(host)) listOf(p) else listOf(java.net.Proxy.NO_PROXY)
+            }
+
+            override fun connectFailed(uri: java.net.URI, sa: java.net.SocketAddress, ioe: java.io.IOException) = Unit
+        })
+        .addInterceptor { chain ->
+            chain.proceed(
+                chain.request().newBuilder()
+                    .header("User-Agent", com.open115.pad.util.APP_USER_AGENT)
+                    .build()
+            )
+        }
+        .connectTimeout(15, TimeUnit.SECONDS)
+        .readTimeout(40, TimeUnit.SECONDS)
+        .build()
+
+    /** 第三方请求的代理（null = 直连）；由设置里的「代理地址」灌进来，改完立刻生效 */
+    @Volatile
+    private var thirdPartyProxy: java.net.Proxy? = null
+
+    /** 第三方图片下载（海报字节）用的实例；与 [com.open115.pad.data.media.scrape.MetadataScraper] 共用 */
+    val thirdPartyHttpClient: OkHttpClient = newThirdPartyClient()
+
     private fun retrofit(baseUrl: String, client: OkHttpClient = okHttpClient): Retrofit = Retrofit.Builder()
         .baseUrl(baseUrl)
         .client(client)
@@ -311,6 +366,105 @@ class AppContainer(context: Context) {
         mediaCache, imageUrlResolver, cacheDir, scope,
     )
 
+    // ---- 元数据刮削（TMDB，实验室）：地址与 key 的运行时镜像（设置改完立刻生效） ----
+
+    /** TMDB 接口基址。默认官方域名（国内多半直连不通），实际用自建反代地址（设置 → 实验室） */
+    @Volatile
+    var scrapeTmdbApiBase: String = com.open115.pad.data.media.MediaPrefs.DEFAULT_TMDB_API_BASE
+        private set
+
+    /** TMDB 图片基址（海报/缩略图），可与接口地址走同一个反代 */
+    @Volatile
+    var scrapeTmdbImageBase: String = com.open115.pad.data.media.MediaPrefs.DEFAULT_TMDB_IMAGE_BASE
+        private set
+
+    /** TMDB API key（v3 的 32 位 key 或 v4 的 JWT，两种都认，见 TmdbClient） */
+    @Volatile
+    var scrapeTmdbApiKey: String = ""
+        private set
+
+    /** HTTP 服务源：服务基址与 token 镜像，改完下一条请求就生效 */
+    @Volatile
+    var metatubeUrl: String = ""
+        private set
+
+    @Volatile
+    var metatubeToken: String = ""
+        private set
+
+    // ---- AI 检索词（可选）：镜像设置，改完立刻生效；三项没配全时界面上的「用 AI 优化」不出现 ----
+    @Volatile
+    var aiEndpoint: String = ""
+        private set
+
+    @Volatile
+    var aiApiKey: String = ""
+        private set
+
+    @Volatile
+    var aiModel: String = ""
+        private set
+
+    /** AI 走**独立直连** client（不挂 TMDB 那条代理——多半是另一家服务；也不带 115 鉴权） */
+    private val aiHttpClient: OkHttpClient = OkHttpClient.Builder()
+        .addInterceptor { chain ->
+            chain.proceed(chain.request().newBuilder().header("User-Agent", com.open115.pad.util.APP_USER_AGENT).build())
+        }
+        .connectTimeout(15, TimeUnit.SECONDS)
+        .readTimeout(45, TimeUnit.SECONDS)
+        .build()
+
+    /** AI 检索词/重命名的网络客户端；提示词由调用方按模板传入，这里只管端点/key/模型 */
+    val aiQueryClient = com.open115.pad.data.media.scrape.AiQueryClient(
+        client = aiHttpClient,
+        endpoint = { aiEndpoint },
+        apiKey = { aiApiKey },
+        model = { aiModel },
+    )
+
+    /** TMDB 源：配置全是"调用时现取"的 lambda，所以一个实例就够，改了设置不用重建 */
+    val tmdbMetadataSource = com.open115.pad.data.media.scrape.TmdbMetadataSource(
+        com.open115.pad.data.media.scrape.TmdbClient(
+            client = thirdPartyHttpClient,
+            apiBase = { scrapeTmdbApiBase },
+            imageBase = { scrapeTmdbImageBase },
+            apiKey = { scrapeTmdbApiKey },
+        ),
+    )
+
+    /** HTTP 服务源：同 TMDB 一个常驻实例，基址/token 现读镜像 */
+    val metatubeSource = com.open115.pad.data.media.scrape.MetatubeSource(
+        client = thirdPartyHttpClient,
+        baseUrl = { metatubeUrl },
+        token = { metatubeToken },
+    )
+
+    /**
+     * 元数据刮削编排：搜索 + 写回云盘（nfo/海报）+ 定向重扫 + 批量会话。
+     *
+     * 跑在 [transferScope]（切页/锁屏不断），进度汇进 taskActivity（红点 + 前台服务保活）。
+     * "只补空"与"人工确认"由界面的默认行为保证：批量候选集本身就排除了已有 nfo 的片，
+     * 覆盖只发生在详情页里用户显式点的那一条。
+     */
+    val scrapeSourceRegistry = com.open115.pad.data.media.scrape.ScrapeSourceRegistry(
+        prefs = mediaPrefs,
+        tmdb = tmdbMetadataSource,
+        metatube = metatubeSource,
+        http = thirdPartyHttpClient,
+        appContext = context,
+    )
+
+    val metadataScraper = com.open115.pad.data.media.scrape.MetadataScraper(
+        api = openApi,
+        transferLog = transferLog,
+        dao = mediaDatabase.mediaDao(),
+        scanner = mediaScanner,
+        http = thirdPartyHttpClient,
+        source = { scrapeSourceRegistry.currentSource() },
+        stillsMax = { mediaPrefs.scrapeStillsMax.first() },
+        scope = transferScope,
+    )
+
     /** 云下载提交（含持久化的保存位置），手动添加/剪贴板/外部唤起共用 */
     val downloadSubmitter = com.open115.pad.data.DownloadSubmitter(downloadPrefs)
 
@@ -404,11 +558,13 @@ class AppContainer(context: Context) {
         duplicateFinder.progress,
         versionFinder.progress,
         previewBuilder.progress,
-    ) { base, deduping, versioning, previewing ->
+        metadataScraper.progress,
+    ) { base, deduping, versioning, previewing, scraping ->
         val extra = when {
             deduping.running -> "正在查找重复文件"
             versioning.running -> "正在预筛同片多版本"
             previewing.running -> "正在生成视频预览图"
+            scraping.running -> "正在刮削元数据"
             else -> null
         }
         if (extra == null) base else listOfNotNull(base, extra).joinToString(" · ")
@@ -458,6 +614,11 @@ class AppContainer(context: Context) {
             coil.ImageLoader.Builder(context)
                 .okHttpClient(okHttpClient)
                 .crossfade(true)
+                // 内存缓存调大：海报墙/作品页一屏几十张竖图，默认 25% 堆内存很快被挤掉，
+                // 快速滑动回看就要重解码 → 露出占位块。给到 40% 让已解码的位图留得住。
+                .memoryCache {
+                    coil.memory.MemoryCache.Builder(context).maxSizePercent(0.40).build()
+                }
                 .build()
         )
         // 防杀（设置 → 后台任务 → 「任务进行时防止被杀」）：开关开着 + 有任务 → 前台服务常驻，
@@ -469,6 +630,7 @@ class AppContainer(context: Context) {
         // 图片那几层也要清：画廊的原图/缩略图磁盘缓存、超大图的 huge_img 现在都按
         // **pick_code** 命名（见 ImageGalleryDialog.diskKeyOf），不再随直链签名变化自动失效，
         // 留着就可能被下一个账号的同名文件命中。
+        // 播放缓存同理：它按文件 sha1 存（见 PlayerCache），拿的是上个账号的直链下的内容。
         scope.launch {
             session.loggedInFlow.collect {
                 if (!it) {
@@ -477,6 +639,7 @@ class AppContainer(context: Context) {
                     withContext(Dispatchers.IO) {
                         coil.Coil.imageLoader(context).diskCache?.clear()
                         ImageUrlResolver.clearHugeCache(cacheDir)
+                        com.open115.pad.player.PlayerCache.clear(context)
                     }
                     // 已解码的位图按 Coil 的约定在主线程清（内存缓存只在进程内有效，
                     // 但换账号后不该让上一账号的图继续从内存里命中）
@@ -515,6 +678,36 @@ class AppContainer(context: Context) {
             appPrefs.apiRateIntervalMs.collect { apiRateIntervalMs = it }
         }
 
+        // TMDB 刮削的地址/key 镜像：改完立刻生效（TmdbClient 每次请求现读）
+        scope.launch { mediaPrefs.scrapeTmdbApiBase.collect { scrapeTmdbApiBase = it } }
+        scope.launch { mediaPrefs.scrapeTmdbImageBase.collect { scrapeTmdbImageBase = it } }
+        scope.launch { mediaPrefs.scrapeTmdbApiKey.collect { scrapeTmdbApiKey = it } }
+        scope.launch { mediaPrefs.metatubeUrl.collect { metatubeUrl = it } }
+        scope.launch { mediaPrefs.metatubeToken.collect { metatubeToken = it } }
+        // 代理镜像：ProxySelector 每次建连接现读，所以改完下一条请求就生效
+        scope.launch {
+            mediaPrefs.scrapeProxy.collect {
+                thirdPartyProxy = com.open115.pad.data.media.scrape.parseScrapeProxy(it)
+            }
+        }
+        // AI 检索词设置镜像（读时现取，改完立刻生效）
+        scope.launch { mediaPrefs.aiEndpoint.collect { aiEndpoint = it } }
+        scope.launch { mediaPrefs.aiApiKey.collect { aiApiKey = it } }
+        scope.launch { mediaPrefs.aiModel.collect { aiModel = it } }
+        // 源注册表：启动建一次，之后任一相关设置变化重建快照
+        // （combine 的定型重载最多 5 个流，这里 6 个，两两打包再合并）
+        scope.launch { scrapeSourceRegistry.refresh() }
+        scope.launch {
+            combine(
+                combine(
+                    mediaPrefs.jsSources, mediaPrefs.selectedSourceId, mediaPrefs.jsSourcesDir,
+                ) { _, _, _ -> Unit },
+                combine(
+                    mediaPrefs.scrapeTmdbApiKey, mediaPrefs.metatubeUrl, mediaPrefs.metatubeToken,
+                ) { _, _, _ -> Unit },
+            ) { _, _ -> Unit }.collect { scrapeSourceRegistry.refresh() }
+        }
+
         scope.launch {
             mediaPrefs.cacheMaxMb.collect { mb ->
                 val oldBytes = mediaCacheMaxBytes
@@ -546,9 +739,11 @@ class AppContainer(context: Context) {
                     scope.launch {
                         delay(30_000L)
                         runCatching { backupManager.autoBackupIfDue() }
+                            .onFailure { Log.w("App115", "定时备份检查失败（下个小时再查）", it) }
                         while (true) {
                             delay(3_600_000L)
                             runCatching { backupManager.autoBackupIfDue() }
+                                .onFailure { Log.w("App115", "定时备份检查失败（下个小时再查）", it) }
                         }
                     }
                 } else {
@@ -558,6 +753,8 @@ class AppContainer(context: Context) {
                     duplicateFinder.stop()
                     versionFinder.stop()
                     previewBuilder.stop()
+                    // 刮削：登出后 token 没了、上传一律失败，停在半路只会留一堆错误记录
+                    metadataScraper.stop()
                     // 媒体库扫描同理，而且队列化之后更明显：登出时排着 5 个库，
                     // 不撤的话它们会一个一个跑下去，每个目录都请求失败 —— 白占频控额度。
                     // stopAll 的语义正是要的：停当前那轮 + 清空队列（队列也一并落盘清掉，

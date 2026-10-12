@@ -16,7 +16,6 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CircularProgressIndicator
@@ -55,6 +54,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import com.open115.pad.ui.components.FadeAlertDialog
 
 class LoginViewModel(private val container: AppContainer) : ViewModel() {
 
@@ -297,7 +297,7 @@ private fun QrAuthPane(vm: LoginViewModel) {
     }
 
     editingClientId?.let { current ->
-        AlertDialog(
+        FadeAlertDialog(
             onDismissRequest = { editingClientId = null },
             title = { Text("修改 AppID") },
             text = { ClientIdForm(initial = current, onSave = { vm.saveClientId(it); editingClientId = null }) },

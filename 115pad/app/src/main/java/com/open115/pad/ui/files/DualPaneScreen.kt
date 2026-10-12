@@ -37,6 +37,7 @@ import androidx.compose.material.icons.outlined.BookmarkBorder
 import androidx.compose.material.icons.outlined.Check
 import androidx.compose.material.icons.outlined.Close
 import androidx.compose.material.icons.outlined.CreateNewFolder
+import androidx.compose.material.icons.outlined.NoteAdd
 import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
@@ -76,6 +77,7 @@ import com.open115.pad.data.QuickDir
 import com.open115.pad.data.isTextFile
 import com.open115.pad.ui.components.ConfirmDialog
 import com.open115.pad.ui.components.TextEntryDialog
+import com.open115.pad.ui.components.TextFileEditorDialog
 import com.open115.pad.ui.components.isImageItem
 import com.open115.pad.ui.components.videoExts
 import com.open115.pad.ui.theme.AppColors
@@ -207,6 +209,7 @@ private fun DualPaneColumn(
     var layerMenu by remember { mutableStateOf(false) }
     var quickMenu by remember { mutableStateOf(false) }
     var showCreate by remember { mutableStateOf(false) }
+    var showCreateFile by remember { mutableStateOf(false) }
     // pointerInput(Unit) 的闭包不随重组重启，用 rememberUpdatedState 保证读到的是最新的回调
     val currentOperate by rememberUpdatedState(onOperate)
 
@@ -309,6 +312,9 @@ private fun DualPaneColumn(
             IconButton(onClick = { showCreate = true }) {
                 Icon(Icons.Outlined.CreateNewFolder, contentDescription = "新建文件夹", modifier = Modifier.size(18.dp))
             }
+            IconButton(onClick = { showCreateFile = true }) {
+                Icon(Icons.Outlined.NoteAdd, contentDescription = "新建文本文件", modifier = Modifier.size(18.dp))
+            }
             IconButton(onClick = { vm.refresh() }) {
                 Icon(Icons.Outlined.Refresh, contentDescription = "刷新", modifier = Modifier.size(18.dp))
             }
@@ -361,6 +367,18 @@ private fun DualPaneColumn(
             showCreate = false
             scope.launch { notify(vm.addFolder(it)) }
         }, onDismiss = { showCreate = false })
+    }
+    if (showCreateFile) {
+        TextFileEditorDialog(
+            title = "新建文本文件",
+            initialName = "新建文本文档.txt",
+            initialContent = "",
+            onDismiss = { showCreateFile = false },
+            onSave = { name, content ->
+                showCreateFile = false
+                scope.launch { notify(vm.createTextFile(name, content)) }
+            },
+        )
     }
 }
 

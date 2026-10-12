@@ -254,6 +254,18 @@ class VideoFrameGrabber(
         runCatching { previewTier(parseVideoPlayResponse(api.videoPlay(pickCode)).videoUrls) }.getOrNull()
     }
 
+    /**
+     * 拉某个档位的 media playlist（返回带分片列表的那一份），失败返回 null。
+     *
+     * 预下载（PlayerPrefetcher）用它拿"后面还有哪些分片、各自什么时间"。走的是抽帧那条
+     * 不限速的 CDN 通道，不占 115 接口的节拍额度。
+     * ⚠️ master 里若有多个变体，这里只取码率最低的那份 —— 115 每个清晰度档一个 master，
+     * 实测只有一个变体，所以就是播放器实际会用的那一份。
+     */
+    suspend fun playlistFor(tierUrl: String): HlsPlaylist? = withContext(Dispatchers.IO) {
+        fetchPlaylist(tierUrl)
+    }
+
     /** 抓一张封面图（JPEG 字节），失败/无转码档返回 null */
     suspend fun grab(pickCode: String, fraction: Double = PREVIEW_AT): ByteArray? =
         grabFrames(pickCode, listOf(FrameAsk(fraction, PREVIEW_MAX_WIDTH, PREVIEW_JPEG_QUALITY))).firstOrNull()

@@ -58,6 +58,7 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
@@ -86,7 +87,7 @@ import androidx.compose.ui.unit.IntOffset
 import kotlin.math.roundToInt
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import coil.compose.SubcomposeAsyncImage
+import coil.compose.AsyncImage
 import com.open115.pad.data.media.backgroundSourceOf
 import com.open115.pad.data.media.WorksSort
 import com.open115.pad.data.media.MediaDao
@@ -101,6 +102,7 @@ import com.open115.pad.data.media.MovieDeleteResult
 import com.open115.pad.data.media.deleteMovie
 import com.open115.pad.ui.theme.AdaptiveBody
 import com.open115.pad.ui.components.dissolve
+import com.open115.pad.ui.components.pressScale
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
@@ -188,7 +190,12 @@ fun PosterWallScreen(
      * 别的库里的同演员作品也搜不到。现在搜出来的就是全库的，卡片、海报、点进去都一样。
      */
     val hits by produceState<List<MovieCard>?>(initialValue = null, query, all, sort) {
-        value = if (query.isBlank()) null else dao.searchAll(query, MEDIA_NO_LIMIT, sort.sql)
+        if (query.isBlank()) {
+            value = null
+            return@produceState
+        }
+        delay(250) // 防抖：连续输入只跑最后一次（produceState 换 key 会取消上一轮）
+        value = dao.searchAll(query, MEDIA_NO_LIMIT, sort.sql)
     }
     val searching = !hits.isNullOrEmpty() || query.isNotBlank()
     // 筛选（年份/类型·标签/演员，多选）：选项从"这个库实际有的"现算，纯本地过滤
@@ -202,8 +209,12 @@ fun PosterWallScreen(
     fun extraOf(card: MovieCard): CardFacets = extraOfKey[card.mediaKey] ?: CardFacets.Empty
     val facets = remember(all, extraOfKey) { facetsOf(all) { extraOf(it) } }
 
-    val list = (hits ?: all).let { base ->
-        if (filter.isEmpty) base else base.filter { filter.matches(it, extraOf(it)) }
+    // remember 住：不然每次重组（20 秒背景轮播那一下也算）都重算过滤、产生新 List 实例，
+    // 下游网格的 equals 全部失效跟着重排。deps 是过滤真正依赖的四样。
+    val list = remember(hits, all, filter, extraOfKey) {
+        (hits ?: all).let { base ->
+            if (filter.isEmpty) base else base.filter { filter.matches(it, extraOf(it)) }
+        }
     }
 
     // 系统返回键 = 逐层退：有搜索词先清搜索，否则退回媒体库列表
@@ -420,16 +431,24 @@ fun PosterWallScreen(
 @OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
 @Composable
 fun PosterCard(card: MovieCard, onClick: () -> Unit, onLongClick: (() -> Unit)? = null) {
+    // 深色海报上水波纹几乎看不见：按压缩放承担「按到了」
+    val interaction = remember { MutableInteractionSource() }
     Column(
         Modifier
             .fillMaxWidth()
+            .pressScale(interaction)
             .clip(RoundedCornerShape(12.dp))
             // 长按：用 combinedClickable 而不是叠加一个 clickable，否则两个手势会互相吃掉
             .then(
                 if (onLongClick != null) {
-                    Modifier.combinedClickable(onClick = onClick, onLongClick = onLongClick)
+                    Modifier.combinedClickable(
+                        interactionSource = interaction,
+                        indication = null,
+                        onClick = onClick,
+                        onLongClick = onLongClick,
+                    )
                 } else {
-                    Modifier.clickable(onClick = onClick)
+                    Modifier.clickable(interactionSource = interaction, indication = null, onClick = onClick)
                 },
             ),
     ) {
@@ -559,13 +578,11 @@ fun PickCodeImage(
         value = container.imageUrlResolver.posterFor(pickCode, container.cacheDir)
     }
     if (model != null) {
-        SubcomposeAsyncImage(
+        AsyncImage(
             model = model,
             contentDescription = null,
             contentScale = contentScale,
             modifier = modifier,
-            loading = { ShimmerPlaceholder(Modifier.fillMaxSize()) },
-            error = {},
         )
     } else {
         Spacer(modifier)
@@ -607,13 +624,11 @@ fun PosterImage(
         }
     }
     if (model != null) {
-        SubcomposeAsyncImage(
+        AsyncImage(
             model = model,
             contentDescription = null,
             contentScale = contentScale,
             modifier = modifier,
-            loading = { ShimmerPlaceholder(Modifier.fillMaxSize()) },
-            error = {},
         )
     } else {
         Spacer(modifier)

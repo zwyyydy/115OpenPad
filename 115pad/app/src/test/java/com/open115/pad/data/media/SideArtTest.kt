@@ -95,6 +95,24 @@ class SideArtTest {
         assertFalse(isSideArtDirName("extrafanart2"))
     }
 
+    // ---------------- 每片专属剧照目录（多片同目录不串图） ----------------
+
+    @Test
+    fun `专属剧照目录认前缀`() {
+        assertEquals("Spider.Man.2002", perMovieFanartPrefix("Spider.Man.2002-extrafanart"))
+        // 不区分大小写认尾巴，但前缀保留原样（与簇前缀比对由调用方折小写）
+        assertEquals("X", perMovieFanartPrefix("X-EXTRAFANART"))
+        assertNull(perMovieFanartPrefix("extrafanart"))
+        assertNull(perMovieFanartPrefix("-extrafanart"))
+        assertNull(perMovieFanartPrefix("Season 1"))
+    }
+
+    @Test
+    fun `专属剧照目录也算侧挂素材（不递归不当条目）`() {
+        assertTrue(isSideArtDirName("Spider.Man.2002-extrafanart"))
+        assertTrue(isSideArtDirName("x-ExtraFanart"))
+    }
+
     // ---------------- 屏蔽的附加内容目录 ----------------
 
     @Test

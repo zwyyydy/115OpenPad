@@ -17,7 +17,6 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.ChevronLeft
 import androidx.compose.material.icons.outlined.ChevronRight
 import androidx.compose.material.icons.outlined.Folder
-import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
@@ -43,6 +42,7 @@ import com.open115.pad.data.FilterRules
 import com.open115.pad.data.OpenApi
 import com.open115.pad.data.parseFilesResponse
 import kotlinx.coroutines.launch
+import com.open115.pad.ui.components.FadeAlertDialog
 
 private data class PickerDir(val cid: String, val name: String)
 
@@ -96,7 +96,7 @@ fun DirMultiPickerDialog(
     /** 当前层的 fullPath 前缀：根目录不计入，形如 "/影视/4K电影" */
     val prefixPath = stack.drop(1).joinToString("/") { it.name }
 
-    AlertDialog(
+    FadeAlertDialog(
         onDismissRequest = onDismiss,
         title = { Text(title) },
         text = {

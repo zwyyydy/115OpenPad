@@ -24,7 +24,6 @@ import androidx.compose.material.icons.automirrored.outlined.ArrowBack
 import androidx.compose.material.icons.outlined.CheckCircle
 import androidx.compose.material.icons.outlined.Description
 import androidx.compose.material.icons.outlined.Sync
-import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -52,6 +51,7 @@ import com.open115.pad.data.media.signalFileLabel
 import com.open115.pad.ui.components.MetaChip
 import com.open115.pad.ui.theme.AppColors
 import kotlinx.coroutines.launch
+import com.open115.pad.ui.components.FadeAlertDialog
 
 /**
  * 「手动同步文件」对话框：**挑一份信号文件 → 跟本地库比对 → 按需排同步**。
@@ -115,7 +115,7 @@ fun ManualSignalSyncDialog(
     }
 
     val current = inspection
-    AlertDialog(
+    FadeAlertDialog(
         onDismissRequest = { if (!applying) onDismiss() },
         title = {
             Row(verticalAlignment = Alignment.CenterVertically) {

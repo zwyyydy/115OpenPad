@@ -5,6 +5,8 @@ import android.content.Context
 import android.content.Intent
 import android.content.res.Configuration
 import android.media.AudioManager
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -26,6 +28,8 @@ import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
+import androidx.compose.animation.expandVertically
+import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -154,6 +158,7 @@ import com.open115.pad.data.parseVideoHistoryTime
 import com.open115.pad.data.envMsg
 import com.open115.pad.data.parseFilesResponse
 import com.open115.pad.ui.files.videoPreviewFileName
+import com.open115.pad.ui.components.FadePresence
 import com.open115.pad.data.envOk
 import com.open115.pad.data.parseVideoPlayResponse
 import com.open115.pad.data.parseFileDownloadUrl
@@ -302,6 +307,42 @@ private const val PRELOAD_MAX_TRIES = 2
 /** 预载器起播/重缓冲阈值，与 ExoPlayer 默认一致（只改了缓冲目标时长，这两项保持默认语义） */
 private const val PRELOAD_START_MS = 2_500
 private const val PRELOAD_REBUFFER_MS = 5_000
+
+/**
+ * 115 CDN 的上游数据源工厂（播放器与预下载各建一份实例，互不共享状态）。
+ *
+ * ⚠️ 必须用 [APP_USER_AGENT]：115 的下载直链与「申请它时的 UA」绑定（见 Util.kt），
+ * 原盘档位拿的是下载直链，UA 不一致会被 CDN 判 403。
+ *
+ * [prefetch] = true 时用**更短的超时**（10s / 15s）：预下载是后台写入，而 media3 的缓存写入
+ * 在整个网络读取期间**握着这部片的缓存锁** —— 连接要是半死（只慢慢滴、不报错），
+ * 那把锁就会被占着不放，连播放器要续缓冲都写不进去（实测就是这样卡住的：画面停了、零流量）。
+ * 短超时把这个"占锁窗口"封在十几秒内。
+ */
+private fun upstreamDataSourceFactory(context: Context, prefetch: Boolean = false): DefaultDataSource.Factory =
+    DefaultDataSource.Factory(
+        context,
+        DefaultHttpDataSource.Factory()
+            .setUserAgent(APP_USER_AGENT)
+            .setAllowCrossProtocolRedirects(true)
+            .setConnectTimeoutMs(if (prefetch) 10_000 else 15_000)
+            .setReadTimeoutMs(if (prefetch) 15_000 else 30_000),
+    )
+
+/**
+ * 预下载只在"不是蜂窝"的网络上跑：一开就是几个 GB 的自动下载，走流量会出人命。
+ *
+ * 判断写成"明确是蜂窝才拒绝"：VPN 下的 activeNetwork 是 VPN 自己（看不出底层是什么），
+ * 一律放行 —— 用户装了 VPN 时不该莫名其妙不预下载。返回 false 只在确认走蜂窝时。
+ */
+private fun prefetchNetworkAllowed(context: Context): Boolean {
+    val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return true
+    val caps = cm.activeNetwork?.let { cm.getNetworkCapabilities(it) } ?: return false
+    val cellular = caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) &&
+        !caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) &&
+        !caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)
+    return !cellular
+}
 
 /** 一轮预载的结局，决定 switchQuality 下一步（重试／换地址／报错） */
 private enum class PreloadOutcome {
@@ -677,6 +718,8 @@ private val SOFTWARE_FIRST_DECODER = MediaCodecSelector { mime, secure, tunnelin
 private data class PlayerPrefValues(
     val cacheEnabled: Boolean,
     val cacheMaxMb: Int,
+    /** 预下载：播放时把后面的分片按顺序灌进播放缓存，到片尾为止（满了按进度滚动，见 PlayerPrefetcher） */
+    val prefetchEnabled: Boolean,
     val speedBoost: Float,
     val seekSeconds: Int,
     val miniProgress: Boolean,
@@ -711,7 +754,15 @@ private data class PlayerPrefValues(
     val labDanmuDensity: Int,
     /** 实验室：弹幕缓存时效（天） */
     val labDanmuCacheDays: Int,
-)
+) {
+    /** 见上面的 cacheMaxMb：动态挡位时给到滑块上限，"按片 5%"由预下载裁 */
+    val cacheLimitBytes: Long get() =
+        if (cacheMaxMb == PlayerCache.CACHE_DYNAMIC) {
+            PlayerCache.DYNAMIC_MAX_MB * 1024 * 1024
+        } else {
+            cacheMaxMb.coerceAtLeast(1).toLong() * 1024 * 1024
+        }
+}
 
 @Composable
 fun PlayerScreen(
@@ -761,15 +812,9 @@ fun PlayerScreen(
      */
     val itemKey = localUri ?: currentPickCode
 
-    // 退出播放器时清掉视频缓存。缓存 key 是完整播放地址（带签名），每次进播放器都重新
-    // 解析地址，上一会话的缓存不可能再命中，留着只占空间（见 PlayerCache 注释）。
-    // 必须注册在两个播放器的 DisposableEffect 之前：Compose 的 onDispose 逆序执行，
-    // 这样这里（最后执行）跑的时候两个播放器已经 release，删缓存才安全。
-    // 不能挂在播放器自己的 DisposableEffect(player) 上：切软/硬解会重建播放器并触发它，
-    // 会把正用着的缓存中途清掉。
-    DisposableEffect(Unit) {
-        onDispose { PlayerCache.clearAsync(context.applicationContext) }
-    }
+    // 播放缓存**退出不清**（2026-10-07 改）：key 已按内容标识稳定化（见 PlayerCache），
+    // 重进同一部片、往回拖进度都能直接命中，清掉才是浪费。占用由「缓存上限」LRU 兜底，
+    // 登出与设置页的「清空播放缓存」负责清。
 
     var currentIndex by remember { mutableStateOf(initialIndex) }
     var currentName by remember { mutableStateOf(initialName) }
@@ -805,6 +850,12 @@ fun PlayerScreen(
     var rebuffering by remember { mutableStateOf(false) }
     var showBuffering by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
+    /**
+     * 本次会话从**本机缓存**读到的字节数。
+     * 起播十几秒后拿它提示一句"已从本机缓存读取 N MB" —— 用户最想知道的就是缓存到底有没有用
+     * （否则只能看到网速在动，分不清是读盘还是重新下载）。
+     */
+    var cacheHitBytes by remember { mutableStateOf(0L) }
     var qualityMenuOpen by remember { mutableStateOf(false) }
     var audioMenuOpen by remember { mutableStateOf(false) }
     var speedMenuOpen by remember { mutableStateOf(false) }
@@ -819,6 +870,11 @@ fun PlayerScreen(
     var positionMs by remember { mutableStateOf(0L) }
     var durationMs by remember { mutableStateOf(0L) }
     var bufferedMs by remember { mutableStateOf(0L) }
+    /**
+     * 本机缓存状态：已缓存的时间区间（进度条画淡蓝）与字节数（状态栏"缓存 N MB"）。
+     * 与 [bufferedMs]（内存缓冲窗口）是两码事：前者决定"拖回去要不要重新下载"。
+     */
+    var prefetchState by remember { mutableStateOf(PrefetchState()) }
     // 正在拖拽交互式进度条：期间冻结进度轮询，避免与播放器内部进度互相拉扯
     var isDraggingSeek by remember { mutableStateOf(false) }
     // 在线字幕（迅雷搜索加载）与搜索框开关
@@ -1139,6 +1195,7 @@ fun PlayerScreen(
         pv = PlayerPrefValues(
             cacheEnabled = container.playerPrefs.cacheEnabled.first(),
             cacheMaxMb = container.playerPrefs.cacheMaxMb.first(),
+            prefetchEnabled = container.playerPrefs.prefetchEnabled.first(),
             speedBoost = container.playerPrefs.speedBoost.first(),
             seekSeconds = container.playerPrefs.seekSeconds.first(),
             miniProgress = container.playerPrefs.alwaysShowMiniProgress.first(),
@@ -1412,33 +1469,27 @@ fun PlayerScreen(
         val mediaFactory = if (prefs.cacheEnabled && localUri == null) {
             DefaultMediaSourceFactory(
                 CacheDataSource.Factory()
-                    .setCache(PlayerCache.get(context, prefs.cacheMaxMb.toLong() * 1024L * 1024L))
+                    .setCache(PlayerCache.get(context, prefs.cacheLimitBytes))
                     .setUpstreamDataSourceFactory(upstream)
-                    // 诊断（debug 级）：把"seek 后到底命中没命中缓存"变得可观测 ——
-                    // 排查过"缓冲条已加载一段、快进 10 秒仍偶尔出现缓冲提示"：
-                    // ⚠️ cacheKey 打印的是**请求 URL（含签名）**，两次请求同一分片若 URL 不同
-                    //    （播放列表刷新导致分片签名换新）就必然 miss，靠这行看出来。
-                    .setCacheKeyFactory { dataSpec ->
-                        android.util.Log.d("PlayerCacheIO", "请求 ${dataSpec.uri}")
-                        dataSpec.key ?: dataSpec.uri.toString()
-                    }
+                    // key 工厂见 PlayerCache.cacheKeyFactory()：115 的分片地址剥成内容标识
+                    // （跨会话复用），播放列表/字幕/直链保持整条 URL 不变。
+                    // ⚠️ 播放列表**不能**剥签名：旧列表被命中会吐出带过期签名的分片地址 → 403。
+                    .setCacheKeyFactory(PlayerCache.cacheKeyFactory())
+                    // 诊断（debug 级）：命中缓存时补一行，和 key 工厂那行「请求」配对看，
+                    // "这次请求是读了缓存还是走了网络"一目了然。
                     .setEventListener(object : CacheDataSource.EventListener {
                         override fun onCachedBytesRead(cacheSizeBytes: Long, bytesRead: Long) {
                             android.util.Log.d(
                                 "PlayerCacheIO",
                                 "命中缓存 ${bytesRead}B（缓存共 ${cacheSizeBytes / 1024 / 1024}MB）",
                             )
+                            cacheHitBytes += bytesRead
                         }
 
                         override fun onCacheIgnored(reason: Int) {
                             android.util.Log.w("PlayerCacheIO", "缓存被忽略 reason=$reason")
                         }
                     })
-                    // 刻意【不】改写缓存 key。
-                    // 早期为"同一会话内回退零秒播"把 query 里的签名参数去掉，代价是 HLS 播放列表
-                    // 也命中旧缓存：换地址拿到的新列表因 key 相同而读不到，缓存继续吐出带【过期签名】
-                    // 的旧分片地址 → 跳到尚未缓冲的区域必然 403，且换几次地址都救不回来。
-                    // 实测（同文件同位置对照）：去掉 key 改写后 403 归零、正常起播。
                     .setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR)
             )
         } else {
@@ -1494,8 +1545,11 @@ fun PlayerScreen(
         val mediaFactory = if (prefs.cacheEnabled && localUri == null) {
             DefaultMediaSourceFactory(
                 CacheDataSource.Factory()
-                    .setCache(PlayerCache.get(context, prefs.cacheMaxMb.toLong() * 1024L * 1024L))
+                    .setCache(PlayerCache.get(context, prefs.cacheLimitBytes))
                     .setUpstreamDataSourceFactory(upstream)
+                    // key 工厂必须和主播放器一致：预载写进缓存的条目也要是内容标识，
+                    // 否则同一分片会被两份不同的 key 各存一遍（浪费空间，且签名那份永远不会再命中）
+                    .setCacheKeyFactory(PlayerCache.cacheKeyFactory())
                     .setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR)
             )
         } else {
@@ -1585,7 +1639,11 @@ fun PlayerScreen(
      * @param mime 传 null 表示不声明类型，由 ExoPlayer 嗅探容器。
      *             原盘直链不能套 m3u8——那会让 ExoPlayer 按 HLS 去解析 mp4/mkv，直接失败。
      */
-    fun buildMediaItem(url: String, mime: String?): MediaItem {
+    /**
+     * @param cacheKey 直链文件的自定义缓存 key（[PlayerCache.fileKey]）：地址每次进片都换签名，
+     *   不给一个稳定 key 的话缓存永远认不回来。转码档（HLS）不用它 —— 分片走 URL 内容标识。
+     */
+    fun buildMediaItem(url: String, mime: String?, cacheKey: String? = null): MediaItem {
         val cfgs = if (useSubs && subsEnabled) (subtitles + onlineSubs).map { s ->
             MediaItem.SubtitleConfiguration.Builder(android.net.Uri.parse(s.url))
                 .setMimeType(s.mime)
@@ -1597,8 +1655,23 @@ fun PlayerScreen(
         return MediaItem.Builder()
             .setUri(url)
             .apply { if (mime != null) setMimeType(mime) }
+            .apply { if (cacheKey != null) setCustomCacheKey(cacheKey) }
             .setSubtitleConfigurations(cfgs)
             .build()
+    }
+
+    /**
+     * 某个清晰度档的播放地址（含音轨参数；原盘档位不走这里，它的地址是 downUrl 直链）。
+     * 取址与预下载共用同一个函数：预下载必须拉**播放器实际会用的那份** playlist，
+     * 否则分片对不上、白下。
+     */
+    fun tierUrlOf(d: VideoPlayData, def: Int): String? {
+        val entry = d.videoUrls.firstOrNull { it.definition == def } ?: return null
+        var trackUrl = entry.url
+        if (currentAudio >= 0) {
+            trackUrl += (if (trackUrl.contains('?')) "&" else "?") + "audio_track=$currentAudio"
+        }
+        return trackUrl
     }
 
     suspend fun buildItem(def: Int): Pair<Int, MediaItem>? {
@@ -1606,16 +1679,16 @@ fun PlayerScreen(
         // 原盘：绕开 115 的转码/切片，直接播原始文件
         if (def == DEF_ORIGINAL_FILE) {
             val raw = fetchOriginalUrl(currentPickCode) ?: return null
-            return DEF_ORIGINAL_FILE to buildMediaItem(raw, mimeOfFileName(d.fileName))
+            return DEF_ORIGINAL_FILE to
+                buildMediaItem(raw, mimeOfFileName(d.fileName), PlayerCache.fileKey(currentPickCode))
         }
-        val entry = d.videoUrls.firstOrNull { it.definition == def } ?: return null
-        var trackUrl = entry.url
-        if (currentAudio >= 0) {
-            trackUrl += (if (trackUrl.contains('?')) "&" else "?") + "audio_track=$currentAudio"
-        }
+        val trackUrl = tierUrlOf(d, def) ?: return null
+        // 原画档有时直接给原始文件地址（不是 m3u8）：同样挂稳定的内容 key，缓存才认得出它
+        val cacheKey = if (isDirectFileUrl(trackUrl)) PlayerCache.fileKey(currentPickCode) else null
         // 115 的转码地址没有 .m3u8 后缀，必须显式声明 HLS 类型，
         // 否则 ExoPlayer 会按普通容器解析导致 PARSING_CONTAINER_UNSUPPORTED
-        return entry.definition to buildMediaItem(trackUrl, MimeTypes.APPLICATION_M3U8)
+        val mime = if (cacheKey != null) mimeOfFileName(d.fileName) else MimeTypes.APPLICATION_M3U8
+        return def to buildMediaItem(trackUrl, mime, cacheKey)
     }
 
     /** 拉 115 官方字幕列表。失败返回空列表——字幕拿不到不该影响播放（起播与「还原官方字幕」共用） */
@@ -2271,6 +2344,91 @@ fun PlayerScreen(
                 saveWatchHistory(currentPickCode, currentName, positionMs, durationMs)
             }
         }
+    }
+
+    // 起播十几秒后报一下"这次从本机缓存读了多少"。门槛刻意压得低（3MB）：数字本身就是答案 ——
+    // 只要不是 0，就说明上次看的那些确实是从本机读回来的、没重新下载。
+    LaunchedEffect(itemKey, currentDef) {
+        cacheHitBytes = 0L
+        delay(12_000)
+        val hit = cacheHitBytes
+        if (hit > 3L * 1024 * 1024) {
+            setIndicator("起播已从本机缓存读取 ${hit / 1024 / 1024}MB（没重新下载）")
+        }
+    }
+
+    // 预下载：把当前档位后面的内容按顺序灌进播放缓存，到片尾为止；灌满「缓存上限」后按当前
+    // 进度滚动（舍弃进度之前的旧内容继续往前灌，见 PlayerPrefetcher）。
+    // 进度条上那层淡蓝就是它 —— ExoPlayer 自己的缓冲窗口按内存算，只有 90 秒，永远不会"预下载到上限"。
+    // 挂在 effect 上：退出播放器 / 切档 / 切集 / 切软硬解都会随协程取消；地址过期由计划自己重取。
+    LaunchedEffect(itemKey, currentDef, data, pv) {
+        prefetchState = PrefetchState()
+        val p = pv ?: return@LaunchedEffect
+        if (!p.prefetchEnabled || !p.cacheEnabled || localUri != null) return@LaunchedEffect
+        val d = data ?: return@LaunchedEffect
+        if (d.fileSize <= 0L) {
+            android.util.Log.i("PlayerPreload", "拿不到文件大小，跳过预下载")
+            return@LaunchedEffect
+        }
+        if (!prefetchNetworkAllowed(context)) {
+            android.util.Log.i("PlayerPreload", "当前是蜂窝网络，跳过预下载")
+            return@LaunchedEffect
+        }
+        // 原盘与"原画=原始文件"走直链：按字节区间灌；转码档走 HLS：按分片灌
+        // ⚠️ currentDef 初值是 0（起播前还没定档），这时 tierUrlOf 会返回 null —— 直接退出等下一次
+        //   重跑（currentDef 变了自己会重启这个 effect），别拿 `!!` 去撞它
+        val directDef = currentDef == DEF_ORIGINAL_FILE
+        val tierUrl = if (directDef) null else tierUrlOf(d, currentDef)
+        if (!directDef && tierUrl == null) {
+            android.util.Log.i("PlayerPreload", "档位还没定或没有地址，等下一轮 def=$currentDef")
+            return@LaunchedEffect
+        }
+        val plan: PrefetchPlan = if (directDef || isDirectFileUrl(tierUrl!!)) {
+            val url = if (directDef) fetchOriginalUrl(currentPickCode) else tierUrl
+            if (url == null) {
+                android.util.Log.i("PlayerPreload", "拿不到直链，跳过预下载")
+                return@LaunchedEffect
+            }
+            FilePrefetchPlan(
+                pickCode = currentPickCode,
+                fileSize = d.fileSize,
+                urlProvider = {
+                    if (directDef) fetchOriginalUrl(currentPickCode)
+                    else tierUrlOf(data ?: return@FilePrefetchPlan null, currentDef)
+                },
+                initialUrl = url,
+            )
+        } else {
+            val playlist = container.videoFrames.playlistFor(tierUrl) ?: run {
+                android.util.Log.i("PlayerPreload", "拉不到分片列表，跳过预下载")
+                return@LaunchedEffect
+            }
+            if (playlist.segments.isEmpty()) return@LaunchedEffect
+            HlsPrefetchPlan(playlist.segments) { container.videoFrames.playlistFor(tierUrl)?.segments }
+        }
+        val maxBytes = p.cacheLimitBytes
+        // 动态挡位：这部片的目标占用（片长的 5%；≤5 分钟的片不套比例、按整片给到上限）
+        val dynamicKeepBytes = if (p.cacheMaxMb == PlayerCache.CACHE_DYNAMIC) {
+            PlayerCache.dynamicLimitBytes(d.playLong * 1000L, d.fileSize)
+        } else {
+            0L
+        }
+        val cache = PlayerCache.get(context, maxBytes)
+        val prefetcher = PlayerPrefetcher(
+            cache = cache,
+            // 与两个播放器同一套上游参数与 key 工厂（自己 createDataSource，不共用实例）
+            dataSourceFactory = CacheDataSource.Factory()
+                .setCache(cache)
+                .setUpstreamDataSourceFactory(upstreamDataSourceFactory(context, prefetch = true))
+                .setCacheKeyFactory(PlayerCache.cacheKeyFactory())
+                // BLOCK_ON_CACHE：撞上播放器正在下的那一段时等它写完再读，不重复下载
+                .setFlags(CacheDataSource.FLAG_BLOCK_ON_CACHE or CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR),
+            maxCacheBytes = maxBytes,
+            plan = plan,
+            dynamicKeepBytes = dynamicKeepBytes,
+        )
+        launch { prefetcher.state.collect { prefetchState = it } }
+        prefetcher.run(player)
     }
 
     // 本地源的续播位置：没有云端观看记录可用，只能在本机记一份。
@@ -3026,12 +3184,25 @@ fun PlayerScreen(
                         ),
                     )
                     setApplyEmbeddedStyles(false)
+                    // ★ 底部内缩归零：外挂/本地字幕（SRT 转的 cue 不带行位置）默认吃
+                    //   media3 的 8% 底部内缩，贴底时字幕悬空在画面底上方一大截
+                    //   （「贴底不是真正的贴底」的主因）；115 官方字幕带行位置、
+                    //   本来就不吃这个参数，不受影响
+                    setBottomPaddingFraction(0f)
                 }
             }
             DisposableEffect(subtitleView, player) {
                 val cueListener = object : Player.Listener {
                     override fun onCues(cues: List<Cue>) {
-                        subtitleView.setCues(cues)
+                        // ★ 抹掉 cue 自带的行位置：115 官方字幕带 line，会把字幕钉在
+                        //   画面底上方（「贴底不是真正的贴底」），且完全无视底部内缩参数。
+                        //   行位置清掉后统一按「贴画面底」渲染，垂直位置只由整层
+                        //   translationY（设置里的「底部位置」滑块）决定——与字幕格式无关。
+                        subtitleView.setCues(
+                            cues.map {
+                                it.buildUpon().setLine(Cue.DIMEN_UNSET, Cue.TYPE_UNSET).build()
+                            },
+                        )
                     }
                 }
                 player.addListener(cueListener)
@@ -3130,8 +3301,7 @@ fun PlayerScreen(
                             // DIMEN_UNSET）时生效，115 官方字幕带行位置时会被完全忽略（实测拉滑块
                             // 字幕纹丝不动）；整层位移与字幕格式、行位置无关。
                             // 用 boxH 而不是 surfaceH：滤镜模式下盒子是旋转后的尺寸，两者不等
-                            .graphicsLayer { translationY = -boxH * subtitleBottomPercent / 100f }
-                            .padding(bottom = 4.dp),
+                            .graphicsLayer { translationY = -boxH * subtitleBottomPercent / 100f },
                     )
                 }
             } else {
@@ -3144,8 +3314,7 @@ fun PlayerScreen(
                     modifier = Modifier
                         .align(Alignment.BottomCenter)
                         .fillMaxSize()
-                        .graphicsLayer { translationY = -vsH * subtitleBottomPercent / 100f }
-                        .padding(bottom = 4.dp),
+                        .graphicsLayer { translationY = -vsH * subtitleBottomPercent / 100f },
                 )
             }
             // 缓冲动效：叠在画面上但**不拦手势**（没有 clickable，事件照旧穿透到手势层），
@@ -3497,7 +3666,12 @@ fun PlayerScreen(
                     // VR 模式菜单：挂在控制排顶部（贴底居中）。此前它挂在右侧圆钮旁、
                     // 整排横在画面正中，非常突兀；贴底之后与进度条/按钮排同生共死，
                     // 4 秒淡出行为完全一致，也不遮画面中心。
-                    if (vrMenuOpen) {
+                    AnimatedVisibility(
+                        visible = vrMenuOpen,
+                        enter = fadeIn(tween(140)) + expandVertically(tween(140)),
+                        exit = fadeOut(tween(120)) + shrinkVertically(tween(120)),
+                        modifier = Modifier.align(Alignment.CenterHorizontally),
+                    ) {
                         VrModeMenu(
                             current = vrMode,
                             onDismiss = { vrMenuOpen = false },
@@ -3567,12 +3741,17 @@ fun PlayerScreen(
                                 pushVrParams()
                                 pulseControlRow()
                             },
-                            modifier = Modifier.align(Alignment.CenterHorizontally),
+                            modifier = Modifier,
                         )
                     }
                     // 滤镜面板（实验室）：与 VR 菜单同一个位置、同一套交互 ——
                     // 贴底挂在控制排顶部，跟进度条/按钮排同生共死，4 秒淡出一致。
-                    if (filterMenuOpen) {
+                    AnimatedVisibility(
+                        visible = filterMenuOpen,
+                        enter = fadeIn(tween(140)) + expandVertically(tween(140)),
+                        exit = fadeOut(tween(120)) + shrinkVertically(tween(120)),
+                        modifier = Modifier.align(Alignment.CenterHorizontally),
+                    ) {
                         // 命中判定：先比内置预设，没中再比自定义模板 —— 两边参数可能一样
                         //（用户照着内置存了个一模一样的），高亮给先命中的一方就够
                         val builtinPresetIndex = FilterPresets.indexOf(filterParams)
@@ -3627,12 +3806,17 @@ fun PlayerScreen(
                             },
                             // 抬手才落盘：拖动过程中每帧写一次 DataStore 纯属浪费
                             onParamCommit = { persistFilterParams() },
-                            modifier = Modifier.align(Alignment.CenterHorizontally),
+                            modifier = Modifier,
                         )
                     }
                     // 弹幕面板（实验室）：与 VR 菜单/滤镜面板同一个位置、同一套交互 ——
                     // 贴底挂在控制排顶部，跟进度条/按钮排同生共死，4 秒淡出一致。
-                    if (danmuMenuOpen) {
+                    AnimatedVisibility(
+                        visible = danmuMenuOpen,
+                        enter = fadeIn(tween(140)) + expandVertically(tween(140)),
+                        exit = fadeOut(tween(120)) + shrinkVertically(tween(120)),
+                        modifier = Modifier.align(Alignment.CenterHorizontally),
+                    ) {
                         DanmuMenu(
                             tuning = danmuTuning,
                             statusText = danmuStatusText,
@@ -3662,7 +3846,7 @@ fun PlayerScreen(
                                 pulseControlRow()
                             },
                             onDismiss = { danmuMenuOpen = false },
-                            modifier = Modifier.align(Alignment.CenterHorizontally),
+                            modifier = Modifier,
                         )
                     }
                     // 状态行（时长 / 当前画质 / 缓存 / 解码方式）：挂在控制排上方。
@@ -3689,6 +3873,7 @@ fun PlayerScreen(
                         positionMs = positionMs,
                         durationMs = durationMs,
                         bufferedMs = bufferedMs,
+                        cachedRangesMs = prefetchState.rangesMs,
                         onSeekStart = {
                             // 拖拽期间冻结进度轮询，并暂停 4 秒自动淡出倒计时
                             isDraggingSeek = true
@@ -4006,16 +4191,16 @@ fun PlayerScreen(
                     positionMs = positionMs,
                     durationMs = durationMs,
                     bufferedMs = bufferedMs,
+                    cachedRangesMs = prefetchState.rangesMs,
                 )
             }
 
             // 瞬时提示：compact 是小字（切清晰度等待），其余是动作回执
-            indicator?.let { hint ->
+            FadePresence(indicator, modifier = Modifier.align(Alignment.Center)) { hint ->
                 val compact = hint.compact
                 Surface(
                     shape = RoundedCornerShape(if (compact) 8.dp else 10.dp),
                     color = Color.Black.copy(alpha = if (compact) 0.55f else 0.65f),
-                    modifier = Modifier.align(Alignment.Center),
                 ) {
                     Text(
                         hint.text,
@@ -4076,6 +4261,10 @@ fun PlayerScreen(
                 clockText = clockText,
                 batteryPct = batteryPct,
                 specText = specBadge,
+                // 本机已缓存多少（含播放器自己下下来的）：用户最关心的就是"缓存到底有没有在长"
+                cacheText = if (prefetchState.cachedBytes >= 1024L * 1024) {
+                    "缓存 ${prefetchState.cachedBytes / 1024 / 1024}MB"
+                } else "",
                 showNetSpeed = prefs.showNetSpeed,
                 showClock = prefs.showClock,
                 showBattery = prefs.showBattery,
@@ -4592,6 +4781,8 @@ internal fun PlayerStatusRow(
     clockText: String,
     batteryPct: Int?,
     specText: String?,
+    /** 本机已缓存字节的可读文案（空串 = 不显示）。它跟"播放缓存"开关走，不受四项开关影响 */
+    cacheText: String,
     showNetSpeed: Boolean,
     showClock: Boolean,
     showBattery: Boolean,
@@ -4601,7 +4792,8 @@ internal fun PlayerStatusRow(
     val hasClock = showClock && clockText.isNotBlank()
     val hasBattery = showBattery && batteryPct != null
     val hasSpec = showSpec && !specText.isNullOrBlank()
-    if (!hasSpeed && !hasClock && !hasBattery && !hasSpec) return
+    val hasCache = cacheText.isNotBlank()
+    if (!hasSpeed && !hasClock && !hasBattery && !hasSpec && !hasCache) return
 
     Surface(
         color = Color.Black.copy(alpha = 0.45f),
@@ -4622,6 +4814,13 @@ internal fun PlayerStatusRow(
             if (hasClock) {
                 Text(
                     clockText,
+                    color = Color.White,
+                    style = MaterialTheme.typography.labelMedium,
+                )
+            }
+            if (hasCache) {
+                Text(
+                    cacheText,
                     color = Color.White,
                     style = MaterialTheme.typography.labelMedium,
                 )

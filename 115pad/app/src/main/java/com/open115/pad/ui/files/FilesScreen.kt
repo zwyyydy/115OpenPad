@@ -34,6 +34,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.DriveFileMove
@@ -52,8 +53,8 @@ import androidx.compose.material.icons.outlined.History
 import androidx.compose.material.icons.outlined.Image
 import androidx.compose.material.icons.outlined.PlayCircle
 import androidx.compose.material.icons.outlined.Upload
-import androidx.compose.material3.AlertDialog
-import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Button
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.FilterChip
@@ -126,6 +127,9 @@ import com.open115.pad.data.uploadFolder
 import com.open115.pad.data.parseFilesResponse
 import com.open115.pad.data.parseRecycleList
 import com.open115.pad.data.parseSearchResponse
+import com.open115.pad.data.media.scrape.ScrapePlan
+import androidx.compose.material3.OutlinedTextField
+import com.open115.pad.data.media.scrape.MetadataScraper
 import com.open115.pad.data.envData
 import com.open115.pad.data.envMsg
 import com.open115.pad.data.envOk
@@ -137,7 +141,12 @@ import com.open115.pad.ui.components.FolderPickerDialog
 import com.open115.pad.ui.components.ImageGalleryDialog
 import com.open115.pad.ui.components.SidePaneWidth
 import com.open115.pad.ui.components.TextEntryDialog
+import com.open115.pad.ui.components.TextFileEditorDialog
 import com.open115.pad.ui.components.isImageItem
+import com.open115.pad.ui.media.MediaScrapeDialog
+import com.open115.pad.ui.media.ScrapeBatchPanel
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import com.open115.pad.ui.settings.UserInfoCard
 import com.open115.pad.util.Downloader
 import com.open115.pad.util.Format
@@ -163,6 +172,8 @@ import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Date
 import java.util.Locale
+import com.open115.pad.ui.components.FadeAlertDialog
+import com.open115.pad.ui.components.FadeDialog
 
 class FilesViewModel(
     val api: OpenApi,
@@ -865,6 +876,27 @@ class FilesViewModel(
         ok to (resp.envMsg() ?: "创建失败")
     }
 
+    /**
+     * 新建文本文件：内容按 UTF-8 传到当前目录。文本都是 KB 级，直接走小文件上传、
+     * 不进传输中心（一闪而就，占一条记录反而吵）；成功回一句带文件名的提示。
+     *
+     * 没填后缀自动补 .txt；挡掉空名与含路径分隔符的名字。同名 115 会生成「（1）」副本
+     * （这是"新建"，不是覆盖，副本语义正合适）。
+     */
+    suspend fun createTextFile(name: String, content: String): String? {
+        val raw = name.trim().let { if (it.endsWith(".")) it.dropLast(1) else it }
+        if (raw.isEmpty()) return "文件名不能为空"
+        if (raw.contains('/') || raw.contains('\\')) return "文件名不能包含 / 或 \\"
+        val finalName = if (raw.substringAfterLast('.', "").isNotBlank()) raw else "$raw.txt"
+        return runOp(onSuccess = "已创建：$finalName") {
+            val cid = currentCid()
+            val r = Uploader.uploadSmall(api, finalName, content.toByteArray(Charsets.UTF_8), target = "U_1_$cid")
+            opLog?.log(OpType.UPLOAD, finalName, "新建文本文件", cid, _ui.value.stack.lastOrNull()?.name.orEmpty())
+            refresh()
+            true to r.fileName
+        }
+    }
+
     suspend fun rename(item: FileItem, newName: String): String? = runOp {
         val fid = item.fid ?: return@runOp false to "缺少文件ID"
         val resp = api.updateFile(fid, newName)
@@ -1232,6 +1264,7 @@ fun FilesScreen(
     }
 
     var showCreate by remember { mutableStateOf(false) }
+    var showCreateFile by remember { mutableStateOf(false) }
     var renameTarget by remember { mutableStateOf<FileItem?>(null) }
     var showDeleteConfirm by remember { mutableStateOf(false) }
     var moveMode by remember { mutableStateOf<String?>(null) }
@@ -1256,6 +1289,19 @@ fun FilesScreen(
     }
     /** 视频行下面的宽幅预览条（设置 → 界面可关）：实时跟随，关掉立即收起 */
     val showVideoStrip by appContainer.filesPrefs.videoStrip.collectAsState(initial = true)
+
+    // 顶栏「查找重复 / 生成视频预览图」按键上的"任务在跑"红点：面板关掉之后任务照跑
+    // （两个引擎都挂在 transferScope 上），红点是"那边还在干"的唯一指示。
+    // 只订阅**布尔的派生流**、不 collect 整个 Progress —— 后者每列一个目录就换一次值，
+    // 会让整页（含海报/列表）跟着重组。
+    val dupRunning by remember {
+        combine(appContainer.duplicateFinder.progress, appContainer.versionFinder.progress) { a, b ->
+            a.running || b.running
+        }
+    }.collectAsState(initial = false)
+    val previewRunning by remember { appContainer.previewBuilder.progress.map { it.running } }
+        .collectAsState(initial = false)
+
     // 右栏是第二个完整的 FilesViewModel 实例：移动/复制/操作记录/缓存全走同一套。
     // key 区分于主 vm；退出双栏不销毁（挂在导航条目上），再进来两栏还停在原目录
     val vmB: FilesViewModel = viewModel(key = "dualPaneB", initializer = {
@@ -1292,6 +1338,115 @@ fun FilesScreen(
 
     fun notify(msg: String?) {
         if (msg != null) scope.launch { snackbarHostState.showSnackbar(msg) }
+    }
+
+    /**
+     * 文件页发起刮削（TMDB）：选中的**目录**（或目录里的一个**视频文件**）交给刮削引擎。
+     *
+     * 与媒体库那条路的差别：这里没有 DB 行 —— "目录里哪个是正片、有没有 nfo"要**现列一次目录**
+     * （见 [MetadataScraper.planFromDirectory]），拿到 [ScrapePlan] 才弹对话框。
+     * 目录路径按媒体库的写法拼（去掉栈首那层"全部文件"），库里认得出这个目录就会顺带排重扫。
+     */
+    var scrapePlan by remember { mutableStateOf<ScrapePlan?>(null) }
+    // 选中的目录里混了多部片时的"要刮哪一部"选择器（不再默默拿最大的那个）
+    var scrapePick by remember { mutableStateOf<ScrapePick?>(null) }
+    // 多选刮削：先弹"改名方式"设置，确认后才开跑
+    var scrapeManyItems by remember { mutableStateOf<List<FileItem>?>(null) }
+    // 复核面板是否在前台（收起≠取消：任务没跑完就在后台继续）
+    var scrapePanelShown by remember { mutableStateOf(false) }
+    val aiCustomTemplates by appContainer.mediaPrefs.aiCustomTemplates.collectAsState(initial = emptyList())
+    val aiScrapeTplId by appContainer.mediaPrefs.aiScrapeTemplate.collectAsState(
+        initial = com.open115.pad.data.media.scrape.AiPromptTemplates.SCRAPE_QUERY,
+    )
+    val savedRenameMode by appContainer.mediaPrefs.scrapeRenameMode.collectAsState(initial = "ON")
+    val selectedSourceId by appContainer.mediaPrefs.selectedSourceId.collectAsState(initial = "tmdb")
+    val jsSourcesForPicker by appContainer.mediaPrefs.jsSources.collectAsState(initial = emptyList())
+    val scrapeSources = remember(selectedSourceId, jsSourcesForPicker) {
+        appContainer.scrapeSourceRegistry.sources().map { it.displayName to it.id }
+    }
+
+    fun buildScrapePlan(dirCid: String, dirPath: String, dirName: String, hint: String?) {
+        scope.launch {
+            runCatching { appContainer.metadataScraper.planFromDirectory(dirCid, dirPath, dirName, hint) }
+                .onSuccess { scrapePlan = it }
+                .onFailure { notify("刮削准备失败：${it.message}") }
+        }
+    }
+
+    fun startScrape(item: FileItem) {
+        val parentPath = ui.stack.drop(1).joinToString("/") { it.name }
+        val dirCid = if (item.isDir) item.fid.orEmpty() else vm.currentCid()
+        val dirPath = if (item.isDir) {
+            listOf(parentPath, item.fn).filter { it.isNotBlank() }.joinToString("/")
+        } else {
+            parentPath
+        }
+        val dirName = if (item.isDir) item.fn else ui.stack.last().name
+        // 选的是具体视频：直接按它刮（若和别的片混目录，写回时会自动归位到独立文件夹）
+        if (!item.isDir) {
+            buildScrapePlan(dirCid, dirPath, dirName, item.fn)
+            return
+        }
+        // 选的是目录：先数里面几部片，多于一个让用户挑
+        scope.launch {
+            val groups = runCatching { appContainer.metadataScraper.directoryGroups(dirCid) }
+                .getOrDefault(emptyList())
+            if (groups.size > 1) scrapePick = ScrapePick(dirCid, dirPath, dirName, groups)
+            else buildScrapePlan(dirCid, dirPath, dirName, null)
+        }
+    }
+
+    /**
+     * 多选一次刮多部：先弹「改名方式」设置（记住上次），确认后才备 plan、开批量会话。
+     * 会话跑在应用级 scope，可关面板后台继续。
+     */
+    fun startScrapeMany(items: List<FileItem>) {
+        if (items.isEmpty()) return
+        if (appContainer.metadataScraper.session.value != null) {
+            // 已有会话（可能在后台跑）→ 直接把它重新拉回前台
+            scrapePanelShown = true
+            return
+        }
+        scrapeManyItems = items
+    }
+
+    /**
+     * 前置「规范化清单」确认后真正开跑：逐条备 plan，把标题**覆盖成用户定的规范名**
+     * （规范名 = 搜索词 = 最终文件名），[renameOn] 时写回顺手按规范名重命名。
+     */
+    fun launchScrapeMany(items: List<FileItem>, cleanNames: List<String>, renameOn: Boolean) {
+        val parentPath = ui.stack.drop(1).joinToString("/") { it.name }
+        val curName = ui.stack.last().name
+        scope.launch {
+            val batchItems = mutableListOf<com.open115.pad.data.media.scrape.MetadataScraper.BatchItem>()
+            var skipped = 0
+            items.forEachIndexed { i, it ->
+                val cid = if (it.isDir) it.fid.orEmpty() else vm.currentCid()
+                val path = if (it.isDir) listOf(parentPath, it.fn).filter { s -> s.isNotBlank() }.joinToString("/") else parentPath
+                val name = if (it.isDir) it.fn else curName
+                val hint = if (it.isDir) null else it.fn
+                val clean = cleanNames.getOrNull(i)?.trim().orEmpty()
+                runCatching { appContainer.metadataScraper.planFromDirectory(cid, path, name, hint) }
+                    .onSuccess { p ->
+                        // mediaKey 必须每条唯一（同目录多选会撞复核面板的 LazyColumn key）
+                        batchItems.add(
+                            com.open115.pad.data.media.scrape.MetadataScraper.BatchItem(
+                                mediaKey = "${p.key}#${batchItems.size}",
+                                title = clean.ifBlank { p.title },  // 规范名当搜索词
+                                year = p.year, videoName = p.videoName, dirCid = p.dirCid, dirPath = p.dirPath,
+                                isEpisodeLike = p.isEpisodeLike, kind = p.kind,
+                            )
+                        )
+                    }
+                    .onFailure { skipped++ }
+            }
+            if (batchItems.isEmpty()) { notify("这些条目都没能识别出可刮的影片"); return@launch }
+            appContainer.metadataScraper.startBatchFromItems(
+                batchItems, curName.ifBlank { "所选条目" }, withStills = false, renameToClean = renameOn,
+            )
+            scrapePanelShown = true
+            if (skipped > 0) notify("已跳过 $skipped 个无法识别的条目")
+        }
     }
 
     // 拖动多选 → 快捷目录：host 由文件行（手势源）与侧栏条目（落点）共享
@@ -1642,6 +1797,8 @@ fun FilesScreen(
                 onSelectAll = { vm.toggleSelectAll() },
                 // 直接在点击时启动：星标没有"目标要先记下来"的理由，走状态中转反而会自取消
                 onStar = { scope.launch { notify(vm.toggleStarItem(it)) } },
+                onScrape = { startScrape(it) },
+                onScrapeMany = { startScrapeMany(it) },
                 onPin = { scope.launch { notify(vm.togglePins(it)) } },
                 onDownload = {
                     val files = ui.items.filter { it.fid in ui.selection && !it.isDir }
@@ -1662,6 +1819,7 @@ fun FilesScreen(
                 onUploadFolder = { folderPicker.launch(null) },
                 onOpenFilterRules = onOpenFilterRules,
                 onCreateFolder = { showCreate = true },
+                onCreateFile = { showCreateFile = true },
                 onOrganize = {
                     // 已有整理在跑就不重复发车：横幅就挂在顶栏下面，不会有"点了没反应"的困惑
                     if (organizing.running) notify("已有分类整理任务在进行")
@@ -1677,6 +1835,8 @@ fun FilesScreen(
                 onGeneratePreviews = {
                     onGeneratePreviews(PreviewRequest(vm.currentCid(), ui.stack.last().name))
                 },
+                dupBusy = dupRunning,
+                previewBusy = previewRunning,
                 showVideoStrip = showVideoStrip,
                 quickDirDrag = quickDirDrag,
                 onQuickDirDrop = ::onQuickDirDrop,
@@ -1725,6 +1885,8 @@ fun FilesScreen(
                 onSelectAll = { vm.toggleSelectAll() },
                 // 直接在点击时启动：星标没有"目标要先记下来"的理由，走状态中转反而会自取消
                 onStar = { scope.launch { notify(vm.toggleStarItem(it)) } },
+                onScrape = { startScrape(it) },
+                onScrapeMany = { startScrapeMany(it) },
                 onPin = { scope.launch { notify(vm.togglePins(it)) } },
                 onDownload = {
                     val files = ui.items.filter { it.fid in ui.selection && !it.isDir }
@@ -1745,6 +1907,7 @@ fun FilesScreen(
                 onUploadFolder = { folderPicker.launch(null) },
                 onOpenFilterRules = onOpenFilterRules,
                 onCreateFolder = { showCreate = true },
+                onCreateFile = { showCreateFile = true },
                 onOrganize = {
                     // 已有整理在跑就不重复发车：横幅就挂在顶栏下面，不会有"点了没反应"的困惑
                     if (organizing.running) notify("已有分类整理任务在进行")
@@ -1759,6 +1922,8 @@ fun FilesScreen(
                 onGeneratePreviews = {
                     onGeneratePreviews(PreviewRequest(vm.currentCid(), ui.stack.last().name))
                 },
+                dupBusy = dupRunning,
+                previewBusy = previewRunning,
                 showVideoStrip = showVideoStrip,
                 quickDirDrag = quickDirDrag,
                 onQuickDirDrop = ::onQuickDirDrop,
@@ -1781,6 +1946,18 @@ fun FilesScreen(
             showCreate = false
             scope.launch { notify(vm.addFolder(it)) }
         }, onDismiss = { showCreate = false })
+    }
+    if (showCreateFile) {
+        TextFileEditorDialog(
+            title = "新建文本文件",
+            initialName = "新建文本文档.txt",
+            initialContent = "",
+            onDismiss = { showCreateFile = false },
+            onSave = { name, content ->
+                showCreateFile = false
+                scope.launch { notify(vm.createTextFile(name, content)) }
+            },
+        )
     }
     if (showOrganizeConfirm) {
         OrganizeConfirmDialog(
@@ -1811,6 +1988,100 @@ fun FilesScreen(
             renameTarget = null
             scope.launch { notify(vm.rename(target, it)) }
         }, onDismiss = { renameTarget = null })
+    }
+    // 批量刮削复核面板：文件页多选发起的会话也走它（全屏覆盖）。
+    // 返回/X 只是收起面板——任务没跑完就留它在后台继续（红点跟进度、跑完弹提示）；跑完才清会话。
+    val scrapeSession by appContainer.metadataScraper.session.collectAsState()
+    if (scrapeSession != null && scrapePanelShown) {
+        val closePanel: () -> Unit = {
+            if (scrapeSession?.finished == true) appContainer.metadataScraper.closeSession()
+            scrapePanelShown = false
+        }
+        FadeDialog(
+            onDismissRequest = closePanel,
+            properties = DialogProperties(usePlatformDefaultWidth = false),
+            modifier = Modifier.fillMaxSize(),
+        ) {
+            Box(Modifier.fillMaxSize()) {
+                ScrapeBatchPanel(scraper = appContainer.metadataScraper, onClose = closePanel)
+            }
+        }
+    }
+    scrapePlan?.let { plan ->
+        MediaScrapeDialog(
+            plan = plan,
+            scraper = appContainer.metadataScraper,
+            aiClient = appContainer.aiQueryClient,
+            mediaPrefs = appContainer.mediaPrefs,
+            registry = appContainer.scrapeSourceRegistry,
+            onDismiss = { scrapePlan = null },
+            onWritten = { _ ->
+                scrapePlan = null
+                // 云端刚多了 nfo/海报：作废这个目录的缓存并重拉，否则列表里看不到新文件
+                appContainer.dirCache.invalidateDir(plan.dirCid)
+                vm.refresh()
+                notify("已写入云端")
+            },
+        )
+    }
+    scrapePick?.let { pick ->
+        FadeAlertDialog(
+            onDismissRequest = { scrapePick = null },
+            title = { Text("这个目录里有多部片") },
+            text = {
+                Column {
+                    Text(
+                        "「${pick.dirName}」里有 ${pick.groups.size} 部片，选一部来刮（刮完会自动给它建独立文件夹）：",
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+                    pick.groups.forEach { g ->
+                        Row(
+                            Modifier.fillMaxWidth()
+                                .clickable {
+                                    scrapePick = null
+                                    buildScrapePlan(pick.dirCid, pick.dirPath, pick.dirName, g.videoName)
+                                }
+                                .padding(vertical = 10.dp),
+                            verticalAlignment = androidx.compose.ui.Alignment.CenterVertically,
+                        ) {
+                            Text(g.videoName, modifier = Modifier.weight(1f), maxLines = 2)
+                            Text(
+                                Format.size(g.sizeBytes),
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    }
+                }
+            },
+            confirmButton = {},
+            dismissButton = { TextButton(onClick = { scrapePick = null }) { Text("取消") } },
+        )
+    }
+    scrapeManyItems?.let { items ->
+        ScrapeNormalizeDialog(
+            items = items,
+            aiReady = appContainer.aiQueryClient.configured(),
+            initialRenameOn = savedRenameMode == "ON",
+            sources = scrapeSources,
+            selectedSourceId = selectedSourceId,
+            onSetSource = { id -> scope.launch { appContainer.mediaPrefs.setSelectedSourceId(id); appContainer.scrapeSourceRegistry.refresh() } },
+            defaultClean = { f ->
+                val raw = if (f.isDir) f.fn else com.open115.pad.data.media.fileBasePrefix(f.fn) ?: f.fn
+                appContainer.metadataScraper.cleanQueryTitle(raw)
+            },
+            onAiClean = { name ->
+                val prompt = com.open115.pad.data.media.scrape.AiPromptTemplates.all(aiCustomTemplates)
+                    .firstOrNull { it.id == aiScrapeTplId }?.prompt ?: ""
+                if (prompt.isBlank()) null else appContainer.aiQueryClient.suggest(name, prompt)
+            },
+            onDismiss = { scrapeManyItems = null },
+            onConfirm = { cleanNames, renameOn ->
+                scrapeManyItems = null
+                scope.launch { appContainer.mediaPrefs.setScrapeRenameMode(if (renameOn) "ON" else "OFF") }
+                launchScrapeMany(items, cleanNames, renameOn)
+            },
+        )
     }
     if (showDeleteConfirm) {
         ConfirmDialog(
@@ -1876,7 +2147,7 @@ private fun OrganizeConfirmDialog(
     onConfirm: () -> Unit,
     onDismiss: () -> Unit,
 ) {
-    AlertDialog(
+    FadeAlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("分类整理当前目录") },
         text = {
@@ -1938,7 +2209,7 @@ private fun OrganizeExclusionDialog(
     onDismiss: () -> Unit,
 ) {
     var picked by remember { mutableStateOf(selected) }
-    AlertDialog(
+    FadeAlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("选择例外（不整理）") },
         text = {
@@ -2365,7 +2636,7 @@ private fun FilesSidePane(
     }
     // 移除快捷目录要过一次确认：× 挨着点击跳转的行，误触代价不该是"书签没了"
     removeTarget?.let { target ->
-        AlertDialog(
+        FadeAlertDialog(
             onDismissRequest = { removeTarget = null },
             title = { Text("移除快捷目录") },
             text = { Text("移除「${target.name}」？只删这条书签，云端目录不受影响。") },
@@ -2384,7 +2655,7 @@ private fun FilesSidePane(
     // 已经站在原目录时 openByCid 不会重新加载，改用 refresh 把恢复出来的条目刷出来
     restoreTarget?.let { op ->
         val primary = op.name.substringBefore(" 等")
-        AlertDialog(
+        FadeAlertDialog(
             onDismissRequest = { restoreTarget = null },
             title = { Text("是否恢复？") },
             text = {
@@ -2443,7 +2714,118 @@ private fun opRelTime(at: Long): String {
             if (cal.get(Calendar.YEAR) == yesterday.get(Calendar.YEAR) &&
                 cal.get(Calendar.DAY_OF_YEAR) == yesterday.get(Calendar.DAY_OF_YEAR)
             ) "昨天"
-            else SimpleDateFormat("M-d", Locale.getDefault()).format(Date(at))
+                else SimpleDateFormat("M-d", Locale.getDefault()).format(Date(at))
         }
     }
+}
+
+/** 「这个目录有多部片」选择器的上下文：选中目录的 cid/path/名 + 按部归组后的候选 */
+private data class ScrapePick(
+    val dirCid: String,
+    val dirPath: String,
+    val dirName: String,
+    val groups: List<MetadataScraper.DirGroup>,
+)
+
+/**
+ * 多选刮削前的「规范化清单」：每行 原名 → 可编辑的规范名。
+ * 规范名既是拿去 TMDB 搜索的词，也是写回后给文件改的新名（[onConfirm] 回传）。
+ * 「AI 规范化全部」用刮削检索词模板把每条原名洗成干净片名；没配 AI 时该按钮隐藏。
+ */
+@Composable
+private fun ScrapeNormalizeDialog(
+    items: List<FileItem>,
+    aiReady: Boolean,
+    initialRenameOn: Boolean,
+    sources: List<Pair<String, String>>,
+    selectedSourceId: String,
+    onSetSource: (String) -> Unit,
+    defaultClean: (FileItem) -> String,
+    onAiClean: suspend (String) -> String?,
+    onDismiss: () -> Unit,
+    onConfirm: (List<String>, Boolean) -> Unit,
+) {
+    val scope = androidx.compose.runtime.rememberCoroutineScope()
+    val names = remember(items) { androidx.compose.runtime.mutableStateListOf(*items.map(defaultClean).toTypedArray()) }
+    var renameOn by remember { mutableStateOf(initialRenameOn) }
+    var aiBusy by remember { mutableStateOf(false) }
+    var aiDone by remember { mutableStateOf(0 to items.size) }
+    var sourceMenu by remember { mutableStateOf(false) }
+    val curSourceName = sources.firstOrNull { it.second == selectedSourceId }?.first ?: selectedSourceId
+    FadeAlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("规范化 ${items.size} 个名称") },
+        text = {
+            Column(Modifier.fillMaxWidth().heightIn(max = 480.dp).verticalScroll(rememberScrollState())) {
+                // 源切换：多选刮削用哪个源（= 全局当前源），开搜前就定好
+                if (sources.size > 1) {
+                    Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
+                        Text("源", style = MaterialTheme.typography.bodyMedium)
+                        Spacer(Modifier.size(8.dp))
+                        Box {
+                            Text(curSourceName, color = MaterialTheme.colorScheme.primary, modifier = Modifier.clickable { sourceMenu = true })
+                            DropdownMenu(expanded = sourceMenu, onDismissRequest = { sourceMenu = false }) {
+                                sources.forEach { (name, id) ->
+                                    DropdownMenuItem(
+                                        text = { Text(if (id == selectedSourceId) "✓ $name" else name) },
+                                        onClick = { sourceMenu = false; onSetSource(id) },
+                                    )
+                                }
+                            }
+                        }
+                    }
+                    Spacer(Modifier.height(8.dp))
+                }
+                Text(
+                    "规范名会拿去搜索、也会作为写回后的文件名。可点「AI 规范化」一键洗，或逐条手改。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Spacer(Modifier.height(8.dp))
+                if (aiReady) {
+                    Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
+                        Button(
+                            enabled = !aiBusy,
+                            onClick = {
+                                aiBusy = true; aiDone = 0 to items.size
+                                scope.launch {
+                                    items.forEachIndexed { i, it ->
+                                        val cleaned = runCatching { onAiClean(it.fn) }.getOrNull()
+                                        if (!cleaned.isNullOrBlank() && i < names.size) names[i] = cleaned
+                                        aiDone = (i + 1) to items.size
+                                    }
+                                    aiBusy = false
+                                }
+                            },
+                        ) { Text(if (aiBusy) "AI 中 ${aiDone.first}/${aiDone.second}" else "AI 规范化全部") }
+                    }
+                    Spacer(Modifier.height(8.dp))
+                }
+                items.forEachIndexed { i, it ->
+                    Column(Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
+                        Text(it.fn, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
+                        OutlinedTextField(
+                            value = names.getOrElse(i) { "" },
+                            onValueChange = { if (i < names.size) names[i] = it },
+                            singleLine = true,
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                    }
+                }
+                Spacer(Modifier.height(8.dp))
+                Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
+                    androidx.compose.material3.Switch(checked = renameOn, onCheckedChange = { renameOn = it })
+                    Spacer(Modifier.size(8.dp))
+                    Text("刮完按规范名重命名文件", style = MaterialTheme.typography.bodyMedium)
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(
+                enabled = names.any { it.isNotBlank() } && !aiBusy,
+                onClick = { onConfirm(names.toList(), renameOn) },
+            ) { Text("开始刮削") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } },
+    )
 }

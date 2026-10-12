@@ -14,8 +14,9 @@ android {
         applicationId = "com.open115.pad"
         minSdk = 26
         targetSdk = 35
-        versionCode = 6
-        versionName = "0.6.0"
+        // 这里的版本号 = **最近一次发布的版本**（发版提交在 release 线上做，见 tools/release_notes）
+        versionCode = 7
+        versionName = "0.7.0"
     }
 
     signingConfigs {
@@ -25,6 +26,12 @@ android {
         release {
             isMinifyEnabled = false
             signingConfig = signingConfigs.getByName("debug")
+        }
+        // 从源码直接装的 debug 包在「关于」里带 -dev 后缀（0.7.0-dev）：master 的版本号只在
+        // 发版时前进，不加后缀的话"开发版"和"已发布的同名版本"在界面上完全分不出来，
+        // 装机后看着像"没更新"。发布用的包在 release 线上构建、不受这里影响。
+        debug {
+            versionNameSuffix = "-dev"
         }
     }
     compileOptions {
@@ -87,6 +94,9 @@ dependencies {
     implementation("androidx.media3:media3-exoplayer-hls:1.4.1")
     implementation("androidx.media3:media3-ui:1.4.1")
     implementation("com.google.zxing:core:3.5.3")
+
+    // 插件化 JS 源：QuickJS（带多 ABI 的 native .so），用户在 App 内写/导入 .js 当元数据源
+    implementation("io.github.taoweiji.quickjs:quickjs-android:1.4.6")
 
     // 媒体库（类 Yamby）：影视/季集/演员/标签都是关系型查询（标题搜索、评分排序、
     // 按演员/标签筛选），JSON 全量遍历撑不住 → Room + KSP

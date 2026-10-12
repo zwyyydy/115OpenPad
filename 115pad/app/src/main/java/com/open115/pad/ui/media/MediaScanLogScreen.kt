@@ -26,7 +26,6 @@ import androidx.compose.material.icons.automirrored.outlined.ArrowBack
 import androidx.compose.material.icons.outlined.Delete
 import androidx.compose.material.icons.outlined.Movie
 import androidx.compose.material.icons.outlined.Update
-import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -62,6 +61,7 @@ import com.open115.pad.ui.theme.AdaptiveBody
 import com.open115.pad.ui.theme.AppColors
 import com.open115.pad.util.Format
 import kotlinx.coroutines.launch
+import com.open115.pad.ui.components.FadeAlertDialog
 
 /**
  * 扫描记录：**什么时候、扫的哪个库、结果如何、新增了哪些片**。
@@ -166,7 +166,7 @@ fun MediaScanLogScreen(
     }
 
     if (confirmClear) {
-        AlertDialog(
+        FadeAlertDialog(
             onDismissRequest = { confirmClear = false },
             title = { Text("清空扫描记录？") },
             text = { Text("${logs.size} 条记录会全部删除。影片索引与云端文件都不受影响。") },

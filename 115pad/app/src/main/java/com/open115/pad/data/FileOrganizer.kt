@@ -303,8 +303,9 @@ class FileOrganizer(
             // 节拍每个目录一次：列目录与删除对 115 是同一把刀，连续空目录也不能放行
             val empty = runCatching { listAll(cid) }.map { it.isEmpty() }.getOrDefault(false)
             if (empty) {
-                val ok = runCatching { api.deleteFiles(cid) }.getOrNull()?.envOk() == true
-                if (ok) removed++
+                val r = runCatching { api.deleteFiles(cid) }
+                if (r.getOrNull()?.envOk() == true) removed++
+                else android.util.Log.w("FileOrganizer", "删空目录失败 $cid：${r.exceptionOrNull()?.message ?: "接口返回失败"}")
             }
             throttle()
         }

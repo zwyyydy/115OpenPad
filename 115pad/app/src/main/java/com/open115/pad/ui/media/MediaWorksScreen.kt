@@ -74,10 +74,16 @@ fun MediaWorksScreen(
     kind: WorksKind,
     name: String,
     dao: MediaDao,
-    /** 外部刷新信号（详情页删完会把它 +1）：这一页在详情浮层下面没被销毁，得靠它重查 */
+    /** 外部刷新信号（详情页删完会把它 +1）。浮层栈只渲染栈顶：详情盖上来时这一页实例已被销毁，
+     *  退回是全新组合，靠初值 + 重查把画面接回来 */
     refreshKey: Int = 0,
     /** 这一页自己长按删掉一部之后通知外面（外面 +refreshKey，三处浮层一起刷新） */
     onChanged: () -> Unit = {},
+    /** 最近一次加载的结果（外面缓存的）：退回重建时当首帧初值——本页是纯黑底、
+     *  背景图也取自 cards，空着起步叠上详情页的淡出就是肉眼可见的闪黑 */
+    initialCards: List<MovieCard> = emptyList(),
+    /** 查完交出去让外面缓存，下次退回重建有首帧数据 */
+    onCardsLoaded: (List<MovieCard>) -> Unit = {},
     onBack: () -> Unit,
     onOpenMovie: (MovieCard, List<MovieCard>, Int) -> Unit,
 ) {
@@ -89,11 +95,12 @@ fun MediaWorksScreen(
     val compact = LocalConfiguration.current.screenWidthDp < 600
     // 排序方式（表头那个菜单选的）：存设置里，跨页面/重启都记得
     val sort by container.mediaPrefs.worksSort.collectAsState(initial = WorksSort.DEFAULT)
-    val cards by produceState<List<MovieCard>>(emptyList(), kind, name, refreshKey, sort) {
+    val cards by produceState<List<MovieCard>>(initialCards, kind, name, refreshKey, sort) {
         value = when (kind) {
             WorksKind.Actor -> dao.byActor(name, sort.sql)
             WorksKind.Tag -> dao.byTag(name, sort.sql)
         }
+        onCardsLoaded(value)
     }
     var deleteTarget by remember { mutableStateOf<MovieCard?>(null) }
     var sortMenu by remember { mutableStateOf(false) }

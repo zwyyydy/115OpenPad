@@ -4,6 +4,7 @@ import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.layout.Arrangement
@@ -51,10 +52,12 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.produceState
 import androidx.compose.ui.platform.LocalContext
 import coil.compose.AsyncImage
-import coil.compose.SubcomposeAsyncImage
 import coil.request.ImageRequest
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import com.open115.pad.appContainer
 import com.open115.pad.data.FileItem
 import com.open115.pad.ui.theme.AppColors
@@ -148,22 +151,23 @@ fun thumbUrlFor(item: FileItem): String? = when {
 internal fun Thumb(item: FileItem, modifier: Modifier = Modifier, iconSize: Int = 40) {
     val context = LocalContext.current
     val store = remember(context) { context.appContainer.videoPreviews }
-    // 生成侧（播放器/批量任务）写完一张就 +1：这样从播放器回到列表时这一行会重新取缩略图
+    // 生成侧（播放器/批量任务）写完一张就 +1：这样从播放器回到列表时这一行会重新取缩略图。
+    // 本地预览的探测（file.exists / lastModified）是磁盘 IO，放 IO 上算 —— 早先在 remember 块里
+    // 组合期同步做，几百行的列表一滚就是几百次主线程 stat。
     val version by store.version.collectAsState()
-    val model = remember(item.pc, item.fn, item.thumb, item.uo, item.fco, item.isDir, version) {
-        localPreviewModel(context, item, store) ?: thumbUrlFor(item)
+    val model by produceState<Any?>(initialValue = thumbUrlFor(item), item, version) {
+        value = withContext(Dispatchers.IO) { localPreviewModel(context, item, store) }
+            ?: thumbUrlFor(item)
     }
     Box(modifier, contentAlignment = Alignment.Center) {
         // 彩色类型视觉做底层常驻：缩略图加载失败/无缩略图时兜底，避免出现空白图标
         KindBadge(item.fn, item.isDir, Modifier.size(iconSize.dp))
         if (model != null) {
-            SubcomposeAsyncImage(
+            AsyncImage(
                 model = model,
                 contentDescription = null,
                 contentScale = ContentScale.Crop,
                 modifier = Modifier.fillMaxSize().clip(RoundedCornerShape(10.dp)),
-                loading = {},
-                error = {},
             )
         }
     }
@@ -228,9 +232,12 @@ fun FileListRow(
     val solidCard = !glass.active
     val cardRadius = if (solidCard) 14.dp else glassRadius
     val cardShape = RoundedCornerShape(cardRadius)
+    // 实底卡上默认水波纹反馈太弱：按压缩放承担「按到了」（整行缩一点，graphicsLayer 不重排）
+    val interaction = remember { MutableInteractionSource() }
     Column(
         Modifier
             .fillMaxWidth()
+            .pressScale(interaction, pressedScale = 0.985f)
             .padding(horizontal = 12.dp, vertical = if (solidCard) 4.dp else glassGapPad)
             .then(
                 when {
@@ -272,7 +279,12 @@ fun FileListRow(
                         .border(1.dp, AppColors.Divider, cardShape)
                 }
             )
-            .combinedClickable(onClick = onClick, onLongClick = onLongClick)
+            .combinedClickable(
+                interactionSource = interaction,
+                indication = null,
+                onClick = onClick,
+                onLongClick = onLongClick,
+            )
             .padding(horizontal = if (solidCard) 4.dp else 16.dp, vertical = 8.dp),
     ) {
         Row(
@@ -381,9 +393,12 @@ internal fun VideoStrip(
 ) {
     val context = LocalContext.current
     val store = remember(context) { context.appContainer.videoPreviews }
-    // 生成侧写完会 +1：从播放器/批量任务回来后这一行要立刻长出预览条
+    // 生成侧写完会 +1：从播放器/批量任务回来后这一行要立刻长出预览条。
+    // count 要读预览条目录的索引（首次/重新抓过之后要 listFiles 一次），放 IO 上算
     val version by store.version.collectAsState()
-    val count = remember(pc, version) { store.stripCount(pc) }
+    val count by produceState(initialValue = 0, pc, version) {
+        value = withContext(Dispatchers.IO) { store.stripCount(pc) }
+    }
     if (count <= 0) return
     // 预览条自己垫一层"底托"：帧的明暗没法预料，暗场片子（比如 VR/夜戏）落在暗底上时
     // 光看画面根本找不到这条预览占了多大一块 —— 底托把它的范围固定下来
@@ -401,12 +416,15 @@ internal fun VideoStrip(
             horizontalArrangement = Arrangement.spacedBy(6.dp),
         ) {
             for (i in 0 until count) {
-                val file = remember(pc, i) { store.stripFileFor(pc, i) }
+                // 文件对象本身是纯路径拼接（零 IO）；mtime 的 stat 每次重组都跑一次是纯浪费，
+                // remember 住（version 变了才重算 —— 那时 mtime 也真的变了）
+                val file = remember(pc, i, version) { store.stripFileFor(pc, i) }
+                val mtime = remember(file, version) { file.lastModified() }
                 AsyncImage(
                     model = ImageRequest.Builder(context)
                         .data(file)
                         // 文件名固定，掺 mtime 才不会在重新抓过之后继续显示旧帧（同 Thumb 的坑）
-                        .memoryCacheKey("vstrip|$pc|$i|${file.lastModified()}")
+                        .memoryCacheKey("vstrip|$pc|$i|$mtime")
                         .build(),
                     contentDescription = null,
                     contentScale = ContentScale.Crop,
@@ -442,7 +460,9 @@ fun FileGridCard(
         pinned -> AppColors.BlueBg
         else -> AppColors.Card
     }
+    val interaction = remember { MutableInteractionSource() }
     Surface(
+        modifier = Modifier.pressScale(interaction),
         shape = RoundedCornerShape(14.dp),
         // 置顶比选中态用得再深一档（卡片浮在灰底上，略强的色块才读得出"成组"）；
         // 选中优先，避免"又选中又置顶"时两种状态互相盖住
@@ -462,7 +482,12 @@ fun FileGridCard(
         Column(
             Modifier
                 .fillMaxWidth()
-                .combinedClickable(onClick = onClick, onLongClick = onLongClick)
+                .combinedClickable(
+                    interactionSource = interaction,
+                    indication = null,
+                    onClick = onClick,
+                    onLongClick = onLongClick,
+                )
                 .padding(8.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {

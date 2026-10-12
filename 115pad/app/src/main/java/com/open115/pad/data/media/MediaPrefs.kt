@@ -7,9 +7,14 @@ import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.longPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
+import com.open115.pad.data.media.scrape.AiPromptTemplate
+import com.open115.pad.data.media.scrape.JsSource
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.builtins.ListSerializer
+import kotlinx.serialization.json.Json
 
 private val Context.mediaDataStore by preferencesDataStore(name = "media")
 
@@ -133,6 +138,196 @@ class MediaPrefs(private val context: Context) {
             it[KEY_AVATAR_TOTAL] = total
         }
 
+    // ---- 元数据刮削（TMDB）：地址与 key 全都不写死，见 [MetadataScraper] ----
+
+    /**
+     * TMDB 接口基址。默认官方域名，**国内直连多半不通**（DNS 污染，见 docs 里 TMDB 那轮的结论），
+     * 所以用户通常要填自己服务器上的反代地址 —— 能拼出 `{基址}/3/search/movie` 即可。
+     */
+    val scrapeTmdbApiBase: Flow<String> =
+        context.mediaDataStore.data.map { it[KEY_SCRAPE_API_BASE]?.takeIf { v -> v.isNotBlank() } ?: DEFAULT_TMDB_API_BASE }
+
+    /** TMDB 图片基址（海报/缩略图），可与接口地址走同一个反代 */
+    val scrapeTmdbImageBase: Flow<String> =
+        context.mediaDataStore.data.map { it[KEY_SCRAPE_IMAGE_BASE]?.takeIf { v -> v.isNotBlank() } ?: DEFAULT_TMDB_IMAGE_BASE }
+
+    /** TMDB API key（v3 的 32 位 key，或 v4 的 JWT 以 eyJ 开头 —— 两种都认，见 [TmdbClient]） */
+    val scrapeTmdbApiKey: Flow<String> =
+        context.mediaDataStore.data.map { it[KEY_SCRAPE_API_KEY] ?: "" }
+
+    suspend fun setScrapeTmdbApiBase(url: String) =
+        context.mediaDataStore.edit { it[KEY_SCRAPE_API_BASE] = url.trim() }
+
+    suspend fun setScrapeTmdbImageBase(url: String) =
+        context.mediaDataStore.edit { it[KEY_SCRAPE_IMAGE_BASE] = url.trim() }
+
+    suspend fun setScrapeTmdbApiKey(key: String) =
+        context.mediaDataStore.edit { it[KEY_SCRAPE_API_KEY] = key.trim() }
+
+    /**
+     * 给刮削这条路单独用的**代理地址**（空 = 直连）。TMDB 在国内直连不通，
+     * 用户填自己已有的代理（`host:port` / `socks5://host:port`）即可，不需要给 App 全局挂代理。
+     */
+    val scrapeProxy: Flow<String> =
+        context.mediaDataStore.data.map { it[KEY_SCRAPE_PROXY] ?: "" }
+
+    suspend fun setScrapeProxy(url: String) =
+        context.mediaDataStore.edit { it[KEY_SCRAPE_PROXY] = url.trim() }
+
+    // ---- AI 检索词（可选）：把乱七八糟的文件名交给 OpenAI 兼容的大模型洗成干净的片名，见 [AiQueryClient] ----
+    // 端点/key/模型全不写死、默认留空；没配全之前界面上的「用 AI 优化」按钮不出现。
+
+    /** OpenAI 兼容的服务基址（能拼出 `{基址}/chat/completions`），如 https://api.openai.com/v1 */
+    val aiEndpoint: Flow<String> =
+        context.mediaDataStore.data.map { it[KEY_AI_ENDPOINT] ?: "" }
+
+    suspend fun setAiEndpoint(url: String) =
+        context.mediaDataStore.edit { it[KEY_AI_ENDPOINT] = url.trim() }
+
+    val aiApiKey: Flow<String> =
+        context.mediaDataStore.data.map { it[KEY_AI_API_KEY] ?: "" }
+
+    suspend fun setAiApiKey(key: String) =
+        context.mediaDataStore.edit { it[KEY_AI_API_KEY] = key.trim() }
+
+    /** 模型名，如 gpt-4o-mini / deepseek-chat */
+    val aiModel: Flow<String> =
+        context.mediaDataStore.data.map { it[KEY_AI_MODEL] ?: "" }
+
+    suspend fun setAiModel(m: String) =
+        context.mediaDataStore.edit { it[KEY_AI_MODEL] = m.trim() }
+
+    /** 用户自建的提示词模板（内置的不在这里，见 [com.open115.pad.data.media.scrape.AiPromptTemplates.BUILTINS]） */
+    val aiCustomTemplates: Flow<List<AiPromptTemplate>> =
+        context.mediaDataStore.data.map { decodeTemplates(it[KEY_AI_CUSTOM_TEMPLATES]) }
+
+    suspend fun setAiCustomTemplates(list: List<AiPromptTemplate>) =
+        context.mediaDataStore.edit { it[KEY_AI_CUSTOM_TEMPLATES] = encodeTemplates(list) }
+
+    /** 新建一个自定义模板，返回它的 id（id 用时间戳，够唯一） */
+    suspend fun addAiTemplate(name: String, prompt: String): String {
+        val id = "custom_" + System.currentTimeMillis()
+        setAiCustomTemplates(aiCustomTemplates.first() + AiPromptTemplate(id, name.trim(), prompt.trim(), false))
+        return id
+    }
+
+    suspend fun updateAiTemplate(id: String, name: String, prompt: String) =
+        setAiCustomTemplates(
+            aiCustomTemplates.first().map { if (it.id == id) it.copy(name = name.trim(), prompt = prompt.trim()) else it },
+        )
+
+    suspend fun deleteAiTemplate(id: String) =
+        setAiCustomTemplates(aiCustomTemplates.first().filterNot { it.id == id })
+
+    /** 刮削场景默认用哪个模板 id */
+    val aiScrapeTemplate: Flow<String> =
+        context.mediaDataStore.data.map { it[KEY_AI_SCRAPE_TPL] ?: com.open115.pad.data.media.scrape.AiPromptTemplates.SCRAPE_QUERY }
+
+    suspend fun setAiScrapeTemplate(id: String) =
+        context.mediaDataStore.edit { it[KEY_AI_SCRAPE_TPL] = id }
+
+    /** 重命名场景默认用哪个模板 id */
+    val aiRenameTemplate: Flow<String> =
+        context.mediaDataStore.data.map { it[KEY_AI_RENAME_TPL] ?: com.open115.pad.data.media.scrape.AiPromptTemplates.RENAME_CLEAN }
+
+    suspend fun setAiRenameTemplate(id: String) =
+        context.mediaDataStore.edit { it[KEY_AI_RENAME_TPL] = id }
+
+    /** 多选批量刮削的改名方式（记住上次）：存枚举名，默认 NONE */
+    val scrapeRenameMode: Flow<String> =
+        context.mediaDataStore.data.map { it[KEY_SCRAPE_RENAME_MODE] ?: "NONE" }
+
+    suspend fun setScrapeRenameMode(mode: String) =
+        context.mediaDataStore.edit { it[KEY_SCRAPE_RENAME_MODE] = mode }
+
+    /** 手动命名的模板（记住上次），token：{片名}{原名}{年份}{序号} */
+    val scrapeRenameTemplate: Flow<String> =
+        context.mediaDataStore.data.map { it[KEY_SCRAPE_RENAME_TPL]?.takeIf { v -> v.isNotBlank() } ?: "{片名}" }
+
+    suspend fun setScrapeRenameTemplate(t: String) =
+        context.mediaDataStore.edit { it[KEY_SCRAPE_RENAME_TPL] = t.trim() }
+
+    /**
+     * 刮削写回时每部片存的剧照张数上限（按赞数取前几张进 `<前缀>-extrafanart/` 目录）。
+     *
+     * [SCRAPE_STILLS_UNLIMITED]（0）= 不限制：源给多少存多少（写回更慢、流量更大）。
+     * 只管**刮削写回**这一条路 —— 扫描器本来就不下剧照字节（只记 pick_code、详情页按需缓存），不受它影响。
+     */
+    val scrapeStillsMax: Flow<Int> =
+        context.mediaDataStore.data.map { it[KEY_SCRAPE_STILLS_MAX] ?: DEFAULT_SCRAPE_STILLS_MAX }
+
+    suspend fun setScrapeStillsMax(n: Int) =
+        context.mediaDataStore.edit { it[KEY_SCRAPE_STILLS_MAX] = n.coerceIn(SCRAPE_STILLS_UNLIMITED, SCRAPE_STILLS_HARD_MAX) }
+
+    /**
+     * 单片刮削「搜完自动刮第一条」开关（默认**关**）。
+     *
+     * 开着时：对话框搜出结果后，用户 5 秒内没手动点选任何候选，就自动选**第一条**并直接写回。
+     * 只在对话框开着时计时（关框即取消，挂后台搜索不会自动落笔）；用户一旦点过候选就不再自动刮。
+     */
+    val scrapeAutoFirst: Flow<Boolean> =
+        context.mediaDataStore.data.map { it[KEY_SCRAPE_AUTO_FIRST] ?: false }
+
+    suspend fun setScrapeAutoFirst(enabled: Boolean) =
+        context.mediaDataStore.edit { it[KEY_SCRAPE_AUTO_FIRST] = enabled }
+
+    // ---- 插件化 JS 源 ----
+
+    /** 用户在 App 内建的 JS 源（内置的 TMDB 不在这里）。存 JSON 列表。 */
+    val jsSources: Flow<List<JsSource>> =
+        context.mediaDataStore.data.map { decodeJsSources(it[KEY_JS_SOURCES]) }
+
+    suspend fun setJsSources(list: List<JsSource>) =
+        context.mediaDataStore.edit { it[KEY_JS_SOURCES] = encodeJsSources(list) }
+
+    suspend fun addJsSource(name: String, code: String): String {
+        val id = "js_" + System.currentTimeMillis()
+        setJsSources(jsSources.first() + JsSource(id, name.trim(), code, enabled = true))
+        return id
+    }
+
+    suspend fun updateJsSource(id: String, name: String, code: String) =
+        setJsSources(jsSources.first().map { if (it.id == id) it.copy(name = name.trim(), code = code) else it })
+
+    suspend fun setJsSourceEnabled(id: String, enabled: Boolean) =
+        setJsSources(jsSources.first().map { if (it.id == id) it.copy(enabled = enabled) else it })
+
+    suspend fun deleteJsSource(id: String) =
+        setJsSources(jsSources.first().filterNot { it.id == id })
+
+    /** 当前选用的源 id（"tmdb" 或某个 js 源 id） */
+    val selectedSourceId: Flow<String> =
+        context.mediaDataStore.data.map { it[KEY_SELECTED_SOURCE] ?: "tmdb" }
+
+    suspend fun setSelectedSourceId(id: String) =
+        context.mediaDataStore.edit { it[KEY_SELECTED_SOURCE] = id }
+
+    /** 扫描 .js 的本地目录（SAF tree uri；空 = 不扫描） */
+    val jsSourcesDir: Flow<String> =
+        context.mediaDataStore.data.map { it[KEY_JS_DIR] ?: "" }
+
+    suspend fun setJsSourcesDir(uri: String) =
+        context.mediaDataStore.edit { it[KEY_JS_DIR] = uri }
+
+    // ---- HTTP 服务源 ----
+    // 插件的另一种形态：代码跑在服务器上，App 只当一个 HTTP 客户端。
+    // 协议即 HTTP 服务源的 REST（/v1/movies/search、/v1/movies/{provider}/{id}）——
+    // 自建服务照这三个端点实现就能接进来。
+
+    /** 服务基址（如 `http://192.168.x.x:8090`，不带尾部斜杠）；空 = 不启用这个源 */
+    val metatubeUrl: Flow<String> =
+        context.mediaDataStore.data.map { it[KEY_METATUBE_URL]?.trim()?.trimEnd('/') ?: "" }
+
+    suspend fun setMetatubeUrl(url: String) =
+        context.mediaDataStore.edit { it[KEY_METATUBE_URL] = url.trim() }
+
+    /** 鉴权 token（服务端设了 -token 才要填；空 = 不带 Authorization 头） */
+    val metatubeToken: Flow<String> =
+        context.mediaDataStore.data.map { it[KEY_METATUBE_TOKEN]?.trim() ?: "" }
+
+    suspend fun setMetatubeToken(token: String) =
+        context.mediaDataStore.edit { it[KEY_METATUBE_TOKEN] = token.trim() }
+
     companion object {
         const val DEFAULT_MAX_MB = 2048L
         const val MIN_MAX_MB = 512L
@@ -143,6 +338,15 @@ class MediaPrefs(private val context: Context) {
 
         /** 滑块步进 */
         const val STEP_MB = 256L
+
+        /** 剧照张数：默认与 [com.open115.pad.data.media.scrape.MetadataScraper.EXTRAFANART_MAX] 一致 */
+        const val DEFAULT_SCRAPE_STILLS_MAX = 8
+
+        /** 剧照张数滑块的右端点（再往右没有挡位） */
+        const val SCRAPE_STILLS_HARD_MAX = 30
+
+        /** 剧照张数"不限制"挡的存储值（0 = 源给多少存多少） */
+        const val SCRAPE_STILLS_UNLIMITED = 0
 
         private val KEY_CACHE_ENABLED = booleanPreferencesKey("cache_enabled")
         private val KEY_CACHE_MAX_MB = longPreferencesKey("cache_max_mb")
@@ -162,6 +366,60 @@ class MediaPrefs(private val context: Context) {
         private val KEY_AVATAR_AT = longPreferencesKey("avatar_index_at")
         private val KEY_AVATAR_HIT = intPreferencesKey("avatar_coverage_hit")
         private val KEY_AVATAR_TOTAL = intPreferencesKey("avatar_coverage_total")
+
+        /** TMDB 官方地址。只是**预填值**，用户可在实验室改成反代地址（改地址不需要改代码） */
+        const val DEFAULT_TMDB_API_BASE = "https://api.themoviedb.org"
+        const val DEFAULT_TMDB_IMAGE_BASE = "https://image.tmdb.org"
+
+        private val KEY_SCRAPE_API_BASE = stringPreferencesKey("scrape_tmdb_api_base")
+        private val KEY_SCRAPE_IMAGE_BASE = stringPreferencesKey("scrape_tmdb_image_base")
+        private val KEY_SCRAPE_API_KEY = stringPreferencesKey("scrape_tmdb_api_key")
+        private val KEY_SCRAPE_PROXY = stringPreferencesKey("scrape_proxy")
+
+        private val KEY_AI_ENDPOINT = stringPreferencesKey("ai_endpoint")
+        private val KEY_AI_API_KEY = stringPreferencesKey("ai_api_key")
+        private val KEY_AI_MODEL = stringPreferencesKey("ai_model")
+        private val KEY_AI_CUSTOM_TEMPLATES = stringPreferencesKey("ai_custom_templates")
+        private val KEY_AI_SCRAPE_TPL = stringPreferencesKey("ai_scrape_template")
+        private val KEY_AI_RENAME_TPL = stringPreferencesKey("ai_rename_template")
+        private val KEY_SCRAPE_RENAME_MODE = stringPreferencesKey("scrape_rename_mode")
+        private val KEY_SCRAPE_RENAME_TPL = stringPreferencesKey("scrape_rename_template")
+        private val KEY_SCRAPE_STILLS_MAX = intPreferencesKey("scrape_stills_max")
+        private val KEY_SCRAPE_AUTO_FIRST = booleanPreferencesKey("scrape_auto_first")
+        private val KEY_JS_SOURCES = stringPreferencesKey("js_sources")
+        private val KEY_SELECTED_SOURCE = stringPreferencesKey("selected_source")
+        private val KEY_JS_DIR = stringPreferencesKey("js_sources_dir")
+        private val KEY_METATUBE_URL = stringPreferencesKey("metatube_url")
+        private val KEY_METATUBE_TOKEN = stringPreferencesKey("metatube_token")
+
+        private val jsJson = Json { ignoreUnknownKeys = true; isLenient = true }
+
+        internal fun decodeJsSources(raw: String?): List<JsSource> =
+            if (raw.isNullOrBlank()) emptyList() else runCatching {
+                jsJson.decodeFromString(ListSerializer(JsSource.serializer()), raw)
+            }.getOrDefault(emptyList())
+
+        internal fun encodeJsSources(list: List<JsSource>): String =
+            jsJson.encodeToString(ListSerializer(JsSource.serializer()), list)
+
+        private val tplJson = Json { ignoreUnknownKeys = true; isLenient = true }
+
+        /** 自定义模板只存 id/name/prompt（builtin 恒 false），读回来补 builtin=false */
+        @Serializable
+        private data class StoredTemplate(val id: String, val name: String, val prompt: String)
+
+        internal fun decodeTemplates(raw: String?): List<AiPromptTemplate> {
+            if (raw.isNullOrBlank()) return emptyList()
+            val list = runCatching {
+                tplJson.decodeFromString(ListSerializer(StoredTemplate.serializer()), raw)
+            }.getOrNull() ?: return emptyList()
+            return list.map { AiPromptTemplate(it.id, it.name, it.prompt, false) }
+        }
+
+        internal fun encodeTemplates(list: List<AiPromptTemplate>): String {
+            val stored = list.filterNot { it.builtin }.map { StoredTemplate(it.id, it.name, it.prompt) }
+            return tplJson.encodeToString(ListSerializer(StoredTemplate.serializer()), stored)
+        }
 
         /**
          * nfo 文本池从总上限里分到的份额（5%）。

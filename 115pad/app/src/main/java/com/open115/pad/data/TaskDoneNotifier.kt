@@ -11,10 +11,11 @@ import com.open115.pad.MainActivity
 import com.open115.pad.R
 
 /**
- * 后台任务（媒体库扫描 / 批量重命名 / 分类整理）**跑完**时的系统通知。
+ * 后台任务（媒体库扫描 / 查找重复 / 视频预览图 / 批量重命名 / 分类整理）**跑完**时的系统通知。
  *
- * 只在主界面不可见时发（调用点见 ui/AppRoot 的 finishNotice）：人正看着主界面时 Snackbar 已经报了，
- * 再响一声是噪音；切到别的 App、锁屏、或者在播放器里（另一个 Activity）才需要它补位。
+ * 只在主界面不可见时发（调用点见 ui/AppRoot 的 announceDone 与 finishNotice）：人正看着主界面时
+ * 弹窗/Snackbar 已经报了，再响一声是噪音；切到别的 App、锁屏、或者在播放器里（另一个 Activity）
+ * 才需要它补位。
  *
  * 与 [KeepAliveService] 的「正在后台运行」是两条独立渠道：那条是 IMPORTANCE_LOW 的常驻状态
  * （别杀我，全静默），这条是 DEFAULT 的一次性提醒（活干完了，响一声）—— 用户可以单独关掉后者。
@@ -60,7 +61,7 @@ object TaskDoneNotifier {
         if (nm.getNotificationChannel(CHANNEL_ID) != null) return
         nm.createNotificationChannel(
             NotificationChannel(CHANNEL_ID, "任务完成", NotificationManager.IMPORTANCE_DEFAULT).apply {
-                description = "扫描 / 重命名 / 整理这些任务跑完时提醒一声"
+                description = "扫描 / 查重 / 预览图 / 重命名 / 整理这些任务跑完时提醒一声"
             },
         )
     }

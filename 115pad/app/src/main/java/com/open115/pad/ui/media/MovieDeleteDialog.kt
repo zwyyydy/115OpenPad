@@ -4,7 +4,6 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.height
-import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
@@ -16,6 +15,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
+import com.open115.pad.ui.components.FadeAlertDialog
 
 /**
  * 删除条目的对话框，两种模式：
@@ -39,7 +39,7 @@ fun MovieDeleteDialog(
     val scope = if (episodeCount > 0) "（连同名下的 $episodeCount 集）" else ""
 
     if (!confirmingCloud) {
-        AlertDialog(
+        FadeAlertDialog(
             onDismissRequest = onDismiss,
             title = { Text("删除「$name」$scope") },
             text = {
@@ -67,7 +67,7 @@ fun MovieDeleteDialog(
             },
         )
     } else {
-        AlertDialog(
+        FadeAlertDialog(
             onDismissRequest = onDismiss,
             title = { Text("彻底删除「$name」$scope？") },
             text = {

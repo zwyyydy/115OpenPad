@@ -1,5 +1,11 @@
 package com.open115.pad.ui.media
 
+import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.SizeTransform
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -39,7 +45,7 @@ import androidx.compose.material.icons.outlined.Update
 import androidx.compose.material.icons.outlined.Delete
 import androidx.compose.material.icons.outlined.Folder
 import androidx.compose.material.icons.outlined.Movie
-import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.FilterChip
@@ -90,6 +96,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
+import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Popup
 import androidx.compose.ui.window.PopupProperties
 import coil.compose.AsyncImage
@@ -101,6 +108,7 @@ import com.open115.pad.data.media.MediaScanner
 import com.open115.pad.data.media.MovieCard
 import com.open115.pad.data.media.QueuedScan
 import com.open115.pad.data.media.ScanMode
+import com.open115.pad.data.media.MediaPrefs
 import com.open115.pad.data.media.WatchHistoryRow
 import com.open115.pad.data.media.WorksSort
 import com.open115.pad.data.media.autoScanModeOrDefault
@@ -122,6 +130,12 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlin.math.abs
 import kotlin.math.roundToInt
+import com.open115.pad.ui.components.FadeAlertDialog
+import com.open115.pad.ui.components.FadeIn
+
+// 媒体库各页之间淡入淡出溶解的时长（列表↔海报墙、浮层栈进出共用）
+private const val DISSOLVE_IN_MS = 500
+private const val DISSOLVE_OUT_MS = 450
 
 /**
  * 媒体库页（类 Yamby）：左侧独立入口。
@@ -204,6 +218,14 @@ fun MediaLibraryScreen(api: com.open115.pad.data.OpenApi) {
      * 都是本地 Room 查询（毫秒级），换来的是内存不随层数增长。
      */
     val overlays = remember { mutableStateListOf<MediaOverlay>() }
+    // 作品页最近一次的数据（kind+name → cards）：栈只渲染栈顶，详情盖上来时作品页实例被销毁，
+    // 退回是全新组合。它纯黑底起步、背景图也取自 cards，不喂初值的话头几帧是"黑底空网格"，
+    // 叠上详情页的淡出就是肉眼可见的闪黑。查完写回（onCardsLoaded），重建时当首帧初值。
+    val worksCache = remember { mutableMapOf<Pair<WorksKind, String>, List<MovieCard>>() }
+    // 入栈/出栈各包一层：转场目前是方向无关的淡入淡出，这两个只是把"改栈"收口到一处，
+    // 将来若要换回带方向的滑动，方向标志在这里加回即可。
+    fun pushOverlay(o: MediaOverlay) { overlays.add(o) }
+    fun popOverlay() { overlays.removeLastOrNull() }
     /**
      * 海报墙的刷新信号，**墙和详情页共用**。
      *
@@ -221,17 +243,24 @@ fun MediaLibraryScreen(api: com.open115.pad.data.OpenApi) {
     // 搜索结果跟着"作品排序"设置走（与海报墙/作品页同一个设置，不在这里再放一个菜单）
     val sort by container.mediaPrefs.worksSort.collectAsState(initial = WorksSort.DEFAULT)
     val hits by produceState<List<MovieCard>?>(initialValue = null, query, sort) {
-        value = if (query.isBlank()) null else dao.searchAll(query, MEDIA_NO_LIMIT, sort.sql)
+        if (query.isBlank()) {
+            value = null
+            return@produceState
+        }
+        delay(250) // 防抖：连续输入只跑最后一次（produceState 换 key 会取消上一轮，不必手动去抖）
+        value = dao.searchAll(query, MEDIA_NO_LIMIT, sort.sql)
     }
     // 返回键：正在搜索就先清搜索（与海报墙一致）
     androidx.activity.compose.BackHandler(enabled = query.isNotBlank()) { query = "" }
 
     // ---- 首页化的两个横排（只在非搜索态出现） ----
 
-    /** 继续观看：观影历史里"开了头还没看完"的前 12 条（判据与观影历史页同一个 isFinished） */
+    /** 继续观看：观影历史里"开了头还没看完"的前 12 条（判据与观影历史页同一个 isFinished）。
+     *  ★ 只要还在库里的（[WatchHistoryRow.inLibrary]）：片删了（详情页删、扫描陈旧清理）就不再出现——
+     *    观影历史页那边故意连孤儿行也显示（退回用文件名认），横排上它只是一张没头没名的死卡 */
     val historyRows by dao.watchHistoryRows(60).collectAsState(initial = emptyList())
     val continueRows = remember(historyRows) {
-        historyRows.filter { !isFinished(it) && it.positionMs > 0 }.take(12)
+        historyRows.filter { it.inLibrary && !isFinished(it) && it.positionMs > 0 }.take(12)
     }
 
     /**
@@ -287,6 +316,23 @@ fun MediaLibraryScreen(api: com.open115.pad.data.OpenApi) {
      */
     fun startScan(lib: MediaLibraryEntity, mode: ScanMode) {
         container.mediaScanner.enqueue(lib, mode)
+    }
+
+    /**
+     * 批量刮削的入口：先数"这个库里有多少部缺 nfo 的片"（一次本地查询），数字摆进确认框，
+     * 用户点了才真的开跑。数量为 0 就不给点 —— 免得白跑一趟。
+     */
+    var scrapeAsk by remember { mutableStateOf<MediaLibraryEntity?>(null) }
+    var scrapeCount by remember { mutableStateOf(-1) }
+    var scrapeExtras by remember { mutableStateOf(false) }
+
+    fun askScrape(lib: MediaLibraryEntity) {
+        scrapeAsk = lib
+        scrapeCount = -1
+        scrapeExtras = false
+        scope.launch {
+            scrapeCount = runCatching { container.metadataScraper.countTargets(lib) }.getOrDefault(0)
+        }
     }
 
     /** 「继续观看」的卡片点了直接续播（与观影历史页同一套意图：本机源走 localIntent） */
@@ -394,13 +440,13 @@ fun MediaLibraryScreen(api: com.open115.pad.data.OpenApi) {
                 ) {
                     // 扫描记录：媒体库自己的流水（何时扫的哪个库、结果、新增影片带图）——
                     // 不放文件页那份「操作记录」（那是文件操作的流水），也不占导航栏
-                    IconButton(onClick = { overlays.add(MediaOverlay.ScanLog) }) {
+                    IconButton(onClick = { pushOverlay(MediaOverlay.ScanLog) }) {
                         Icon(Icons.Outlined.Update, contentDescription = "扫描记录")
                     }
                     TopActionDivider()
                     // 观影历史：入口放在媒体库页（它是"媒体库看到哪儿了"，不属于文件页 ——
                     // 文件页的播放记录在操作记录里，两处不重复）
-                    IconButton(onClick = { overlays.add(MediaOverlay.History) }) {
+                    IconButton(onClick = { pushOverlay(MediaOverlay.History) }) {
                         Icon(Icons.Outlined.History, contentDescription = "观影历史")
                     }
                     TopActionDivider()
@@ -484,7 +530,7 @@ fun MediaLibraryScreen(api: com.open115.pad.data.OpenApi) {
                             PosterCard(
                                 card = card,
                                 onClick = {
-                                    overlays.add(
+                                    pushOverlay(
                                         MediaOverlay.Detail(card, results, results.indexOf(card)),
                                     )
                                 },
@@ -533,6 +579,7 @@ fun MediaLibraryScreen(api: com.open115.pad.data.OpenApi) {
                                 host = dragHost,
                                 onOpen = { openedLib = heroLib },
                                 onScan = { mode -> startScan(heroLib, mode) },
+                                onScrape = { askScrape(heroLib) },
                                 onEdit = { editTarget = heroLib },
                                 onDelete = { deleteTarget = heroLib },
                                 onDrop = { fromId, hoverId -> dropLibrary(fromId, hoverId) },
@@ -566,6 +613,7 @@ fun MediaLibraryScreen(api: com.open115.pad.data.OpenApi) {
                                     host = dragHost,
                                     onOpen = { openedLib = lib },
                                     onScan = { mode -> startScan(lib, mode) },
+                                    onScrape = { askScrape(lib) },
                                     onEdit = { editTarget = lib },
                                     onDelete = { deleteTarget = lib },
                                     onDrop = { fromId, hoverId -> dropLibrary(fromId, hoverId) },
@@ -584,7 +632,7 @@ fun MediaLibraryScreen(api: com.open115.pad.data.OpenApi) {
                             SectionHeaderRow(
                                 "最近新增",
                                 actionText = "查看全部",
-                                onAction = { overlays.add(MediaOverlay.ScanLog) },
+                                onAction = { pushOverlay(MediaOverlay.ScanLog) },
                             )
                         }
                         item(key = "recent-row") {
@@ -597,7 +645,7 @@ fun MediaLibraryScreen(api: com.open115.pad.data.OpenApi) {
                                         card = card,
                                         libraryName = recentLibOf[card.mediaKey],
                                         onClick = {
-                                            overlays.add(
+                                            pushOverlay(
                                                 MediaOverlay.Detail(card, recentCards, recentCards.indexOf(card)),
                                             )
                                         },
@@ -673,57 +721,111 @@ fun MediaLibraryScreen(api: com.open115.pad.data.OpenApi) {
         )
     }
 
-    openedLib?.let { lib ->
-        PosterWallScreen(
-            library = lib,
-            dao = dao,
-            refreshKey = wallTick,
-            onChanged = { wallTick++ },
-            onBack = { openedLib = null },
-            onOpenMovie = { card, list, index ->
-                overlays.add(MediaOverlay.Detail(card, list, index))
-            },
-        )
+    // 库列表 ↔ 海报墙：同款淡入淡出溶解（点库卡片进、返回退都淡变，不再硬切）。
+    // 墙盖在列表之上、浮层栈之下；进详情时 openedLib 不变、墙不动，只有下面浮层那个 AnimatedContent 在淡。
+    AnimatedContent(
+        targetState = openedLib,
+        transitionSpec = {
+            fadeIn(tween(DISSOLVE_IN_MS)) togetherWith fadeOut(tween(DISSOLVE_OUT_MS)) using SizeTransform(clip = false)
+        },
+        contentKey = { it?.id ?: -1L },
+    ) { lib ->
+        Box(Modifier.fillMaxSize()) {
+            if (lib != null) PosterWallScreen(
+                library = lib,
+                dao = dao,
+                refreshKey = wallTick,
+                onChanged = { wallTick++ },
+                onBack = { openedLib = null },
+                onOpenMovie = { card, list, index ->
+                    pushOverlay(MediaOverlay.Detail(card, list, index))
+                },
+            )
+        }
     }
 
-    // 浮层栈：只渲染栈顶。返回 = 出栈，进详情/进"同演员作品" = 入栈
-    when (val top = overlays.lastOrNull()) {
+    // 浮层栈：只渲染栈顶。返回 = 出栈，进详情/进"同演员作品" = 入栈。进出都是淡入淡出溶解。
+    AnimatedContent(
+        targetState = overlays.lastOrNull(),
+        transitionSpec = {
+            // alpha 淡变是合成器最便宜的活、基本不掉帧（整屏平移在低端机必掉帧，换缓动都治不了本）。
+            //
+            // ★ 两边对称淡出/淡入是**经黑的假溶解**，录屏逐帧+截屏连拍实测（"退回作品页黑一下"）：
+            //   浮层页全是不透明纯黑底（作品页 Scaffold 是 Color.Black、详情页黑底），新页整层
+            //   淡入时它的黑底先上屏、背景图/海报要再等一两百毫秒才画出来；旧页若同时淡完，
+            //   中段整屏就只剩黑底（亮度实测 0.0）。所以**旧页退场放慢一倍**：它垫在底下一直
+            //   画到新页不透明盖严为止，黑窗被旧页画面和渐显的新页内容填满，没有全黑帧。
+            //   （不能用 ExitTransition.None 垫底——那在 AnimatedContent 里是"零时长退场"，
+            //   旧页第一帧就被拆掉，实测露出的是更下面的海报墙。）
+            //   例外：退到栈空（target=null，下面是海报墙）没有新页盖，保持对称淡出。
+            if (targetState == null) {
+                fadeIn(tween(DISSOLVE_IN_MS)) togetherWith fadeOut(tween(DISSOLVE_OUT_MS)) using SizeTransform(clip = false)
+            } else {
+                fadeIn(tween(DISSOLVE_IN_MS)) togetherWith fadeOut(tween(DISSOLVE_OUT_MS * 2)) using SizeTransform(clip = false)
+            }
+        },
+        // key 只认浮层实例自己的 id（创建后不变）：入栈/出栈换了实例 → id 变 → 走转场；
+        // 刮削写完原地换卡（overlays[at]=… 带着原 id）→ key 不变 → 只更新内容、不重播动画。
+        // ★ 千万别把栈深掺进来——出栈那一帧栈深就变了，转场里的旧页会被当成新内容重建（见 MediaOverlay.id 注释）
+        contentKey = { top -> top?.id ?: -1L },
+    ) { top -> Box(Modifier.fillMaxSize()) { when (top) {
         is MediaOverlay.Detail -> MediaDetailScreen(
             card = top.card,
             playlist = top.list,
             index = top.index,
             dao = dao,
             onDeleted = { wallTick++ },
-            onOpenWorks = { kind, name -> overlays.add(MediaOverlay.Works(kind, name)) },
+            onOpenWorks = { kind, name -> pushOverlay(MediaOverlay.Works(kind, name)) },
             // 点详情底部的推荐 → 再压一层详情；传的是那一批推荐，播完自动接下一部就在推荐里走
-            onOpenMovie = { c, l, i -> overlays.add(MediaOverlay.Detail(c, l, i)) },
-            onBack = { overlays.removeLastOrNull() },
+            onOpenMovie = { c, l, i -> pushOverlay(MediaOverlay.Detail(c, l, i)) },
+            // 刮削写完：mediaKey 可能已经变了（文件前缀 → tmdb-<id>，扫描器删旧行建新行），
+            // 详情页捧的还是旧卡 —— 按**不随 nfo 变的视频 pick_code** 把这条片重新认回来，
+            // 换掉栈顶这张卡（produceState 以 mediaKey 为 key，换了卡才会拿新数据重查）
+            onScraped = { newKey ->
+                wallTick++
+                scope.launch {
+                    val fixed = container.metadataScraper.resolveCard(top.card.videoPickCode, newKey)
+                    val at = overlays.indexOf(top)
+                    if (fixed != null && at >= 0) {
+                        // 带着原 id 原地换卡：contentKey 不变，只换内容、不重播进出场动画
+                        overlays[at] = MediaOverlay.Detail(fixed, top.list, top.index, top.id)
+                    }
+                }
+            },
+            onBack = { popOverlay() },
         )
 
-        is MediaOverlay.Works -> MediaWorksScreen(
-            kind = top.kind,
-            name = top.name,
-            dao = dao,
-            refreshKey = wallTick,
-            onChanged = { wallTick++ },
-            onBack = { overlays.removeLastOrNull() },
-            onOpenMovie = { card, list, index ->
-                overlays.add(MediaOverlay.Detail(card, list, index))
-            },
-        )
+        is MediaOverlay.Works -> {
+            val worksKey = top.kind to top.name
+            MediaWorksScreen(
+                kind = top.kind,
+                name = top.name,
+                dao = dao,
+                refreshKey = wallTick,
+                onChanged = { wallTick++ },
+                onBack = { popOverlay() },
+                onOpenMovie = { card, list, index ->
+                    pushOverlay(MediaOverlay.Detail(card, list, index))
+                },
+                initialCards = worksCache[worksKey].orEmpty(),
+                onCardsLoaded = { worksCache[worksKey] = it },
+            )
+        }
 
         is MediaOverlay.History -> WatchHistoryScreen(
             container = container,
-            onBack = { overlays.removeLastOrNull() },
+            onBack = { popOverlay() },
         )
 
         is MediaOverlay.ScanLog -> MediaScanLogScreen(
             dao = dao,
-            onOpenMovie = { card, list, index -> overlays.add(MediaOverlay.Detail(card, list, index)) },
-            onBack = { overlays.removeLastOrNull() },
+            onOpenMovie = { card, list, index -> pushOverlay(MediaOverlay.Detail(card, list, index)) },
+            onBack = { popOverlay() },
         )
 
         null -> Unit
+    }
+    }
     }
 
     // 拖动幻影：只在拎起来时挂。挂在 Popup 里所以独立于列表，列表滚动也不影响它的坐标
@@ -744,7 +846,7 @@ fun MediaLibraryScreen(api: com.open115.pad.data.OpenApi) {
         // 判据用 libraryId（每轮扫描都带着它）：早先只有 rootCid，库多根时对不齐。
         val scanningThis = scanProgress.running && scanProgress.libraryId == lib.id
         val queuedThis = pendingScans.any { it.libraryId == lib.id }
-        AlertDialog(
+        FadeAlertDialog(
             onDismissRequest = { deleteTarget = null },
             title = { Text("删除媒体库") },
             text = {
@@ -768,6 +870,65 @@ fun MediaLibraryScreen(api: com.open115.pad.data.OpenApi) {
                 }) { Text("删除") }
             },
             dismissButton = { TextButton(onClick = { deleteTarget = null }) { Text("取消") } },
+        )
+    }
+    // 刮削批量面板：数据都在 scraper 的会话里（切页回来还在、跑完自己停），这里只负责盖在最上层
+    val scrapeSession by container.metadataScraper.session.collectAsState()
+    // 剧照张数（设置 → 实验室；0 = 不限制）：确认框的勾选文案跟着当前设置走
+    val scrapeStillsMax by container.mediaPrefs.scrapeStillsMax.collectAsState(initial = MediaPrefs.DEFAULT_SCRAPE_STILLS_MAX)
+    // 批量跑完把海报墙/库卡片的数字刷一次（数据是被别的引擎改的，墙只看 refreshKey）
+    LaunchedEffect(scrapeSession?.finished) {
+        if (scrapeSession?.finished == true) wallTick++
+    }
+    if (scrapeSession != null) {
+        FadeIn(Modifier.fillMaxSize()) {
+            ScrapeBatchPanel(scraper = container.metadataScraper, onClose = { container.metadataScraper.closeSession() })
+        }
+    }
+
+    scrapeAsk?.let { lib ->
+        FadeAlertDialog(
+            onDismissRequest = { scrapeAsk = null },
+            title = { Text("补全缺失元数据（刮削）") },
+            text = {
+                Column {
+                    Text(
+                        // listOfNotNull + joinToString：字符串拼接里的 if 会吞掉后面几段（踩过的坑）
+                        listOfNotNull(
+                            "为「${lib.name}」里没有 nfo 的影片搜元数据（TMDB），确认后写回云端（nfo + 海报 + 背景图）。",
+                            "已经有 nfo 的影片一律跳过，不动流水线刮好的成果。",
+                            when {
+                                scrapeCount < 0 -> "\n正在统计待补数量…"
+                                scrapeCount == 0 -> "\n这个库里没有需要补元数据的影片。"
+                                else -> "\n待补 $scrapeCount 部。搜完先在面板里核对候选、勾选，再点「写入选中」。"
+                            },
+                        ).joinToString("\n"),
+                    )
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Checkbox(
+                            checked = scrapeExtras,
+                            onCheckedChange = { scrapeExtras = it },
+                        )
+                        Text(
+                            "同时刮剧照（每部${if (scrapeStillsMax == MediaPrefs.SCRAPE_STILLS_UNLIMITED) "不限制张数，源里全部按赞数排序取回" else "按赞数取前 $scrapeStillsMax 张"}存各自专属目录，会多花不少时间）",
+                            fontSize = 12.sp,
+                            modifier = Modifier.weight(1f),
+                        )
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(
+                    enabled = scrapeCount > 0,
+                    onClick = {
+                        val target = scrapeAsk ?: return@TextButton
+                        val extras = scrapeExtras
+                        scrapeAsk = null
+                        container.metadataScraper.startBatch(target, withStills = extras)
+                    },
+                ) { Text("开始搜索") }
+            },
+            dismissButton = { TextButton(onClick = { scrapeAsk = null }) { Text("取消") } },
         )
     }
     }   // 极光底 Box 收尾
@@ -796,6 +957,7 @@ private suspend fun deleteLibraryFully(
     val paths = lib.rootPaths
     val nfoCodes = mutableListOf<String>()
     val imageCodes = mutableListOf<String>()
+    val videoCodes = mutableListOf<String>()
     // 逐根处理而不是拼 5 参数 SQL：多根库本来就少见，循环更简单也不会踩 SQLite 变量上限
     paths.forEach { prefix ->
         dao.pickCodesInPath(prefix).forEach { p ->
@@ -803,6 +965,7 @@ private suspend fun deleteLibraryFully(
             p.posterPickCode?.let(imageCodes::add)
             p.fanartPickCode?.let(imageCodes::add)
             p.thumbPickCode?.let(imageCodes::add)
+            p.videoPickCode?.let(videoCodes::add)
         }
         dao.deleteLibraryContent(prefix)
     }
@@ -815,6 +978,8 @@ private suspend fun deleteLibraryFully(
     // nfo 的 key 是 `nfo|v<解析器版本>|<pickCode>|<upt>`，清 "nfo|" 会把别的库的 nfo 一起清掉。
     container.mediaCache.invalidateAll(nfoCodes.distinct().map { MediaScanner.nfoCachePrefix(it) })
     container.imageUrlResolver.evictPosterCache(imageCodes, container.cacheDir)
+    // 预览图缓存（封面 + 预览条）按视频 pick_code 键，不删的话整库永久变垃圾（只能等上限淘汰）
+    if (videoCodes.isNotEmpty()) container.videoPreviews.deleteFor(videoCodes)
 }
 
 /**
@@ -889,6 +1054,8 @@ private fun LibraryCell(
     host: LibraryDragHost,
     onOpen: () -> Unit,
     onScan: (ScanMode) -> Unit,
+    /** 批量「补全缺失元数据」（TMDB 刮削），见 LibraryCard 的同名参数 */
+    onScrape: () -> Unit,
     onEdit: () -> Unit,
     onDelete: () -> Unit,
     onDrop: (fromId: Long, hoverId: Long) -> Unit,
@@ -915,6 +1082,7 @@ private fun LibraryCell(
             highlighted = host.hoverId == lib.id && host.draggingId != lib.id,
             onOpen = onOpen,
             onScan = onScan,
+            onScrape = onScrape,
             onEdit = onEdit,
             onDelete = onDelete,
             modifier = Modifier.fillMaxWidth(),
@@ -957,6 +1125,8 @@ private fun LibraryCard(
     highlighted: Boolean = false,
     onOpen: () -> Unit,
     onScan: (ScanMode) -> Unit,
+    /** 批量「补全缺失元数据」（TMDB 刮削）：先数数量再开跑，见页面里的确认框 */
+    onScrape: () -> Unit,
     onEdit: () -> Unit,
     onDelete: () -> Unit,
     modifier: Modifier = Modifier,
@@ -1072,6 +1242,13 @@ private fun LibraryCard(
                         onClick = {
                             menuOpen = false
                             onScan(ScanMode.Full)
+                        },
+                    )
+                    DropdownMenuItem(
+                        text = { Text("补全缺失元数据（刮削）") },
+                        onClick = {
+                            menuOpen = false
+                            onScrape()
                         },
                     )
                     DropdownMenuItem(
@@ -1440,7 +1617,7 @@ private fun LibraryEditDialog(
     // 上限 30 天：再大就等于"关了"，不如直接留空（留空 = 不限间隔）
     val intervalHours = intervalText.toIntOrNull()?.coerceIn(1, 24 * 30) ?: 0
 
-    AlertDialog(
+    FadeAlertDialog(
         onDismissRequest = onDismiss,
         title = { Text(title) },
         text = {
@@ -1871,18 +2048,43 @@ private const val QUEUE_ROWS_SHOWN = 4
  * 详情页之上还能再叠"同演员/同标签的作品"页，所以这里不是单个变量而是一个栈。
  */
 private sealed interface MediaOverlay {
+    /**
+     * 每个实例一个**创建后不变**的 id，AnimatedContent 的 contentKey 只认它。
+     *
+     * ☠ 不能用「栈深 + 类型」当 key：出栈那一帧栈深就变了，**还在转场里的旧页** key 跟着变，
+     * AnimatedContent 把它当成"出现了新内容"就地重建——详情页重建成加载态（data==null，
+     * 整屏黑底+转圈）盖住一切，这就是"退回作品页黑一下"的真身（录屏逐帧抓到的白点就是转圈）。
+     */
+    val id: Long
+
     /** 影片/系列详情（[list] 是它所在的列表，播完自动接下一部就是按它排的） */
-    data class Detail(val card: MovieCard, val list: List<MovieCard>, val index: Int) : MediaOverlay
+    data class Detail(
+        val card: MovieCard,
+        val list: List<MovieCard>,
+        val index: Int,
+        override val id: Long = newOverlayId(),
+    ) : MediaOverlay
 
     /** 同一个演员 / 同一个标签的全部作品（**跨所有媒体库**，见 dao.byActor/byTag） */
-    data class Works(val kind: WorksKind, val name: String) : MediaOverlay
+    data class Works(
+        val kind: WorksKind,
+        val name: String,
+        override val id: Long = newOverlayId(),
+    ) : MediaOverlay
 
     /** 观影历史（媒体库这一库线自己的记录；文件页的播放不走这里，那边看操作记录） */
-    object History : MediaOverlay
+    object History : MediaOverlay {
+        override val id: Long = 1L
+    }
 
     /** 扫描记录（何时扫的哪个库、结果、新增了哪些片——带海报图） */
-    object ScanLog : MediaOverlay
+    object ScanLog : MediaOverlay {
+        override val id: Long = 2L
+    }
 }
+
+/** 浮层实例 id 发号器：nanoTime 足够唯一（同一进程内不会重复） */
+private fun newOverlayId(): Long = System.nanoTime()
 
 
 // ---------------- 库卡片拖动排序 ----------------

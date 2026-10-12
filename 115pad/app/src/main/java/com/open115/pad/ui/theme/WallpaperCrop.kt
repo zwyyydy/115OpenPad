@@ -50,8 +50,6 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.window.Dialog
-import androidx.compose.ui.window.DialogProperties
 import coil.imageLoader
 import coil.request.ImageRequest
 import kotlinx.coroutines.Dispatchers
@@ -108,11 +106,17 @@ fun WallpaperCropFlow(
         decodeFailed = source == null
     }
 
-    Dialog(
-        onDismissRequest = onCancelled,
-        properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false),
+    // 页面内全屏浮层（**不是 Dialog**）：Dialog 是独立窗口、铺不进状态栏底下，顶部会漏一条缝
+    // 露出宿主页面 —— 剧照浏览器/图片画廊踩过同一个坑后改的浮层，这里照方抓药。
+    // 浮层跟着 Activity 铺满整个窗口（App 全局沉浸），顶栏/底栏各自 statusBars/navigationBars
+    // padding 让位，就不漏缝了。返回键：浮层是后组合的，BackHandler 优先级高于宿主，拦截 = 取消。
+    androidx.activity.compose.BackHandler(onBack = onCancelled)
+    // 空的 pointerInput 挡命中：浮层不是模态窗口，不加它的话顶栏/底栏按钮之间的空隙
+    // 点击会穿透到宿主页面的按键上（Dialog 那会儿不存在这个问题）
+    Surface(
+        Modifier.fillMaxSize().pointerInput(Unit) {},
+        color = Color(0xFF0E0F12),
     ) {
-        Surface(Modifier.fillMaxSize(), color = Color(0xFF0E0F12)) {
             when {
                 source == null -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                     if (decodeFailed) {
@@ -204,7 +208,6 @@ fun WallpaperCropFlow(
                 }
             }
         }
-    }
 }
 
 /** 单步裁切的变换状态：缩放 + 平移（graphicsLayer 围绕中心应用） */

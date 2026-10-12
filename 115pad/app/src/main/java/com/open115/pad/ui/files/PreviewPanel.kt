@@ -44,6 +44,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import coil.compose.AsyncImage
+import androidx.compose.runtime.rememberCoroutineScope
 import com.open115.pad.data.FileItem
 import com.open115.pad.data.PreviewBuilder
 import com.open115.pad.data.VideoPreviewStore
@@ -51,6 +52,9 @@ import com.open115.pad.ui.theme.AppChip
 import com.open115.pad.ui.theme.AppColors
 import com.open115.pad.ui.components.VideoStrip
 import com.open115.pad.util.Format
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 /** 从文件页哪个目录发起批量生成预览图 */
 data class PreviewRequest(val cid: String, val path: String)
@@ -73,14 +77,15 @@ fun PreviewPanel(
     onDismiss: () -> Unit,
 ) {
     val progress by builder.progress.collectAsState()
+    val scope = rememberCoroutineScope()
     /** 缓存占用（每轮跑完/清空后重算一次，不用实时订阅） */
     var cacheBytes by remember { mutableStateOf(0L) }
     var recursive by remember { mutableStateOf(true) }
 
     // 占用只在"进面板"和"跑完"这两个时刻算（列一次目录）；跑的过程中用引擎累加的字节数，
-    // 别每生成一张就 listFiles 一遍（那是在主线程上做 IO）
+    // 别每生成一张就 listFiles 一遍。sizeBytes/clear 都是列目录的重 IO，放 IO 上走。
     LaunchedEffect(progress.finishedAt, progress.running) {
-        if (!progress.running) cacheBytes = store.sizeBytes()
+        if (!progress.running) cacheBytes = withContext(Dispatchers.IO) { store.sizeBytes() }
     }
 
     BackHandler { onDismiss() }
@@ -115,8 +120,9 @@ fun PreviewPanel(
                     store = store,
                     cacheBytes = cacheBytes,
                     onClearCache = {
-                        store.clear()
-                        cacheBytes = store.sizeBytes()
+                        scope.launch {
+                            cacheBytes = withContext(Dispatchers.IO) { store.clear(); store.sizeBytes() }
+                        }
                     },
                 )
 
@@ -127,8 +133,9 @@ fun PreviewPanel(
                     cacheBytes = cacheBytes,
                     onStart = { builder.start(request.cid, request.path, recursive) },
                     onClearCache = {
-                        store.clear()
-                        cacheBytes = store.sizeBytes()
+                        scope.launch {
+                            cacheBytes = withContext(Dispatchers.IO) { store.clear(); store.sizeBytes() }
+                        }
                     },
                 )
             }

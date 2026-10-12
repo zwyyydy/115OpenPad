@@ -42,6 +42,8 @@ class VideoPreviewStore(
      * 预览条目录、把 `vs_<hash>_<i>.jpg` 解成"每个哈希有几张"，之后只在写入时失效重算。
      */
     @Volatile
+    // volatile 是必须的：index() 会从 IO 线程重建（VideoStrip 把 stripCount 挪出了主线程），
+    // map 整体构建完才发布，volatile 保证发布后的可见性
     private var stripIndex: Map<Int, Int>? = null
 
     /** 封面缓存目录（设置页算占用/清理共用同一份定义） */
@@ -91,6 +93,7 @@ class VideoPreviewStore(
             prune()
             f
         } catch (e: Exception) {
+            android.util.Log.w("VideoPreviewStore", "写预览封面失败 $pickCode（磁盘满/权限？）", e)
             null
         }
     }
@@ -113,6 +116,7 @@ class VideoPreviewStore(
                 f.setLastModified(System.currentTimeMillis())
                 true
             } catch (e: Exception) {
+                android.util.Log.w("VideoPreviewStore", "写预览条失败 $pickCode#$i（磁盘满/权限？）", e)
                 false
             }
             if (ok) written++

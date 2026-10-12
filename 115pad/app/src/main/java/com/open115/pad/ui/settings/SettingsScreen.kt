@@ -8,6 +8,8 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.material3.Button
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -32,12 +34,18 @@ import androidx.compose.material.icons.outlined.ExpandLess
 import androidx.compose.material.icons.outlined.Info
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.Surface
+import androidx.compose.ui.window.Dialog
+import com.open115.pad.data.media.scrape.AiPromptTemplate
+import androidx.compose.material.icons.outlined.Delete
+import androidx.compose.material.icons.outlined.Edit
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Switch
@@ -50,6 +58,13 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.expandVertically
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.shrinkVertically
+import androidx.compose.runtime.key
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -78,6 +93,7 @@ import com.open115.pad.data.UserInfo
 import com.open115.pad.data.media.PadSync
 import com.open115.pad.data.media.ActorAvatarSource
 import com.open115.pad.ui.components.ConfirmDialog
+import com.open115.pad.ui.components.FadeIn
 import com.open115.pad.ui.components.FolderPickerDialog
 import com.open115.pad.ui.components.TextEntryDialog
 import com.open115.pad.ui.theme.AppChip
@@ -91,6 +107,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlin.math.roundToInt
+import com.open115.pad.ui.components.FadeAlertDialog
 
 // 探活（AppRoot 启动）也会写入，故放开为 internal
 internal object UserInfoCache {
@@ -222,7 +239,8 @@ fun SettingsScreen(container: AppContainer) {
     val miniProgress by container.playerPrefs.alwaysShowMiniProgress.collectAsState(initial = true)
     val playerCacheEnabled by container.playerPrefs.cacheEnabled.collectAsState(initial = true)
     val playerCacheMaxMb by container.playerPrefs.cacheMaxMb.collectAsState(initial = 2048)
-    val previewCacheMaxMb by container.previewPrefs.maxMb
+    val playerPrefetchEnabled by container.playerPrefs.prefetchEnabled.collectAsState(initial = true)
+        val previewCacheMaxMb by container.previewPrefs.maxMb
         .collectAsState(initial = com.open115.pad.data.PreviewPrefs.DEFAULT_MAX_MB)
     val showClock by container.playerPrefs.showClock.collectAsState(initial = true)
     val showBattery by container.playerPrefs.showBattery.collectAsState(initial = true)
@@ -271,6 +289,62 @@ fun SettingsScreen(container: AppContainer) {
     val avatarCoverageTotal by container.mediaPrefs.avatarCoverageTotal.collectAsState(initial = 0)
     var avatarRefreshing by remember { mutableStateOf(false) }
     var avatarError by remember { mutableStateOf("") }
+    // ---- 元数据刮削（TMDB）----
+    val tmdbApiBase by container.mediaPrefs.scrapeTmdbApiBase
+        .collectAsState(initial = com.open115.pad.data.media.MediaPrefs.DEFAULT_TMDB_API_BASE)
+    val tmdbImageBase by container.mediaPrefs.scrapeTmdbImageBase
+        .collectAsState(initial = com.open115.pad.data.media.MediaPrefs.DEFAULT_TMDB_IMAGE_BASE)
+    val tmdbApiKey by container.mediaPrefs.scrapeTmdbApiKey.collectAsState(initial = "")
+    val tmdbProxy by container.mediaPrefs.scrapeProxy.collectAsState(initial = "")
+    // 剧照张数上限（0 = 不限制，源给多少存多少）
+    val scrapeStillsMax by container.mediaPrefs.scrapeStillsMax.collectAsState(
+        initial = com.open115.pad.data.media.MediaPrefs.DEFAULT_SCRAPE_STILLS_MAX,
+    )
+    // 搜完 5 秒无操作自动刮第一条（默认关）
+    val scrapeAutoFirst by container.mediaPrefs.scrapeAutoFirst.collectAsState(initial = false)
+    // ---- AI 检索词（可选）----
+    val aiEndpoint by container.mediaPrefs.aiEndpoint.collectAsState(initial = "")
+    val aiApiKey by container.mediaPrefs.aiApiKey.collectAsState(initial = "")
+    val aiModel by container.mediaPrefs.aiModel.collectAsState(initial = "")
+    val aiCustomTemplates by container.mediaPrefs.aiCustomTemplates.collectAsState(initial = emptyList())
+    val aiScrapeTpl by container.mediaPrefs.aiScrapeTemplate.collectAsState(
+        initial = com.open115.pad.data.media.scrape.AiPromptTemplates.SCRAPE_QUERY,
+    )
+    val aiRenameTpl by container.mediaPrefs.aiRenameTemplate.collectAsState(
+        initial = com.open115.pad.data.media.scrape.AiPromptTemplates.RENAME_CLEAN,
+    )
+    val aiTemplateOptions = remember(aiCustomTemplates) {
+        com.open115.pad.data.media.scrape.AiPromptTemplates.all(aiCustomTemplates).map { it.name to it.id }
+    }
+    var showAiTemplates by remember { mutableStateOf(false) }
+
+    // ---- 元数据源(插件)：TMDB + HTTP 服务源 + 用户 JS 源（App 内建 + 扫描目录 .js）----
+    val jsSources by container.mediaPrefs.jsSources.collectAsState(initial = emptyList())
+    val selectedSourceId by container.mediaPrefs.selectedSourceId.collectAsState(initial = "tmdb")
+    val jsSourcesDir by container.mediaPrefs.jsSourcesDir.collectAsState(initial = "")
+    val metatubeUrl by container.mediaPrefs.metatubeUrl.collectAsState(initial = "")
+    val metatubeToken by container.mediaPrefs.metatubeToken.collectAsState(initial = "")
+    var showSourceManager by remember { mutableStateOf(false) }
+    val jsDirPicker = androidx.activity.compose.rememberLauncherForActivityResult(
+        androidx.activity.result.contract.ActivityResultContracts.OpenDocumentTree(),
+    ) { uri ->
+        if (uri != null) {
+            runCatching {
+                context.contentResolver.takePersistableUriPermission(
+                    uri, android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION,
+                )
+            }
+            scope.launch { container.mediaPrefs.setJsSourcesDir(uri.toString()) }
+        }
+    }
+    // 当前源可选项：TMDB + HTTP 服务源（配了地址才有）+ 已启用 JS 源（编辑器里的）+ 目录扫描的（这里只列编辑器源，扫描的进管理器看）
+    val sourceOptions = remember(jsSources, metatubeUrl) {
+        buildList {
+            add("TMDB（内置）" to "tmdb")
+            if (metatubeUrl.isNotBlank()) add("HTTP 服务源" to "metatube")
+            jsSources.filter { it.enabled }.forEach { add(it.name to it.id) }
+        }
+    }
 
     /**
      * 拉头像索引 + 建本地紧凑索引 + 算覆盖率。
@@ -318,13 +392,18 @@ fun SettingsScreen(container: AppContainer) {
     var cacheUsageKey by remember { mutableIntStateOf(0) }
     var usage by remember { mutableStateOf(CacheUsage()) }
     LaunchedEffect(cacheUsageKey) {
-        usage = CacheUsage(
-            mediaTextBytes = container.mediaCache.sizeBytes(),
-            mediaPosterBytes = ImageUrlResolver.mediaCacheSizeBytes(container.cacheDir),
-            hugeBytes = ImageUrlResolver.hugeCacheSizeBytes(context.cacheDir),
-            previewBytes = container.videoPreviews.sizeBytes(),
-            imageBytes = withContext(Dispatchers.IO) { coilCacheBytes(context) },
-        )
+        // 全部读盘、算大小都在 IO 上：海报/预览目录几万文件时，这几个 listFiles+sum 在主线程
+        // 会让进设置页、清完缓存那一刻卡住
+        usage = withContext(Dispatchers.IO) {
+            CacheUsage(
+                mediaTextBytes = container.mediaCache.sizeBytes(),
+                mediaPosterBytes = ImageUrlResolver.mediaCacheSizeBytes(container.cacheDir),
+                hugeBytes = ImageUrlResolver.hugeCacheSizeBytes(context.cacheDir),
+                previewBytes = container.videoPreviews.sizeBytes(),
+                imageBytes = coilCacheBytes(context),
+                videoBytes = com.open115.pad.player.PlayerCache.sizeBytes(context),
+            )
+        }
     }
     LaunchedEffect(Unit) { clientId = container.session.currentClientId() }
 
@@ -368,18 +447,31 @@ fun SettingsScreen(container: AppContainer) {
         if (uri != null) cropUri = uri.toString()
     }
 
-    // 裁切流程浮层：横竖各裁一次，全部完成才落壁纸偏好
-    cropUri?.let { picked ->
-        com.open115.pad.ui.theme.WallpaperCropFlow(
-            uri = picked,
-            onFinished = {
-                scope.launch {
-                    container.appPrefs.setWallpaper(com.open115.pad.ui.theme.wallpaperBasePath(context))
-                }
-                cropUri = null
-            },
-            onCancelled = { cropUri = null },
-        )
+    // ---- 磁力搜索（MCP，云下载配套）----
+    val labMagnetEnabled by container.playerPrefs.labMagnetEnabled.collectAsState(initial = false)
+    val labMagnetEndpoint by container.playerPrefs.labMagnetEndpoint.collectAsState(
+        initial = com.open115.pad.data.PlayerPrefs.MAGNET_ENDPOINT_DEFAULT,
+    )
+    val labMagnetToken by container.playerPrefs.labMagnetToken.collectAsState(initial = "")
+    var magnetTestNote by remember { mutableStateOf("") }
+    var magnetTesting by remember { mutableStateOf(false) }
+    fun testMagnet() {
+        if (magnetTesting) return
+        magnetTesting = true
+        magnetTestNote = "测试中…"
+        scope.launch {
+            try {
+                magnetTestNote = com.open115.pad.data.mcp.MagnetSearchClient(
+                    endpoint = labMagnetEndpoint.ifBlank { com.open115.pad.data.PlayerPrefs.MAGNET_ENDPOINT_DEFAULT },
+                    token = labMagnetToken.trim(),
+                    http = container.okHttpClient,
+                ).test()
+            } catch (e: Exception) {
+                magnetTestNote = "连接失败：${e.message ?: e.javaClass.simpleName}"
+            } finally {
+                magnetTesting = false
+            }
+        }
     }
 
     val sections = listOf(
@@ -465,6 +557,7 @@ fun SettingsScreen(container: AppContainer) {
         storageSection(
             playerCacheEnabled = playerCacheEnabled,
             playerCacheMaxMb = playerCacheMaxMb,
+            playerPrefetchEnabled = playerPrefetchEnabled,
             previewCacheMaxMb = previewCacheMaxMb,
             mediaCacheEnabled = mediaCacheEnabled,
             mediaCacheMaxMb = mediaCacheMaxMb,
@@ -472,23 +565,37 @@ fun SettingsScreen(container: AppContainer) {
             usage = usage,
             onPlayerCacheEnabled = { v -> scope.launch { container.playerPrefs.setCacheEnabled(v) } },
             onPlayerCacheMaxMb = { mb -> scope.launch { container.playerPrefs.setCacheMaxMb(mb) } },
+            onPlayerPrefetchEnabled = { v -> scope.launch { container.playerPrefs.setPrefetchEnabled(v) } },
+            onClearPlayerCache = {
+                scope.launch {
+                    // 同步删（IO 线程）：删完再重算占用，否则会显示成"还没删掉"的旧值
+                    withContext(Dispatchers.IO) { com.open115.pad.player.PlayerCache.clear(context) }
+                    cacheUsageKey++
+                }
+            },
             onMediaCacheEnabled = { v -> scope.launch { container.mediaPrefs.setCacheEnabled(v) } },
             onMediaCacheMaxMb = { mb -> scope.launch { container.mediaPrefs.setCacheMaxMb(mb) } },
             onClearMedia = {
                 scope.launch {
-                    container.mediaCache.clear()
-                    ImageUrlResolver.clearMediaCache(container.cacheDir)
+                    withContext(Dispatchers.IO) {
+                        container.mediaCache.clear()
+                        ImageUrlResolver.clearMediaCache(container.cacheDir)
+                    }
                     cacheUsageKey++
                 }
             },
             onClearHuge = {
-                ImageUrlResolver.clearHugeCache(context.cacheDir)
-                cacheUsageKey++
+                scope.launch {
+                    withContext(Dispatchers.IO) { ImageUrlResolver.clearHugeCache(context.cacheDir) }
+                    cacheUsageKey++
+                }
             },
             onPreviewCacheMaxMb = { v -> scope.launch { container.previewPrefs.setMaxMb(v) } },
             onClearPreview = {
-                container.videoPreviews.clear()
-                cacheUsageKey++
+                scope.launch {
+                    withContext(Dispatchers.IO) { container.videoPreviews.clear() }
+                    cacheUsageKey++
+                }
             },
             onClearImage = {
                 scope.launch {
@@ -559,6 +666,48 @@ fun SettingsScreen(container: AppContainer) {
             onAvatarSourceEnabled = { v -> scope.launch { container.mediaPrefs.setAvatarSourceEnabled(v) } },
             onAvatarSourceUrl = { v -> scope.launch { container.mediaPrefs.setAvatarSourceUrl(v) } },
             onRefreshAvatarIndex = { refreshAvatarIndex() },
+            tmdbApiBase = tmdbApiBase,
+            tmdbImageBase = tmdbImageBase,
+            tmdbApiKey = tmdbApiKey,
+            tmdbProxy = tmdbProxy,
+            onTmdbApiBase = { v -> scope.launch { container.mediaPrefs.setScrapeTmdbApiBase(v) } },
+            onTmdbImageBase = { v -> scope.launch { container.mediaPrefs.setScrapeTmdbImageBase(v) } },
+            onTmdbApiKey = { v -> scope.launch { container.mediaPrefs.setScrapeTmdbApiKey(v) } },
+            onTmdbProxy = { v -> scope.launch { container.mediaPrefs.setScrapeProxy(v) } },
+            metatubeUrl = metatubeUrl,
+            metatubeToken = metatubeToken,
+            onMetatubeUrl = { v -> scope.launch { container.mediaPrefs.setMetatubeUrl(v) } },
+            onMetatubeToken = { v -> scope.launch { container.mediaPrefs.setMetatubeToken(v) } },
+            scrapeStillsMax = scrapeStillsMax,
+            onScrapeStillsMax = { v -> scope.launch { container.mediaPrefs.setScrapeStillsMax(v) } },
+            scrapeAutoFirst = scrapeAutoFirst,
+            onScrapeAutoFirst = { v -> scope.launch { container.mediaPrefs.setScrapeAutoFirst(v) } },
+            aiEndpoint = aiEndpoint,
+            aiApiKey = aiApiKey,
+            aiModel = aiModel,
+            aiTemplateOptions = aiTemplateOptions,
+            aiScrapeTpl = aiScrapeTpl,
+            aiRenameTpl = aiRenameTpl,
+            onAiEndpoint = { v -> scope.launch { container.mediaPrefs.setAiEndpoint(v) } },
+            onAiApiKey = { v -> scope.launch { container.mediaPrefs.setAiApiKey(v) } },
+            onAiModel = { v -> scope.launch { container.mediaPrefs.setAiModel(v) } },
+            onAiScrapeTpl = { v -> scope.launch { container.mediaPrefs.setAiScrapeTemplate(v) } },
+            onAiRenameTpl = { v -> scope.launch { container.mediaPrefs.setAiRenameTemplate(v) } },
+            onManageTemplates = { showAiTemplates = true },
+            sourceOptions = sourceOptions,
+            selectedSourceId = selectedSourceId,
+            jsDirLabel = if (jsSourcesDir.isBlank()) "未设置（点选一个本地文件夹）" else "已设置：${jsSourcesDir.substringAfterLast('/').ifBlank { jsSourcesDir }}",
+            onSetSource = { v -> scope.launch { container.mediaPrefs.setSelectedSourceId(v) } },
+            onManageSources = { showSourceManager = true },
+            onPickJsDir = { jsDirPicker.launch(null) },
+            labMagnetEnabled = labMagnetEnabled,
+            labMagnetEndpoint = labMagnetEndpoint,
+            labMagnetToken = labMagnetToken,
+            magnetTestNote = magnetTestNote,
+            onLabMagnetEnabled = { v -> scope.launch { container.playerPrefs.setLabMagnetEnabled(v) } },
+            onLabMagnetEndpoint = { v -> scope.launch { container.playerPrefs.setLabMagnetEndpoint(v) } },
+            onLabMagnetToken = { v -> scope.launch { container.playerPrefs.setLabMagnetToken(v) } },
+            onTestMagnet = { testMagnet() },
         ),
         accountSection(
             clientId = clientId,
@@ -590,7 +739,11 @@ fun SettingsScreen(container: AppContainer) {
             compact -> Column(Modifier.fillMaxSize()) {
                 BackHandler { phoneOpened = false }
                 PaneHeader(current.category.label) { phoneOpened = false }
-                SettingsPane(current, showTitle = false, modifier = Modifier.fillMaxSize())
+                key(current.category) {
+                    FadeIn(Modifier.fillMaxSize()) {
+                        SettingsPane(current, showTitle = false, modifier = Modifier.fillMaxSize())
+                    }
+                }
             }
 
             // 平板：左分类 + 右内容，整页收进 920dp 居中，不让行被拉到屏幕两端
@@ -609,7 +762,11 @@ fun SettingsScreen(container: AppContainer) {
                         modifier = Modifier.width(240.dp).fillMaxHeight(),
                     )
                     VerticalDivider(color = AppColors.Divider)
-                    SettingsPane(current, showTitle = true, modifier = Modifier.weight(1f).fillMaxHeight())
+                    key(current.category) {
+                        FadeIn(Modifier.weight(1f).fillMaxHeight()) {
+                            SettingsPane(current, showTitle = true, modifier = Modifier.fillMaxSize())
+                        }
+                    }
                 }
             }
         }
@@ -654,6 +811,27 @@ fun SettingsScreen(container: AppContainer) {
         )
     }
 
+    if (showAiTemplates) {
+        AiTemplatesDialog(
+            templates = com.open115.pad.data.media.scrape.AiPromptTemplates.all(aiCustomTemplates),
+            onDismiss = { showAiTemplates = false },
+            onCreate = { name, prompt -> scope.launch { container.mediaPrefs.addAiTemplate(name, prompt) } },
+            onUpdate = { id, name, prompt -> scope.launch { container.mediaPrefs.updateAiTemplate(id, name, prompt) } },
+            onDelete = { id -> scope.launch { container.mediaPrefs.deleteAiTemplate(id) } },
+        )
+    }
+
+    if (showSourceManager) {
+        ScrapeSourceManagerDialog(
+            sources = jsSources,
+            onDismiss = { showSourceManager = false },
+            onCreate = { name, code -> scope.launch { container.mediaPrefs.addJsSource(name, code) } },
+            onUpdate = { id, name, code -> scope.launch { container.mediaPrefs.updateJsSource(id, name, code) } },
+            onDelete = { id -> scope.launch { container.mediaPrefs.deleteJsSource(id) } },
+            onToggle = { id, on -> scope.launch { container.mediaPrefs.setJsSourceEnabled(id, on) } },
+        )
+    }
+
     if (showPadPickDir) {
         FolderPickerDialog(
             api = container.openApi,
@@ -676,6 +854,23 @@ fun SettingsScreen(container: AppContainer) {
                 // 与头像索引那条一样用 Toast：设置页没有自己的 SnackbarHost
                 android.widget.Toast.makeText(context, report.note, android.widget.Toast.LENGTH_LONG).show()
             },
+        )
+    }
+
+    // 裁切流程浮层：横竖各裁一次，全部完成才落壁纸偏好。
+    // 必须放在主布局**之后**发射：它不是 Dialog、跟主布局是同一个容器 Box 里的兄弟节点，
+    // Box 按组合顺序绘制——放在前面会被整页设置内容压在底下（ WallpaperCropFlow 的 BackHandler
+    // 也靠后组合才抢得到返回键）
+    cropUri?.let { picked ->
+        com.open115.pad.ui.theme.WallpaperCropFlow(
+            uri = picked,
+            onFinished = {
+                scope.launch {
+                    container.appPrefs.setWallpaper(com.open115.pad.ui.theme.wallpaperBasePath(context))
+                }
+                cropUri = null
+            },
+            onCancelled = { cropUri = null },
         )
     }
 }
@@ -848,7 +1043,7 @@ private fun TextRow(item: TextItem) {
         )
     }
     if (editing) {
-        AlertDialog(
+        FadeAlertDialog(
             onDismissRequest = { editing = false },
             title = { Text(item.title) },
             text = {
@@ -931,7 +1126,11 @@ private fun ItemShell(
             }
             trailing?.invoke()
         }
-        if (expanded) {
+        AnimatedVisibility(
+            visible = expanded,
+            enter = fadeIn(tween(150)) + expandVertically(tween(150)),
+            exit = fadeOut(tween(120)) + shrinkVertically(tween(120)),
+        ) {
             item.detail?.let {
                 Text(
                     it,
@@ -1480,9 +1679,13 @@ private fun backupSection(
     }
 }
 
+/** 「动态」挡位在滑块上的位置：就是 PlayerCache.CACHE_DYNAMIC（4096 + 一格 128） */
+private const val DYN_POS = com.open115.pad.player.PlayerCache.CACHE_DYNAMIC
+
 private fun storageSection(
     playerCacheEnabled: Boolean,
     playerCacheMaxMb: Int,
+    playerPrefetchEnabled: Boolean,
     previewCacheMaxMb: Int,
     mediaCacheEnabled: Boolean,
     mediaCacheMaxMb: Long,
@@ -1490,6 +1693,9 @@ private fun storageSection(
     usage: CacheUsage,
     onPlayerCacheEnabled: (Boolean) -> Unit,
     onPlayerCacheMaxMb: (Int) -> Unit,
+    onPlayerPrefetchEnabled: (Boolean) -> Unit,
+    /** 清空播放缓存（播放器下载的视频分片） */
+    onClearPlayerCache: () -> Unit,
     onMediaCacheEnabled: (Boolean) -> Unit,
     onMediaCacheMaxMb: (Long) -> Unit,
     onClearMedia: () -> Unit,
@@ -1503,27 +1709,70 @@ private fun storageSection(
     val mp = com.open115.pad.data.media.MediaPrefs
     val pp = com.open115.pad.data.PreviewPrefs
     return section(SettingsCategory.STORAGE) {
-        // 播放缓存没有「占用 / 清除」行是刻意的：它只在单次播放会话内有效，退出播放器就清空，
-        // 占用永远接近 0，显示出来只会让人以为没生效。开关与上限留着（会话内的回退、切档预载要用）
         group("播放")
         switch(
             id = "player_cache",
             title = "播放缓存",
-            subtitle = "已播内容缓存到本机，本次播放内回退进度零等待",
-            detail = "播放地址每次进入都会更换签名，上次播放的缓存对新地址无效 —— " +
-                "所以退出播放器时会整个清空，只服务本次播放。达到上限自动清理最旧的分片。",
+            subtitle = "看过的内容缓存到本机：往回拖进度、重新进同一部片都直接读缓存",
+            detail = "115 的播放地址每次请求都换签名，缓存改按内容标识（文件 sha1 + 档位 + 分片号）存放，" +
+                "所以换地址、退出重进都能复用；超过上限自动淘汰最久没用到的那批分片。登出会整个清空。" +
+                "「预下载」决定要不要主动往后灌满这些空间。",
             checked = playerCacheEnabled,
             onChange = onPlayerCacheEnabled,
         )
         slider(
             id = "player_cache_max",
             title = "缓存上限",
-            valueText = "$playerCacheMaxMb MB",
-            value = playerCacheMaxMb.toFloat(),
-            range = 256f..4096f,
-            steps = 14,
-            subtitle = "单次播放最多占用多少本机空间；小于片长时，往回拖到更早的位置仍需重新下载",
-            onChange = { v -> onPlayerCacheMaxMb((v / 256).toInt() * 256) },
+            // 最右端点是「动态」挡（内部存 4224 = PlayerCache.CACHE_DYNAMIC）：上限交给这部片自己算
+            valueText = if (playerCacheMaxMb == com.open115.pad.player.PlayerCache.CACHE_DYNAMIC) {
+                "动态（片长的 5%）"
+            } else {
+                "$playerCacheMaxMb MB"
+            },
+            value = (if (playerCacheMaxMb == com.open115.pad.player.PlayerCache.CACHE_DYNAMIC) {
+                DYN_POS
+            } else {
+                playerCacheMaxMb
+            }).toFloat(),
+            range = 128f..DYN_POS.toFloat(),
+            // 128MB 一格；末位是「动态」挡（比 4096 多一格）
+            steps = (DYN_POS - 128) / 128 - 1,
+            subtitle = "播放缓存最多占多少本机空间；装不下整部片时按当前进度滚动，进度之前的旧内容会被舍弃",
+            detail = "「动态」= 按这部片自己算：留片长的 5% 左右（5% 的时长 ≈ 5% 的体积），" +
+                "片长不足 5 分钟的按整片缓存。缓存写满之后 media3 每写一块都要先淘汰一块（边写边删），" +
+                "实测会把速度从 25MB/s 拖到 ~1MB/s（清空缓存立刻恢复满速，所以问题在淘汰而不在网速）；" +
+                "现在开播前会先成批清掉最久没用到的旧片，灌满之后按当前进度滚动：舍弃进度之前的旧内容" +
+                "（保留最近 2 分钟给小幅回退）、继续往前灌 —— 一部比缓存还大的片也能一路边看边缓存，" +
+                "这些裁剪都发生在写路径之外。",
+            onChange = { v ->
+                val mb = (v / 128).toInt() * 128
+                onPlayerCacheMaxMb(
+                    if (mb >= DYN_POS) com.open115.pad.player.PlayerCache.CACHE_DYNAMIC else mb,
+                )
+            },
+        )
+        switch(
+            id = "player_prefetch",
+            title = "预下载",
+            subtitle = "播放时往后预下载、满了按当前进度滚动继续灌，进度条上显示已缓存的范围（淡蓝那段）",
+            detail = "打开后进播放器就把后面的内容按顺序存进本机（只占上面的上限空间、不吃内存）：" +
+                "缓存过的部分往回拖、重进这部片都不用重新下载；到片尾自动停。" +
+                "灌满上限后不会停：按当前进度滚动，舍弃进度之前的旧内容（保留最近 2 分钟给小幅回退）、" +
+                "继续往前灌，所以比缓存还大的片也是从开始一直缓存到片尾。" +
+                "播放自己下的也会进缓存，这里是再把空余带宽也用上 —— 链路慢时预下载自然跑得慢（播放优先）。" +
+                "用蜂窝网络时不预下载；右上角状态栏的「缓存 N MB」随时能看已经存了多少。" +
+                "缓存快满时会先自动清掉最久没用到的旧片再往下灌。",
+            checked = playerPrefetchEnabled,
+            onChange = onPlayerPrefetchEnabled,
+        )
+        action(
+            id = "player_clear",
+            title = "清空播放缓存",
+            subtitle = if (usage.ready) "已下载的视频分片，当前 ${fmtBytes(usage.videoBytes)}" else "计算中…",
+            detail = "清掉后往回拖进度、重进看过的片都要重新下载。" +
+                "它只装云端片源的已下载分片，播放本机文件不进这里。",
+            confirm = "将清掉已缓存的视频分片。往回拖进度会重新下载。",
+            onClick = onClearPlayerCache,
         )
 
         group("媒体库")
@@ -1725,6 +1974,57 @@ private fun labSection(
     onAvatarSourceEnabled: (Boolean) -> Unit,
     onAvatarSourceUrl: (String) -> Unit,
     onRefreshAvatarIndex: () -> Unit,
+    /** 元数据刮削（TMDB）：地址与 key 全都不写死，用户自填（国内要填自建反代或代理） */
+    tmdbApiBase: String,
+    tmdbImageBase: String,
+    tmdbApiKey: String,
+    /** 刮削专用代理地址（空 = 直连）；TMDB 直连不通时填自己的代理 */
+    tmdbProxy: String,
+    onTmdbApiBase: (String) -> Unit,
+    onTmdbImageBase: (String) -> Unit,
+    onTmdbApiKey: (String) -> Unit,
+    onTmdbProxy: (String) -> Unit,
+    /** HTTP 服务源：服务基址 + token（都空 = 不启用） */
+    metatubeUrl: String,
+    metatubeToken: String,
+    onMetatubeUrl: (String) -> Unit,
+    onMetatubeToken: (String) -> Unit,
+    /** 刮削写回的剧照张数上限（0 = 不限制） */
+    scrapeStillsMax: Int,
+    onScrapeStillsMax: (Int) -> Unit,
+    /** 单片刮削「搜完 5 秒无操作自动刮第一条」开关（默认关） */
+    scrapeAutoFirst: Boolean,
+    onScrapeAutoFirst: (Boolean) -> Unit,
+    /** AI 检索词（可选）：OpenAI 兼容端点/key/模型；模板库 + 各场景默认模板 */
+    aiEndpoint: String,
+    aiApiKey: String,
+    aiModel: String,
+    aiTemplateOptions: List<Pair<String, String>>,
+    aiScrapeTpl: String,
+    aiRenameTpl: String,
+    onAiEndpoint: (String) -> Unit,
+    onAiApiKey: (String) -> Unit,
+    onAiModel: (String) -> Unit,
+    onAiScrapeTpl: (String) -> Unit,
+    onAiRenameTpl: (String) -> Unit,
+    onManageTemplates: () -> Unit,
+    /** 元数据源(插件) */
+    sourceOptions: List<Pair<String, String>>,
+    selectedSourceId: String,
+    jsDirLabel: String,
+    onSetSource: (String) -> Unit,
+    onManageSources: () -> Unit,
+    onPickJsDir: () -> Unit,
+    /** 磁力搜索（MCP）：云下载页的搜索入口，端点+Token 在实验室配 */
+    labMagnetEnabled: Boolean,
+    labMagnetEndpoint: String,
+    labMagnetToken: String,
+    /** 「测试连接」的当前状态一句话（空 = 没测过） */
+    magnetTestNote: String,
+    onLabMagnetEnabled: (Boolean) -> Unit,
+    onLabMagnetEndpoint: (String) -> Unit,
+    onLabMagnetToken: (String) -> Unit,
+    onTestMagnet: () -> Unit,
 ): SettingsSection = section(SettingsCategory.LAB) {
     switch(
         id = "video_filter",
@@ -1846,6 +2146,212 @@ private fun labSection(
     if (avatarCoverageNote.isNotBlank()) {
         info(id = "avatar_source_coverage", title = "本库覆盖情况", subtitle = avatarCoverageNote)
     }
+    group("元数据源")
+    info(
+        id = "source_how",
+        title = "怎么用",
+        subtitle = "三种源选一个当「当前源」，下面就是各自的配置；媒体库「⋯」批量补、详情页魔杖单条刮",
+        detail = "TMDB（内置）：检索主流片，自备 key，国内要反代或代理；" +
+            "HTTP 服务源：自建的开源聚合服务，番号类检索最合适，App 只发 HTTP；" +
+            "JS 源：一段脚本一个源，写法见「管理 JS 源」的内置示例。",
+    )
+    choice(
+        id = "source_current",
+        title = "当前源",
+        subtitle = "刮削/批量用哪个源",
+        options = sourceOptions,
+        selected = selectedSourceId,
+        onSelect = onSetSource,
+    )
+    text(
+        id = "scrape_tmdb_key",
+        title = "TMDB API Key",
+        subtitle = "TMDB（内置源）的 key，自备：v3 的 32 位 key 与 v4 的 JWT（eyJ 开头）都认",
+        value = tmdbApiKey,
+        placeholder = "填你自己申请的 TMDB API Key",
+        onChange = onTmdbApiKey,
+    )
+    text(
+        id = "scrape_tmdb_api",
+        title = "TMDB 接口地址",
+        subtitle = "国内直连多半不通，填自建反代（要能拼出 {基址}/3/search/movie）；留空用官方地址",
+        value = tmdbApiBase,
+        placeholder = com.open115.pad.data.media.MediaPrefs.DEFAULT_TMDB_API_BASE,
+        onChange = onTmdbApiBase,
+    )
+    text(
+        id = "scrape_tmdb_image",
+        title = "TMDB 图片地址",
+        subtitle = "海报与缩略图的基址；通常和接口地址填同一台反代上的不同前缀",
+        value = tmdbImageBase,
+        placeholder = com.open115.pad.data.media.MediaPrefs.DEFAULT_TMDB_IMAGE_BASE,
+        onChange = onTmdbImageBase,
+    )
+    text(
+        id = "metatube_url",
+        title = "HTTP 服务源地址",
+        subtitle = "自建服务的基址，如 http://192.168.31.x:8090；留空不启用",
+        detail = "刮削逻辑与出口代理都在服务器侧，平板不用翻墙；配完在「当前源」里选它。",
+        value = metatubeUrl,
+        placeholder = "http://host:8090（留空 = 不启用）",
+        onChange = onMetatubeUrl,
+    )
+    text(
+        id = "metatube_token",
+        title = "服务源 Token（可选）",
+        subtitle = "服务端启动时设了 -token 就填同一个；没设鉴权就留空",
+        value = metatubeToken,
+        placeholder = "留空 = 不带鉴权",
+        onChange = onMetatubeToken,
+    )
+    action(
+        id = "source_manage",
+        title = "管理 JS 源",
+        subtitle = "新建/编辑/启用/删除自定义 JS 源",
+        onClick = onManageSources,
+    )
+    action(
+        id = "source_dir",
+        title = "扫描目录（.js）",
+        subtitle = jsDirLabel,
+        detail = "选一个本地文件夹，里面每个 .js 文件自动作为一个源加载（改文件后重进本页刷新）。",
+        onClick = onPickJsDir,
+    )
+    group("刮削行为")
+    info(
+        id = "scrape_tmdb_how",
+        title = "写回是什么行为",
+        subtitle = "结果写回云端：nfo（标题/简介/评分/演员等）+ 海报传到影片目录，写完自动重扫该目录",
+        detail = "只补空：已有 nfo 的影片跳过（详情页手动刮才覆盖）；批量搜索先在面板核对候选再写入。",
+    )
+    // 右端点是「不限制」挡（内部存 0）：源给多少存多少
+    slider(
+        id = "scrape_stills_max",
+        title = "剧照数量上限",
+        valueText = if (scrapeStillsMax == 0) "不限制" else "$scrapeStillsMax 张",
+        value = if (scrapeStillsMax <= 0) 32f else scrapeStillsMax.toFloat(),
+        range = 2f..32f,
+        // 只走偶数档（2~30），最右端 32 = 不限制；steps 是两端点之间的刻度数
+        steps = 14,
+        subtitle = "刮削写回时每部片存进 extrafanart 目录的剧照张数（按赞数取），下次刮削生效",
+        detail = "取源的背景图按赞数排前 N 张；拉到最右「不限制」= 源给多少存多少，几十张时写回变慢。" +
+            "只管刮削写回，扫描已有的剧照不受限。",
+        onChange = { v ->
+            val n = (v / 2f).toInt() * 2
+            onScrapeStillsMax(if (n >= 32) 0 else n)
+        },
+    )
+    switch(
+        id = "scrape_auto_first",
+        title = "搜完自动刮第一条",
+        subtitle = "单片刮削搜出结果后 5 秒没手动选，就自动选第一条写回（默认关）",
+        detail = "只在对话框开着时计时，期间你点过候选或「写入云端」就不再自动落笔；关掉对话框挂后台搜索也不会自动写。",
+        checked = scrapeAutoFirst,
+        onChange = onScrapeAutoFirst,
+    )
+    text(
+        id = "scrape_proxy",
+        title = "代理地址（可选）",
+        subtitle = "给整条刮削链出国用：TMDB、图床、JS 源抓站；留空直连",
+        detail = "海外图床在国内直连不稳（域名污染 + SNI 阻断），搜索失败/缩略图空白多半因此。填 HTTP/SOCKS5 代理" +
+            "（如 192.168.x.x:20171 或 socks5://host:1080）；只有刮削走它，115 请求不受影响，局域网服务源自动直连。" +
+            "TMDB 也可改用自建反代。改完立刻生效。",
+        value = tmdbProxy,
+        placeholder = "host:port / socks5://host:port（留空 = 直连）",
+        onChange = onTmdbProxy,
+    )
+    group("AI 检索词 / 重命名（可选）")
+    info(
+        id = "scrape_ai_how",
+        title = "怎么用",
+        subtitle = "把乱文件名交给大模型洗成干净名字，用在刮削检索词和批量重命名",
+        detail = "填好下面三项（地址/Key/模型）后：单片刮削出现「AI 优化」、批量重命名出现「AI 重命名」。" +
+            "两处都用「提示词模板」，可各设默认、用时也能换。只处理文本，改文件名要你在面板确认；AI 独立直连。",
+    )
+    text(
+        id = "ai_endpoint",
+        title = "服务地址",
+        subtitle = "OpenAI 兼容基址，能拼出 {基址}/chat/completions，如 https://api.openai.com/v1",
+        value = aiEndpoint,
+        placeholder = "https://api.openai.com/v1（留空 = 不启用）",
+        onChange = onAiEndpoint,
+    )
+    text(
+        id = "ai_key",
+        title = "API Key",
+        subtitle = "上面服务的密钥（Bearer）",
+        value = aiApiKey,
+        placeholder = "sk-…",
+        onChange = onAiApiKey,
+    )
+    text(
+        id = "ai_model",
+        title = "模型",
+        subtitle = "模型名，如 gpt-4o-mini / deepseek-chat（三项都填了 AI 才启用）",
+        value = aiModel,
+        placeholder = "gpt-4o-mini",
+        onChange = onAiModel,
+    )
+    choice(
+        id = "ai_scrape_tpl",
+        title = "刮削 · 默认模板",
+        subtitle = "单片刮削「AI 优化」默认用哪套提示词",
+        options = aiTemplateOptions,
+        selected = aiScrapeTpl,
+        onSelect = onAiScrapeTpl,
+    )
+    choice(
+        id = "ai_rename_tpl",
+        title = "重命名 · 默认模板",
+        subtitle = "批量重命名「AI 重命名」默认用哪套提示词",
+        options = aiTemplateOptions,
+        selected = aiRenameTpl,
+        onSelect = onAiRenameTpl,
+    )
+    action(
+        id = "ai_templates",
+        title = "提示词模板",
+        subtitle = "查看内置模板、新建/编辑/删除自定义模板",
+        onClick = onManageTemplates,
+    )
+    group("磁力搜索（云下载配套）")
+    switch(
+        id = "magnet_enabled",
+        title = "启用磁力搜索",
+        subtitle = "云下载页出现「磁力搜索」入口：搜到资源 → 看文件结构 → 一键推进 115 离线下载",
+        checked = labMagnetEnabled,
+        onChange = onLabMagnetEnabled,
+    )
+    text(
+        id = "magnet_endpoint",
+        title = "MCP 端点",
+        subtitle = "MCP Streamable HTTP 入口。默认是「纸鸢磁力」的公开端点，自建/换源自己改",
+        value = labMagnetEndpoint,
+        placeholder = com.open115.pad.data.PlayerPrefs.MAGNET_ENDPOINT_DEFAULT,
+        onChange = onLabMagnetEndpoint,
+    )
+    text(
+        id = "magnet_token",
+        title = "MCP Token",
+        subtitle = "在该网站注册后于 /mcp 页生成；明文只显示一次，忘了就重置一份",
+        detail = "所有工具都要带它（未鉴权一律 401）。与网页登录态独立；换 Token 立即生效。",
+        value = labMagnetToken,
+        placeholder = "网站 /mcp 页生成的专用 Token",
+        onChange = onLabMagnetToken,
+    )
+    action(
+        id = "magnet_test",
+        title = "测试连接",
+        subtitle = if (magnetTestNote.isBlank()) "握手并列出该源提供的工具" else magnetTestNote,
+        onClick = onTestMagnet,
+    )
+    info(
+        id = "magnet_how",
+        title = "说明",
+        subtitle = "搜索范围是该站的聚合索引库（非全网实时）；第三方服务，可用性不承诺",
+        detail = "流程：云下载页 → 磁力搜索 → 选结果看文件结构 → 推进 115 离线下载（走的就是「添加任务」" +
+            "那套保存位置与错误提示）。资源内容请自行确认合规；推上去之后由 115 审核。",
+    )
     group()
 }
 
@@ -1900,10 +2406,10 @@ private fun aboutSection(version: String, onOpenDocs: () -> Unit): SettingsSecti
 // ---------------- 缓存占用 ----------------
 
 /**
- * 落盘缓存的占用快照。[mediaTextBytes] / [mediaPosterBytes] / [hugeBytes] / [imageBytes] 为 -1 表示还在算。
+ * 落盘缓存的占用快照。某一项为 -1 表示还在算。
  *
- * 没有「播放缓存」这一项是刻意的：它只在单次播放会话内有效、退出播放器就清空，
- * 显示出来永远是 0，只会让人以为没生效。
+ * 播放缓存（[videoBytes]）也在报：它的 key 按内容标识稳定化之后跨会话可复用，
+ * 占用是有意义的量（见 PlayerCache）。
  */
 private data class CacheUsage(
     val mediaTextBytes: Long = -1,
@@ -1912,9 +2418,11 @@ private data class CacheUsage(
     val imageBytes: Long = -1,
     /** 视频预览图缓存（文件页视频缩略图） */
     val previewBytes: Long = -1,
+    /** 播放缓存（播放器已下载的视频分片） */
+    val videoBytes: Long = -1,
 ) {
     val ready: Boolean get() = mediaTextBytes >= 0 && mediaPosterBytes >= 0 && hugeBytes >= 0 &&
-        imageBytes >= 0 && previewBytes >= 0
+        imageBytes >= 0 && previewBytes >= 0 && videoBytes >= 0
 }
 
 /** Coil 自己的图片磁盘缓存（画廊原图/缩略图落在这里，见 ImageGalleryDialog 的 diskKeyOf） */
@@ -1950,5 +2458,186 @@ private fun fmtBytes(bytes: Long): String {
         kb < 1024 -> "%.0f KB".format(kb)
         kb < 10 * 1024 -> "%.1f MB".format(kb / 1024)
         else -> "%.0f MB".format(kb / 1024)
+    }
+}
+
+/** 模板编辑态：id=null 表示新建 */
+private data class TplEdit(val id: String?, val name: String, val prompt: String)
+
+/**
+ * 提示词模板管理：列出内置（只读，可"以此新建"改个副本）+ 自定义（编辑/删除），底部"新建模板"。
+ * 点条目进入编辑页（名称 + 提示词两个框），保存回写。
+ */
+@Composable
+private fun AiTemplatesDialog(
+    templates: List<AiPromptTemplate>,
+    onDismiss: () -> Unit,
+    onCreate: (String, String) -> Unit,
+    onUpdate: (String, String, String) -> Unit,
+    onDelete: (String) -> Unit,
+) {
+    var editing by remember { mutableStateOf<TplEdit?>(null) }
+    Dialog(onDismissRequest = { if (editing == null) onDismiss() else editing = null }) {
+        Surface(shape = RoundedCornerShape(16.dp), color = MaterialTheme.colorScheme.surface) {
+            Column(
+                Modifier.fillMaxWidth().heightIn(max = 560.dp).verticalScroll(rememberScrollState()).padding(16.dp),
+            ) {
+                val ed = editing
+                if (ed == null) {
+                    Text("提示词模板", fontWeight = FontWeight.SemiBold, fontSize = 16.sp)
+                    Spacer(Modifier.height(4.dp))
+                    Text("内置模板只读、可另存为自定义；自定义可改可删", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Spacer(Modifier.height(8.dp))
+                    templates.forEach { t ->
+                        Column(Modifier.fillMaxWidth().padding(vertical = 6.dp)) {
+                            Text(t.name + if (t.builtin) "（内置）" else "", fontSize = 14.sp, fontWeight = FontWeight.Medium)
+                            Text(
+                                t.prompt, fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                maxLines = 2, overflow = TextOverflow.Ellipsis,
+                            )
+                            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                                TextButton(onClick = { editing = TplEdit(if (t.builtin) null else t.id, t.name, t.prompt) }) {
+                                    Text(if (t.builtin) "以此新建" else "编辑")
+                                }
+                                if (!t.builtin) {
+                                    TextButton(onClick = { onDelete(t.id) }) { Text("删除", color = MaterialTheme.colorScheme.error) }
+                                }
+                            }
+                        }
+                        HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+                    }
+                    Spacer(Modifier.height(10.dp))
+                    Button(onClick = { editing = TplEdit(null, "", "") }, modifier = Modifier.fillMaxWidth()) { Text("新建模板") }
+                    Spacer(Modifier.height(6.dp))
+                    TextButton(onClick = onDismiss, modifier = Modifier.fillMaxWidth()) { Text("关闭") }
+                } else {
+                    var name by remember(ed.id) { mutableStateOf(ed.name) }
+                    var prompt by remember(ed.id) { mutableStateOf(ed.prompt) }
+                    Text(if (ed.id == null) "新建模板" else "编辑模板", fontWeight = FontWeight.SemiBold, fontSize = 16.sp)
+                    Spacer(Modifier.height(10.dp))
+                    OutlinedTextField(
+                        value = name, onValueChange = { name = it }, label = { Text("模板名称") }, singleLine = true,
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    OutlinedTextField(
+                        value = prompt, onValueChange = { prompt = it }, label = { Text("系统提示词") },
+                        minLines = 6, modifier = Modifier.fillMaxWidth(),
+                    )
+                    Spacer(Modifier.height(12.dp))
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                        TextButton(onClick = { editing = null }) { Text("取消") }
+                        Spacer(Modifier.width(8.dp))
+                        Button(
+                            enabled = name.isNotBlank() && prompt.isNotBlank(),
+                            onClick = {
+                                if (ed.id == null) onCreate(name, prompt) else onUpdate(ed.id, name, prompt)
+                                editing = null
+                            },
+                        ) { Text("保存") }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/** 新建 JS 源时预填的示例：演示 SOURCE 契约 + http 用法（一个走公开 JSON API 的最小源） */
+private const val SAMPLE_JS_SOURCE = """
+// 一个 JS 源 = 定义全局 SOURCE 对象。宿主注入 http.get/post、log；返回对象/数组即可（会自动转 JSON）。
+// 字段名与内置 TMDB 源一致：search 回 [{id,title,year,...}]，fetch 回 {title,plot,genres,actors:[{name,role}],posterUrl,fanartUrl,tmdbId}。
+SOURCE = {
+  id: 'demo',
+  name: '示例源',
+  search: function (query, kind) {
+    // query = {title, year, kind}
+    var r = http.get('https://example.com/api/search?q=' + encodeURIComponent(query.title));
+    if (r.status !== 200) return [];
+    var data = JSON.parse(r.body);
+    return data.map(function (x) {
+      return { id: x.imdb_id, title: x.Title, year: parseInt(x.Year) || null,
+               posterUrl: x.Poster && x.Poster !== 'N/A' ? x.Poster : null };
+    });
+  },
+  fetch: function (id) {
+    var r = http.get('https://example.com/api/title?id=' + encodeURIComponent(id));
+    if (r.status !== 200) throw new Error('未找到');
+    var x = JSON.parse(r.body);
+    return {
+      title: x.Title, year: parseInt(x.Year) || null, plot: x.Plot,
+      rating: parseFloat(x.imdbRating) || null,
+      genres: (x.Genre || '').split(',').map(function (s) { return s.trim(); }).filter(Boolean),
+      actors: (x.Actors || '').split(',').map(function (s) { return { name: s.trim() }; }).filter(function (a) { return a.name; }),
+      posterUrl: x.Poster && x.Poster !== 'N/A' ? x.Poster : null,
+      imdbId: x.imdbID,
+    };
+  },
+};
+"""
+
+/** JS 源管理：列出编辑器里建的源（启用/编辑/删除），底部"新建源"进编辑器（预填示例）。 */
+@Composable
+private fun ScrapeSourceManagerDialog(
+    sources: List<com.open115.pad.data.media.scrape.JsSource>,
+    onDismiss: () -> Unit,
+    onCreate: (String, String) -> Unit,
+    onUpdate: (String, String, String) -> Unit,
+    onDelete: (String) -> Unit,
+    onToggle: (String, Boolean) -> Unit,
+) {
+    var editing by remember { mutableStateOf<Triple<String?, String, String>?>(null) }
+    Dialog(onDismissRequest = { if (editing == null) onDismiss() else editing = null }) {
+        Surface(shape = RoundedCornerShape(16.dp), color = MaterialTheme.colorScheme.surface) {
+            Column(Modifier.fillMaxWidth().heightIn(max = 600.dp).verticalScroll(rememberScrollState()).padding(16.dp)) {
+                val ed = editing
+                if (ed == null) {
+                    Text("JS 源", fontWeight = FontWeight.SemiBold, fontSize = 16.sp)
+                    Spacer(Modifier.height(4.dp))
+                    Text("扫描目录里的 .js 会自动作为额外源加载，这里管理的是 App 内建的。", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Spacer(Modifier.height(8.dp))
+                    if (sources.isEmpty()) Text("还没有源，点下面「新建源」。", fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    sources.forEach { s ->
+                        Row(Modifier.fillMaxWidth().padding(vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Column(Modifier.weight(1f)) {
+                                Text(s.name, fontSize = 14.sp, fontWeight = FontWeight.Medium)
+                                Text(if (s.enabled) "已启用" else "已停用", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            }
+                            androidx.compose.material3.Switch(checked = s.enabled, onCheckedChange = { onToggle(s.id, it) })
+                            TextButton(onClick = { editing = Triple(s.id, s.name, s.code) }) { Text("编辑") }
+                            TextButton(onClick = { onDelete(s.id) }) { Text("删除", color = MaterialTheme.colorScheme.error) }
+                        }
+                        HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+                    }
+                    Spacer(Modifier.height(10.dp))
+                    Button(onClick = { editing = Triple(null, "我的源", SAMPLE_JS_SOURCE) }, modifier = Modifier.fillMaxWidth()) { Text("新建源") }
+                    Spacer(Modifier.height(6.dp))
+                    TextButton(onClick = onDismiss, modifier = Modifier.fillMaxWidth()) { Text("关闭") }
+                } else {
+                    var name by remember(ed.first) { mutableStateOf(ed.second) }
+                    var code by remember(ed.first) { mutableStateOf(ed.third) }
+                    Text(if (ed.first == null) "新建 JS 源" else "编辑源", fontWeight = FontWeight.SemiBold, fontSize = 16.sp)
+                    Spacer(Modifier.height(10.dp))
+                    OutlinedTextField(value = name, onValueChange = { name = it }, label = { Text("源名称") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+                    Spacer(Modifier.height(8.dp))
+                    OutlinedTextField(
+                        value = code, onValueChange = { code = it }, label = { Text("JS 代码（定义 SOURCE 对象）") },
+                        minLines = 12, modifier = Modifier.fillMaxWidth(),
+                    )
+                    Spacer(Modifier.height(12.dp))
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                        TextButton(onClick = { editing = null }) { Text("取消") }
+                        Spacer(Modifier.width(8.dp))
+                        Button(
+                            enabled = name.isNotBlank() && code.isNotBlank(),
+                            onClick = {
+                                val eid = ed.first
+                                if (eid == null) onCreate(name, code) else onUpdate(eid, name, code)
+                                editing = null
+                            },
+                        ) { Text("保存") }
+                    }
+                }
+            }
+        }
     }
 }

@@ -80,8 +80,11 @@ import kotlinx.coroutines.launch
  *
  * 与 `BatchRenameRequest` 同一套写法：文件页只负责"发起 + 告诉 App 根层要显示什么"，
  * 面板本身渲染在内容区之上（盖住内容、不盖左侧导航栏），删除逻辑都在面板里边。
+ *
+ * [version] 只在"完成弹窗点查看结果"时带上：那一轮跑的是哪个模式，面板就落在哪一屏
+ * （两种模式的结果各自留着，见面板里 mode 的说明）。
  */
-data class DupScanRequest(val cid: String, val path: String)
+data class DupScanRequest(val cid: String, val path: String, val version: Boolean = false)
 
 /**
  * 重复文件查找面板（去重一期）：起始层 / 进度 / 结果三态一屏。
@@ -107,7 +110,7 @@ fun DuplicatePanel(
     val progress by finder.progress.collectAsState()
     val versionProgress by versionFinder.progress.collectAsState()
     /** 0 = 内容相同（sha1，可删）/ 1 = 同片多版本（时长预筛，只出候选清单） */
-    var mode by remember { mutableStateOf(0) }
+    var mode by remember { mutableStateOf(if (request.version) 1 else 0) }
     val busy = progress.running || versionProgress.running
 
     /** 扫描范围：默认只看当前这一层（最快，也最不容易误伤） */

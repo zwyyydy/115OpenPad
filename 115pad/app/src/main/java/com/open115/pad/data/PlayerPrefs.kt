@@ -38,6 +38,16 @@ class PlayerPrefs(private val context: Context) {
      * 见 PlayerActivity 的 BACK_BUFFER_MS）。
      */
     val cacheMaxMb: Flow<Int> = context.playerDataStore.data.map { it[KEY_CACHE_MB] ?: 2048 }
+
+    /**
+     * 预下载：播放时把后面的分片按顺序灌进播放缓存，到片尾为止；灌满「缓存上限」后
+     * 以当前进度为锚点滚动（舍弃进度之前的旧内容、继续往前灌），不是到上限就停。
+     *
+     * 播放器自带的缓冲窗口只按内存算（90 秒），"上限设大 → 进度条预下载更远"只能靠这条
+     * 链路自己往磁盘缓存里写（见 PlayerPrefetcher）。默认开：用户把上限拉大就是想让它多留下来。
+     */
+    val prefetchEnabled: Flow<Boolean> = context.playerDataStore.data.map { it[KEY_PREFETCH] ?: true }
+
     val speedBoost: Flow<Float> = context.playerDataStore.data.map { it[KEY_SPEED_BOOST] ?: 2.5f }
     val seekSeconds: Flow<Int> = context.playerDataStore.data.map { it[KEY_SEEK_SECONDS] ?: 10 }
     val subtitlesEnabled: Flow<Boolean> = context.playerDataStore.data.map { it[KEY_SUBS_ENABLED] ?: true }
@@ -98,6 +108,7 @@ class PlayerPrefs(private val context: Context) {
 
     suspend fun setCacheEnabled(v: Boolean) = context.playerDataStore.edit { it[KEY_CACHE_ENABLED] = v }
     suspend fun setCacheMaxMb(v: Int) = context.playerDataStore.edit { it[KEY_CACHE_MB] = v }
+    suspend fun setPrefetchEnabled(v: Boolean) = context.playerDataStore.edit { it[KEY_PREFETCH] = v }
     suspend fun setSpeedBoost(v: Float) = context.playerDataStore.edit { it[KEY_SPEED_BOOST] = v }
     suspend fun setSeekSeconds(v: Int) = context.playerDataStore.edit { it[KEY_SEEK_SECONDS] = v }
 
@@ -245,6 +256,32 @@ class PlayerPrefs(private val context: Context) {
     suspend fun setLabDanmuCacheDays(v: Int) =
         context.playerDataStore.edit { it[KEY_LAB_DANMU_CACHE_DAYS] = v }
 
+    // ---- 实验室：磁力搜索（云下载配套，MCP 协议） ----
+
+    /** 磁力搜索总开关：开着时云下载页出现搜索入口 */
+    val labMagnetEnabled: Flow<Boolean> =
+        context.playerDataStore.data.map { it[KEY_LAB_MAGNET_ENABLED] ?: false }
+
+    /** MCP 端点（Streamable HTTP）。默认就是纸鸢磁力的公开端点，自建/换源自己改 */
+    val labMagnetEndpoint: Flow<String> =
+        context.playerDataStore.data.map { it[KEY_LAB_MAGNET_ENDPOINT] ?: MAGNET_ENDPOINT_DEFAULT }
+
+    /**
+     * MCP Token：网站注册后在 /mcp 页生成，**明文只显示一次**（忘了就重置一份），
+     * 与网页登录态独立。没有它所有工具都 401。
+     */
+    val labMagnetToken: Flow<String> =
+        context.playerDataStore.data.map { it[KEY_LAB_MAGNET_TOKEN] ?: "" }
+
+    suspend fun setLabMagnetEnabled(v: Boolean) =
+        context.playerDataStore.edit { it[KEY_LAB_MAGNET_ENABLED] = v }
+
+    suspend fun setLabMagnetEndpoint(v: String) =
+        context.playerDataStore.edit { it[KEY_LAB_MAGNET_ENDPOINT] = v.trim().trimEnd('/') }
+
+    suspend fun setLabMagnetToken(v: String) =
+        context.playerDataStore.edit { it[KEY_LAB_MAGNET_TOKEN] = v.trim() }
+
     // ---- 本地/外部源的续播位置 ----
     // 云盘片走 115 的观看记录；本地文件（已下载的、外部应用传进来的）没有那个接口，
     // 只能在本机记一份。不做的话 40 分钟的下载片每次进都从头开始，体验像半成品。
@@ -263,9 +300,10 @@ class PlayerPrefs(private val context: Context) {
         }
     }
 
-    private companion object {
+    companion object {
         val KEY_CACHE_ENABLED = booleanPreferencesKey("cache_enabled")
         val KEY_CACHE_MB = intPreferencesKey("cache_max_mb")
+        val KEY_PREFETCH = booleanPreferencesKey("cache_prefetch")
         val KEY_SPEED_BOOST = floatPreferencesKey("speed_boost")
         val KEY_SEEK_SECONDS = intPreferencesKey("seek_seconds")
         val KEY_SUBS_ENABLED = booleanPreferencesKey("subs_enabled")
@@ -299,6 +337,13 @@ class PlayerPrefs(private val context: Context) {
 
         /** 弹幕源默认地址：留空 = 未配置（弹幕源自托管，不预置公共地址） */
         const val DANMU_API_DEFAULT = ""
+
+        // 磁力搜索（MCP）：端点是第三方服务的公开入口，预置省得手抄；Token 必须自备
+        val KEY_LAB_MAGNET_ENABLED = booleanPreferencesKey("lab_magnet_enabled")
+        val KEY_LAB_MAGNET_ENDPOINT = stringPreferencesKey("lab_magnet_endpoint")
+        val KEY_LAB_MAGNET_TOKEN = stringPreferencesKey("lab_magnet_token")
+        const val MAGNET_ENDPOINT_DEFAULT = "https://magnet.kiteyuan.info/api/v1/mcp"
+
         val KEY_LOCAL_RESUME = stringPreferencesKey("local_resume")
     }
 }

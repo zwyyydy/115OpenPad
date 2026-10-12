@@ -34,7 +34,6 @@ import androidx.compose.material.icons.outlined.MoreHoriz
 import androidx.compose.material.icons.outlined.RestoreFromTrash
 import androidx.compose.material.icons.outlined.Settings
 import androidx.compose.material.icons.outlined.Tune
-import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Badge
 import androidx.compose.material3.BadgedBox
 import androidx.compose.material3.Button
@@ -104,6 +103,7 @@ import com.open115.pad.data.media.label
 import com.open115.pad.player.PlayerActivity
 import com.open115.pad.ui.components.BatchRenamePanel
 import com.open115.pad.ui.components.DownloadLinkSheet
+import com.open115.pad.ui.components.FadePresence
 import com.open115.pad.ui.components.ImageGalleryDialog
 import com.open115.pad.ui.components.PreviewZoomHost
 import com.open115.pad.ui.components.TextPreviewHost
@@ -130,6 +130,7 @@ import kotlinx.coroutines.flow.debounce
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
+import com.open115.pad.ui.components.FadeAlertDialog
 
 private data class Dest(val route: String, val label: String, val icon: ImageVector)
 
@@ -146,9 +147,9 @@ private const val MEDIA_ROUTE = "media"
 private const val SCAN_BUSY_DEBOUNCE_MS = 1200L
 
 /**
- * 「这个结果是刚出的吗」的判据窗口（重命名 / 整理用）。
+ * 「这个结果是刚出的吗」的判据窗口（重命名 / 整理 / 查重 / 预览图的收尾提示用）。
  *
- * 这两类任务的结束状态是**持久**的（finishedAt 留在任务/进度里），而暂停、取消、停止
+ * 这几类任务的结束状态是**持久**的（finishedAt 留在任务/进度里），而暂停、取消、停止
  * 也会把"忙"翻成"闲"、走同一条边沿 —— 靠时间窗把它们分开：刚结束的才值得报一句。
  */
 private const val FINISH_WINDOW_MS = 15_000L
@@ -194,19 +195,26 @@ private fun phoneSelectedTab(route: String?): String? = when {
 private val moreRoutes = listOf("filter", "rename")
 
 /**
- * 把一个"忙不忙"的流做成**防抖**的 Compose 状态，并在"忙 → 闲"的边沿调一次 [onFinished]。
+ * 把一个"忙不忙"的流做成**（可防抖的）** Compose 状态，并在"忙 → 闲"的边沿调一次 [onFinished]。
  *
  * 防抖理由同 [SCAN_BUSY_DEBOUNCE_MS]：队列换任务的空档会闪假空闲，不防抖红点会抖、
- * 完成提示还会在空档里提前弹。[onFinished] 经 rememberUpdatedState 取最新一份（闭包冻结坑）。
+ * 完成提示还会在空档里提前弹。**不排队**的任务（查重 / 预览图）传 [debounceMs] = 0：
+ * 它们没有假空闲可等，而边沿要即时生效（完成弹窗得按"这一刻面板开没开"决定弹不弹）。
+ * [onFinished] 经 rememberUpdatedState 取最新一份（闭包冻结坑）。
  */
 @OptIn(FlowPreview::class)
 @Composable
-private fun rememberBusyEdge(busy: Flow<Boolean>, onFinished: suspend () -> Unit): State<Boolean> {
+private fun rememberBusyEdge(
+    busy: Flow<Boolean>,
+    debounceMs: Long = SCAN_BUSY_DEBOUNCE_MS,
+    onFinished: suspend () -> Unit,
+): State<Boolean> {
     val state = remember { mutableStateOf(false) }
     val callback = rememberUpdatedState(onFinished)
     LaunchedEffect(Unit) {
         var was = false
-        busy.debounce(SCAN_BUSY_DEBOUNCE_MS).distinctUntilChanged().collect { now ->
+        val source = if (debounceMs > 0) busy.debounce(debounceMs) else busy
+        source.distinctUntilChanged().collect { now ->
             state.value = now
             if (was && !now) callback.value()
             was = now
@@ -216,10 +224,10 @@ private fun rememberBusyEdge(busy: Flow<Boolean>, onFinished: suspend () -> Unit
 }
 
 /**
- * 导航入口图标上的"任务在跑"小红点（扫描 → 媒体库、重命名 → 重命名/更多、整理 → 文件）。
+ * 导航入口图标上的"任务在跑"小红点（扫描 → 媒体库、重命名 → 重命名/更多、整理/查重/预览图 → 文件）。
  *
  * 挂在导航栏上而不是各页面里 —— 任务跑着时用户往往已经退到别的页，这个点是"那边还有活在干"
- * 的唯一指示：跑完红点消失，同时弹一条完成提示（见 notifyXxxFinished）。
+ * 的唯一指示：跑完红点消失，同时弹一条完成提示（见 announceDone 与几个 xxxNotice）。
  */
 @Composable
 private fun BusyDestIcon(icon: ImageVector, label: String, busy: Boolean) {
@@ -231,20 +239,109 @@ private fun BusyDestIcon(icon: ImageVector, label: String, busy: Boolean) {
 }
 
 /**
- * 三类后台任务（扫描 / 重命名 / 整理）跑完时的收尾提示。
+ * 一条"任务跑完了"的提示内容。
  *
- * 「停止 / 取消 / 暂停」都不算完成，各自判据见下面三个函数 —— 停止类语义在各自的页面里
- * 本来就有文案（媒体库进度卡的"扫描已停止"、重命名页的任务状态），这里只报**真的干完了**。
+ * 与重命名 / 整理仍走 Snackbar 不同，扫描 / 查找重复 / 视频预览图 这三类**耗时以分钟计**、
+ * 又多半在用户已经翻到别的页面时才跑完，所以用**弹窗**报（Snackbar 一闪就过去了）；
+ * 主界面不可见时改发系统通知（见 announceDone）。
  */
-private suspend fun notifyScanFinished(context: Context, container: AppContainer, snackbar: SnackbarHostState) {
+private data class TaskDoneNotice(
+    val title: String,
+    val text: String,
+    /** 「查看结果」的落点；null = 没有可看的结果，只给一个「知道了」（如扫描） */
+    val view: PanelTarget? = null,
+)
+
+/** 「查看结果」要打开的面板：面板还留着这一轮的结果，所以只要把它的请求重新挂回去 */
+private sealed interface PanelTarget {
+    data class Dup(val request: DupScanRequest) : PanelTarget
+    data class Preview(val request: PreviewRequest) : PanelTarget
+
+    /**
+     * 刮削的"结果"就是媒体库页里的复核面板（它直接读引擎的会话，不需要请求对象）——
+     * 点「查看结果」回到媒体库页即可。
+     */
+    data object MediaScrape : PanelTarget
+}
+
+/**
+ * 媒体库扫描跑完：库名 + 队列累计入库数。
+ *
+ * 用**队列累计**（[MediaScanner.batchIndexed]）而不是 Progress.moviesIndexed：后者只是最后一个
+ * 目录的数字（流水线同步一次排 6 个目录，拿它报会少报成"新增 1 部"）。
+ * 「停止 / 取消」不算完成，不报 —— 那两种的文案在媒体库自己的进度卡上。
+ */
+private fun scanNotice(container: AppContainer): TaskDoneNotice? {
     val p = container.mediaScanner.progress.value
-    if (p.stopped) return
-    // 用**队列累计**而不是 Progress.moviesIndexed：后者只是最后一个目录的数字
-    // （流水线同步一次排 6 个目录，拿它报会少报成"新增 1 部"）
+    if (p.stopped) return null
     val indexed = container.mediaScanner.batchIndexed.value
-    val extra = if (indexed > 0) "，新增 $indexed 部" else ""
+    val body = if (indexed > 0) "本次新增 $indexed 部" else "没有新增影片"
     val name = p.libraryName.trim()
-    finishNotice(context, snackbar, if (name.isEmpty()) "媒体库扫描完成$extra" else "「$name」扫描完成$extra")
+    return TaskDoneNotice(
+        title = "媒体库扫描完成",
+        text = if (name.isEmpty()) body else "「$name」$body",
+    )
+}
+
+/**
+ * 查找重复 / 同片多版本：两个引擎共用「查找重复」面板，谁刚跑完就报谁（取 finishedAt 更新的那个）。
+ *
+ * 与扫描不同，这里**「停止 / 出错」也报** —— 这两个引擎特意做了"停下来也把已经扫到的结果给你"，
+ * summary 里那句（"已停止 · 发现 2 组重复" / "出错了（…）· 已扫到的仍在下面"）本身就是用户要的结果。
+ * 面板开着时不报（结果就在眼前），判据在调用点。
+ */
+private fun dupNotice(container: AppContainer): TaskDoneNotice? {
+    val now = System.currentTimeMillis()
+    val dp = container.duplicateFinder.progress.value
+    val vp = container.versionFinder.progress.value
+    // 时间窗把"刚跑完"与"上一轮的旧结果"分开（[FINISH_WINDOW_MS]）
+    fun freshText(finishedAt: Long, summary: String?): String? =
+        summary?.takeIf { finishedAt > 0 && now - finishedAt <= FINISH_WINDOW_MS }
+    val dupText = freshText(dp.finishedAt, dp.summary)
+    val verText = freshText(vp.finishedAt, vp.summary)
+    return when {
+        dupText != null && (verText == null || dp.finishedAt >= vp.finishedAt) -> TaskDoneNotice(
+            title = "查找重复文件",
+            text = dupText,
+            view = PanelTarget.Dup(DupScanRequest(dp.rootCid, dp.rootPath)),
+        )
+        verText != null -> TaskDoneNotice(
+            title = "同片多版本预筛",
+            text = verText,
+            view = PanelTarget.Dup(DupScanRequest(vp.rootCid, vp.rootPath, version = true)),
+        )
+        else -> null
+    }
+}
+
+/** 视频预览图跑完：summary 自带"已生成 / 已停止 / 出错了"的措辞，原样报 */
+private fun previewNotice(container: AppContainer): TaskDoneNotice? {
+    val p = container.previewBuilder.progress.value
+    val text = p.summary ?: return null
+    if (p.finishedAt <= 0 || System.currentTimeMillis() - p.finishedAt > FINISH_WINDOW_MS) return null
+    return TaskDoneNotice(
+        title = "视频预览图",
+        text = text,
+        view = PanelTarget.Preview(PreviewRequest(p.rootCid, p.rootPath)),
+    )
+}
+
+/**
+ * 元数据刮削跑完（单条写入 / 批量的搜索与写入各算一轮）：summary 自带措辞，原样报。
+ *
+ * 「查看结果」只在**批量会话还在**时给 —— 那种结果在媒体库页的复核面板里；
+ * 单条写入（详情页点的）没有独立结果页，就不给这个按钮。
+ */
+private fun scrapNotice(container: AppContainer): TaskDoneNotice? {
+    val p = container.metadataScraper.progress.value
+    val text = p.summary ?: return null
+    if (p.finishedAt <= 0 || System.currentTimeMillis() - p.finishedAt > FINISH_WINDOW_MS) return null
+    val hasSession = container.metadataScraper.session.value != null
+    return TaskDoneNotice(
+        title = "元数据刮削",
+        text = text,
+        view = if (hasSession) PanelTarget.MediaScrape else null,
+    )
 }
 
 /**
@@ -274,8 +371,9 @@ private suspend fun notifyOrganizeFinished(context: Context, container: AppConta
 }
 
 /**
- * 提示走哪条路看主界面在不在前台：看得见 → Snackbar；看不见（切走 / 锁屏 / 在播放器里）→ 系统通知。
+ * 重命名 / 整理的收尾提示走哪条路看主界面在不在前台：看得见 → Snackbar；看不见 → 系统通知。
  * 不做"两边都发"：通知栏和屏幕同时各响一次是双份打扰。
+ * （扫描 / 查重 / 预览图不用这条 —— 那三类走弹窗，见 [TaskDoneNotice]。）
  */
 private suspend fun finishNotice(context: Context, snackbar: SnackbarHostState, text: String) {
     if (context.mainUiVisible) snackbar.showSnackbar(text)
@@ -380,25 +478,71 @@ private fun MainScaffold(container: AppContainer, widthClass: WindowWidthSizeCla
     // 媒体库页自己的海报墙/详情浮层盖在它上面，返回也逐层退，不依赖导航栏
     val immersiveMedia = currentRoute == "media"
 
-    // 三类后台任务的"忙"状态（导航栏红点）+ 跑完的提示/通知。
-    // 防抖的理由见 SCAN_BUSY_DEBOUNCE_MS：队列换任务的空档会被当成"跑完了"。
+    // ---------------- 长任务跑完的收尾提示（扫描 / 查找重复 / 视频预览图）----------------
+    /** 完成弹窗的槽位：三类任务共用，后到的覆盖先到的（同时跑完两个的场景极少，够用） */
+    var taskDone by remember { mutableStateOf<TaskDoneNotice?>(null) }
+    /** 查找重复文件面板的请求：从文件页发起，面板与批量重命名同层渲染 */
+    var dupRequest by remember { mutableStateOf<DupScanRequest?>(null) }
+    /** 批量生成视频预览图面板的请求：与查重面板同层渲染 */
+    var previewRequest by remember { mutableStateOf<PreviewRequest?>(null) }
+
+    /**
+     * 收尾提示的分发：主界面看得见 → 弹窗（比 Snackbar 显眼，长任务跑完时用户往往已经翻到别的页）；
+     * 看不见（切走 / 锁屏 / 在播放器里）→ 系统通知。不做"两边都发"：双份打扰。
+     */
+    fun announceDone(notice: TaskDoneNotice) {
+        if (context.mainUiVisible) taskDone = notice
+        else TaskDoneNotifier.notifyDone(context, "${notice.title}：${notice.text}")
+    }
+
+    // 后台任务的"忙"状态（导航栏红点）+ 跑完的提示。
+    // 扫描要防抖（理由见 SCAN_BUSY_DEBOUNCE_MS：队列换任务的空档会被当成"跑完了"）；
+    // 查重 / 预览图不排队、一轮跑完就散场，边沿即时可用（debounceMs = 0）——
+    // 它们的完成弹窗要按"这一刻面板开没开"决定弹不弹，防抖会把那个判据推迟 1.2 秒。
     val scanBusy by rememberBusyEdge(
         busy = combine(container.mediaScanner.progress, container.mediaScanner.pending) { p, queue ->
             p.running || queue.isNotEmpty()
         },
-    ) { notifyScanFinished(context, container, snackbarHostState) }
+    ) { scanNotice(container)?.let { announceDone(it) } }
     val renameBusy by rememberBusyEdge(
         busy = container.renameWorker.activeTaskId.map { it != null },
     ) { notifyRenameFinished(context, container, snackbarHostState) }
     val organizeBusy by rememberBusyEdge(
         busy = container.fileOrganizer.progress.map { it.running },
     ) { notifyOrganizeFinished(context, container, snackbarHostState) }
+    val dupBusy by rememberBusyEdge(
+        busy = combine(container.duplicateFinder.progress, container.versionFinder.progress) { a, b ->
+            a.running || b.running
+        },
+        debounceMs = 0L,
+    ) {
+        // 面板开着 = 结果就在眼前，不再弹窗打扰；但"人已经切走"时面板看不见，照旧发通知
+        if (dupRequest == null || !context.mainUiVisible) dupNotice(container)?.let { announceDone(it) }
+    }
+    val previewBusy by rememberBusyEdge(
+        busy = container.previewBuilder.progress.map { it.running },
+        debounceMs = 0L,
+    ) {
+        if (previewRequest == null || !context.mainUiVisible) previewNotice(container)?.let { announceDone(it) }
+    }
+    val scrapBusy by rememberBusyEdge(
+        busy = container.metadataScraper.progress.map { it.running },
+        debounceMs = 0L,
+    ) {
+        // 批量面板开着（在媒体库页复核候选）或单片刮削对话框开着：搜索/写入的结果就在眼前，
+        // 不弹窗打扰；切走了（对话框关了、任务挂后台）才报
+        val panelVisible = context.mainUiVisible &&
+            (container.metadataScraper.session.value != null || container.metadataScraper.singleDialogOpen)
+        if (!panelVisible) scrapNotice(container)?.let { announceDone(it) }
+    }
 
     /** 某个导航入口上要不要挂"任务在跑"的红点（route 现算：手机底栏把重命名收在「更多」里） */
     fun destBusy(route: String): Boolean = when (route) {
-        "files" -> organizeBusy
+        // 整理 / 查重 / 预览图都是从文件页发起的长任务：谁在跑都点亮「文件」这个入口
+        "files" -> organizeBusy || dupBusy || previewBusy
         "rename", "more" -> renameBusy
-        MEDIA_ROUTE -> scanBusy
+        // 刮削红点也挂媒体库入口（批量从媒体库发起；详情页单条写入同样在这条线里）
+        MEDIA_ROUTE -> scanBusy || scrapBusy
         else -> false
     }
 
@@ -511,6 +655,27 @@ private fun MainScaffold(container: AppContainer, widthClass: WindowWidthSizeCla
     }
 
     /**
+     * 完成弹窗点「查看结果」：面板的"家"在文件页，先切过去再把面板挂回来 ——
+     * 结果还在引擎的进度对象里，不用重跑。
+     *
+     * 媒体库要走**反向水波**退出（它没有导航栏、只能走那条路），其它页走普通切页；
+     * 面板渲染在内容区之上、水波又画在全部内容之上，所以切页那一下不会穿帮。
+     */
+    fun gotoPanel(open: () -> Unit) {
+        when (currentRoute) {
+            "files" -> open()
+            MEDIA_ROUTE -> {
+                leaveMediaWave()
+                open()
+            }
+            else -> {
+                navigateRoute("files")
+                open()
+            }
+        }
+    }
+
+    /**
      * 启动首页：导航图起点**恒为文件页**，登录后只往偏好页跳一次。
      *
      * 为什么不直接把偏好页设成 startDestination：媒体库页是"盖在文件页之上"的沉浸页
@@ -555,11 +720,6 @@ private fun MainScaffold(container: AppContainer, widthClass: WindowWidthSizeCla
     var textPreview by remember { mutableStateOf<FileItem?>(null) }
     /** 批量重命名：面板渲染在内容区之内（左侧导航栏保持可见），状态由文件页触发 */
     var batchRename by remember { mutableStateOf<BatchRenameRequest?>(null) }
-    /** 查找重复文件：同上 —— 从文件页发起，面板与批量重命名同层 */
-    var dupRequest by remember { mutableStateOf<DupScanRequest?>(null) }
-
-    /** 批量生成视频预览图的请求（面板与查重同层渲染，见下面 PreviewPanel） */
-    var previewRequest by remember { mutableStateOf<PreviewRequest?>(null) }
     /** 云下载页点任务跳转：待打开的目录 (cid, name)，文件页进页时消费（openByCid） */
     var pendingCloudJump by remember { mutableStateOf<Pair<String, String>?>(null) }
     val jumpToCloudDir: (String, String) -> Unit = { cid, name ->
@@ -578,7 +738,7 @@ private fun MainScaffold(container: AppContainer, widthClass: WindowWidthSizeCla
     // （这时什么都不显示），探到接口通才翻成 false 放出来（见 MediaScanner.raiseResumeProposal）
     val resumeProposal by container.mediaScanner.resumeProposal.collectAsState()
     resumeProposal?.takeIf { !it.checking }?.let { proposal ->
-        AlertDialog(
+        FadeAlertDialog(
             onDismissRequest = { container.mediaScanner.dismissResume() },
             title = { Text("上次扫描未完成") },
             text = { Text(resumeScanText(proposal)) },
@@ -870,6 +1030,11 @@ private fun MainScaffold(container: AppContainer, widthClass: WindowWidthSizeCla
                                 container.downloadPrefs,
                                 container.dirCache,
                                 container.dirRemovals,
+                                // 提交走 DownloadSubmitter（剪贴板/外部唤起同一套错误文案）
+                                container.downloadSubmitter,
+                                // 磁力搜索（MCP）：配置在实验室
+                                container.playerPrefs,
+                                container.okHttpClient,
                             )
                         })
                         OfflineScreen(vm, expanded, snackbarHostState, onJump = jumpToCloudDir)
@@ -925,11 +1090,18 @@ private fun MainScaffold(container: AppContainer, widthClass: WindowWidthSizeCla
                 // 批量重命名面板：与 NavHost 同层，浮在内容区之上但**不盖住左侧导航栏** ——
                 // 批量改名时经常要换目录挑文件，把导航藏掉反而挡路。
                 // （图片画廊 / 文本预览仍是根层级全屏，那是沉浸式查看，语义不同）
-                batchRename?.let { req ->
+                FadePresence(batchRename) { req ->
+                    val aiCustom = container.mediaPrefs.aiCustomTemplates.collectAsState(initial = emptyList()).value
+                    val aiRenameTpl = container.mediaPrefs.aiRenameTemplate.collectAsState(
+                        initial = com.open115.pad.data.media.scrape.AiPromptTemplates.RENAME_CLEAN,
+                    ).value
                     BatchRenamePanel(
                         request = req,
                         queue = container.renameQueue,
                         scope = scope,
+                        aiClient = container.aiQueryClient,
+                        aiTemplates = com.open115.pad.data.media.scrape.AiPromptTemplates.all(aiCustom),
+                        aiDefaultTpl = aiRenameTpl,
                         onGotoTasks = {
                             batchRename = null
                             destinations.firstOrNull { it.route == "rename" }?.let { navigate(it) }
@@ -939,7 +1111,7 @@ private fun MainScaffold(container: AppContainer, widthClass: WindowWidthSizeCla
                 }
 
                 // 查找重复文件面板：同一层（盖内容区、不盖导航栏）。判重是只读的，删除走 115 回收站。
-                dupRequest?.let { req ->
+                FadePresence(dupRequest) { req ->
                     DuplicatePanel(
                         request = req,
                         finder = container.duplicateFinder,
@@ -971,7 +1143,7 @@ private fun MainScaffold(container: AppContainer, widthClass: WindowWidthSizeCla
                 }
 
                 // 批量生成视频预览图面板：同一层，只读（抓帧落本机缓存，不动云端）
-                previewRequest?.let { req ->
+                FadePresence(previewRequest) { req ->
                     PreviewPanel(
                         request = req,
                         builder = container.previewBuilder,
@@ -1046,7 +1218,7 @@ private fun MainScaffold(container: AppContainer, widthClass: WindowWidthSizeCla
     // 刻意不用 finish()：主界面若被销毁，任务栈就空了，用户再切回来等于冷启动
     // （正在播放的视频、浏览到的目录全丢），这正是要避免的"返回后把应用杀掉"。
     returnAsk?.let { ask ->
-        AlertDialog(
+        FadeAlertDialog(
             onDismissRequest = { returnAsk = null },
             title = { Text(if (ask.error == null) "已提交云下载" else "云下载未提交") },
             text = {
@@ -1063,6 +1235,34 @@ private fun MainScaffold(container: AppContainer, widthClass: WindowWidthSizeCla
             },
             dismissButton = {
                 TextButton(onClick = { returnAsk = null }) { Text("留在本应用") }
+            },
+        )
+    }
+
+    // 长任务（扫描 / 查找重复 / 视频预览图）跑完的弹窗。
+    // 「查看结果」把面板挂回来：结果还在引擎的进度对象里，不用重跑（查重面板还会落在
+    // 它跑的那个模式上，见 DupScanRequest.version）。
+    taskDone?.let { done ->
+        FadeAlertDialog(
+            onDismissRequest = { taskDone = null },
+            title = { Text(done.title) },
+            text = { Text(done.text) },
+            confirmButton = {
+                done.view?.let { target ->
+                    TextButton(onClick = {
+                        taskDone = null
+                        when (target) {
+                            is PanelTarget.Dup -> gotoPanel { dupRequest = target.request }
+                            is PanelTarget.Preview -> gotoPanel { previewRequest = target.request }
+                            // 刮削的结果在媒体库页的复核面板里：直接切过去
+                            // （不走 gotoPanel —— 那个是"面板挂在文件页"的语义）
+                            PanelTarget.MediaScrape -> navigateRoute(MEDIA_ROUTE)
+                        }
+                    }) { Text("查看结果") }
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { taskDone = null }) { Text("知道了") }
             },
         )
     }

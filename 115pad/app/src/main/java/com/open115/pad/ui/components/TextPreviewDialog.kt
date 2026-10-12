@@ -51,6 +51,11 @@ import com.open115.pad.ui.theme.AppColors
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
+import android.widget.Toast
+import androidx.compose.foundation.text.selection.SelectionContainer
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.AnnotatedString
 
 /**
  * 文本预览：解析直链 → 取前若干字节 → 按行分页展示。
@@ -113,6 +118,8 @@ private fun TextPreviewOverlay(
     onDownload: () -> Unit,
     onDismiss: () -> Unit,
 ) {
+    val context = LocalContext.current
+    val clipboard = LocalClipboardManager.current
     var page by remember(preview) { mutableIntStateOf(0) }
     var encodingMenu by remember { mutableStateOf(false) }
     // 编码切换时重解，不走网络，直接替换本地内容
@@ -223,14 +230,18 @@ private fun TextPreviewOverlay(
                             .verticalScroll(rememberScrollState())
                             .padding(horizontal = 16.dp, vertical = 12.dp),
                     ) {
-                        Text(
-                            text = current!!.page(pageNo).joinToString("\n"),
-                            // 等宽：代码缩进、目录树的对齐都靠它
-                            fontFamily = FontFamily.Monospace,
-                            fontSize = 13.sp,
-                            lineHeight = 19.sp,
-                            color = AppColors.TextPrimary,
-                        )
+                        // SelectionContainer：长按选择、拖动手柄、系统「复制」菜单
+                        //（可滚动容器里与滚动手势共存：未进入选择态时滑动仍翻滚页面）
+                        SelectionContainer {
+                            Text(
+                                text = current!!.page(pageNo).joinToString("\n"),
+                                // 等宽：代码缩进、目录树的对齐都靠它
+                                fontFamily = FontFamily.Monospace,
+                                fontSize = 13.sp,
+                                lineHeight = 19.sp,
+                                color = AppColors.TextPrimary,
+                            )
+                        }
                     }
                 }
             }
@@ -254,6 +265,14 @@ private fun TextPreviewOverlay(
                     color = AppColors.TextSecondary,
                     modifier = Modifier.weight(1f),
                 )
+                // 复制本页：长按选择适合挑着复制，这一颗是「整页拿走」的快捷方式
+                if (current != null && error == null) {
+                    TextButton(onClick = {
+                        val text = current!!.page(pageNo).joinToString("\n")
+                        clipboard.setText(AnnotatedString(text))
+                        Toast.makeText(context, "已复制本页 ${current!!.page(pageNo).size} 行", Toast.LENGTH_SHORT).show()
+                    }) { Text("复制本页") }
+                }
                 TextButton(
                     onClick = { page = (pageNo + 1).coerceAtMost(total - 1) },
                     enabled = pageNo < total - 1,

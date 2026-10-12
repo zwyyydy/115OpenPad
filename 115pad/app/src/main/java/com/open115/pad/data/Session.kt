@@ -154,13 +154,26 @@ class Session(private val context: Context) {
     }
 }
 
+/**
+ * 115 自家域（含 CDN 家族）：只有这些 host 才配带上 115 的 Bearer。
+ *
+ * 全局 OkHttpClient 被复用到第三方链路（Coil 加载 gfriends 头像、弹幕源、迅雷字幕搜索），
+ * 早先"除 passportapi 外一律加头"会把 115 token 发给这些站 —— 凭证外泄。改成白名单：
+ * 非 115 host 一律不加 Authorization。passportapi 是登录接口（那时还没有 token），一并排除。
+ * 域名族与 [com.open115.pad.util.LinkParser] 的 TRUSTED_FILE_HOSTS 对齐。
+ */
+internal fun is115Host(host: String): Boolean {
+    val h = host.lowercase()
+    if (h.startsWith("passportapi")) return false
+    return h == "115.com" || h.endsWith(".115.com") ||
+        h.endsWith(".115cdn.com") || h.endsWith(".115cdn.net") || h.endsWith(".anxia.com")
+}
+
 class AuthInterceptor(private val session: Session) : okhttp3.Interceptor {
     override fun intercept(chain: okhttp3.Interceptor.Chain): okhttp3.Response {
         val req = chain.request()
-        // 授权相关接口（passportapi）不需要 Bearer 头
-        val host = req.url.host
-        val token = if (host.startsWith("passportapi")) null
-        else kotlinx.coroutines.runBlocking { session.currentAccessToken() }
+        // 只给 115 自家域带 Bearer；第三方（头像 CDN / 弹幕 / 字幕）一律不加
+        val token = if (is115Host(req.url.host)) kotlinx.coroutines.runBlocking { session.currentAccessToken() } else null
         val newReq = if (token.isNullOrBlank()) req
         else req.newBuilder().header("Authorization", "Bearer $token").build()
         return chain.proceed(newReq)
@@ -169,6 +182,8 @@ class AuthInterceptor(private val session: Session) : okhttp3.Interceptor {
 
 class TokenAuthenticator(private val session: Session) : okhttp3.Authenticator {
     override fun authenticate(route: okhttp3.Route?, response: okhttp3.Response): okhttp3.Request? {
+        // 只为 115 自家域做 401 刷新重试；第三方 401（密码错/限流）不该动我们的令牌
+        if (!is115Host(response.request.url.host)) return null
         if (responseCount(response) >= 2) return null
         val token = kotlinx.coroutines.runBlocking { session.refreshBlocking() } ?: return null
         return response.request.newBuilder()
@@ -202,6 +217,10 @@ class Logical401Interceptor(private val session: Session) : okhttp3.Interceptor 
     override fun intercept(chain: okhttp3.Interceptor.Chain): okhttp3.Response {
         val request = chain.request()
         val response = chain.proceed(request)
+        // 40140xxx 是 115 的"HTTP 200 + body 带码"语义，只对 115 自家域解析；
+        // 第三方正文碰巧含这串数字会把人误踢下线（配合 AuthInterceptor 的白名单，
+        // 非 115 请求现在本来就不带 Authorization 了，这里是双保险）
+        if (!is115Host(request.url.host)) return response
         if (request.header("Authorization").isNullOrBlank()) return response
         val peeked = runCatching { response.peekBody(65536).string() }.getOrNull() ?: return response
 

@@ -15,7 +15,6 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.CloudUpload
-import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
@@ -50,6 +49,7 @@ import okhttp3.OkHttpClient
 import java.net.URLEncoder
 import java.nio.charset.Charset
 import java.nio.charset.CodingErrorAction
+import com.open115.pad.ui.components.FadeAlertDialog
 
 data class XunleiSub(
     val name: String,
@@ -270,7 +270,7 @@ internal fun SubtitleSearchDialog(
         }
     }
 
-    AlertDialog(
+    FadeAlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("在线字幕") },
         text = {

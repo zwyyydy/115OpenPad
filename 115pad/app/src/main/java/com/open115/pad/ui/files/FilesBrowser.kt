@@ -26,6 +26,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.PushPin
+import androidx.compose.material.icons.outlined.AutoFixHigh
 import androidx.compose.material.icons.outlined.Check
 import androidx.compose.material.icons.outlined.Category
 import androidx.compose.material.icons.outlined.ChevronRight
@@ -41,6 +42,7 @@ import androidx.compose.material.icons.outlined.Edit
 import androidx.compose.material.icons.outlined.FilterAlt
 import androidx.compose.material.icons.outlined.FilterList
 import androidx.compose.material.icons.outlined.GridView
+import androidx.compose.material.icons.outlined.NoteAdd
 import androidx.compose.material.icons.outlined.PushPin
 import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material.icons.outlined.Search
@@ -50,6 +52,8 @@ import androidx.compose.material.icons.outlined.Star
 import androidx.compose.material.icons.outlined.StarBorder
 import androidx.compose.material.icons.outlined.Upload
 import androidx.compose.material.icons.outlined.ViewList
+import androidx.compose.material3.Badge
+import androidx.compose.material3.BadgedBox
 import androidx.compose.material3.BottomAppBar
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
@@ -113,6 +117,17 @@ private val sortOptions = listOf(
     "user_utime" to "按修改时间",
 )
 
+/**
+ * 任务在跑时给按键图标挂一个小红点（与导航栏那几个红点同一套语义：那边还有活在干）。
+ *
+ * 有红点的是"关掉面板之后任务还在跑"的两个入口（查找重复 / 生成视频预览图）——
+ * 整理任务不用它，整理在跑时顶栏下面本来就有进度横幅。
+ */
+@Composable
+private fun BusyBadge(busy: Boolean, content: @Composable () -> Unit) {
+    if (busy) BadgedBox(badge = { Badge() }) { content() } else content()
+}
+
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
 @Composable
 fun FilesBrowserPane(
@@ -131,12 +146,21 @@ fun FilesBrowserPane(
     /** 全选 / 取消全选当前显示的条目 */
     onSelectAll: () -> Unit,
     onStar: (FileItem) -> Unit,
+    /**
+     * 刮削元数据（TMDB）：只对**单个目录**或**单个视频文件**可用 ——
+     * 选中一个 → 单条刮削对话框；选中多个 → [onScrapeMany] 一次批量。
+     */
+    onScrape: (FileItem) -> Unit,
+    /** 多选里选了多个可刮条目时：一次批量刮削（复核面板逐条核对再写） */
+    onScrapeMany: (List<FileItem>) -> Unit,
     /** 置顶 / 取消置顶：传入当前选择集里可置顶的文件夹（可能为空） */
     onPin: (List<FileItem>) -> Unit,
     onDownload: () -> Unit,
     onUpload: () -> Unit,
     onUploadFolder: () -> Unit,
     onCreateFolder: () -> Unit,
+    /** 新建文本文件：点顶栏按键，弹全屏编辑器（文件名 + 内容），保存由上层走上传 */
+    onCreateFile: () -> Unit = {},
     onOpenFilterRules: () -> Unit,
     /** 分类整理：点顶栏按键，弹确认框（确认与否由 FilesScreen 决定） */
     onOrganize: () -> Unit = {},
@@ -144,6 +168,10 @@ fun FilesBrowserPane(
     onFindDuplicates: () -> Unit = {},
     /** 生成视频预览图：同上，把"从当前层开始抓帧"的请求交给上层（只读，不动云端） */
     onGeneratePreviews: () -> Unit = {},
+    /** 查重任务在跑（面板关掉之后任务照跑，红点是"还在干"的唯一指示） */
+    dupBusy: Boolean = false,
+    /** 预览图任务在跑：同上 */
+    previewBusy: Boolean = false,
     /** 列表里是否显示视频预览条（设置 → 界面可关） */
     showVideoStrip: Boolean = true,
     /** 双面板模式开关：开=内容区换成左右两栏（类 MT 管理器，跨栏快速移动） */
@@ -214,13 +242,18 @@ fun FilesBrowserPane(
                         IconButton(onClick = onOrganize) {
                             Icon(Icons.Outlined.Category, contentDescription = "分类整理")
                         }
-                        // 查找重复文件：按 sha1 找内容完全相同的副本（同样是"大动作"，紧挨着整理）
+                        // 查找重复文件：按 sha1 找内容完全相同的副本（同样是"大动作"，紧挨着整理）。
+                        // 面板关掉之后任务照跑，所以按键上挂"还在干"的红点（与导航栏那几个同一套语义）
                         IconButton(onClick = onFindDuplicates) {
-                            Icon(Icons.Outlined.ContentCopy, contentDescription = "查找重复")
+                            BusyBadge(dupBusy) {
+                                Icon(Icons.Outlined.ContentCopy, contentDescription = "查找重复")
+                            }
                         }
                         // 生成视频预览图：抓最小转码档的一帧当缩略图（只读，不动云端）
                         IconButton(onClick = onGeneratePreviews) {
-                            Icon(Icons.Outlined.Collections, contentDescription = "生成视频预览图")
+                            BusyBadge(previewBusy) {
+                                Icon(Icons.Outlined.Collections, contentDescription = "生成视频预览图")
+                            }
                         }
                         // 双面板（类 MT 管理器）：开启高亮主色，再点一次退出
                         IconButton(onClick = onToggleDualPane) {
@@ -297,6 +330,9 @@ fun FilesBrowserPane(
                         }
                         IconButton(onClick = onCreateFolder) {
                             Icon(Icons.Outlined.CreateNewFolder, contentDescription = "新建文件夹")
+                        }
+                        IconButton(onClick = onCreateFile) {
+                            Icon(Icons.Outlined.NoteAdd, contentDescription = "新建文本文件")
                         }
                         // 上传：文件 / 文件夹（SAF 目录树）二选一
                         var uploadMenuOpen by remember { mutableStateOf(false) }
@@ -774,6 +810,17 @@ fun FilesBrowserPane(
                     }
                     IconButton(onClick = { single?.let(onStar) }, enabled = single != null) {
                         Icon(Icons.Outlined.StarBorder, contentDescription = "星标")
+                    }
+                    // 刮削元数据（TMDB）：选中的目录/视频里可刮的那些。
+                    // 恰好一个 → 单条对话框；多个 → 一次批量（复核面板逐条核对再写）。
+                    val scrapeTargets = ui.items.filter {
+                        it.fid in ui.selection && (it.isDir || it.isv == 1 || com.open115.pad.data.media.isVideoFileName(it.fn))
+                    }
+                    IconButton(
+                        onClick = { if (scrapeTargets.size == 1) onScrape(scrapeTargets[0]) else onScrapeMany(scrapeTargets) },
+                        enabled = scrapeTargets.isNotEmpty(),
+                    ) {
+                        Icon(Icons.Outlined.AutoFixHigh, contentDescription = "刮削元数据")
                     }
                     // 置顶：只对文件夹有意义，所以选择集里至少有一个文件夹时按钮才可用
                     //（夹在里面的文件会被忽略）。这些文件夹若已全部置顶，按钮转为实心态。

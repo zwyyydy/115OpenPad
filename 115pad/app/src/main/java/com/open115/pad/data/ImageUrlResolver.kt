@@ -515,7 +515,7 @@ class ImageUrlResolver(
                     val len = f.length()
                     if (f.delete()) total -= len
                 }
-            }
+            }.onFailure { android.util.Log.w(TAG, "海报缓存 LRU 淘汰失败（缓存可能一直超出上限）", it) }
         }
     }
 }

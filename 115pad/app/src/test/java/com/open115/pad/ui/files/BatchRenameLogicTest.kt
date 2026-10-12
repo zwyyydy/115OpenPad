@@ -265,4 +265,30 @@ class BatchRenameLogicTest {
         assertTrue(!previews[0].changed)
         assertTrue(previews[1].changed)
     }
+
+    @Test
+    fun `AI 模式取 manualByFid 里的生成名`() {
+        val items = names("a.mkv", "b.mkv")
+        val cfg = RenameConfig(
+            mode = RenameMode.AI,
+            manualByFid = mapOf(items[0].fid!! to "新名.mkv"),
+        )
+        val previews = computeNewNames(items, cfg)
+        assertEquals("新名.mkv", previews[0].newName)
+        // 没生成的行保持原名（unchanged）
+        assertEquals("b.mkv", previews[1].newName)
+        assertTrue(!previews[1].changed)
+    }
+
+    @Test
+    fun `keepExt 把扩展名配回原文件的`() {
+        // AI 没带扩展名 → 补原扩展名
+        assertEquals("蜘蛛侠 (2002).mkv", keepExt("spider.2002.1080p.mkv", "蜘蛛侠 (2002)"))
+        // AI 带了正确扩展名 → 原样
+        assertEquals("干净名.mp4", keepExt("x.y.z.mp4", "干净名.mp4"))
+        // AI 带了别的扩展名 → 用原扩展名替换
+        assertEquals("片名.mkv", keepExt("片名旧.mkv", "片名.mp4"))
+        // 原文件没扩展名 → 不动
+        assertEquals("README", keepExt("README", "README"))
+    }
 }

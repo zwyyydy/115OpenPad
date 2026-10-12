@@ -28,7 +28,6 @@ import androidx.compose.material.icons.outlined.Delete
 import androidx.compose.material.icons.outlined.Folder
 import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material.icons.outlined.Search
-import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
@@ -71,6 +70,7 @@ import com.open115.pad.data.DownloadPrefs
 import com.open115.pad.data.DirCache
 import com.open115.pad.data.OpenApi
 import com.open115.pad.data.OfflineTask
+import com.open115.pad.data.PlayerPrefs
 import com.open115.pad.data.envMsg
 import com.open115.pad.data.envOk
 import com.open115.pad.data.parseOfflineQuota
@@ -83,6 +83,9 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.flowOf
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
@@ -91,10 +94,12 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import okhttp3.OkHttpClient
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.ui.draw.clip
+import com.open115.pad.ui.components.FadeAlertDialog
 
 class OfflineViewModel(
     val api: OpenApi,
@@ -106,6 +111,10 @@ class OfflineViewModel(
     private val dirRemovals: MutableSharedFlow<Map<String, Set<String>>>? = null,
     /** 提交入口（与剪贴板/外部唤起共用同一套语义与错误提示） */
     private val submitter: DownloadSubmitter? = null,
+    /** 磁力搜索源（MCP）配置：开关/端点/Token 都在实验室 */
+    private val playerPrefs: PlayerPrefs? = null,
+    /** 磁力搜索用的 HTTP 客户端（不带 115 限速的那个） */
+    val okHttpClient: OkHttpClient? = null,
 ) : ViewModel() {
 
     data class UiState(
@@ -231,6 +240,28 @@ class OfflineViewModel(
         viewModelScope.launch { downloadPrefs?.setSaveLocation(DownloadPrefs.SaveLocation(cid, name)) }
     }
 
+    // ---- 磁力搜索源（MCP）：配置在实验室；开关开着且 Token 非空时云下载页才出搜索入口 ----
+
+    val magnetEndpoint: StateFlow<String> =
+        (playerPrefs?.labMagnetEndpoint ?: MutableStateFlow("")).stateIn(
+            viewModelScope, SharingStarted.WhileSubscribed(5_000), "",
+        )
+
+    val magnetToken: StateFlow<String> =
+        (playerPrefs?.labMagnetToken ?: MutableStateFlow("")).stateIn(
+            viewModelScope, SharingStarted.WhileSubscribed(5_000), "",
+        )
+
+    val magnetReady: StateFlow<Boolean> =
+        combine(
+            playerPrefs?.labMagnetEnabled ?: flowOf(false),
+            playerPrefs?.labMagnetToken ?: flowOf(""),
+        ) { on, token ->
+            android.util.Log.d("MAGDBG", "combine: enabled=$on tokenLen=${token.length} prefs=$playerPrefs")
+            on && token.isNotBlank()
+        }
+            .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), false)
+
     suspend fun addUrls(urls: String, wpPathId: String): String? {
         // 与剪贴板识别、外部唤起的提交共用同一套实现与错误提示
         val err = if (submitter != null) {
@@ -351,6 +382,9 @@ fun OfflineScreen(
     onJump: ((cid: String, name: String) -> Unit)? = null,
 ) {
     var showAdd by remember { mutableStateOf(false) }
+    var showMagnetSearch by remember { mutableStateOf(false) }
+    val magnetReady by vm.magnetReady.collectAsState()
+    android.util.Log.d("MAGDBG", "OfflineScreen: magnetReady=$magnetReady")
     Scaffold(
         topBar = {
             TopAppBar(
@@ -373,6 +407,9 @@ fun OfflineScreen(
         OfflineBody(
             vm, snackbarHostState, Modifier.padding(padding), embedded = false,
             showAdd = showAdd, onAddDismiss = { showAdd = false }, onJump = onJump,
+            showMagnetSearch = showMagnetSearch, onMagnetDismiss = { showMagnetSearch = false },
+            onMagnetOpen = { showAdd = false; showMagnetSearch = true },
+            magnetReady = magnetReady,
         )
     }
 }
@@ -388,10 +425,15 @@ fun OfflineEmbedded(
     onJump: ((cid: String, name: String) -> Unit)? = null,
 ) {
     var showAdd by remember { mutableStateOf(false) }
+    var showMagnetSearch by remember { mutableStateOf(false) }
+    val magnetReady by vm.magnetReady.collectAsState()
     Box(Modifier.fillMaxSize()) {
         OfflineBody(
             vm, snackbarHostState, Modifier.fillMaxSize(), embedded = true,
             showAdd = showAdd, onAddDismiss = { showAdd = false }, onJump = onJump,
+            showMagnetSearch = showMagnetSearch, onMagnetDismiss = { showMagnetSearch = false },
+            onMagnetOpen = { showAdd = false; showMagnetSearch = true },
+            magnetReady = magnetReady,
         )
         ExtendedFloatingActionButton(
             onClick = { showAdd = true },
@@ -411,6 +453,11 @@ private fun OfflineBody(
     showAdd: Boolean,
     onAddDismiss: () -> Unit,
     onJump: ((cid: String, name: String) -> Unit)? = null,
+    showMagnetSearch: Boolean = false,
+    onMagnetDismiss: () -> Unit = {},
+    /** 「添加任务」对话框里的磁力搜索入口（磁力源就绪才非空） */
+    onMagnetOpen: (() -> Unit)? = null,
+    magnetReady: Boolean = false,
 ) {
     val ui by vm.ui.collectAsState()
     val saveLocation by vm.saveLocation.collectAsState()
@@ -508,27 +555,37 @@ private fun OfflineBody(
                 }
             }
 
-            // 搜索：本地过滤（任务名/链接/hash），输入时 VM 自动把剩余分页拉全
-            OutlinedTextField(
-                value = ui.query,
-                onValueChange = { vm.setSearch(it) },
-                placeholder = { Text("搜索任务名 / 链接 / hash") },
-                leadingIcon = { Icon(Icons.Outlined.Search, contentDescription = null) },
-                trailingIcon = {
-                    if (ui.query.isNotEmpty()) {
-                        IconButton(onClick = { vm.setSearch("") }) {
-                            Icon(Icons.Outlined.Close, contentDescription = "清空搜索")
+            // 搜索：本地过滤（任务名/链接/hash），输入时 VM 自动把剩余分页拉全。
+            // 行尾挂「磁力搜索」入口——★必须放在内容区：顶栏（y<100）触摸不响应
+            // （实测整片死区，放大镜/刷新都点不动），入口放顶栏等于摆设。
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                OutlinedTextField(
+                    value = ui.query,
+                    onValueChange = { vm.setSearch(it) },
+                    placeholder = { Text("搜索任务名 / 链接 / hash") },
+                    leadingIcon = { Icon(Icons.Outlined.Search, contentDescription = null) },
+                    trailingIcon = {
+                        if (ui.query.isNotEmpty()) {
+                            IconButton(onClick = { vm.setSearch("") }) {
+                                Icon(Icons.Outlined.Close, contentDescription = "清空搜索")
+                            }
                         }
-                    }
-                },
-                singleLine = true,
-                shape = RoundedCornerShape(24.dp),
-                textStyle = MaterialTheme.typography.bodyMedium,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 12.dp, vertical = 4.dp)
-                    .heightIn(min = 48.dp),
-            )
+                    },
+                    singleLine = true,
+                    shape = RoundedCornerShape(24.dp),
+                    textStyle = MaterialTheme.typography.bodyMedium,
+                    modifier = Modifier
+                        .weight(1f)
+                        .padding(start = 12.dp, top = 4.dp, bottom = 4.dp)
+                        .heightIn(min = 48.dp),
+                )
+                if (magnetReady) {
+                    TextButton(
+                        onClick = { onMagnetOpen?.invoke() },
+                        modifier = Modifier.padding(end = 8.dp),
+                    ) { Text("磁力搜索") }
+                }
+            }
 
             // 状态筛选：轻量分段胶囊
             Row(
@@ -644,11 +701,18 @@ private fun OfflineBody(
                 vm.rememberSaveLocation(cid, name)
                 scope.launch { notify(vm.addUrls(urls, cid)) }
             },
+            onMagnetSearch = onMagnetOpen,
         )
+    }
+    // ★ 浮层必须在 `if (showAdd)` **之外**：入口点击是「关掉添加任务、开磁力搜索」
+    // （showAdd=false; showMagnetSearch=true），嵌在 showAdd 里的话浮层永远不组合——
+    // 用户实测的「点搜索没反应、再点添加任务才出现」就是这个嵌套造成的
+    if (showMagnetSearch) {
+        MagnetSearchOverlay(vm = vm, onDismiss = onMagnetDismiss)
     }
     deleteTarget?.let { task ->
         var deleteSource by remember(task.infoHash) { mutableStateOf(false) }
-        AlertDialog(
+        FadeAlertDialog(
             onDismissRequest = { deleteTarget = null },
             title = { Text("删除任务") },
             text = {
@@ -672,7 +736,7 @@ private fun OfflineBody(
     }
     if (batchDelete) {
         var deleteSource by remember { mutableStateOf(false) }
-        AlertDialog(
+        FadeAlertDialog(
             onDismissRequest = { batchDelete = false },
             title = { Text("删除 ${selected.size} 个任务") },
             text = {
@@ -857,6 +921,8 @@ private fun AddTaskDialog(
     onDismiss: () -> Unit,
     onPickLocation: (cid: String, name: String) -> Unit,
     onConfirm: (urls: String, wpPathId: String, wpName: String) -> Unit,
+    /** 磁力搜索入口（磁力源就绪才非空）：关掉本对话框、打开搜索 */
+    onMagnetSearch: (() -> Unit)? = null,
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
@@ -892,7 +958,7 @@ private fun AddTaskDialog(
         }
     }
 
-    AlertDialog(
+    FadeAlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("添加云下载任务") },
         text = {
@@ -912,6 +978,10 @@ private fun AddTaskDialog(
                         enabled = !torrentBusy,
                     ) {
                         Text(if (torrentBusy) "解析中…" else "选择种子文件")
+                    }
+                    onMagnetSearch?.let {
+                        Spacer(Modifier.width(8.dp))
+                        TextButton(onClick = it, enabled = !torrentBusy) { Text("磁力搜索…") }
                     }
                     Spacer(Modifier.width(8.dp))
                     Text(

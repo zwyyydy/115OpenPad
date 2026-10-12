@@ -29,7 +29,6 @@ import androidx.compose.material.icons.outlined.Delete
 import androidx.compose.material.icons.outlined.Edit
 import androidx.compose.material.icons.outlined.FolderOpen
 import androidx.compose.material.icons.outlined.Tune
-import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.AssistChip
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -71,6 +70,7 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import java.util.UUID
 import androidx.compose.ui.draw.clip
+import com.open115.pad.ui.components.FadeAlertDialog
 
 /**
  * 过滤方案管理 VM：方案的增删改查直写 DataStore（整存整取 JSON 列表）。
@@ -194,7 +194,7 @@ fun FilterRulesScreen(container: AppContainer) {
     }
 
     deleteTarget?.let { target ->
-        AlertDialog(
+        FadeAlertDialog(
             onDismissRequest = { deleteTarget = null },
             title = { Text("删除方案") },
             text = { Text("确定删除「${target.name.ifBlank { "未命名方案" }}」？") },

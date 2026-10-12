@@ -33,5 +33,18 @@ Apache License 2.0 全文见 [licenses/Apache-2.0.txt](./licenses/Apache-2.0.txt
 | OkHttp、Retrofit、retrofit2-kotlinx-serialization-converter | Apache-2.0 |
 | Coil（coil-compose） | Apache-2.0 |
 | ZXing core | Apache-2.0 |
+| QuickJS（quickjs-android，插件化 JS 元数据源引擎） | Apache-2.0 |
 | JUnit 4（仅测试） | EPL-1.0 |
 | kxml2（仅测试，提供 XmlPullParser 实现） | BSD-3-Clause |
+
+## 对接的第三方服务与数据源
+
+以下均为运行期按需远程访问，本仓库不含其代码或数据；地址可在设置里改或关闭：
+
+| 名称 | 用途 | 说明 |
+| --- | --- | --- |
+| HTTP 服务源 | 元数据刮削 | 按固定的 REST 形态（`/v1/movies/search`、`/v1/movies/{provider}/{id}`）实现客户端，可接自建或第三方的兼容服务 |
+| TMDB API | 元数据刮削 | 用户自备 API Key，用于主流影片与剧集 |
+| [gfriends](https://github.com/xinxin8816/gfriends) 演员头像库 | 演员头像 | 默认经 jsDelivr 读取其公开索引与图片，只对库里没有本地头像的演员补图 |
+| 纸鸢磁力（MCP） | 磁力搜索 | Streamable HTTP MCP 端点，用户自备 Token |
+| 迅雷字幕搜索接口 | 在线字幕 | 按片名检索外挂字幕 |

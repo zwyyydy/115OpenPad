@@ -752,7 +752,7 @@ object Uploader {
                                     extraHeaders = listOf("x-oss-security-token" to cred.token),
                                     canonResource = "/$bucket/$obj?uploadId=$uid",
                                 )
-                            }
+                            }.onFailure { Log.w(TAG, "废弃分片会话的 DELETE 失败（云端可能残留未完成分片、占配额）", it) }
                             uploadId = createSequentialSession(cred, bucket, obj)
                             onSession(sha1, pickCode, uploadId)
                             completedParts = LinkedHashMap()

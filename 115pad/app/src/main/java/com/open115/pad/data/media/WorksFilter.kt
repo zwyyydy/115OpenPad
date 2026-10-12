@@ -62,7 +62,11 @@ data class CardFacets(
  * 一次查回这批作品的标签与演员，按 mediaKey 建好映射（筛选用）。
  *
  * 两条查询而不是每部片两条：列表最多几百条，逐条查就是上千次查询。
+ * 但 `IN (:keys)` 会被 Room 展开成 N 个占位符，SQLite 有变量数上限（老内核 999），
+ * 大库（几千部）一把梭会抛异常 —— 所以按 [KEY_CHUNK] 分块查、逐块合并。
  */
+private const val KEY_CHUNK = 500
+
 suspend fun cardFacetsOf(dao: MediaDao, keys: List<String>): Map<String, CardFacets> {
     if (keys.isEmpty()) return emptyMap()
     val out = HashMap<String, CardFacets>(keys.size)
@@ -72,8 +76,14 @@ suspend fun cardFacetsOf(dao: MediaDao, keys: List<String>): Map<String, CardFac
             out[row.mediaKey] = if (tag) old.copy(tags = old.tags + row.name) else old.copy(actors = old.actors + row.name)
         }
     }
-    runCatching { dao.tagNamesOf(keys) }.getOrDefault(emptyList()).let { merge(it, tag = true) }
-    runCatching { dao.actorNamesOf(keys) }.getOrDefault(emptyList()).let { merge(it, tag = false) }
+    for (chunk in keys.chunked(KEY_CHUNK)) {
+        runCatching { dao.tagNamesOf(chunk) }
+            .onFailure { android.util.Log.w("WorksFilter", "批量查标签失败（${chunk.size} 条）", it) }
+            .getOrDefault(emptyList()).let { merge(it, tag = true) }
+        runCatching { dao.actorNamesOf(chunk) }
+            .onFailure { android.util.Log.w("WorksFilter", "批量查演员失败（${chunk.size} 条）", it) }
+            .getOrDefault(emptyList()).let { merge(it, tag = false) }
+    }
     return out
 }
 

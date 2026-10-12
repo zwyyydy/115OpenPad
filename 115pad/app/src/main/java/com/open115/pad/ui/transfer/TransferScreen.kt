@@ -30,7 +30,6 @@ import androidx.compose.material.icons.outlined.OpenInNew
 import androidx.compose.material.icons.outlined.Pause
 import androidx.compose.material.icons.outlined.PlayArrow
 import androidx.compose.material.icons.outlined.Refresh
-import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
@@ -78,6 +77,7 @@ import com.open115.pad.util.Format
 import androidx.lifecycle.viewmodel.compose.viewModel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import com.open115.pad.ui.components.FadeAlertDialog
 
 /**
  * 传输中心：本机下载（系统 DownloadManager 任务）+ 上传（文件页 / 播放器字幕上传）两份记录。
@@ -459,7 +459,7 @@ fun TransferScreen(
     }
 
     pendingDelete?.let { t ->
-        AlertDialog(
+        FadeAlertDialog(
             onDismissRequest = { pendingDelete = null },
             title = { Text("删除下载") },
             text = { Text("将删除「${t.name}」的任务记录与已下载的文件。") },
@@ -476,7 +476,7 @@ fun TransferScreen(
     }
 
     pendingUploadDelete?.let { r ->
-        AlertDialog(
+        FadeAlertDialog(
             onDismissRequest = { pendingUploadDelete = null },
             title = { Text("移除上传记录") },
             // 只是历史记录，云盘上的文件不动——避免用户误以为会删云端文件
@@ -493,7 +493,7 @@ fun TransferScreen(
     }
 
     pendingUploadCancel?.let { r ->
-        AlertDialog(
+        FadeAlertDialog(
             onDismissRequest = { pendingUploadCancel = null },
             title = { Text("取消上传") },
             text = {

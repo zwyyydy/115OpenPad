@@ -23,7 +23,6 @@ import androidx.compose.material.icons.outlined.DeleteForever
 import androidx.compose.material.icons.outlined.Folder
 import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material.icons.outlined.RestoreFromTrash
-import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
@@ -70,6 +69,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import com.open115.pad.ui.components.FadeAlertDialog
 
 class RecycleViewModel(
     private val api: OpenApi,
@@ -530,7 +530,7 @@ private fun RecycleContent(
     }
 
     if (showClearAll) {
-        AlertDialog(
+        FadeAlertDialog(
             onDismissRequest = onDismissClearAll,
             title = { Text("清空回收站") },
             text = { Text("回收站内所有文件将被彻底删除且无法恢复，确定继续？") },
@@ -544,7 +544,7 @@ private fun RecycleContent(
         )
     }
     if (showDeleteConfirm) {
-        AlertDialog(
+        FadeAlertDialog(
             onDismissRequest = { showDeleteConfirm = false },
             title = { Text("彻底删除 ${ui.selection.size} 项") },
             text = { Text("删除后无法恢复，确定继续？") },

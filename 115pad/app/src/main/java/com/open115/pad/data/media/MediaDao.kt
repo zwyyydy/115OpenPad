@@ -40,6 +40,23 @@ data class MovieCard(
 )
 
 /**
+ * 详情页「分集」列表的一行：比普通 [MovieCard] 多带每集自己的**简介 / 首播 / 季号 / 集号**
+ * （这些是刮削写进 `episodedetails` nfo、扫描时落到该集行 + episodes 表的）。
+ *
+ * 番号式/多视频那批分集没有逐集简介，plot/aired 为空、season 常为空，界面按缺省显示。
+ */
+data class EpisodeRow(
+    val mediaKey: String,
+    val title: String,
+    val plot: String?,
+    val premiered: String?,
+    val season: Int?,
+    val episode: Int?,
+    val videoPickCode: String?,
+    val videoName: String?,
+)
+
+/**
  * 给 `LIMIT :limit` 传这个值 = **不限制**（SQLite 把负的 LIMIT 当"全都要"）。
  *
  * 海报墙要列**整个库**，不能再落在默认的 200 上 —— 那正是"库里有 2000 部、
@@ -48,6 +65,23 @@ data class MovieCard(
  */
 const val MEDIA_NO_LIMIT = -1
 
+/**
+ * 批量刮削的候选行：只要"够用来搜索 + 够用来写回"的字段。
+ *
+ * 不复用 [MovieCard]：它没有 dirCid/dirPath，而写回（上传到该片目录、排定向重扫）
+ * 两者都要；反过来说 rating/poster/genre 这些刮削候选也用不上。
+ */
+data class ScrapeTarget(
+    val mediaKey: String,
+    val title: String,
+    val year: Int? = null,
+    val videoPickCode: String? = null,
+    val videoName: String? = null,
+    val dirCid: String? = null,
+    val dirPath: String? = null,
+    val isEpisodeLike: Boolean = false,
+)
+
 /** 删库前收集的 pick_code：清该库对应的海报与 nfo 落盘缓存用 */
 data class MediaPickCodes(
     val nfoPickCode: String?,
@@ -55,6 +89,8 @@ data class MediaPickCodes(
     val fanartPickCode: String?,
     /** 自己目录里的缩略图（番号式的 `-thumb.jpg`）——刮削器会覆盖写它，清缓存时要一起清 */
     val thumbPickCode: String?,
+    /** 视频文件本身的 pick_code：预览图缓存（封面 + 预览条）按它键，删库要跟着清 */
+    val videoPickCode: String? = null,
 )
 
 /** 一条"作品 → 名字"（标签名 / 演员名，给列表筛选批量取用，见 [MediaDao.tagNamesOf] / [MediaDao.actorNamesOf]） */
@@ -698,6 +734,14 @@ interface MediaDao {
     )
     suspend fun episodesOfSeries(seriesKey: String): List<MovieCard>
 
+    /** 系列下分集的**富信息**（详情页选集用）：带每集简介/首播 + join episodes 拿季/集号 */
+    @Query(
+        "SELECT m.mediaKey AS mediaKey, m.title AS title, m.plot AS plot, m.premiered AS premiered, " +
+            "e.season AS season, e.episode AS episode, m.videoPickCode AS videoPickCode, m.videoName AS videoName " +
+            "FROM movies m LEFT JOIN episodes e ON e.mediaKey = m.mediaKey WHERE m.seriesKey = :seriesKey",
+    )
+    suspend fun episodeDetailsOfSeries(seriesKey: String): List<EpisodeRow>
+
     /**
      * 这条**以及它名下的分集**的文件信息（删单个条目用）。
      *
@@ -756,7 +800,7 @@ interface MediaDao {
 
     /** 删库 / 流水线同步前先收集要清缓存的 pick_code（投影，不取整个实体） */
     @Query(
-        "SELECT nfoPickCode, posterPickCode, fanartPickCode, thumbPickCode FROM movies " +
+        "SELECT nfoPickCode, posterPickCode, fanartPickCode, thumbPickCode, videoPickCode FROM movies " +
             "WHERE dirPath = :prefix OR dirPath LIKE :prefix || '/%'",
     )
     suspend fun pickCodesInPath(prefix: String): List<MediaPickCodes>
@@ -1184,13 +1228,16 @@ interface MediaDao {
      * 分集的 `seriesKey` 再 join 一次系列拿系列名，列表里显示"剧名 · 第 7 集"。
      *
      * join 不上时（片子后来被删了、库被删了）三个字段全是 null —— 界面退回用播放时记的
-     * [WatchHistoryRow.name]（文件名），列表**不会因此空一行**。
+     * [WatchHistoryRow.name]（文件名），列表**不会因此空一行**。`inLibrary` 就是这个命中
+     * 标记：「继续观看」横排只出 [WatchHistoryRow.inLibrary] 的行，孤儿行只在观影历史页
+     * 留着（那边有"文件名"可认，横排上只有一张没头没名的死卡）。
      */
     @Query(
         "SELECT h.itemKey AS itemKey, h.name AS name, h.positionMs AS positionMs, " +
             "h.durationMs AS durationMs, h.updatedAt AS updatedAt, h.local AS local, " +
             "COALESCE(m.posterPickCode, s.posterPickCode) AS posterPickCode, " +
-            "COALESCE(s.title, m.title) AS libraryTitle, m.title AS ownTitle " +
+            "COALESCE(s.title, m.title) AS libraryTitle, m.title AS ownTitle, " +
+            "m.mediaKey IS NOT NULL AS inLibrary " +
             "FROM watch_history h " +
             "LEFT JOIN movies m ON m.videoPickCode = h.itemKey " +
             "LEFT JOIN movies s ON s.mediaKey = m.seriesKey " +
@@ -1396,6 +1443,36 @@ interface MediaDao {
             "isEpisodeLike, videoPickCode, genre, videoName FROM movies WHERE mediaKey IN (:keys)",
     )
     suspend fun movieCardsByKeysChunk(keys: List<String>): List<MovieCard>
+
+    // ---------------- 元数据刮削（TMDB）：找"缺元数据的片"与写回后的重解析 ----------------
+
+    /**
+     * 这个路径前缀下**没有 nfo** 的顶层影片行 —— 批量「补全缺失元数据」的候选集。
+     *
+     * 三条过滤各有原因：
+     *  - `seriesKey IS NULL`：分集（CD 子盘 / 整季各集）的元数据归属系列，不单独刮；
+     *  - `isEpisodeLike = 0`：番号式资源按演员目录组织、TMDB 上没有，刮了也是空；
+     *  - `videoPickCode IS NOT NULL`：没有视频的行（剧集根、CD 合成行）不入候选。
+     * 已经有 nfo 的一律跳过（"只补空"）—— 流水线刮好的东西不能动。
+     */
+    @Query(
+        "SELECT mediaKey, title, year, videoPickCode, videoName, dirCid, dirPath, isEpisodeLike FROM movies " +
+            "WHERE seriesKey IS NULL AND isEpisodeLike = 0 AND videoPickCode IS NOT NULL AND videoPickCode != '' " +
+            "AND (nfoPickCode IS NULL OR nfoPickCode = '') " +
+            "AND (dirPath = :prefix OR dirPath LIKE :prefix || '/%') " +
+            "ORDER BY title ASC",
+    )
+    suspend fun scrapeTargetsInPath(prefix: String): List<ScrapeTarget>
+
+    /**
+     * 写回并重扫之后按**主视频 pick_code** 反查。
+     *
+     * 必须按 pick_code 而不是 mediaKey：写完带 `<uniqueid type="tmdb">` 的 nfo 之后，
+     * 扫描器会把 mediaKey 从"文件前缀"改成 `tmdb-<id>` 并在陈旧清理里删掉旧键的行 ——
+     * 详情页拿的还是旧键，只能靠不随 nfo 变的视频 pick_code 找回来。
+     */
+    @Query("SELECT * FROM movies WHERE videoPickCode = :pc LIMIT 1")
+    suspend fun movieByVideoPickCode(pc: String): MovieEntity?
 
     private companion object {
         /** 扫描记录最多留这么多条（每次启动的自动扫描也算一次，不裁会一直涨） */

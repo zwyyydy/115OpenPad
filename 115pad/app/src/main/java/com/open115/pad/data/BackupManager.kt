@@ -102,8 +102,13 @@ class BackupManager(
         val fileName = "pad_${kind.key}_$stamp.zip"
         val tmp = File(context.cacheDir, "backup/$fileName")
         try {
-            val packed = withContext(Dispatchers.IO) { runCatching { buildPayload(kind, tmp) }.getOrElse { false } }
+            val packed = withContext(Dispatchers.IO) {
+                runCatching { buildPayload(kind, tmp) }
+                    .onFailure { Log.e(TAG, "备份打包异常（${kind.key}）", it) }
+                    .getOrElse { false }
+            }
             if (!packed || !tmp.exists() || tmp.length() == 0L) {
+                Log.w(TAG, "备份未产出文件（${kind.key}）：packed=$packed 存在=${tmp.exists()} 大小=${tmp.length()}")
                 return BackupResult.Failed("打包失败（见日志）")
             }
             val size = tmp.length()
