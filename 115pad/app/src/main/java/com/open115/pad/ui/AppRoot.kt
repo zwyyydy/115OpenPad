@@ -100,6 +100,9 @@ import com.open115.pad.data.TaskDoneNotifier
 import com.open115.pad.data.media.MediaScanner
 import com.open115.pad.data.media.ScanMode
 import com.open115.pad.data.media.label
+import com.open115.pad.data.media.syncAfterCloudEdits
+import com.open115.pad.player.MusicPlayerActivity
+import com.open115.pad.player.MusicTrack
 import com.open115.pad.player.PlayerActivity
 import com.open115.pad.ui.components.BatchRenamePanel
 import com.open115.pad.ui.components.DownloadLinkSheet
@@ -180,14 +183,23 @@ private val phoneTabs = listOf(
     Dest("settings", "设置", Icons.Outlined.Settings),
 )
 
+/**
+ * 导航项选中的判据：当前路由是不是这一项。
+ *
+ * **不能拿 `==` 直接比**：`currentBackStackEntryAsState` 给的是**路由模式**而不是导航时写的那串 ——
+ * 带可选参数的传输中心稳定后就是 `transfer?tab={tab}`，与 `transfer` 比永远是 false。
+ * 真机表现正是"点一下那个导航项，选中框闪一下就没了"（切页途中有一帧拿到的还是纯路由名，
+ * 于是框先亮再灭）；只有把带参数的路由按"路由名 + 问号"前缀认下来才留得住。
+ */
+private fun routeIs(current: String?, route: String): Boolean =
+    current == route || current?.startsWith("$route?") == true
+
 /** 手机模式下当前路由应高亮的底部 tab（子页面归属到收纳它的 tab） */
 private fun phoneSelectedTab(route: String?): String? = when {
     route == null -> null
-    route == "filter" || route == "rename" -> "more"       // 「更多」里的子页
-    route == "offline" || route == "recycle" -> "transfer" // 传输中心里的子页（含宽窄切换瞬间落在旧路由上）
-    // 注意：currentBackStackEntryAsState 给的是路由模式（"transfer?tab={tab}"），
-    // 不是导航时的实际字符串，所以传输中心要用前缀匹配
-    route.startsWith("transfer") -> "transfer"
+    routeIs(route, "filter") || routeIs(route, "rename") -> "more"     // 「更多」里的子页
+    routeIs(route, "offline") || routeIs(route, "recycle") -> "transfer" // 传输中心里的子页（含宽窄切换瞬间落在旧路由上）
+    routeIs(route, "transfer") -> "transfer"
     else -> route
 }
 
@@ -265,17 +277,21 @@ private sealed interface PanelTarget {
 }
 
 /**
- * 媒体库扫描跑完：库名 + 队列累计入库数。
+ * 媒体库扫描跑完：库名 + 这一批**新增**了几部。
  *
- * 用**队列累计**（[MediaScanner.batchIndexed]）而不是 Progress.moviesIndexed：后者只是最后一个
- * 目录的数字（流水线同步一次排 6 个目录，拿它报会少报成"新增 1 部"）。
+ * 数是"新增"不是"索引了几部"：[MediaScanner.batchNew]，跨目录/跨任务累加
+ * （Progress.moviesIndexed 只是最后一个目录的索引数，流水线同步一次排 6 个目录会少报）。
+ * 拿索引数当新增报就会出现"扫描记录里写着无新增、提示却说新增 1 部"的自相矛盾。
  * 「停止 / 取消」不算完成，不报 —— 那两种的文案在媒体库自己的进度卡上。
  */
 private fun scanNotice(container: AppContainer): TaskDoneNotice? {
     val p = container.mediaScanner.progress.value
     if (p.stopped) return null
-    val indexed = container.mediaScanner.batchIndexed.value
-    val body = if (indexed > 0) "本次新增 $indexed 部" else "没有新增影片"
+    // "顺手扫的"（影片迁移搬完的重扫）不报：一部一个任务、用户正对着迁移进度卡，
+    // 每搬一部弹一次"新增 1 部"就是纯噪音（见 QueuedScan.silent）
+    if (container.mediaScanner.lastRoundSilent.value) return null
+    val added = container.mediaScanner.batchNew.value
+    val body = if (added > 0) "本次新增 $added 部" else "没有新增影片"
     val name = p.libraryName.trim()
     return TaskDoneNotice(
         title = "媒体库扫描完成",
@@ -476,7 +492,7 @@ private fun MainScaffold(container: AppContainer, widthClass: WindowWidthSizeCla
     val expanded = widthClass != WindowWidthSizeClass.Compact
     // 媒体库页隐藏导航栏（rail/bottomBar 都藏），全屏更有沉浸感；
     // 媒体库页自己的海报墙/详情浮层盖在它上面，返回也逐层退，不依赖导航栏
-    val immersiveMedia = currentRoute == "media"
+    val immersiveMedia = routeIs(currentRoute, "media")
 
     // ---------------- 长任务跑完的收尾提示（扫描 / 查找重复 / 视频预览图）----------------
     /** 完成弹窗的槽位：三类任务共用，后到的覆盖先到的（同时跑完两个的场景极少，够用） */
@@ -714,6 +730,11 @@ private fun MainScaffold(container: AppContainer, widthClass: WindowWidthSizeCla
             }
         }
 
+    // 音频：简易音乐播放器（队列 = 文件页当前目录里的音频）
+    val onPlayMusic: (List<MusicTrack>, Int) -> Unit = { tracks, index ->
+        context.startActivity(MusicPlayerActivity.intent(context, tracks, index))
+    }
+
     // ---------------- 大图画廊（应用根层级渲染，才能盖住侧栏） ----------------
     var imageGallery by remember { mutableStateOf<Triple<List<ImageMediaItem>, Int, String>?>(null) }
     /** 文本预览：与画廊一样在根层级全屏渲染，才能盖住侧栏 */
@@ -898,7 +919,7 @@ private fun MainScaffold(container: AppContainer, widthClass: WindowWidthSizeCla
                     // 常规入口（媒体库不在这里，见下面）
                     destinations.filter { it.route != MEDIA_ROUTE }.forEach { dest ->
                         NavigationRailItem(
-                            selected = currentRoute == dest.route,
+                            selected = routeIs(currentRoute, dest.route),
                             onClick = { navigate(dest) },
                             modifier = Modifier.onGloballyPositioned {
                                 navCenters[dest.route] = it.boundsInRoot().center
@@ -923,7 +944,7 @@ private fun MainScaffold(container: AppContainer, widthClass: WindowWidthSizeCla
                     )
                     destinations.firstOrNull { it.route == MEDIA_ROUTE }?.let { media ->
                         NavigationRailItem(
-                            selected = currentRoute == media.route,
+                            selected = routeIs(currentRoute, media.route),
                             onClick = { navigate(media) },
                             modifier = Modifier
                                 // 底部留出边距：贴到屏幕最下沿时这个圆角色的下半部分会被切掉
@@ -967,11 +988,25 @@ private fun MainScaffold(container: AppContainer, widthClass: WindowWidthSizeCla
                                 invalidateMediaDir = { cid ->
                                     container.mediaDatabase.mediaDao().invalidateScanState(cid)
                                 },
+                                // 文件页的移动/复制/删除 → 媒体库把受影响的目录重扫一遍
+                                // （刮削回写那条是引擎自己通知的，不走这里）
+                                onCloudEdits = { edits ->
+                                    syncAfterCloudEdits(
+                                        dao = container.mediaDatabase.mediaDao(),
+                                        scanner = container.mediaScanner,
+                                        api = container.openApi,
+                                        edits = edits,
+                                        // 删掉的目录里那些片的预览图缓存一并清（见该函数参数）
+                                        videoPreviews = container.videoPreviews,
+                                    )
+                                },
                                 // 目录栈存档：进播放器后 MainActivity 被系统回收、回来重建时
                                 // 靠它回到原来那一层，而不是被打回根目录（见该构造参数的说明）
                                 savedState = createSavedStateHandle(),
                                 // 回收站/云下载删除的目录内容广播：文件页同步移除对应条目
                                 dirRemovals = container.dirRemovals,
+                                // 删除的文件：预览图缓存跟着清（见 FilesViewModel 的构造参数）
+                                videoPreviews = container.videoPreviews,
                             )
                         })
                         FilesScreen(
@@ -979,6 +1014,7 @@ private fun MainScaffold(container: AppContainer, widthClass: WindowWidthSizeCla
                             expanded,
                             snackbarHostState,
                             onPlayVideo,
+                            onPlayMusic = onPlayMusic,
                             onOpenGallery = { items, idx, path -> imageGallery = Triple(items, idx, path) },
                             onPreviewText = { item -> textPreview = item },
                             onBatchRename = { batchRename = it },

@@ -132,6 +132,10 @@ fun isImageItem(item: FileItem): Boolean =
 fun isVideoItem(item: FileItem): Boolean =
     !item.isDir && (item.isv == 1 || item.ico?.lowercase() in videoExts)
 
+/** 是不是音频（文件页点它进简易音乐播放器）。isv 只标"是不是视频"，音频只能靠后缀 */
+fun isAudioItem(item: FileItem): Boolean =
+    !item.isDir && !isVideoItem(item) && item.ico?.lowercase() in audioExts
+
 fun thumbUrlFor(item: FileItem): String? = when {
     item.isDir -> item.fco
     item.thumb != null -> item.thumb

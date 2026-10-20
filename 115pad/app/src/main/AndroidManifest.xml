@@ -119,6 +119,16 @@
         </activity>
 
         <!--
+          简易音乐播放器：文件页点音频 / 传输中心点已下载的音频进来。
+          exported=false —— 只给应用内用；外部应用传来的 audio/* 仍走 PlayerActivity。
+        -->
+        <activity
+            android:name=".player.MusicPlayerActivity"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden"
+            android:exported="false"
+            android:theme="@style/Theme.Open115.Player" />
+
+        <!--
           任务常驻服务（设置 → 后台任务 → 「任务进行时防止被杀」）：有任务时挂常驻通知保命。
           exported=false —— 只给自己用；类型 dataSync（上传/下载/扫描都属于这一类）。
         -->

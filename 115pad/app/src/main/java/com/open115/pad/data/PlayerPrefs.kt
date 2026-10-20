@@ -86,6 +86,24 @@ class PlayerPrefs(private val context: Context) {
         context.playerDataStore.edit { it[KEY_MINI_PROGRESS] = v }
 
     /**
+     * 记忆上次播放亮度：下次打开播放器时沿用上一次用亮度手势调到的值。
+     * 关闭则每次打开都跟随系统亮度（窗口 screenBrightness = -1）。
+     * 默认开——只有真的用手势调过亮度的人才会见到差别。
+     */
+    val rememberBrightness: Flow<Boolean> =
+        context.playerDataStore.data.map { it[KEY_REMEMBER_BRIGHTNESS] ?: true }
+
+    /** 上次手势调到的窗口亮度（0.01~1.0）；-1 = 还没调过（跟随系统） */
+    val lastBrightness: Flow<Float> =
+        context.playerDataStore.data.map { it[KEY_LAST_BRIGHTNESS] ?: -1f }
+
+    suspend fun setRememberBrightness(v: Boolean) =
+        context.playerDataStore.edit { it[KEY_REMEMBER_BRIGHTNESS] = v }
+
+    suspend fun setLastBrightness(v: Float) =
+        context.playerDataStore.edit { it[KEY_LAST_BRIGHTNESS] = v.coerceIn(0.01f, 1f) }
+
+    /**
      * 是否优先用「原盘」档位：直接拿下载直链播原始文件，不经 115 转码。
      * 画质上限最高（逐字节原文件、保留全部音轨/字幕轨），但没有自适应码率、
      * 带宽占用高，所以默认关，只有用户在画质菜单里主动选过才记住。
@@ -282,6 +300,27 @@ class PlayerPrefs(private val context: Context) {
     suspend fun setLabMagnetToken(v: String) =
         context.playerDataStore.edit { it[KEY_LAB_MAGNET_TOKEN] = v.trim() }
 
+    // ---- 实验室：磁力预览（whatslink.info 一类的第三方服务） ----
+
+    /**
+     * 磁力预览开关：打开后看磁力详情时顺带取几张视频截图。
+     * 与磁力搜索开关**相互独立**——预览走的是另一个第三方，而且不需要 MCP Token。
+     */
+    val labMagnetPreviewEnabled: Flow<Boolean> =
+        context.playerDataStore.data.map { it[KEY_LAB_MAGNET_PREVIEW_ENABLED] ?: true }
+
+    /** 预览服务地址（只填域名，路径固定 `api/v1/link`） */
+    val labMagnetPreviewEndpoint: Flow<String> =
+        context.playerDataStore.data.map {
+            it[KEY_LAB_MAGNET_PREVIEW_ENDPOINT] ?: MAGNET_PREVIEW_ENDPOINT_DEFAULT
+        }
+
+    suspend fun setLabMagnetPreviewEnabled(v: Boolean) =
+        context.playerDataStore.edit { it[KEY_LAB_MAGNET_PREVIEW_ENABLED] = v }
+
+    suspend fun setLabMagnetPreviewEndpoint(v: String) =
+        context.playerDataStore.edit { it[KEY_LAB_MAGNET_PREVIEW_ENDPOINT] = v.trim().trimEnd('/') }
+
     // ---- 本地/外部源的续播位置 ----
     // 云盘片走 115 的观看记录；本地文件（已下载的、外部应用传进来的）没有那个接口，
     // 只能在本机记一份。不做的话 40 分钟的下载片每次进都从头开始，体验像半成品。
@@ -344,6 +383,15 @@ class PlayerPrefs(private val context: Context) {
         val KEY_LAB_MAGNET_TOKEN = stringPreferencesKey("lab_magnet_token")
         const val MAGNET_ENDPOINT_DEFAULT = "https://magnet.kiteyuan.info/api/v1/mcp"
 
+        // 磁力预览：第三方服务，默认地址预置；开关关掉后一个请求都不发
+        val KEY_LAB_MAGNET_PREVIEW_ENABLED = booleanPreferencesKey("lab_magnet_preview_enabled")
+        val KEY_LAB_MAGNET_PREVIEW_ENDPOINT = stringPreferencesKey("lab_magnet_preview_endpoint")
+        const val MAGNET_PREVIEW_ENDPOINT_DEFAULT = "https://whatslink.info"
+
         val KEY_LOCAL_RESUME = stringPreferencesKey("local_resume")
+
+        // 记忆上次播放亮度：开关 + 上次手势调到的窗口亮度
+        val KEY_REMEMBER_BRIGHTNESS = booleanPreferencesKey("remember_brightness")
+        val KEY_LAST_BRIGHTNESS = floatPreferencesKey("last_brightness")
     }
 }

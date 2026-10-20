@@ -43,9 +43,11 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import com.open115.pad.appContainer
 import com.open115.pad.data.DupFile
 import com.open115.pad.data.DupGroup
 import com.open115.pad.data.DuplicateFinder
@@ -55,7 +57,9 @@ import com.open115.pad.data.OpenApi
 import com.open115.pad.data.VersionFinder
 import com.open115.pad.data.VersionGroup
 import com.open115.pad.data.VersionVerdict
+import com.open115.pad.data.VideoPreviewStore
 import com.open115.pad.data.VideoVersion
+import com.open115.pad.player.PlayerCache
 import com.open115.pad.data.COMPARE_ATS
 import com.open115.pad.data.VideoFrameGrabber
 import com.open115.pad.data.compareFrameHashes
@@ -73,7 +77,9 @@ import com.open115.pad.ui.components.videoExts
 import com.open115.pad.ui.theme.AppChip
 import com.open115.pad.ui.theme.AppColors
 import com.open115.pad.util.Format
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 /**
  * 打开去重面板的请求：带上"从哪一层开始扫"（就是点按键时文件页所在的那个目录）。
@@ -107,6 +113,8 @@ fun DuplicatePanel(
     onMessage: (String?) -> Unit,
 ) {
     val scope = rememberCoroutineScope()
+    // 删掉的重复 / 低档版本，它们的预览图缓存也一起清（键是视频的 pick_code）
+    val previewStore = LocalContext.current.appContainer.videoPreviews
     val progress by finder.progress.collectAsState()
     val versionProgress by versionFinder.progress.collectAsState()
     /** 0 = 内容相同（sha1，可删）/ 1 = 同片多版本（时长预筛，只出候选清单） */
@@ -151,6 +159,23 @@ fun DuplicatePanel(
         }
     }
 
+    /**
+     * 删掉的视频：它们的预览图缓存（列表缩略图 / 预览条）跟着清 —— 与文件页删除、媒体库
+     * 「彻底删除」同一条口径（见 [VideoPreviewStore.deleteFor]）。非视频的 pick_code
+     * 对不上任何缓存文件，自然跳过；清失败只记日志，不影响删除本身的结论。
+     *
+     * 播放缓存同一条口径，但只清直链档（按 pick_code）：查重删的恰恰是**内容相同的副本**，
+     * 转码分片按 sha1 共享，按 sha1 清会把留下来的那份的缓存一起抹掉，所以分片交给上限淘汰。
+     */
+    suspend fun dropPreviews(pcs: List<String?>) {
+        val codes = pcs.filterNotNull().filter { it.isNotBlank() }
+        if (codes.isEmpty()) return
+        runCatching { withContext(Dispatchers.IO) { previewStore.deleteFor(codes) } }
+            .onFailure { android.util.Log.w("VPreview", "清查重删除项的预览图缓存失败：${it.message}") }
+        runCatching { withContext(Dispatchers.IO) { PlayerCache.purge(codes) } }
+            .onFailure { android.util.Log.w("PlayerCacheIO", "清查重删除项的播放缓存失败：${it.message}") }
+    }
+
     fun deletePicked() {
         val ids = picked.map { it.fid }
         if (ids.isEmpty() || deleting) return
@@ -163,6 +188,7 @@ fun DuplicatePanel(
                 if (resp.envOk()) {
                     opLog?.log(OpType.DELETE, "重复文件 ${ids.size} 项", "去重清理 · 移入回收站")
                     finder.markDeleted(ids, cids)
+                    dropPreviews(picked.map { it.item.pc })
                     "已移入回收站 ${ids.size} 个（可在回收站还原）"
                 } else {
                     resp.envMsg() ?: "删除失败"
@@ -192,6 +218,7 @@ fun DuplicatePanel(
                     // 顺带（markDeleted 会更新 lastDeletedAt/lastDeletedCids）让文件页自动刷新列表
                     finder.markDeleted(ids, cids)
                     versionFinder.markDeleted(ids)
+                    dropPreviews(doomed.map { it.item.pc })
                     if (keep != null) "已移入回收站 ${ids.size} 个，保留了「${keep.name}」"
                     else "已移入回收站 ${ids.size} 个（可在回收站还原）"
                 } else {

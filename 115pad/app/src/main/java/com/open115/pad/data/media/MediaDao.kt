@@ -5,6 +5,7 @@ import androidx.room.Insert
 import androidx.room.OnConflictStrategy
 import androidx.room.Query
 import androidx.room.Transaction
+import androidx.room.Update
 import androidx.room.Upsert
 import kotlinx.coroutines.flow.Flow
 
@@ -91,12 +92,39 @@ data class MediaPickCodes(
     val thumbPickCode: String?,
     /** 视频文件本身的 pick_code：预览图缓存（封面 + 预览条）按它键，删库要跟着清 */
     val videoPickCode: String? = null,
+    /**
+     * 剧照（`extrafanart/`）的 pick_code，\n 连接的列。详情页看过的剧照字节按它键 ——
+     * 只落在这一段里的话，删库时它就成了查不到的孤儿（movies 行已经没了）。
+     */
+    val extraFanartPickCodes: String? = null,
 )
 
 /** 一条"作品 → 名字"（标签名 / 演员名，给列表筛选批量取用，见 [MediaDao.tagNamesOf] / [MediaDao.actorNamesOf]） */
 data class MovieNameRow(val mediaKey: String, val name: String)
 
-/** 一条标签盖住多少张卡片：覆盖率的分子（见 [MediaDao.tagCardCounts]） */
+/**
+ * 「这部作品挂在哪些目录里」的轻量行：**影片迁移**的前置判据要用它（见 [migrateMovie]）。
+ *
+ * 只取判据要看的四列 —— 迁移本身不改这些行（改的是扫描器，它在新位置把同一行 upsert 回来），
+ * 所以这里不需要整行的字段。
+ */
+data class MigrationRow(
+    val mediaKey: String,
+    val seriesKey: String? = null,
+    /** 条目所在目录 cid。目录的 file_id 与 cid 是同一个 id（`ufile/move` 直接吃它） */
+    val dirCid: String? = null,
+    val dirPath: String? = null,
+    /** 只为了把"撞车的是谁"说成人话（片名），判据本身不看它 */
+    val title: String = "",
+)
+
+/**
+ * 一条名字（标签 / 演员）盖住多少张卡片。
+ *
+ * 两处用：① 推荐里标签覆盖率的分子（见 [MediaDao.tagCardCounts]）；
+ * ② 标签球的词条大小（见 [MediaDao.tagCloudCounts] / [MediaDao.actorCloudCounts]）。
+ * 口径都按**卡片**算（分集折进它所属的系列卡），所以"球上多大"就是"点进去能看几部"。
+ */
 data class NameCountRow(val name: String, val tagCount: Int)
 
 /**
@@ -716,6 +744,34 @@ interface MediaDao {
     suspend fun tagCardCounts(names: List<String>): List<NameCountRow>
 
     /**
+     * 全库标签各盖住多少张卡片（**按大小排序，不按名字过滤**）：标签球的原料。
+     *
+     * 与 [tagCardCounts] 同口径（分集折进系列卡、`COUNT(DISTINCT 卡键)`），两处差别：
+     * ① 不给名字清单 —— 球要的是"整个库里最大的是哪些"，清单反过来由它算出来；
+     * ② `HAVING >= 2` 滤掉只在一部片里出现过的 —— 那种标签动辄上万条，塞进球里只会糊成一片。
+     *
+     * **画质/编码的剔除故意不在这里做**：判据在 [TagSignals.isNoise]（Kotlin 正则），
+     * SQL 里复刻一份迟早走岔（见 TagSignals 的头注释）。所以这里全量返回、调用方现滤。
+     * 一个两千部的库也就两千多行，一次查询几毫秒。
+     */
+    @Query(
+        "SELECT t.name AS name, COUNT(DISTINCT COALESCE(m.seriesKey, m.mediaKey)) AS tagCount " +
+            "FROM tags t JOIN movie_tags mt ON mt.tagId = t.id JOIN movies m ON m.mediaKey = mt.mediaKey " +
+            "GROUP BY t.name HAVING COUNT(DISTINCT COALESCE(m.seriesKey, m.mediaKey)) >= 2 " +
+            "ORDER BY tagCount DESC",
+    )
+    suspend fun tagCloudCounts(): List<NameCountRow>
+
+    /** 演员版 [tagCloudCounts]：口径完全一致（同一个演员的剧集也只算一张系列卡） */
+    @Query(
+        "SELECT a.name AS name, COUNT(DISTINCT COALESCE(m.seriesKey, m.mediaKey)) AS tagCount " +
+            "FROM actors a JOIN movie_actors ma ON ma.actorId = a.id JOIN movies m ON m.mediaKey = ma.mediaKey " +
+            "GROUP BY a.name HAVING COUNT(DISTINCT COALESCE(m.seriesKey, m.mediaKey)) >= 2 " +
+            "ORDER BY tagCount DESC",
+    )
+    suspend fun actorCloudCounts(): List<NameCountRow>
+
+    /**
      * 这批卡片（含各自的分集）命中了 [names] 里的**哪几条**标签 —— 推荐打分与理由都要"命中的是谁"。
      *
      * 只回关心的那几条：候选上百张、每张自己就带十几条标签，全取回来大半是白取。
@@ -760,6 +816,30 @@ interface MediaDao {
     @Query("SELECT * FROM movies WHERE mediaKey = :mediaKey")
     suspend fun movie(mediaKey: String): MovieEntity?
 
+    /**
+     * 这部**作品**的全部索引行：`mediaKey` 自己 + `seriesKey` 指向它的（分集、分 CD 的各张盘）。
+     *
+     * 迁移前用它回答两个问题：① 它有哪些行（系列卡连分集一起）；② 这些行是不是都在同一个目录里。
+     * 口径与 [filesOf] 一致（那一条取的是文件 id / pick_code，这一条取的是位置）。
+     */
+    @Query(
+        "SELECT mediaKey, seriesKey, dirCid, dirPath, title FROM movies " +
+            "WHERE mediaKey = :key OR seriesKey = :key",
+    )
+    suspend fun migrationRowsOf(key: String): List<MigrationRow>
+
+    /**
+     * 这个路径（**含它下面所有层级**）里挂了哪些行：迁移的独占性判据。
+     *
+     * 前缀匹配与 [byLibraryPath] 同一写法 —— 在这个仓库里"路径属于某个目录"只有一个意思，
+     * 别处另写一套（比如用 substr 绕开 LIKE 的 `_` 通配）迟早会跟库归属算得不一样。
+     */
+    @Query(
+        "SELECT mediaKey, seriesKey, dirCid, dirPath, title FROM movies " +
+            "WHERE dirPath = :path OR dirPath LIKE :path || '/%'",
+    )
+    suspend fun migrationRowsUnderPath(path: String): List<MigrationRow>
+
     /** 影片所在目录 cid —— 播放器「截图设为预览图」要上传到那里（见 PlayerActivity.EXTRA_SOURCE_CID） */
     @Query("SELECT dirCid FROM movies WHERE mediaKey = :key LIMIT 1")
     suspend fun dirCidOf(key: String): String?
@@ -800,7 +880,7 @@ interface MediaDao {
 
     /** 删库 / 流水线同步前先收集要清缓存的 pick_code（投影，不取整个实体） */
     @Query(
-        "SELECT nfoPickCode, posterPickCode, fanartPickCode, thumbPickCode, videoPickCode FROM movies " +
+        "SELECT nfoPickCode, posterPickCode, fanartPickCode, thumbPickCode, videoPickCode, extraFanartPickCodes FROM movies " +
             "WHERE dirPath = :prefix OR dirPath LIKE :prefix || '/%'",
     )
     suspend fun pickCodesInPath(prefix: String): List<MediaPickCodes>
@@ -929,6 +1009,29 @@ interface MediaDao {
             "WHERE ma.mediaKey IN (:keys) AND a.avatarPickCode IS NOT NULL",
     )
     suspend fun actorAvatarsOfMovies(keys: List<String>): List<ActorAvatarRef>
+
+    /**
+     * [actorAvatarsOfMovies] 的**按库路径**版本（删整个库时用）。
+     *
+     * 用子查询而不是 `IN (:keys)`：一个库几千条记录，直接拼 key 会踩 SQLite 的变量上限。
+     * 同样**必须在清索引之前查** —— 删完 movie_actors 就问不出"这个库用了谁"了。
+     */
+    @Query(
+        "SELECT DISTINCT a.id AS id, a.name AS name, a.avatarPickCode AS avatarPickCode, " +
+            "a.avatarDirCid AS avatarDirCid FROM actors a JOIN movie_actors ma ON ma.actorId = a.id " +
+            "WHERE ma.mediaKey IN (SELECT mediaKey FROM movies WHERE dirPath = :prefix OR dirPath LIKE :prefix || '/%') " +
+            "AND a.avatarPickCode IS NOT NULL",
+    )
+    suspend fun actorAvatarsInPath(prefix: String): List<ActorAvatarRef>
+
+    /**
+     * 这批演员里**在 movie_actors 里还有关联**的（删库清完之后调）。
+     *
+     * 那时剩下的关联都来自别的库 —— 有链接 = 还有库在用这个演员，头像得留着复用。
+     * 入参分批调（[MediaDao] 别处的惯例是 300），避开 SQLite 的 999 变量上限。
+     */
+    @Query("SELECT DISTINCT actorId FROM movie_actors WHERE actorId IN (:ids)")
+    suspend fun actorIdsStillLinked(ids: List<Long>): List<Long>
 
     /**
      * 这些演员里**还有别的作品留在库里**的（本次要删的影片不算）。
@@ -1106,6 +1209,24 @@ interface MediaDao {
             "WHERE dirKey = :dirKey",
     )
     suspend fun invalidateScanState(dirKey: String)
+
+    /**
+     * 这个目录在库里的完整路径（**只有扫过的目录才有**）。
+     *
+     * 文件页那条"只有 cid、要认出它在哪个库"的路上用它，省一次列目录
+     * （见 [syncAfterCloudEdits] 的路径三级取值）。
+     */
+    @Query("SELECT dirPath FROM scan_state WHERE dirKey = :dirKey AND dirPath <> '' LIMIT 1")
+    suspend fun scanStatePath(dirKey: String): String?
+
+    /**
+     * 这个路径下（含子目录）全部 mediaKey。
+     *
+     * 文件页**删掉一个目录**时先拿它清衍生记录（观影历史 / 扫描记录的新增列表），
+     * 再删索引 —— 顺序与扫描器的陈旧清理、MovieDeleter 是同一条约定。
+     */
+    @Query("SELECT mediaKey FROM movies WHERE dirPath = :prefix OR dirPath LIKE :prefix || '/%'")
+    suspend fun mediaKeysInPath(prefix: String): List<String>
 
     /**
      * 这个目录里还剩多少条索引。
@@ -1374,6 +1495,34 @@ interface MediaDao {
 
     @Insert
     suspend fun insertScanLog(row: ScanLogEntity): Long
+
+    /**
+     * 写一条**流水线同步**记录：与上一条（同库、同模式、还在 [PIPELINE_LOG_MERGE_WINDOW_MS] 内）
+     * 合并成一条，而不是又插一行。
+     *
+     * 为什么：一轮同步的形状是"一份信号一个任务"，同一批信号连着来几轮（手动同步一次，
+     * 自动轮询随后又按顺序消费一次）就会在记录里堆出几条「目录 1/1 · 索引 1 项 · 无新增」——
+     * 合并之后是一条"这一批同步动了什么"（判据见 [mergePipelineLog]）。
+     * 合并走 UPDATE、id 不变，界面上不会出现插入/删除的闪动。
+     */
+    @Transaction
+    suspend fun addOrMergePipelineLog(row: ScanLogEntity, windowMs: Long = PIPELINE_LOG_MERGE_WINDOW_MS) {
+        val merged = latestScanLogOf(row.libraryId, row.mode)?.let { mergePipelineLog(it, row, windowMs) }
+        if (merged != null) {
+            updateScanLog(merged)
+        } else {
+            insertScanLog(row)
+            trimScanLogs(SCAN_LOG_KEEP)
+        }
+    }
+
+    /** 最近一条同库同模式的记录（"连续几轮并成一条"要找的上一条），没有就是 null */
+    @Query("SELECT * FROM scan_log WHERE libraryId = :libraryId AND mode = :mode ORDER BY at DESC LIMIT 1")
+    suspend fun latestScanLogOf(libraryId: Long, mode: String): ScanLogEntity?
+
+    /** 整行覆盖（合并后的记录写回同一条；其余字段由调用方拼好） */
+    @Update
+    suspend fun updateScanLog(row: ScanLogEntity)
 
     /** 只保留最新 [keep] 条（扫一次插一条，按完成时间倒序数） */
     @Query(

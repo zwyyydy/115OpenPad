@@ -82,6 +82,14 @@ private const val NO_PROGRESS_GIVE_UP_MS = 90_000L
 /** 成批清旧片时清到剩多少（占上限的比例）：一次腾够，之后一路顺写 */
 private const val CLEAN_TO_RATIO = 0.5
 
+/**
+ * 滚动缓存里"这部片没有可舍弃的旧内容、改清其他片"的兜底频率。
+ *
+ * 不清就是个死角：开播时缓存不到 95%（没触发开播清理），之后被其他片和播放器自己灌满，
+ * 而当前这部片又还没播出回退余量 —— 会一直等下去，播放器继续写就又回到 LRU「边写边淘汰」。
+ */
+private const val OLD_EVICT_COOLDOWN_MS = 10_000L
+
 /** 预下载的速率软上限：一秒最多往缓存里写这么多，超了就等窗口翻页（只是"别失控"的兜底） */
 private const val MAX_BYTES_PER_SEC = 16L * 1024 * 1024
 
@@ -528,7 +536,7 @@ internal class PlayerPrefetcher(
                 )
                 android.util.Log.i(
                     TAG,
-                    "缓存到水位：清掉 $n 份旧内容、腾出 ${freed / 1024 / 1024}MB" +
+                    "缓存到水位：清掉 $n 个旧缓存条目、腾出 ${freed / 1024 / 1024}MB" +
                         "（现 ${cache.cacheSpace / 1024 / 1024}MB / 上限 ${maxCacheBytes / 1024 / 1024}MB）",
                 )
             }
@@ -547,6 +555,8 @@ internal class PlayerPrefetcher(
         val doneChunks = AtomicInteger(0)
         // 最后一次"有块下完"的时刻：长时间没进展说明这条连接被饿着（见 NO_PROGRESS_GIVE_UP_MS）
         val lastDoneAt = AtomicLong(android.os.SystemClock.elapsedRealtime())
+        // 上次兜底清其他片的时刻（见 OLD_EVICT_COOLDOWN_MS）：别每 500ms 扫一遍全部 key
+        var lastOldEvictAt = 0L
         /** 让路计数：每让 60 次（约 30 秒）打一行日志 */
         var yieldTicks = 0
         /** 水位等待计数：每 120 次（约 60 秒）打一行日志 */
@@ -633,9 +643,28 @@ internal class PlayerPrefetcher(
                                 "（现 ${cache.cacheSpace / 1024 / 1024}MB / 上限 ${maxCacheBytes / 1024 / 1024}MB）",
                         )
                     } else {
-                        // 锚点之前还没有可舍弃的（刚起播 / 还没播出回退余量之外）：等一会儿再看，别停 ——
-                        // 播放器往前走，很快就有旧内容可以滚出去。这期间不是连接被饿，别触发无进展收手
-                        lastDoneAt.set(android.os.SystemClock.elapsedRealtime())
+                        // 锚点之前还没有可舍弃的（刚起播 / 还没播出回退余量之外），或者这部片
+                        // 自己已经没有旧内容了：如果水位是**别的片**占着的（开播时没到 95%，
+                        // 之后被其他片和播放器自己灌满），就成批清一次旧片 —— 否则会一直等，
+                        // 播放器继续写又会回到 media3「边写边淘汰」（吞吐从 25MB/s 掉到 ~1MB/s）。
+                        val now = android.os.SystemClock.elapsedRealtime()
+                        if (cache.cacheSpace >= fullAt && now - lastOldEvictAt > OLD_EVICT_COOLDOWN_MS) {
+                            lastOldEvictAt = now
+                            val (n, freedOld) = PlayerCache.evictOldestExcept(
+                                plan.keepKeyPrefix,
+                                (maxCacheBytes * CLEAN_TO_RATIO).toLong(),
+                            )
+                            if (freedOld > 0) {
+                                android.util.Log.i(
+                                    TAG,
+                                    "循环缓存：这部片没有可舍弃的旧内容，改清 $n 个最久没用到的旧缓存条目、" +
+                                        "腾出 ${freedOld / 1024 / 1024}MB",
+                                )
+                            }
+                        }
+                        // 等播放器往前走，很快就有旧内容可以滚出去。这期间不是连接被饿，
+                        // 别触发无进展收手
+                        lastDoneAt.set(now)
                         waitTicks++
                         if (waitTicks % 120 == 1) {
                             android.util.Log.i(
@@ -772,11 +801,6 @@ internal class PlayerPrefetcher(
     }
 
     /** 状态推送：只有真的变了才写（免得每 0.5 秒重组一次 UI）*/
-    private fun refreshState(starts: LongArray, ends: LongArray, cached: BooleanArray, bytes: Long) {
-        val next = PrefetchState(mergeCachedRanges(starts, ends, cached), bytes)
-        if (next != _state.value) _state.value = next
-    }
-
     private fun mergeAndPush(starts: LongArray, ends: LongArray, cached: BooleanArray) {
         val next = _state.value.copy(rangesMs = mergeCachedRanges(starts, ends, cached))
         if (next != _state.value) _state.value = next

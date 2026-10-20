@@ -394,18 +394,25 @@ class ImageUrlResolver(
     }
 
     /**
-     * 删掉这些 pick_code 对应的海报/背景图落盘文件（删媒体库时清该库的缓存）。
+     * 删掉这些 pick_code 对应的落盘图片（删库/删片时清缓存）。
+     *
+     * 两个目录一起清：`MEDIA_DIR`（海报/背景/缩略图，以及由背景图裁出的兜底海报）和
+     * `HUGE_DIR`（画廊里点开看过的**原图**）。两者键都是 pickCode（见 [fetchToCache]），
+     * 只清前者的话原图会一直留着当垃圾（少则几十 MB），只能等上限淘汰。
      *
      * 只删文件、不动直链 LRU：那里面只是字符串、且 20 分钟就过期，留着不影响正确性。
      * 文件名走 [targetOf]，和 cachedPoster/fetchBytesToCache 共用同一份命名规则 ——
      * 这里各写一遍的话，哪天命名规则改了就会静默删不掉。
      */
     suspend fun evictPosterCache(pickCodes: Collection<String>, cacheDir: File) = withContext(Dispatchers.IO) {
-        val dir = File(cacheDir, MEDIA_DIR)
+        val mediaDir = File(cacheDir, MEDIA_DIR)
+        val hugeDir = File(cacheDir, HUGE_DIR)
         pickCodes.filter { it.isNotBlank() }.distinct().forEach { pc ->
-            targetOf(dir, pc).delete()
+            targetOf(mediaDir, pc).delete()
             // 由这张背景图裁出来的兜底海报也一起删（它的键是背景图 pickCode）
-            derivedPosterFile(dir, pc).delete()
+            derivedPosterFile(mediaDir, pc).delete()
+            // 同一张图在画廊里看过的原图（huge_img），键同为 pickCode
+            targetOf(hugeDir, pc).delete()
         }
     }
 

@@ -223,7 +223,7 @@ private fun DualPaneColumn(
             }
         },
     ) {
-        // ---- 迷你头：返回上级 / 目录名（点击跳层）/ 快捷目录 / 新建夹 / 刷新 ----
+        // ---- 迷你头：返回上级 / 目录名（点击跳层）/ 快捷目录 / 新建（夹·文本）/ 刷新 ----
         Row(
             Modifier.fillMaxWidth().height(44.dp).padding(horizontal = 2.dp),
             verticalAlignment = Alignment.CenterVertically,
@@ -309,11 +309,30 @@ private fun DualPaneColumn(
                     }
                 }
             }
-            IconButton(onClick = { showCreate = true }) {
-                Icon(Icons.Outlined.CreateNewFolder, contentDescription = "新建文件夹", modifier = Modifier.size(18.dp))
-            }
-            IconButton(onClick = { showCreateFile = true }) {
-                Icon(Icons.Outlined.NoteAdd, contentDescription = "新建文本文件", modifier = Modifier.size(18.dp))
+            // 新建：文件夹 / 文本文件 二选一（单面板顶栏同款下拉，这里地方更小更该合）
+            var newMenu by remember { mutableStateOf(false) }
+            Box {
+                IconButton(onClick = { newMenu = true }) {
+                    Icon(Icons.Outlined.CreateNewFolder, contentDescription = "新建", modifier = Modifier.size(18.dp))
+                }
+                DropdownMenu(expanded = newMenu, onDismissRequest = { newMenu = false }) {
+                    DropdownMenuItem(
+                        text = { Text("新建文件夹") },
+                        leadingIcon = { Icon(Icons.Outlined.CreateNewFolder, contentDescription = null) },
+                        onClick = {
+                            newMenu = false
+                            showCreate = true
+                        },
+                    )
+                    DropdownMenuItem(
+                        text = { Text("新建文本文件") },
+                        leadingIcon = { Icon(Icons.Outlined.NoteAdd, contentDescription = null) },
+                        onClick = {
+                            newMenu = false
+                            showCreateFile = true
+                        },
+                    )
+                }
             }
             IconButton(onClick = { vm.refresh() }) {
                 Icon(Icons.Outlined.Refresh, contentDescription = "刷新", modifier = Modifier.size(18.dp))

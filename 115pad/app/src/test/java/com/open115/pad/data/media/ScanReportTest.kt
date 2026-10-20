@@ -118,4 +118,87 @@ class ScanReportTest {
             ScanLogEntity(libraryName = "库", at = 1L, newKeys = "A\n\n").newKeyList,
         )
     }
+
+    // ---------------- 流水线同步的跨轮合并（见 mergePipelineLog） ----------------
+
+    private fun pipelineLog(
+        at: Long,
+        libraryId: Long = 7,
+        mode: String = SCAN_MODE_PIPELINE,
+        dirs: Int = 1,
+        indexed: Int = 1,
+        newKeys: String = "",
+        elapsedMs: Long = 1_000,
+        listRequests: Int = 1,
+    ) = ScanLogEntity(
+        id = at, // 用例里用 at 当 id，方便断言"沿用上一条的 id"
+        libraryId = libraryId,
+        libraryName = "库$libraryId",
+        at = at,
+        elapsedMs = elapsedMs,
+        totalDirs = dirs,
+        doneDirs = dirs,
+        indexed = indexed,
+        mode = mode,
+        listRequests = listRequests,
+        newKeys = newKeys,
+    )
+
+    @Test
+    fun `同库同模式挨得近_并成一条总账`() {
+        val prev = pipelineLog(at = 1_000_000L, dirs = 1, indexed = 1, listRequests = 1)
+        val next = pipelineLog(at = 1_000_000L + 120_000L, dirs = 2, indexed = 3, listRequests = 2)
+        val merged = mergePipelineLog(prev, next, PIPELINE_LOG_MERGE_WINDOW_MS)!!
+        assertEquals("沿用上一条的 id，界面上不会闪", prev.id, merged.id)
+        assertEquals("时间取新一轮那刻", next.at, merged.at)
+        assertEquals(3, merged.totalDirs)
+        assertEquals(4, merged.indexed)
+        assertEquals(3, merged.listRequests)
+        assertEquals(2_000L, merged.elapsedMs)
+    }
+
+    @Test
+    fun `合并保留两轮的新增影片_去重`() {
+        val prev = pipelineLog(at = 1_000L, newKeys = "A\nB")
+        val next = pipelineLog(at = 2_000L, newKeys = "B\nC")
+        val merged = mergePipelineLog(prev, next, PIPELINE_LOG_MERGE_WINDOW_MS)!!
+        assertEquals(listOf("A", "B", "C"), merged.newKeyList)
+    }
+
+    @Test
+    fun `隔得太久_另起一条`() {
+        val prev = pipelineLog(at = 1_000L)
+        val next = pipelineLog(at = 1_000L + PIPELINE_LOG_MERGE_WINDOW_MS + 1)
+        assertEquals(null, mergePipelineLog(prev, next, PIPELINE_LOG_MERGE_WINDOW_MS))
+    }
+
+    @Test
+    fun `刚过窗口边界还能并`() {
+        val prev = pipelineLog(at = 1_000L)
+        val next = pipelineLog(at = 1_000L + PIPELINE_LOG_MERGE_WINDOW_MS)
+        assertTrue(mergePipelineLog(prev, next, PIPELINE_LOG_MERGE_WINDOW_MS) != null)
+    }
+
+    @Test
+    fun `不同库或不同模式_不并`() {
+        assertTrue(
+            mergePipelineLog(pipelineLog(1_000L, libraryId = 7), pipelineLog(2_000L, libraryId = 8), 60_000L) == null,
+        )
+        assertTrue(
+            mergePipelineLog(pipelineLog(1_000L, mode = "增量"), pipelineLog(2_000L, mode = "全量"), 60_000L) == null,
+        )
+    }
+
+    @Test
+    fun `时间倒着来_不并`() {
+        // 时钟回拨那类异常：宁多一条记录，也不把两批揉成一条
+        assertTrue(mergePipelineLog(pipelineLog(9_000L), pipelineLog(1_000L), 60_000L) == null)
+    }
+
+    @Test
+    fun `任一轮被停过_合并后仍算被停`() {
+        val prev = pipelineLog(1_000L).copy(stopped = true)
+        val next = pipelineLog(2_000L)
+        assertTrue(mergePipelineLog(prev, next, 60_000L)!!.stopped)
+    }
 }

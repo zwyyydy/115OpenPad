@@ -42,6 +42,7 @@ import androidx.compose.material.icons.outlined.Edit
 import androidx.compose.material.icons.outlined.FilterAlt
 import androidx.compose.material.icons.outlined.FilterList
 import androidx.compose.material.icons.outlined.GridView
+import androidx.compose.material.icons.outlined.MoreVert
 import androidx.compose.material.icons.outlined.NoteAdd
 import androidx.compose.material.icons.outlined.PushPin
 import androidx.compose.material.icons.outlined.Refresh
@@ -64,6 +65,7 @@ import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
+import androidx.compose.material3.LocalContentColor
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
@@ -101,6 +103,7 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.positionChange
 import androidx.compose.ui.layout.LayoutCoordinates
 import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.runtime.rememberUpdatedState
 import kotlinx.coroutines.withTimeoutOrNull
@@ -229,41 +232,18 @@ fun FilesBrowserPane(
                     }
                 },
                 actions = {
-                    // ★ 手机模式下这一排放不下（10 个按键 ×48dp 远超屏宽）：定长的话右边几个
-                    //   （上传/刷新…）被直接裁掉，怎么点都点不到 —— 所以整排**横向可滑**。
-                    //   宽屏下内容比可用宽度窄，摆放位置与原来完全一样（贴右边），没有额外代价；
-                    //   放不下时才滑得动，且**最后一个按键被裁一半**本身就是"还能往右滑"的提示。
-                    Row(
-                        modifier = Modifier.horizontalScroll(rememberScrollState()),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        // 分类整理：递归扫当前目录，把文件按类型移进本目录的六个分类文件夹 + 其他。
-                        // 放最左（漏斗前面），是低频但一用就是"大动作"的入口
-                        IconButton(onClick = onOrganize) {
-                            Icon(Icons.Outlined.Category, contentDescription = "分类整理")
-                        }
-                        // 查找重复文件：按 sha1 找内容完全相同的副本（同样是"大动作"，紧挨着整理）。
-                        // 面板关掉之后任务照跑，所以按键上挂"还在干"的红点（与导航栏那几个同一套语义）
-                        IconButton(onClick = onFindDuplicates) {
-                            BusyBadge(dupBusy) {
-                                Icon(Icons.Outlined.ContentCopy, contentDescription = "查找重复")
-                            }
-                        }
-                        // 生成视频预览图：抓最小转码档的一帧当缩略图（只读，不动云端）
-                        IconButton(onClick = onGeneratePreviews) {
-                            BusyBadge(previewBusy) {
-                                Icon(Icons.Outlined.Collections, contentDescription = "生成视频预览图")
-                            }
-                        }
-                        // 双面板（类 MT 管理器）：开启高亮主色，再点一次退出
-                        IconButton(onClick = onToggleDualPane) {
-                            Icon(
-                                Icons.Outlined.Splitscreen,
-                                contentDescription = if (dualPaneOn) "退出双面板" else "双面板模式",
-                                tint = if (dualPaneOn) MaterialTheme.colorScheme.primary
-                                else MaterialTheme.colorScheme.onSurfaceVariant,
-                            )
-                        }
+                    // 顶栏这一排按键分两条路走：
+                    //   · 手机窄屏：11 个 ×48dp 放不下 → 只留高频 7 个，
+                    //     「分类整理 / 查找重复 / 生成预览图 / 双面板」这四个低频的收进「⋮」溢出菜单
+                    //     （都是大动作、误触代价高，也正好让顶栏不再横向滚动）；「⋮」钉在右端不滚动。
+                    //   · 宽屏：11 个平铺，和原来一样（放不下时照样横向可滑）。
+                    // ★ TopAppBar 会把这条量成整屏宽、贴左边摆，会盖住左上角的返回箭头（看着像
+                    //   "图标重合"、箭头还点不动）—— 有返回键时左边留出它的位置，滚动只发生在留白右侧。
+                    val compactWidth = LocalConfiguration.current.screenWidthDp < 600
+                    val backInset = if (compactWidth && ui.stack.size > 1) 48.dp else 0.dp
+
+                    // 高频按键：过滤 / 搜索 / 排序 / 视图 / 新建（文件夹·文本文件）/ 上传 / 刷新
+                    val mainActions: @Composable () -> Unit = {
                         // 入口 B：高级过滤总开关（漏斗）。
                         // 有生效方案 → 点击开/关过滤（开启高亮主色）；
                         // 没有生效方案 → 点击跳转规则配置中心（而不是做成点不动的死按钮）。
@@ -328,11 +308,31 @@ fun FilesBrowserPane(
                                 contentDescription = "切换视图（列表 / 小图标 / 大图标）",
                             )
                         }
-                        IconButton(onClick = onCreateFolder) {
-                            Icon(Icons.Outlined.CreateNewFolder, contentDescription = "新建文件夹")
-                        }
-                        IconButton(onClick = onCreateFile) {
-                            Icon(Icons.Outlined.NoteAdd, contentDescription = "新建文本文件")
+                        // 新建：文件夹 / 文本文件 二选一，和下面的「上传」同款下拉——
+                        // 两个「新建」在顶栏占掉两个图标，合成一个入口后这两种用法都还在
+                        var newMenuOpen by remember { mutableStateOf(false) }
+                        Box {
+                            IconButton(onClick = { newMenuOpen = true }) {
+                                Icon(Icons.Outlined.CreateNewFolder, contentDescription = "新建")
+                            }
+                            DropdownMenu(expanded = newMenuOpen, onDismissRequest = { newMenuOpen = false }) {
+                                DropdownMenuItem(
+                                    text = { Text("新建文件夹") },
+                                    leadingIcon = { Icon(Icons.Outlined.CreateNewFolder, contentDescription = null) },
+                                    onClick = {
+                                        newMenuOpen = false
+                                        onCreateFolder()
+                                    },
+                                )
+                                DropdownMenuItem(
+                                    text = { Text("新建文本文件") },
+                                    leadingIcon = { Icon(Icons.Outlined.NoteAdd, contentDescription = null) },
+                                    onClick = {
+                                        newMenuOpen = false
+                                        onCreateFile()
+                                    },
+                                )
+                            }
                         }
                         // 上传：文件 / 文件夹（SAF 目录树）二选一
                         var uploadMenuOpen by remember { mutableStateOf(false) }
@@ -361,6 +361,105 @@ fun FilesBrowserPane(
                         }
                         IconButton(onClick = { vm.refresh() }) {
                             Icon(Icons.Outlined.Refresh, contentDescription = "刷新")
+                        }
+                    }
+
+                    if (compactWidth) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth().padding(start = backInset),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Row(
+                                modifier = Modifier.weight(1f).horizontalScroll(rememberScrollState()),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) { mainActions() }
+                            // ⋮ 溢出菜单：低频的大动作。查找重复 / 预览图在跑时按键挂红点
+                            // （面板关掉后红点是"还在干"的唯一指示），菜单项里也写明"运行中"。
+                            var overflowOpen by remember { mutableStateOf(false) }
+                            Box {
+                                IconButton(onClick = { overflowOpen = true }) {
+                                    BusyBadge(dupBusy || previewBusy) {
+                                        Icon(Icons.Outlined.MoreVert, contentDescription = "更多")
+                                    }
+                                }
+                                DropdownMenu(expanded = overflowOpen, onDismissRequest = { overflowOpen = false }) {
+                                    DropdownMenuItem(
+                                        text = { Text("分类整理当前目录") },
+                                        leadingIcon = { Icon(Icons.Outlined.Category, contentDescription = null) },
+                                        onClick = {
+                                            overflowOpen = false
+                                            onOrganize()
+                                        },
+                                    )
+                                    DropdownMenuItem(
+                                        text = { Text(if (dupBusy) "查找重复 · 运行中" else "查找重复") },
+                                        leadingIcon = { Icon(Icons.Outlined.ContentCopy, contentDescription = null) },
+                                        onClick = {
+                                            overflowOpen = false
+                                            onFindDuplicates()
+                                        },
+                                    )
+                                    DropdownMenuItem(
+                                        text = {
+                                            Text(if (previewBusy) "生成视频预览图 · 运行中" else "生成视频预览图")
+                                        },
+                                        leadingIcon = { Icon(Icons.Outlined.Collections, contentDescription = null) },
+                                        onClick = {
+                                            overflowOpen = false
+                                            onGeneratePreviews()
+                                        },
+                                    )
+                                    HorizontalDivider()
+                                    DropdownMenuItem(
+                                        text = { Text(if (dualPaneOn) "退出双面板" else "双面板模式") },
+                                        leadingIcon = {
+                                            Icon(
+                                                Icons.Outlined.Splitscreen,
+                                                contentDescription = null,
+                                                tint = if (dualPaneOn) MaterialTheme.colorScheme.primary
+                                                else LocalContentColor.current,
+                                            )
+                                        },
+                                        onClick = {
+                                            overflowOpen = false
+                                            onToggleDualPane()
+                                        },
+                                    )
+                                }
+                            }
+                        }
+                    } else {
+                        Row(
+                            modifier = Modifier.horizontalScroll(rememberScrollState()),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            // 宽屏：低频四项平铺在最左（沿用原来顺序）
+                            // 分类整理：递归扫当前目录，把文件按类型移进本目录的六个分类文件夹 + 其他
+                            IconButton(onClick = onOrganize) {
+                                Icon(Icons.Outlined.Category, contentDescription = "分类整理")
+                            }
+                            // 查找重复文件：按 sha1 找内容完全相同的副本；面板关掉之后任务照跑，挂红点
+                            IconButton(onClick = onFindDuplicates) {
+                                BusyBadge(dupBusy) {
+                                    Icon(Icons.Outlined.ContentCopy, contentDescription = "查找重复")
+                                }
+                            }
+                            // 生成视频预览图：抓最小转码档的一帧当缩略图（只读，不动云端）
+                            IconButton(onClick = onGeneratePreviews) {
+                                BusyBadge(previewBusy) {
+                                    Icon(Icons.Outlined.Collections, contentDescription = "生成视频预览图")
+                                }
+                            }
+                            // 双面板（类 MT 管理器）：开启高亮主色，再点一次退出
+                            IconButton(onClick = onToggleDualPane) {
+                                Icon(
+                                    Icons.Outlined.Splitscreen,
+                                    contentDescription = if (dualPaneOn) "退出双面板" else "双面板模式",
+                                    tint = if (dualPaneOn) MaterialTheme.colorScheme.primary
+                                    else MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                            mainActions()
                         }
                     }
                 },

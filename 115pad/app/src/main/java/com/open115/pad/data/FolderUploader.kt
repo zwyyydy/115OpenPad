@@ -4,8 +4,10 @@ import android.content.Context
 import android.net.Uri
 import androidx.documentfile.provider.DocumentFile
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.launch
 
 /** 文件夹上传汇总（文件级成败 + 建不出来的目录数） */
 data class FolderUploadSummary(
@@ -84,13 +86,13 @@ suspend fun uploadFolder(
 
     suspend fun uploadOne(file: DocumentFile, name: String, remoteCid: String, displayPath: String) {
         val size = file.length()
-        if (size <= 32L * 1024 * 1024) {
-            // 小文件：整文件读内存直传（与单文件上传同规则）
+        if (size <= Uploader.SMALL_UPLOAD_LIMIT) {
+            // 小文件：整文件读内存直传（与单文件上传同规则）；uri 落库供暂停后继续
             val bytes = context.contentResolver.openInputStream(file.uri)?.use { it.readBytes() }
                 ?: error("无法读取文件")
             val r = Uploader.uploadSmallLogged(
                 log = log, api = api, fileName = name, bytes = bytes,
-                targetCid = remoteCid, targetName = displayPath,
+                targetCid = remoteCid, targetName = displayPath, uri = file.uri.toString(),
             )
             if (r.reused) reused++
         } else {
@@ -123,14 +125,24 @@ suspend fun uploadFolder(
                 walk(child, cid, "$displayPath/$name")
             } else {
                 filesTotal++
-                try {
-                    uploadOne(child, name, remoteCid, displayPath)
-                    succeeded++
-                } catch (e: CancellationException) {
-                    throw e
-                } catch (e: Exception) {
-                    failed++
+                // 每个文件跑在独立子协程里：传输中心「暂停/取消」取消的是这个文件的
+                // job，不该把整条文件夹上传一起掀掉。父任务被取消时 coroutineScope
+                // 会抛 CancellationException，照常中断整个遍历。
+                var fileFailed = false
+                coroutineScope {
+                    val fileJob = launch {
+                        try {
+                            uploadOne(child, name, remoteCid, displayPath)
+                            succeeded++
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (e: Exception) {
+                            fileFailed = true
+                        }
+                    }
+                    fileJob.join()
                 }
+                if (fileFailed) failed++
             }
         }
     }

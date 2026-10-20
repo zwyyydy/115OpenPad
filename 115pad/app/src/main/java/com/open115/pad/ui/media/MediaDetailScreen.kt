@@ -30,6 +30,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.ArrowBack
 import androidx.compose.material.icons.outlined.AutoFixHigh
 import androidx.compose.material.icons.outlined.Delete
+import androidx.compose.material.icons.automirrored.outlined.DriveFileMove
 import androidx.compose.material.icons.outlined.Movie
 import androidx.compose.material.icons.outlined.PlayArrow
 import androidx.compose.material.icons.outlined.Refresh
@@ -156,6 +157,7 @@ fun MediaDetailScreen(
     val container = (context.applicationContext as com.open115.pad.App115).container
     var showDelete by remember { mutableStateOf(false) }
     var showScrape by remember { mutableStateOf(false) }
+    var showMigrate by remember { mutableStateOf(false) }
 
     val data by produceState<MediaDetailData?>(initialValue = null, card.mediaKey) {
         val movie = dao.movie(card.mediaKey)
@@ -425,6 +427,15 @@ fun MediaDetailScreen(
                                     tint = Color.White,
                                 )
                             }
+                        }
+                        // 迁移：把这部片的整个云盘文件夹搬到另一个媒体库（云端真搬）。
+                        // 与"删除"分开摆：一个是换地方、一个是不要了，挨着但概念相反
+                        IconButton(onClick = { showMigrate = true }) {
+                            Icon(
+                                Icons.AutoMirrored.Outlined.DriveFileMove,
+                                contentDescription = "迁移到其他媒体库",
+                                tint = Color.White,
+                            )
                         }
                         IconButton(onClick = { showDelete = true }) {
                             Icon(Icons.Outlined.Delete, contentDescription = "删除", tint = Color.White)
@@ -719,6 +730,8 @@ fun MediaDetailScreen(
     if (showScrape && scrapeMovie != null) {
         MediaScrapeDialog(
             plan = com.open115.pad.data.media.scrape.scrapePlanOfMovie(scrapeMovie),
+            // 现有 nfo 的解析结果：手动编辑用它预填表单（没有就退回片名/年份）
+            prefill = data?.nfo,
             scraper = container.metadataScraper,
             aiClient = container.aiQueryClient,
             mediaPrefs = container.mediaPrefs,
@@ -727,6 +740,20 @@ fun MediaDetailScreen(
             onWritten = { newKey ->
                 showScrape = false
                 onScraped(newKey)
+            },
+        )
+    }
+
+    if (showMigrate) {
+        MovieMigrateDialog(
+            mediaKeys = listOf(card.mediaKey),
+            title = data?.movie?.title ?: card.title,
+            dao = dao,
+            onDismiss = { showMigrate = false },
+            // 搬完不再回头刷新这一页：它的文件已经在别的库了，这一页留着只会让人以为还在这儿
+            onMigrated = {
+                onDeleted()
+                onBack()
             },
         )
     }

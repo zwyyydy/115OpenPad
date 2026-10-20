@@ -6,6 +6,7 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -46,7 +47,7 @@ import androidx.compose.ui.window.DialogProperties
 import coil.compose.AsyncImage
 import com.open115.pad.data.FileItem
 import com.open115.pad.data.OpenApi
-import com.open115.pad.data.parseFilesResponse
+import com.open115.pad.data.listDirPaged
 import kotlinx.coroutines.launch
 
 @Composable
@@ -121,7 +122,9 @@ fun FolderPickerDialog(
             loading = true
             error = null
             try {
-                val page = parseFilesResponse(api.files(cid = cid, limit = 500, order = "file_name", asc = 1))
+                // 全量翻页后再在客户端挑目录：接口没有"只给目录"的开关，而**少列的目录用户
+                // 在选择器里根本点不到** —— 大目录里那一堆文件夹会跟着被截掉
+                val page = listDirPaged(api, cid, order = "file_name", asc = 1)
                 dirs = page.items.filter { it.isDir }
             } catch (e: Exception) {
                 error = e.message
@@ -197,18 +200,54 @@ fun FolderPickerDialog(
     )
 }
 
+/**
+ * 「下载到本机」确认框。
+ *
+ * @param extraLabel 第二个动作的按钮文案（目前只有 `.torrent` 用：转磁力推进云下载）；null = 不显示
+ * @param extraNote 第二行说明：种子在读时的进度、解析出的内容摘要、或失败原因
+ * @param footer 正文最后再追加一块（目前是种子截图预览）；不给就不占地方
+ */
 @Composable
 fun DownloadDialog(
     name: String,
     sizeText: String,
     onDownload: () -> Unit,
     onDismiss: () -> Unit,
+    extraLabel: String? = null,
+    extraEnabled: Boolean = true,
+    extraNote: String? = null,
+    onExtra: (() -> Unit)? = null,
+    footer: (@Composable () -> Unit)? = null,
 ) {
     FadeAlertDialog(
         onDismissRequest = onDismiss,
         title = { Text(name, maxLines = 2) },
-        text = { Text(sizeText) },
-        confirmButton = { Button(onClick = onDownload) { Text("下载") } },
+        text = {
+            Column {
+                Text(sizeText)
+                extraNote?.let {
+                    Spacer(Modifier.height(8.dp))
+                    Text(
+                        it,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                footer?.let {
+                    Spacer(Modifier.height(10.dp))
+                    it()
+                }
+            }
+        },
+        confirmButton = {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                if (extraLabel != null) {
+                    TextButton(onClick = { onExtra?.invoke() }, enabled = extraEnabled) { Text(extraLabel) }
+                    Spacer(Modifier.width(4.dp))
+                }
+                Button(onClick = onDownload) { Text("下载") }
+            }
+        },
         dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } },
     )
 }

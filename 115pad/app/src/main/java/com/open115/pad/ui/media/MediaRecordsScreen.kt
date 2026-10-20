@@ -29,6 +29,7 @@ import androidx.compose.material.icons.outlined.Update
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
@@ -47,6 +48,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import com.open115.pad.data.media.MediaDao
 import com.open115.pad.data.media.MovieCard
@@ -57,27 +59,41 @@ import com.open115.pad.data.media.backgroundSourceOf
 import com.open115.pad.ui.components.GlassCard
 import com.open115.pad.ui.components.MetaChip
 import com.open115.pad.ui.components.auroraBackdrop
+import com.open115.pad.appContainer
 import com.open115.pad.ui.theme.AdaptiveBody
+import com.open115.pad.ui.theme.AppChip
 import com.open115.pad.ui.theme.AppColors
 import com.open115.pad.util.Format
+import com.open115.pad.ui.history.WatchHistoryContent
+import com.open115.pad.ui.history.isFinished
 import kotlinx.coroutines.launch
 import com.open115.pad.ui.components.FadeAlertDialog
 
+/** 记录页的三个页签：扫描 / 迁移 / 观影历史 —— 三条流水合成一个入口 */
+private const val TAB_SCAN = 0
+private const val TAB_MIGRATION = 1
+private const val TAB_HISTORY = 2
+
 /**
- * 扫描记录：**什么时候、扫的哪个库、结果如何、新增了哪些片**。
+ * 「记录」页：**扫描 / 迁移 / 观影历史**三条流水收在一个浮层里（页头三个页签）。
  *
- * 放在媒体库这条线上（顶栏图标进、浮层显示），而不是文件页那份「操作记录」里：
- * 那边是文件操作的流水（复制/移动/上传…），而这里要带**海报图**展示新增影片 —— 那是媒体库的事。
+ * 三条都是"媒体库这条线自己的账"：扫了哪些库、搬过哪些片、看到哪儿了。合成一个入口的来由 ——
+ * 原来扫描记录与观影历史各占顶栏一个图标，加上迁移记录就是三个，顶栏那一排会挤；
+ * 收起来之后各自的小动作（清空 / 只看未看完）跟着页签摆在页头的右侧。
  *
- * 数据是 `scan_log` 表；新增影片只存了键，海报与标题在这里 join `movies` 现取
- * （库里改了名换了海报，旧记录也跟着变），点一张就进详情页。
+ * 具体每一页的数据：
+ * - **扫描记录**（本文件）：`scan_log` 表；新增影片只存了键，海报与标题在这里 join `movies`
+ *   现取（库里改了名换了海报，旧记录也跟着变），点一张就进详情页。带**海报图**是它不放进
+ *   文件页那份「操作记录」的原因 —— 那边是文件操作的流水（复制/移动/上传…），海报是媒体库的事。
+ * - **迁移记录**（[MigrationLogList]）：`MigrationQueue`（落盘的队列）现读，见那个文件。
+ * - **观影历史**（[WatchHistoryContent]）：`watch_history` 表，行由这一层查好传下去。
  *
  * 排版上与库列表页**共用同一套**（[AdaptiveBody] 收窄 + [GlassCard] + [MetaChip]）：
  * 这一页原来是通栏铺满整屏的（宽屏上库名在最左、时间在最右，中间空掉一大片），卡片也是
  * 另一套"35% 灰底方角块"—— 同一产品的两个页面看着像两个应用。
  */
 @Composable
-fun MediaScanLogScreen(
+fun MediaRecordsScreen(
     dao: MediaDao,
     /** 点新增影片的海报 → 开详情（[list] 是这条记录里新增的那一批，播完自动接下一部） */
     onOpenMovie: (MovieCard, List<MovieCard>, Int) -> Unit,
@@ -86,7 +102,20 @@ fun MediaScanLogScreen(
     val scope = rememberCoroutineScope()
     val snackbarHostState = remember { SnackbarHostState() }
     val logs by dao.scanLogs().collectAsState(initial = emptyList())
-    var confirmClear by remember { mutableStateOf(false) }
+    val container = LocalContext.current.appContainer
+    val migTasks by container.migrationQueue.tasks.collectAsState()
+    val migActive by container.mediaMigrator.activeTaskId.collectAsState()
+    // 观影历史的行由这一层查（副标题计数、清空按钮可用性、清空框里的条数都要用），
+    // 列表本体只管展示 —— 同一个查询别在一页里查两遍
+    val watchRows by container.mediaDatabase.mediaDao().watchHistoryRows()
+        .collectAsState(initial = emptyList())
+
+    /** 当前页签（[TAB_SCAN] / [TAB_MIGRATION] / [TAB_HISTORY]） */
+    var tab by remember { mutableStateOf(TAB_SCAN) }
+    /** 观影历史的「只看未看完」 */
+    var onlyUnfinished by remember { mutableStateOf(false) }
+    /** 清空确认框问的是哪一页：-1 = 没问（迁移记录不给整清） */
+    var clearAsk by remember { mutableStateOf(-1) }
 
     // 系统返回键 = 出栈回媒体库页（与详情/作品页一致）。没有这一句时 BACK 会穿透到
     // 应用级导航、直接跳到「文件」页 —— 实测从「查看全部」进来一按返回就莫名其妙离开了媒体库。
@@ -114,20 +143,113 @@ fun MediaScanLogScreen(
                     Icon(Icons.AutoMirrored.Outlined.ArrowBack, contentDescription = "返回")
                 }
                 Column(Modifier.weight(1f)) {
-                    Text("扫描记录", style = MaterialTheme.typography.titleLarge)
                     Text(
-                        if (logs.isEmpty()) "媒体库每扫一次都会记在这里（时间 / 哪个库 / 新增了哪些片）"
-                        else "${logs.size} 次扫描 · 最近一次 ${Format.ago(logs.first().at)}",
+                        // 标题就叫「记录」：具体是哪一页由下面那排页签说 —— 两边都写页签名是重复
+                        "记录",
+                        style = MaterialTheme.typography.titleLarge,
+                    )
+                    Text(
+                        when (tab) {
+                            TAB_MIGRATION ->
+                                if (migTasks.isEmpty()) "还没有迁移记录（海报墙多选 → 迁移…）"
+                                else "${migTasks.size} 批 · 最近一次 ${Format.ago(migTasks.first().createdAt)}"
+
+                            TAB_HISTORY ->
+                                if (watchRows.isEmpty()) "在媒体库里播过的片会出现在这里"
+                                else "${watchRows.size} 条记录 · 未看完 ${watchRows.count { !isFinished(it) }} 条"
+
+                            else ->
+                                if (logs.isEmpty()) "媒体库每扫一次都会记在这里（时间 / 哪个库 / 新增了哪些片）"
+                                else "${logs.size} 次扫描 · 最近一次 ${Format.ago(logs.first().at)}"
+                        },
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
-                }
-                IconButton(onClick = { confirmClear = true }, enabled = logs.isNotEmpty()) {
-                    Icon(Icons.Outlined.Delete, contentDescription = "清空扫描记录")
+                    Spacer(Modifier.height(6.dp))
+                    // 页签在左、**这一页自己的小动作在右**（只跟当前页有关，就不占顶栏的位置了）
+                    Row(
+                        Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(4.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        AppChip("扫描记录", selected = tab == TAB_SCAN, onClick = { tab = TAB_SCAN })
+                        AppChip(
+                            "迁移记录",
+                            selected = tab == TAB_MIGRATION,
+                            onClick = { tab = TAB_MIGRATION },
+                            // 有没跑完的一批就带个点：它就是"要不要去点继续"的提示
+                            leading = {
+                                if (migTasks.any { it.hasPending }) {
+                                    Box(
+                                        Modifier
+                                            .size(7.dp)
+                                            .clip(RoundedCornerShape(50))
+                                            .background(MaterialTheme.colorScheme.primary),
+                                    )
+                                    Spacer(Modifier.size(5.dp))
+                                }
+                            },
+                        )
+                        AppChip("观影历史", selected = tab == TAB_HISTORY, onClick = { tab = TAB_HISTORY })
+                        Spacer(Modifier.weight(1f))
+                        // 观影历史特有的筛子（列表本体只管展示）
+                        if (tab == TAB_HISTORY) {
+                            FilterChip(
+                                selected = onlyUnfinished,
+                                onClick = { onlyUnfinished = !onlyUnfinished },
+                                label = { Text("只看未看完") },
+                            )
+                        }
+                        // 清空：扫描记录与观影历史各清各的（迁移记录一条条删，不给整清）
+                        if (tab != TAB_MIGRATION) {
+                            IconButton(
+                                onClick = { clearAsk = tab },
+                                enabled = if (tab == TAB_SCAN) logs.isNotEmpty() else watchRows.isNotEmpty(),
+                            ) {
+                                Icon(
+                                    Icons.Outlined.Delete,
+                                    contentDescription = if (tab == TAB_SCAN) "清空扫描记录" else "清空观影历史",
+                                )
+                            }
+                        }
+                    }
                 }
             }
 
-            if (logs.isEmpty()) {
+            if (tab == TAB_HISTORY) {
+                WatchHistoryContent(
+                    container = container,
+                    rows = watchRows,
+                    onlyUnfinished = onlyUnfinished,
+                    snackbarHostState = snackbarHostState,
+                    modifier = Modifier.fillMaxSize(),
+                )
+            } else if (tab == TAB_MIGRATION) {
+                if (migTasks.isEmpty()) {
+                    Column(
+                        Modifier.fillMaxSize().padding(32.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.Center,
+                    ) {
+                        Text("还没有迁移记录", style = MaterialTheme.typography.bodyLarge)
+                        Spacer(Modifier.height(8.dp))
+                        Text(
+                            "海报墙长按进多选 → 「迁移…」，每批都会记在这里（可继续 / 重试失败的）",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                } else {
+                    MigrationLogList(
+                        tasks = migTasks.sortedByDescending { it.createdAt },
+                        activeTaskId = migActive,
+                        onResume = { scope.launch { container.mediaMigrator.resume(it) } },
+                        onRetry = { scope.launch { container.mediaMigrator.retryFailed(it) } },
+                        onRemove = { scope.launch { container.migrationQueue.remove(it) } },
+                        modifier = Modifier.fillMaxSize(),
+                    )
+                }
+            } else if (logs.isEmpty()) {
                 Column(
                     Modifier.fillMaxSize().padding(32.dp),
                     horizontalAlignment = Alignment.CenterHorizontally,
@@ -165,24 +287,38 @@ fun MediaScanLogScreen(
     }
     }
 
-    if (confirmClear) {
+    if (clearAsk >= 0) {
+        val forScan = clearAsk == TAB_SCAN
         FadeAlertDialog(
-            onDismissRequest = { confirmClear = false },
-            title = { Text("清空扫描记录？") },
-            text = { Text("${logs.size} 条记录会全部删除。影片索引与云端文件都不受影响。") },
+            onDismissRequest = { clearAsk = -1 },
+            title = { Text(if (forScan) "清空扫描记录？" else "清空观影历史？") },
+            text = {
+                Text(
+                    if (forScan) {
+                        "${logs.size} 次扫描的记录会全部删除，不影响影片索引。"
+                    } else {
+                        "${watchRows.size} 条记录会全部删除。播放进度不受影响，只是这份列表清空。"
+                    },
+                )
+            },
             confirmButton = {
                 TextButton(onClick = {
-                    confirmClear = false
+                    val wasScan = clearAsk == TAB_SCAN
+                    clearAsk = -1
                     scope.launch {
-                        dao.clearScanLogs()
-                        snackbarHostState.showSnackbar("扫描记录已清空")
+                        if (wasScan) {
+                            dao.clearScanLogs()
+                            snackbarHostState.showSnackbar("扫描记录已清空")
+                        } else {
+                            dao.clearWatchHistory()
+                            snackbarHostState.showSnackbar("观影历史已清空")
+                        }
                     }
                 }) { Text("清空") }
             },
-            dismissButton = { TextButton(onClick = { confirmClear = false }) { Text("取消") } },
+            dismissButton = { TextButton(onClick = { clearAsk = -1 }) { Text("取消") } },
         )
-    }
-}
+    }}
 
 /**
  * 一条记录：库名 + 结果徽标 + 相对时间，第二行是结果胶囊（[ScanResultChips]），
@@ -248,7 +384,7 @@ private fun ScanLogCard(
     }
 }
 
-/** 结果徽标：停/中断 / 新增 N 部 / 无新增 —— 一条记录的结论，放库名旁边 */
+/** 结果徽标：停/中断 / 新增 N 部 / 刷新 N 部 / 无新增 —— 一条记录的结论，放库名旁边 */
 @Composable
 private fun ResultBadge(report: ScanReport) {
     when {
@@ -258,6 +394,9 @@ private fun ResultBadge(report: ScanReport) {
             bold = true,
         )
         report.newCount > 0 -> MetaChip("新增 ${report.newCount} 部", tint = AppColors.GreenFg, bold = true)
+        // 没有新片、但确实重新索引了：那是在**原地刷新**（流水线同步覆盖写 nfo/海报、
+        // 增量重扫变了的目录）。只写「无新增」读起来像"啥也没干"，而数字就在旁边摆着
+        report.indexed > 0 -> MetaChip("刷新 ${report.indexed} 部")
         else -> MetaChip("无新增")
     }
 }

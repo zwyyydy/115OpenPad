@@ -12,6 +12,8 @@ import androidx.compose.foundation.layout.heightIn
 import androidx.compose.material3.Button
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxHeight
@@ -237,6 +239,7 @@ fun SettingsScreen(container: AppContainer) {
     val speedBoost by container.playerPrefs.speedBoost.collectAsState(initial = 2.5f)
     val seekSeconds by container.playerPrefs.seekSeconds.collectAsState(initial = 10)
     val miniProgress by container.playerPrefs.alwaysShowMiniProgress.collectAsState(initial = true)
+    val rememberBrightness by container.playerPrefs.rememberBrightness.collectAsState(initial = true)
     val playerCacheEnabled by container.playerPrefs.cacheEnabled.collectAsState(initial = true)
     val playerCacheMaxMb by container.playerPrefs.cacheMaxMb.collectAsState(initial = 2048)
     val playerPrefetchEnabled by container.playerPrefs.prefetchEnabled.collectAsState(initial = true)
@@ -453,6 +456,11 @@ fun SettingsScreen(container: AppContainer) {
         initial = com.open115.pad.data.PlayerPrefs.MAGNET_ENDPOINT_DEFAULT,
     )
     val labMagnetToken by container.playerPrefs.labMagnetToken.collectAsState(initial = "")
+    // 预览走的是另一个第三方（默认 whatslink.info），与搜索源/Token 相互独立
+    val labMagnetPreviewEnabled by container.playerPrefs.labMagnetPreviewEnabled.collectAsState(initial = true)
+    val labMagnetPreviewEndpoint by container.playerPrefs.labMagnetPreviewEndpoint.collectAsState(
+        initial = com.open115.pad.data.PlayerPrefs.MAGNET_PREVIEW_ENDPOINT_DEFAULT,
+    )
     var magnetTestNote by remember { mutableStateOf("") }
     var magnetTesting by remember { mutableStateOf(false) }
     fun testMagnet() {
@@ -479,12 +487,14 @@ fun SettingsScreen(container: AppContainer) {
             speedBoost = speedBoost,
             seekSeconds = seekSeconds,
             miniProgress = miniProgress,
+            rememberBrightness = rememberBrightness,
             softwareDecode = softwareDecode,
             subtitleTextSize = subtitleTextSize,
             subtitleBottomPercent = subtitleBottomPercent,
             onSpeedBoost = { v -> scope.launch { container.playerPrefs.setSpeedBoost((v / 0.5f).roundToInt() * 0.5f) } },
             onSeekSeconds = { sec -> scope.launch { container.playerPrefs.setSeekSeconds(sec) } },
             onMiniProgress = { v -> scope.launch { container.playerPrefs.setAlwaysShowMiniProgress(v) } },
+            onRememberBrightness = { v -> scope.launch { container.playerPrefs.setRememberBrightness(v) } },
             onSoftwareDecode = { v -> scope.launch { container.playerPrefs.setSoftwareDecode(v) } },
             onSubtitleTextSize = { v -> scope.launch { container.playerPrefs.setSubtitleTextSize((v / 2).roundToInt() * 2f) } },
             onSubtitleBottomPercent = { v -> scope.launch { container.playerPrefs.setSubtitleBottomPercent((v / 5).roundToInt() * 5) } },
@@ -704,9 +714,13 @@ fun SettingsScreen(container: AppContainer) {
             labMagnetEndpoint = labMagnetEndpoint,
             labMagnetToken = labMagnetToken,
             magnetTestNote = magnetTestNote,
+            labMagnetPreviewEnabled = labMagnetPreviewEnabled,
+            labMagnetPreviewEndpoint = labMagnetPreviewEndpoint,
             onLabMagnetEnabled = { v -> scope.launch { container.playerPrefs.setLabMagnetEnabled(v) } },
             onLabMagnetEndpoint = { v -> scope.launch { container.playerPrefs.setLabMagnetEndpoint(v) } },
             onLabMagnetToken = { v -> scope.launch { container.playerPrefs.setLabMagnetToken(v) } },
+            onLabMagnetPreviewEnabled = { v -> scope.launch { container.playerPrefs.setLabMagnetPreviewEnabled(v) } },
+            onLabMagnetPreviewEndpoint = { v -> scope.launch { container.playerPrefs.setLabMagnetPreviewEndpoint(v) } },
             onTestMagnet = { testMagnet() },
         ),
         accountSection(
@@ -741,7 +755,7 @@ fun SettingsScreen(container: AppContainer) {
                 PaneHeader(current.category.label) { phoneOpened = false }
                 key(current.category) {
                     FadeIn(Modifier.fillMaxSize()) {
-                        SettingsPane(current, showTitle = false, modifier = Modifier.fillMaxSize())
+                        SettingsPane(current, showTitle = false, compact = true, modifier = Modifier.fillMaxSize())
                     }
                 }
             }
@@ -764,7 +778,7 @@ fun SettingsScreen(container: AppContainer) {
                     VerticalDivider(color = AppColors.Divider)
                     key(current.category) {
                         FadeIn(Modifier.weight(1f).fillMaxHeight()) {
-                            SettingsPane(current, showTitle = true, modifier = Modifier.fillMaxSize())
+                            SettingsPane(current, showTitle = true, compact = false, modifier = Modifier.fillMaxSize())
                         }
                     }
                 }
@@ -966,7 +980,12 @@ private fun PaneHeader(title: String, onBack: () -> Unit) {
 // ---------------- 内容栏 ----------------
 
 @Composable
-private fun SettingsPane(section: SettingsSection, showTitle: Boolean, modifier: Modifier = Modifier) {
+private fun SettingsPane(
+    section: SettingsSection,
+    showTitle: Boolean,
+    compact: Boolean,
+    modifier: Modifier = Modifier,
+) {
     Box(modifier) {
         Column(
             Modifier
@@ -990,18 +1009,18 @@ private fun SettingsPane(section: SettingsSection, showTitle: Boolean, modifier:
             )
             section.groups.forEach { g ->
                 g.label?.let { SectionHeader(it) }
-                g.items.forEach { SettingItemRow(it) }
+                g.items.forEach { SettingItemRow(it, compact) }
             }
         }
     }
 }
 
 @Composable
-private fun SettingItemRow(item: SettingItem) {
+private fun SettingItemRow(item: SettingItem, compact: Boolean) {
     when (item) {
         is SwitchItem -> SwitchRow(item)
         is SliderItem -> SliderRow(item)
-        is ChoiceItem<*> -> ChoiceRow(item)
+        is ChoiceItem<*> -> ChoiceRow(item, compact)
         is ActionItem -> ActionRow(item)
         is TextItem -> TextRow(item)
         is InfoItem -> ItemShell(item)
@@ -1191,24 +1210,42 @@ private fun SliderRow(item: SliderItem) {
     )
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
-private fun ChoiceRow(item: ChoiceItem<*>) {
-    ItemShell(
-        item,
-        trailing = {
-            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                item.options.forEach { (label, value) ->
-                    // onClick 必须显式传：AppChip 最后一个参数是 leading 的 composable 槽，
-                    // 尾随 lambda 会被绑到那里去（onClick 反而报"没传值"）
-                    AppChip(
-                        label = label,
-                        selected = value == item.selected,
-                        onClick = { item.onSelectAny(value) },
-                    )
-                }
-            }
-        },
-    )
+private fun ChoiceRow(item: ChoiceItem<*>, compact: Boolean) {
+    // onClick 必须显式传：AppChip 最后一个参数是 leading 的 composable 槽，
+    // 尾随 lambda 会被绑到那里去（onClick 反而报"没传值"）
+    val chips: @Composable () -> Unit = {
+        item.options.forEach { (label, value) ->
+            AppChip(
+                label = label,
+                selected = value == item.selected,
+                onClick = { item.onSelectAny(value) },
+            )
+        }
+    }
+    if (compact) {
+        // 手机竖屏：胶囊排到标题下方、自动换行。
+        // 别塞进右侧 trailing —— 一排胶囊一旦宽过窄屏，就会把标题列压成 0 宽，
+        // 文字逐字换行撑出整屏空白，右端选项还会被裁掉。
+        ItemShell(
+            item,
+            extra = {
+                FlowRow(
+                    modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                ) { chips() }
+            },
+        )
+    } else {
+        ItemShell(
+            item,
+            trailing = {
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) { chips() }
+            },
+        )
+    }
 }
 
 /** 泛型擦除后 onSelect 收不到具体类型，这里统一转成 Any 再交回去（选项来自同一份列表，类型是安全的） */
@@ -1255,12 +1292,14 @@ private fun playerSection(
     speedBoost: Float,
     seekSeconds: Int,
     miniProgress: Boolean,
+    rememberBrightness: Boolean,
     softwareDecode: Boolean,
     subtitleTextSize: Float,
     subtitleBottomPercent: Int,
     onSpeedBoost: (Float) -> Unit,
     onSeekSeconds: (Int) -> Unit,
     onMiniProgress: (Boolean) -> Unit,
+    onRememberBrightness: (Boolean) -> Unit,
     onSoftwareDecode: (Boolean) -> Unit,
     onSubtitleTextSize: (Float) -> Unit,
     onSubtitleBottomPercent: (Float) -> Unit,
@@ -1281,6 +1320,14 @@ private fun playerSection(
         detail = "唤出控制栏会自动让位给大进度条。关闭后全屏不留任何进度元素。",
         checked = miniProgress,
         onChange = onMiniProgress,
+    )
+    switch(
+        id = "remember_brightness",
+        title = "记忆上次播放亮度",
+        subtitle = "下次打开播放器时，直接沿用上次调好的亮度",
+        detail = "左侧上下滑动的亮度手势只对当前这次播放有效；打开后退出时会记住，下次进播放器直接套用。关闭则每次都用系统亮度。",
+        checked = rememberBrightness,
+        onChange = onRememberBrightness,
     )
 
     group("手势")
@@ -2021,9 +2068,14 @@ private fun labSection(
     labMagnetToken: String,
     /** 「测试连接」的当前状态一句话（空 = 没测过） */
     magnetTestNote: String,
+    /** 磁力预览（另一个第三方服务，与搜索源独立） */
+    labMagnetPreviewEnabled: Boolean,
+    labMagnetPreviewEndpoint: String,
     onLabMagnetEnabled: (Boolean) -> Unit,
     onLabMagnetEndpoint: (String) -> Unit,
     onLabMagnetToken: (String) -> Unit,
+    onLabMagnetPreviewEnabled: (Boolean) -> Unit,
+    onLabMagnetPreviewEndpoint: (String) -> Unit,
     onTestMagnet: () -> Unit,
 ): SettingsSection = section(SettingsCategory.LAB) {
     switch(
@@ -2344,6 +2396,24 @@ private fun labSection(
         title = "测试连接",
         subtitle = if (magnetTestNote.isBlank()) "握手并列出该源提供的工具" else magnetTestNote,
         onClick = onTestMagnet,
+    )
+    switch(
+        id = "magnet_preview_enabled",
+        title = "磁力预览（视频截图）",
+        subtitle = "看磁力详情时多一条视频截图和一行摘要，用来确认是不是要的那部",
+        detail = "截图由第三方服务生成（默认 whatslink.info）：看详情时会把这条磁力链发给它，" +
+            "不需要 MCP Token，与上面的搜索源相互独立。只有含视频内容的种子才有图，一般 5 张 640px " +
+            "抽样帧；关掉之后不向该服务发任何请求。",
+        checked = labMagnetPreviewEnabled,
+        onChange = onLabMagnetPreviewEnabled,
+    )
+    text(
+        id = "magnet_preview_endpoint",
+        title = "预览服务地址",
+        subtitle = "默认 whatslink.info；自建或换源自己改（只填到域名，路径固定）",
+        value = labMagnetPreviewEndpoint,
+        placeholder = com.open115.pad.data.PlayerPrefs.MAGNET_PREVIEW_ENDPOINT_DEFAULT,
+        onChange = onLabMagnetPreviewEndpoint,
     )
     info(
         id = "magnet_how",

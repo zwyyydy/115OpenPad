@@ -45,7 +45,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.open115.pad.AppContainer
 import com.open115.pad.data.RenameTask
-import com.open115.pad.data.parseFilesResponse
+import com.open115.pad.data.listDirPaged
 import com.open115.pad.ui.components.FolderPickerDialog
 import com.open115.pad.ui.files.BatchRenameRequest
 import com.open115.pad.ui.theme.AdaptiveBody
@@ -164,9 +164,10 @@ fun RenameTasksScreen(
                 scope.launch {
                     // 目录内全部条目（含子文件夹）一起进配置面板，面板里还能逐行去掉
                     val err = runCatching {
-                        parseFilesResponse(
-                            container.openApi.files(cid = cid, limit = 200, offset = 0, order = "file_name", asc = 1),
-                        ).items.filter { it.fid != null }
+                        // 全量翻页：这个目录有多少条目就要配多少行 —— 只取第一页会让用户
+                        // **完全不知道**后面还有文件没进重命名列表（115 一页上限 1150）
+                        listDirPaged(container.openApi, cid, order = "file_name", asc = 1)
+                            .items.filter { it.fid != null }
                     }.getOrElse { e ->
                         loadingDir = false
                         snackbarHostState.showSnackbar("读取目录失败：${e.message}")

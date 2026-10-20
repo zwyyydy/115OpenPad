@@ -4,6 +4,7 @@ import android.util.Log
 import com.open115.pad.data.FileItem
 import com.open115.pad.data.FilesPage
 import com.open115.pad.data.ImageUrlResolver
+import com.open115.pad.data.LIST_PAGE_SIZE
 import com.open115.pad.data.OpenApi
 import com.open115.pad.data.envData
 import com.open115.pad.data.parseFilesResponse
@@ -87,6 +88,29 @@ data class QueuedScan(
      */
     val withSideArt: Boolean = false,
     /**
+     * 定向任务也要**从这几个目录往下递归**（影片迁移用）。
+     *
+     * 为什么迁移需要它：剧集的分集行在 `Season 1/` 这样的子目录里，而 [noRecurse] 的定向任务
+     * 只扫给它的那一个目录 —— 分集行的 dirPath 就留在旧位置。真机实测踩到过：卡片看着搬过来了，
+     * 分集还指着已经不存在的路径，之后再迁这部作品会因为"行不在自己的目录下"被直接拒掉。
+     *
+     * ⚠ 光把子目录一个个塞进 [rootCids] **也不行**：`seriesKey` 靠 `ancestorPaths` 往上找祖先行解析，
+     * 而它拿**这一趟扫描的 rootPath** 当下界 —— 给子目录传它自己的 path 就往上爬不动了
+     * （实测分集全部 seriesKey=null、散成一张张独立卡片）。必须是"从作品顶层目录递归下去"这一种形状。
+     *
+     * 老快照没有这个字段 → false = 原来的单目录行为，正好兼容。
+     */
+    val deep: Boolean = false,
+    /**
+     * 这次扫描是**别的功能顺手做的**（影片迁移搬完在目标位置的重扫）：跑完不弹"扫描完成"。
+     *
+     * 为什么：迁移是**一部一个**定向任务，而用户正对着迁移进度卡看 —— 每搬完一部再弹一次
+     * "「目标库」本次新增 1 部"就是纯噪音（用户报的"迁多部弹多次"）。
+     * 用户自己点的扫描、流水线同步照旧报，那才是他要的结果。
+     * 老快照没有这个字段 → false = 照旧报，正好是原来的行为。
+     */
+    val silent: Boolean = false,
+    /**
      * 来自**启动时的定时扫描**（见 [MediaScanner.enqueue] 的 auto 参数）。
      *
      * 唯一的用处：流水线同步（[PadSync]）排定向任务时，把同一个库**还没开跑**的定时任务撤掉 ——
@@ -130,6 +154,8 @@ data class QueuedScan(
             library: MediaLibraryEntity,
             dirs: List<Pair<String, String>>,
             withSideArt: Boolean = false,
+            deep: Boolean = false,
+            silent: Boolean = false,
         ) = QueuedScan(
             libraryId = library.id,
             libraryName = library.name,
@@ -143,6 +169,8 @@ data class QueuedScan(
             minVideoSizeMb = library.minVideoSizeMb,
             noRecurse = true,
             withSideArt = withSideArt,
+            deep = deep,
+            silent = silent,
         )
     }
 }
@@ -201,6 +229,16 @@ internal fun proposalToRestore(snapshot: ScanQueueSnapshot): ScanResume? =
  */
 internal fun proposalToPersist(active: ScanResume?, deferred: ScanResume?): ScanResume? =
     active ?: deferred
+
+/**
+ * 同一个库已有排队中的定向任务时，新的 [QueuedScan.silent] 怎么合并。
+ *
+ * 取 **and**（不像 [QueuedScan.withSideArt] / [QueuedScan.deep] 那样取 or）：
+ * 合并进来的目录里只要有一条是"用户看得见的扫描"（流水线同步），这一轮跑完就该照常报。
+ * 取 or 会把它连通知一起吞掉 —— 宁可多弹一次"新增 N 部"，也不能让用户以为同步没跑。
+ */
+internal fun mergedTargetedSilent(next: Boolean, queued: Boolean?): Boolean =
+    if (queued == null) next else next && queued
 
 /**
  * 这一轮任务**覆盖**了那份现场吗（同库 + 同一种任务：都是整库，或都是流水线定向）？
@@ -428,7 +466,7 @@ internal const val SCAN_MODE_PIPELINE = "流水线同步"
  *
  * 纯数据累积（写库交给调用方），单测可以直接打。
  */
-class ScanLogAccumulator {
+class ScanLogAccumulator(private val modeLabel: String = SCAN_MODE_PIPELINE) {
     private var startedAt = 0L
     private var finishedAt = 0L
     private var totalDirs = 0
@@ -468,7 +506,7 @@ class ScanLogAccumulator {
             indexed = indexed,
             postersFetched = postersFetched,
             stopped = stopped,
-            mode = SCAN_MODE_PIPELINE,
+            mode = modeLabel,
             listRequests = listRequests,
             newKeys = newKeys.joinToString("\n"),
         )
@@ -640,14 +678,29 @@ class MediaScanner(
     private var abnormalInterrupt: String? = null
 
     /**
-     * 本轮队列**累计**入库数 —— 界面完成提示「扫描完成，新增 N 部」用它。
+     * 本轮队列累计**新增影片**数 —— 界面完成提示「本次新增 N 部」用它。
      *
-     * [Progress.moviesIndexed] 只有**当前这一轮 runScan** 的数字；一次排了多个目录时
-     * （流水线同步是"一条任务多个 root"，每个 root 一次 runScan）拿最后一条会少报。
-     * 从空闲状态入队时清零（见 [enqueue]），每条 runScan 收尾累加（见它的 finally）。
+     * 数的是**新入库的片**，不是"索引了几部"：扫描会把没变的片也重新索引一遍
+     * （原地刷新 nfo/海报、迁移搬完的定向重扫都算），拿索引数当新增报，就会出现
+     * 「扫描记录里写着"无新增"、完成提示却说"新增 1 部"」这种自相矛盾（用户报过）。
+     *
+     * 为什么不用 [Progress.moviesIndexed]：那只是**当前这一轮 runScan** 的索引数，
+     * 一次排了多个目录时（流水线同步是"一条任务多个 root"，每个 root 一次 runScan）
+     * 拿最后一条会少报。所以这里跨任务/跨 root 累加：从空闲状态入队时清零（见 [enqueue]），
+     * 每条 runScan 收尾累加（见它的 finally）。
      */
-    private val _batchIndexed = MutableStateFlow(0)
-    val batchIndexed: StateFlow<Int> = _batchIndexed
+    private val _batchNew = MutableStateFlow(0)
+    val batchNew: StateFlow<Int> = _batchNew
+
+    /**
+     * 刚跑完的那一条是不是"顺手扫的"（[QueuedScan.silent]，目前只有影片迁移的重扫）。
+     *
+     * 界面在"忙 → 闲"的边沿上读它，决定弹不弹"扫描完成 · 新增 N 部" —— 迁移那种一部一个的
+     * 重扫要是一直弹，用户迁十部就被打断十次（用户报的）。**每跑完一条都要写**（不只是安静的那些）：
+     * 留着上一次的 true，下一轮用户自己点的扫描就再也不报了。
+     */
+    private val _lastRoundSilent = MutableStateFlow(false)
+    val lastRoundSilent: StateFlow<Boolean> = _lastRoundSilent
 
     private val mutex = Mutex()
 
@@ -749,8 +802,8 @@ class MediaScanner(
      */
     fun enqueue(task: QueuedScan) {
         synchronized(qLock) {
-            // 从"空闲"起的这一批任务算一轮：累计入库数清零（完成提示读它，见 [batchIndexed]）
-            if (_pending.value.isEmpty() && _current.value == null) _batchIndexed.value = 0
+            // 从"空闲"起的这一批任务算一轮：累计新增数清零（完成提示读它，见 [batchNew]）
+            if (_pending.value.isEmpty() && _current.value == null) _batchNew.value = 0
             _pending.value = queueWithTask(_pending.value, task)
         }
         persistQueue()
@@ -891,14 +944,28 @@ class MediaScanner(
      * 信号是一批一批来的，直接替换会把上一批还没轮到的目录丢掉。
      * 正在跑的那条不算进来 —— 它的目录已经在扫了。
      */
-    fun enqueueTargeted(library: MediaLibraryEntity, dirs: List<Pair<String, String>>, withSideArt: Boolean = false) {
+    fun enqueueTargeted(
+        library: MediaLibraryEntity,
+        dirs: List<Pair<String, String>>,
+        withSideArt: Boolean = false,
+        deep: Boolean = false,
+        silent: Boolean = false,
+    ) {
         if (dirs.isEmpty()) return
         val queued = synchronized(qLock) {
             _pending.value.firstOrNull { it.libraryId == library.id && it.noRecurse }
         }
         val queuedDirs = queued?.rootCids?.zip(queued.rootPaths).orEmpty()
         val merged = (queuedDirs + dirs).distinctBy { it.first }
-        enqueue(QueuedScan.targeted(library, merged, withSideArt || queued?.withSideArt == true))
+        enqueue(
+            QueuedScan.targeted(
+                library, merged,
+                withSideArt = withSideArt || queued?.withSideArt == true,
+                // 合并取 or：有一条要往下递归，整条就得递归（多扫一点不会错，少扫会留下半套）
+                deep = deep || queued?.deep == true,
+                silent = mergedTargetedSilent(silent, queued?.silent),
+            ),
+        )
     }
 
     /** 这个库已经有扫描在跑、或者排在队列里吗（启动自动扫描据此不重复排，见 App115） */
@@ -1025,6 +1092,8 @@ class MediaScanner(
                 persistQueue()
                 runCatching { runTask(task) }
                     .onFailure { Log.w(TAG, "排队扫描「${task.libraryName}」中断: ${it.message}") }
+                // 这一条是什么性质：界面收尾提示据此决定弹不弹（见 [lastRoundSilent]）
+                _lastRoundSilent.value = task.silent
                 // 正常跑完 / 用户主动跳过 → 在途现场清掉；**异常中断（频控、网络）则把它变成
                 // 一个"要不要接着扫"的问题** —— 当场就能问，重启后也还问得到（见 ScanQueueSnapshot）
                 if (abnormalInterrupt == null) {
@@ -1062,15 +1131,18 @@ class MediaScanner(
             Log.i(TAG, "跳过排队扫描「${task.libraryName}」：库已不存在")
             return
         }
-        // 定向任务（流水线同步）：rootCids/rootPaths 是一个个**具体目录**，逐目录跑，
-        // 但**只写一条**扫描记录（见 [ScanLogAccumulator]）—— 一次同步 5 个目录就是
-        // 一条「流水线同步 · 新增 N 部」，而不是 5 条「全量 · 新增 1 部」。
+        // 定向任务：rootCids/rootPaths 是一个个**具体目录**，逐目录跑，但**只写一条**扫描记录
+        // （见 [ScanLogAccumulator]）—— 一次同步 5 个目录就是一条「流水线同步 · 新增 N 部」，
+        // 而不是 5 条「全量 · 新增 1 部」。
         if (task.noRecurse) {
+            // 汇总器照旧挂着（它同时挡掉 runScan 那种"一个目录一条记录"的写法），
+            // 只是 [QueuedScan.silent] 的任务最后**不落盘**（见下面的说明）
             val sink = ScanLogAccumulator()
             task.rootCids.zip(task.rootPaths).forEach { (cid, path) ->
                 runScan(
                     cid, path,
-                    includeSubDirs = false,
+                    // deep = 迁移那种"整个作品搬了地方"：它名下的分集/子目录都要跟着重新索引一遍
+                    includeSubDirs = task.deep,
                     withSideArt = task.withSideArt,
                     mode = task.mode,
                     rateLimitMs = task.rateLimitMs,
@@ -1080,8 +1152,14 @@ class MediaScanner(
                     logSink = sink,
                 )
             }
-            runCatching { sink.toEntity(task.libraryId, task.libraryName)?.let { dao.addScanLog(it) } }
-                .onFailure { Log.w(TAG, "「${task.libraryName}」写流水线同步记录失败: ${it.message}") }
+            // ★ [QueuedScan.silent]（影片迁移搬完的重扫）**不写扫描记录**：
+            //   那是"搬片子顺手扫的"，一部一个任务，记下来就是一片「迁移重扫 · 无新增」
+            //   （用户报的"一堆新增 0"）；迁移有自己的「迁移记录」，这里再留一份纯属重复。
+            if (!task.silent) {
+                runCatching {
+                    sink.toEntity(task.libraryId, task.libraryName)?.let { dao.addOrMergePipelineLog(it) }
+                }.onFailure { Log.w(TAG, "「${task.libraryName}」写流水线同步记录失败: ${it.message}") }
+            }
             return
         }
         task.rootCids.zip(task.rootPaths).forEach { (cid, path) ->
@@ -1220,7 +1298,7 @@ class MediaScanner(
      *
      * ★ **按 count 翻页取全**。115 一页最多给 [PAGE_SIZE] 项，早先只取第一页 ——
      * 目录里超过一页的文件会被**静默丢掉**：一季带多语言字幕、或者一个目录几百个文件的库，
-     * 只有前 200 个能入库，界面上看不出任何异常。现在按响应里的 count 一页页取到齐。
+     * 只有第一页能入库，界面上看不出任何异常。现在按响应里的 count 一页页取到齐。
      *
      * 兜底两道：`page.items` 为空就停（服务端 count 不准时不至于死循环）、
      * 总页数封顶 [MAX_PAGES]（真遇到病态目录宁可少扫也不能把频控额度耗光）。
@@ -1970,9 +2048,9 @@ class MediaScanner(
                     )
                 }
             }.onFailure { Log.w(TAG, "「$roundLabel」写扫描记录失败: ${it.message}") }
-            // 本轮队列的累计入库数（完成提示用）：**不随 [Progress] 重置**，跨任务/跨 root 累加。
+            // 本轮队列的累计**新增影片**数（完成提示用）：**不随 [Progress] 重置**，跨任务/跨 root 累加。
             // 在这里而不是别处：正常结束、抛异常、被停止三条路都会走到，与入库事实一致。
-            _batchIndexed.value += movies
+            _batchNew.value += newKeys.size
             // 收尾统一放 finally：正常结束、抛异常、被停止三条路都要把 running 落回去，
             // 否则 UI 会永远停在"扫描中"、且 awaitStopped 的等待永远等不到
             _progress.value = _progress.value.copy(
@@ -2511,11 +2589,11 @@ class MediaScanner(
     companion object {
         private const val TAG = "MediaScanner"
 
-        /** 列目录每页取多少项（115 的上限就是这个量级） */
-        private const val PAGE_SIZE = 200
+        /** 列目录每页取多少项：与 [LIST_PAGE_SIZE] 同源（115 一页的上限 = 1150，实测见该常量） */
+        private const val PAGE_SIZE = LIST_PAGE_SIZE
 
         /** 一个目录最多翻几页：病态目录（count 虚高 / 服务端不认 offset）不至于把频控额度耗光 */
-        private const val MAX_PAGES = 25
+        private const val MAX_PAGES = 8
 
         /** nfo 解析结果的序列化器（缓存里存的是 NfoMeta 的 JSON） */
         private val nfoJson = Json { ignoreUnknownKeys = true; encodeDefaults = true }

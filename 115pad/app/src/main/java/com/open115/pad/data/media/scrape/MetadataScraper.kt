@@ -32,6 +32,8 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -117,6 +119,10 @@ class MetadataScraper(
         val wroteStills: Int = 0,
         /** 分集写了几个 `episodedetails` nfo（剧集用；0 = 没勾或没匹配） */
         val wroteEpisodes: Int = 0,
+        /** 这次真的往云端写了东西；补充模式下可能是 false（现有内容已齐全） */
+        val changed: Boolean = true,
+        /** 补充模式补上的 nfo 字段数（0 = 没补；覆盖模式不展示） */
+        val addedFields: Int = 0,
         val finishedAt: Long = 0,
     )
 
@@ -241,6 +247,8 @@ class MetadataScraper(
         val withStills: Boolean = false,
         /** 多选刮削前的开关：写回时把视频文件改成"规范名"（= 用来搜索的那个 title） */
         val renameToClean: Boolean = false,
+        /** 补充模式：只补缺失的 nfo 字段 / 图片，不覆盖已有内容（默认开） */
+        val supplement: Boolean = true,
     )
 
     private val _session = MutableStateFlow<BatchSession?>(null)
@@ -273,14 +281,14 @@ class MetadataScraper(
      *
      * [withStills] = 批量确认框勾的"同时刮剧照"：每部写回时多刮几张背景图进专属目录。
      */
-    fun startBatch(library: MediaLibraryEntity, withStills: Boolean = false) {
+    fun startBatch(library: MediaLibraryEntity, withStills: Boolean = false, supplement: Boolean = true) {
         if (_session.value != null) return
         stopRequested = false
         batchJob = scope.launch {
             val items = targetsOf(library).map {
                 BatchItem(it.mediaKey, it.title, it.year, it.videoName, it.dirCid, it.dirPath, it.isEpisodeLike)
             }
-            runSearchSession(library.id, library.name, items, withStills)
+            runSearchSession(library.id, library.name, items, withStills, supplement = supplement)
         }
     }
 
@@ -294,11 +302,12 @@ class MetadataScraper(
         libraryName: String,
         withStills: Boolean = false,
         renameToClean: Boolean = false,
+        supplement: Boolean = true,
     ) {
         if (_session.value != null) return
         stopRequested = false
         batchJob = scope.launch {
-            runSearchSession(0L, libraryName, items, withStills, renameToClean)
+            runSearchSession(0L, libraryName, items, withStills, renameToClean, supplement)
         }
     }
 
@@ -309,10 +318,12 @@ class MetadataScraper(
         items: List<BatchItem>,
         withStills: Boolean,
         renameToClean: Boolean = false,
+        supplement: Boolean = true,
     ) {
         val src = source()
         _session.value = BatchSession(
-            libraryId, libraryName, items, searching = true, withStills = withStills, renameToClean = renameToClean,
+            libraryId, libraryName, items, searching = true, withStills = withStills,
+            renameToClean = renameToClean, supplement = supplement,
         )
         if (items.isEmpty()) {
             _session.update { it?.copy(searching = false, finished = true, summary = "没有需要刮削的条目") }
@@ -425,14 +436,20 @@ class MetadataScraper(
                             awaitRescan = false,
                             withStills = s.withStills,
                             renameToClean = s.renameToClean,
+                            supplement = s.supplement,
                             onStep = { step -> updateItem(idx) { it.copy(note = step) } },
                         )
                     }
                     if (r.isSuccess) {
                         ok++
-                        val stills = r.getOrNull()?.wroteStills ?: 0
+                        val res = r.getOrNull()
+                        val stills = res?.wroteStills ?: 0
                         updateItem(idx) {
-                            it.copy(written = true, note = if (stills > 0) "已写入（剧照 $stills 张）" else "已写入", error = null)
+                            when {
+                                res?.changed == false -> it.copy(written = true, note = "已齐全，无需补充", error = null)
+                                stills > 0 -> it.copy(written = true, note = "已写入（剧照 $stills 张）", error = null)
+                                else -> it.copy(written = true, note = "已写入", error = null)
+                            }
                         }
                     } else {
                         fail++
@@ -515,14 +532,26 @@ class MetadataScraper(
      *
      * [withStills] = 对话框勾的"同时刮剧照"（单片入口默认开）。
      * [withEpisodes] = 剧集对话框勾的"同时写分集"（逐集写 episodedetails nfo）。
+     * [supplement] = 补充模式：只补现有 nfo 缺的字段与缺失的图片，不覆盖已有内容。
      */
-    fun startWrite(plan: ScrapePlan, candidate: ScrapeCandidate, withStills: Boolean = false, withEpisodes: Boolean = false) {
+    fun startWrite(
+        plan: ScrapePlan,
+        candidate: ScrapeCandidate,
+        withStills: Boolean = false,
+        withEpisodes: Boolean = false,
+        supplement: Boolean = true,
+    ) {
         if (_writeState.value?.running == true) return
         _writeState.value = WriteState(plan.key, plan.title, running = true, step = "准备…")
         _progress.update { it.copy(running = true, label = "正在刮削《${plan.title}》", summary = null) }
         scope.launch {
             val r = runCatching {
-                writeBack(plan, candidate, withStills = withStills, withEpisodes = withEpisodes) { step ->
+                writeBack(
+                    plan, candidate,
+                    withStills = withStills,
+                    withEpisodes = withEpisodes,
+                    supplement = supplement,
+                ) { step ->
                     _writeState.update { cur -> cur?.copy(step = step) }
                 }
             }
@@ -534,25 +563,32 @@ class MetadataScraper(
                 running = false,
                 error = err?.let { friendly(it) },
                 newKey = res?.newKey,
-                wroteNfo = res != null,
+                // 语义是"这次写成功且有变化"（补充模式下可能只补了图片）
+                wroteNfo = res?.changed == true,
                 wrotePoster = res?.wrotePoster == true,
                 wroteFanart = res?.wroteFanart == true,
                 wroteStills = res?.wroteStills ?: 0,
                 wroteEpisodes = res?.wroteEpisodes ?: 0,
+                changed = res?.changed ?: true,
+                addedFields = res?.addedFields ?: 0,
                 finishedAt = System.currentTimeMillis(),
             )
             _progress.value = Progress(
                 running = false,
                 label = "刮削",
                 summary = if (err == null) {
-                    val wrote = buildList {
-                        add("nfo")
-                        if (res?.wrotePoster == true) add("海报")
-                        if (res?.wroteFanart == true) add("背景图")
-                        (res?.wroteStills ?: 0).takeIf { it > 0 }?.let { add("剧照 $it 张") }
-                        (res?.wroteEpisodes ?: 0).takeIf { it > 0 }?.let { add("分集 $it 集") }
+                    if (res?.changed == false) {
+                        "《${plan.title}》没有需要补充的内容"
+                    } else {
+                        val wrote = buildList {
+                            if (res?.wroteNfo == true || (res?.addedFields ?: 0) > 0) add("nfo")
+                            if (res?.wrotePoster == true) add("海报")
+                            if (res?.wroteFanart == true) add("背景图")
+                            (res?.wroteStills ?: 0).takeIf { it > 0 }?.let { add("剧照 $it 张") }
+                            (res?.wroteEpisodes ?: 0).takeIf { it > 0 }?.let { add("分集 $it 集") }
+                        }
+                        "《${plan.title}》已写入 ${wrote.joinToString("、")}"
                     }
-                    "《${plan.title}》已写入 ${wrote.joinToString("、")}"
                 } else {
                     "《${plan.title}》刮削失败：${friendly(err)}"
                 },
@@ -563,6 +599,102 @@ class MetadataScraper(
 
     fun clearWrite() {
         _writeState.value = null
+    }
+
+    /**
+     * 手动编辑的写回：把用户表单里的元数据直接写成 nfo（不搜候选、不下载图片）。
+     *
+     * 与覆盖刮削的区别：现有 nfo 里表单没涉及的标签（`<fileinfo>`、`<dateadded>`、厂商自定义）
+     * 会保留；表单里编辑过的字段则整体替换（清空 = 删除该字段）。
+     * 海报 / 背景 / 剧照一律不动 —— 手编改的是文字元数据，不该顺手覆盖图片。
+     */
+    fun startWriteManual(plan: ScrapePlan, meta: ScrapedMetadata) {
+        if (_writeState.value?.running == true) return
+        _writeState.value = WriteState(plan.key, plan.title, running = true, step = "准备…")
+        _progress.update { it.copy(running = true, label = "正在保存《${plan.title}》的手动编辑", summary = null) }
+        scope.launch {
+            val r = runCatching {
+                writeManual(plan, meta) { step ->
+                    _writeState.update { cur -> cur?.copy(step = step) }
+                }
+            }
+            val err = r.exceptionOrNull()
+            val res = r.getOrNull()
+            _writeState.value = WriteState(
+                key = plan.key,
+                title = plan.title,
+                running = false,
+                error = err?.let { friendly(it) },
+                wroteNfo = res != null,
+                changed = res != null,
+                finishedAt = System.currentTimeMillis(),
+            )
+            _progress.value = Progress(
+                running = false,
+                label = "刮削",
+                summary = if (err == null) "《${plan.title}》已保存手动编辑的 nfo"
+                else "《${plan.title}》手动编辑保存失败：${friendly(err)}",
+                finishedAt = System.currentTimeMillis(),
+            )
+        }
+    }
+
+    /**
+     * 手动编辑写回本体：现有 nfo 存在时先读出来，做 [NfoMerger.replaceManaged]（表单字段整体替换、
+     * 其余标签保留）；读不到/解析失败就报错中止，绝不拿表单去冲掉原文件。
+     */
+    private suspend fun writeManual(
+        plan: ScrapePlan,
+        meta: ScrapedMetadata,
+        onStep: (String) -> Unit,
+    ): WriteResult {
+        val dirCid = plan.dirCid.takeIf { it.isNotBlank() } ?: error("这条影片没有云端目录，无法写回")
+        val dirPath = plan.dirPath.takeIf { it.isNotBlank() } ?: error("这条影片没有目录路径，无法写回")
+        val base = if (plan.kind == ScrapeKind.TV) "tvshow"
+        else fileBasePrefix(plan.videoName)?.takeIf { it.isNotBlank() }
+            ?: error("拿不到视频文件名，生成不了 nfo 名")
+        val nfoName = "$base.nfo"
+
+        val listing = listItems(dirCid)
+        val existingNfo = listing.firstOrNull {
+            !it.isDir && it.fn.substringAfterLast('.', "").equals("nfo", true) && fileBasePrefix(it.fn) == base
+        } ?: listing.firstOrNull { !it.isDir && it.fid == plan.oldNfoFid }
+
+        onStep("正在写入 nfo…")
+        val incoming = NfoWriter.build(meta)
+        if (existingNfo != null) {
+            val existingText = existingNfo.pc?.takeIf { it.isNotBlank() }?.let { downloadNfoText(it) }
+                ?: error("读不到现有 nfo，已取消写入（避免丢失原有字段）")
+            val merged = NfoMerger.replaceManaged(existingText, incoming)
+                ?: error("现有 nfo 无法解析，已取消写入（避免丢失原有字段）")
+            // 同名上传会生成「（1）」：替换前先回收旧文件（进回收站，可还原）
+            existingNfo.fid?.takeIf { it.isNotBlank() }?.let { fid ->
+                runCatching { api.deleteFiles(fid, dirCid) }
+                    .onFailure { android.util.Log.w(TAG, "手动编辑前回收旧 nfo 失败（可能生成副本）", it) }
+            }
+            Uploader.uploadSmallLogged(
+                transferLog, api, nfoName, merged.toByteArray(Charsets.UTF_8), dirCid, null,
+            )
+        } else {
+            Uploader.uploadSmallLogged(
+                transferLog, api, nfoName, incoming.toByteArray(Charsets.UTF_8), dirCid, null,
+            )
+        }
+
+        onStep("正在确认云端文件…")
+        waitListingHas(dirCid, nfoName)
+
+        onStep("正在重扫该目录…")
+        dao.invalidateScanState(dirCid)
+        val match = libraryForPath(dirPath, dao.libraries().first())
+        if (match != null) {
+            scanner.enqueueTargeted(match.library, listOf(dirCid to match.path), withSideArt = false)
+            withTimeoutOrNull(AWAIT_SCAN_TIMEOUT_MS) {
+                scanner.pending.first { q -> q.none { it.libraryId == match.library.id && it.noRecurse } }
+                scanner.progress.first { !it.running }
+            }
+        }
+        return WriteResult(newKey = null, wrotePoster = false, wroteNfo = true, changed = true)
     }
 
     /**
@@ -693,6 +825,29 @@ class MetadataScraper(
     /** 缩略图用的派生 client：共享连接池，只把单次调用超时压到 15s（列表里别让一行挂 40s） */
     private val thumbHttp: OkHttpClient by lazy { http.newBuilder().callTimeout(15, TimeUnit.SECONDS).build() }
 
+    /**
+     * 下载现有 nfo 文本（补充模式合并用）：pick_code → downUrl 直链 → 字节。
+     * 必须剥掉 UTF-8 BOM：BOM 留在 `<?xml` 前面是非法 XML，解析器第一步就抛。
+     */
+    private suspend fun downloadNfoText(pickCode: String): String? {
+        val url = resolvePickCodeUrl(pickCode) ?: return null
+        return fetchBytes(url)?.toString(Charsets.UTF_8)?.removePrefix("\uFEFF")
+    }
+
+    /** pickCode → 直链（与 MediaScanner 同一套解析：url 可能是字符串，也可能是 {url: …} 对象） */
+    private suspend fun resolvePickCodeUrl(pickCode: String): String? = try {
+        val data = api.downUrl(pickCode).envData() ?: return null
+        val entry = data.values.firstOrNull() as? JsonObject ?: return null
+        when (val el = entry["url"]) {
+            is JsonObject -> (el.values.firstOrNull() as? JsonPrimitive)?.content
+            is JsonPrimitive -> el.content
+            else -> null
+        }
+    } catch (e: Exception) {
+        android.util.Log.w(TAG, "nfo 直链解析失败 pc=$pickCode：${e.message}", e)
+        null
+    }
+
     /** 候选缩略图/海报字节（走独立的第三方 client，带超时保护） */
     suspend fun fetchBytes(url: String): ByteArray? = withContext(Dispatchers.IO) {
         // 海外图床直连是"间歇性"的（dmm 实测：首连 200，紧接着突发性连拒——写回能成、
@@ -726,6 +881,12 @@ class MetadataScraper(
         val wroteFanart: Boolean = false,
         val wroteStills: Int = 0,
         val wroteEpisodes: Int = 0,
+        /** 这次真的写了/更新了 nfo（补充模式下可能是"没写"，因为现有内容已齐全） */
+        val wroteNfo: Boolean = true,
+        /** 这次真的往云端写了东西；补充模式下可能为 false（现有内容已齐全） */
+        val changed: Boolean = true,
+        /** 补充模式往现有 nfo 里补了几个字段 */
+        val addedFields: Int = 0,
     )
 
     /**
@@ -751,6 +912,8 @@ class MetadataScraper(
         withEpisodes: Boolean = false,
         organize: Boolean = true,
         renameToClean: Boolean = false,
+        /** 补充模式：只补缺失的 nfo 字段 / 图片，不覆盖已有内容 */
+        supplement: Boolean = true,
         onStep: (String) -> Unit,
     ): WriteResult {
         val src = source() ?: throw ScrapeException(
@@ -772,7 +935,8 @@ class MetadataScraper(
         // 按"规范名"重命名视频（多选刮削前的开关；规范名 = 用来搜索的 plan.title）。只电影做。
         // ★ 必须在算 nfo/海报名、归位之前：这样装饰文件天生用新前缀、和改名后的视频对得上；
         //   批量刮削的目标本就"缺 nfo"，没有旧装饰文件会被留下变孤儿。
-        if (renameToClean && plan.kind == ScrapeKind.MOVIE && plan.title.isNotBlank()) {
+        // 补充模式不改名：用户要的是"补内容"，不该顺手动文件名。
+        if (!supplement && renameToClean && plan.kind == ScrapeKind.MOVIE && plan.title.isNotBlank()) {
             val proposed = matchedFileName(plan.title, videoName)
             if (proposed != null && proposed != videoName) {
                 val vid = runCatching { listItems(dirCid) }.getOrNull()
@@ -794,11 +958,46 @@ class MetadataScraper(
         val posterName = "$base-poster.jpg"
         val fanartName = "$base-fanart.jpg"
 
-        onStep("正在下载海报…")
-        val poster = meta.posterUrl?.let { url -> fetchBytes(url)?.takeIf { isDecodableImage(it) } }
-        val fanart = meta.fanartUrl?.let { url -> fetchBytes(url)?.takeIf { isDecodableImage(it) } }
+        // 先列一次目录：补充模式靠它判断"nfo/海报/背景/剧照是否已存在"；
+        // 覆盖模式也顺带省掉一次重复列目录（归位搬过家才需要重列）。
+        var listing = runCatching { parseFilesResponse(api.files(cid = dirCid, limit = 1000)).items }
+            .getOrDefault(emptyList())
+        // 一部一目录：混目录先归位。补充模式不动文件布局（只补内容，不搬用户的东西）。
+        if (!supplement && organize && plan.kind == ScrapeKind.MOVIE) {
+            val moved = organizeIntoOwnFolder(dirCid, dirPath, videoName, base, listing, onStep)
+            if (moved != null) {
+                movedFromCid = dirCid
+                dirCid = moved.first
+                dirPath = moved.second
+                listing = listItems(dirCid)
+            }
+        }
 
-        val stills: List<ByteArray> = if (withStills) {
+        // 补充模式：已有的一律不碰，只补缺的
+        val existingPoster = supplement && listing.any { !it.isDir && it.fn == posterName }
+        val existingFanart = supplement && listing.any {
+            !it.isDir && fileBasePrefix(it.fn) == base && hasArtSuffix(it.fn, "-fanart", "-backdrop")
+        }
+        val existingNfo = if (supplement) {
+            listing.firstOrNull {
+                !it.isDir && it.fn.substringAfterLast('.', "").equals("nfo", true) && fileBasePrefix(it.fn) == base
+            } ?: listing.firstOrNull { !it.isDir && it.fid == plan.oldNfoFid }
+        } else null
+
+        onStep("正在下载海报…")
+        val poster = if (existingPoster) null
+        else meta.posterUrl?.let { url -> fetchBytes(url)?.takeIf { isDecodableImage(it) } }
+        val fanart = if (existingFanart) null
+        else meta.fanartUrl?.let { url -> fetchBytes(url)?.takeIf { isDecodableImage(it) } }
+
+        val stillsDirName = "$base$PER_MOVIE_FANART_SUFFIX"
+        var extraCid = listing.firstOrNull { it.isDir && it.fn.equals(stillsDirName, ignoreCase = true) }
+            ?.fid?.takeIf { it.isNotBlank() }
+        // 补充模式：专属剧照目录里已经有图就不动（不删也不追加，避免重复图）
+        val stillsPresent = supplement && withStills && extraCid != null &&
+            runCatching { listItems(extraCid!!).any { !it.isDir } }.getOrDefault(false)
+
+        val stills: List<ByteArray> = if (withStills && !stillsPresent) {
             onStep("正在下载剧照…")
             // 张数上限读设置（0 = 不限制 → 给源传一个足够大的数，pickStills / take 全收）
             val maxStills = runCatching { stillsMax() }.getOrDefault(EXTRAFANART_MAX)
@@ -814,50 +1013,39 @@ class MetadataScraper(
             emptyList()
         }
 
-        // 一部一目录：这部片的视频若和别的片混在同一目录，先建独立文件夹把它（含各张盘 + 同名图 + 专属剧照）搬进去。
-        // 剧集整目录就是一部剧，不归位（搬哪一集都不对）。
-        var listing = runCatching { parseFilesResponse(api.files(cid = dirCid, limit = 1000)).items }
-            .getOrDefault(emptyList())
-        if (organize && plan.kind == ScrapeKind.MOVIE) {
-            val moved = organizeIntoOwnFolder(dirCid, dirPath, videoName, base, listing, onStep)
-            if (moved != null) {
-                movedFromCid = dirCid
-                dirCid = moved.first
-                dirPath = moved.second
-                listing = listItems(dirCid)
+        var changed = false
+        var wroteNfoNow = false
+        if (!supplement) {
+            onStep("正在清理同名旧文件…")
+            val deleteFids = buildList {
+                listing.filter { !it.isDir && it.fn == posterName }.mapNotNullTo(this) { it.fid }
+                listing.filter { !it.isDir && fileBasePrefix(it.fn) == base && hasArtSuffix(it.fn, "-fanart", "-backdrop") }
+                    .mapNotNullTo(this) { it.fid }
+                listing.filter { !it.isDir && it.fn.substringAfterLast('.', "").equals("nfo", true) }
+                    .filter { fileBasePrefix(it.fn) == base }
+                    .mapNotNullTo(this) { it.fid }
+                plan.oldNfoFid?.takeIf { it.isNotBlank() }?.let { add(it) }
+            }.distinct()
+            // 已有专属剧照目录且这次要重刮：旧图整批回收（同名上传会变「（1）」副本）
+            if (stills.isNotEmpty() && extraCid != null) {
+                val cid = extraCid!!
+                val oldFids = runCatching { listItems(cid) }.getOrDefault(emptyList())
+                    .filter { !it.isDir }.mapNotNull { it.fid }
+                if (oldFids.isNotEmpty()) runCatching { api.deleteFiles(oldFids.joinToString(","), cid) }
+                    .onFailure { android.util.Log.w(TAG, "清理旧剧照失败（旧图会与新上传的并存成「（1）」副本）", it) }
             }
+            if (deleteFids.isNotEmpty()) runCatching { api.deleteFiles(deleteFids.joinToString(","), dirCid) }
+                .onFailure { android.util.Log.w(TAG, "清理同名旧 nfo/海报/背景失败（可能生成「（1）」副本）", it) }
         }
-
-        onStep("正在清理同名旧文件…")
-        val deleteFids = buildList {
-            listing.filter { !it.isDir && it.fn == posterName }.mapNotNullTo(this) { it.fid }
-            listing.filter { !it.isDir && fileBasePrefix(it.fn) == base && hasArtSuffix(it.fn, "-fanart", "-backdrop") }
-                .mapNotNullTo(this) { it.fid }
-            listing.filter { !it.isDir && it.fn.substringAfterLast('.', "").equals("nfo", true) }
-                .filter { fileBasePrefix(it.fn) == base }
-                .mapNotNullTo(this) { it.fid }
-            plan.oldNfoFid?.takeIf { it.isNotBlank() }?.let { add(it) }
-        }.distinct()
-        // 已有专属剧照目录且这次要重刮：旧图整批回收（同名上传会变「（1）」副本）
-        val stillsDirName = "$base$PER_MOVIE_FANART_SUFFIX"
-        var extraCid = listing.firstOrNull { it.isDir && it.fn.equals(stillsDirName, ignoreCase = true) }
-            ?.fid?.takeIf { it.isNotBlank() }
-        if (stills.isNotEmpty() && extraCid != null) {
-            val cid = extraCid
-            val oldFids = runCatching { listItems(cid) }.getOrDefault(emptyList())
-                .filter { !it.isDir }.mapNotNull { it.fid }
-            if (oldFids.isNotEmpty()) runCatching { api.deleteFiles(oldFids.joinToString(","), cid) }
-                .onFailure { android.util.Log.w(TAG, "清理旧剧照失败（旧图会与新上传的并存成「（1）」副本）", it) }
-        }
-        if (deleteFids.isNotEmpty()) runCatching { api.deleteFiles(deleteFids.joinToString(","), dirCid) }
-            .onFailure { android.util.Log.w(TAG, "清理同名旧 nfo/海报/背景失败（可能生成「（1）」副本）", it) }
 
         onStep("正在上传海报…")
         if (poster != null) {
             Uploader.uploadSmallLogged(transferLog, api, posterName, poster, dirCid, null)
+            changed = true
         }
         if (fanart != null) {
             Uploader.uploadSmallLogged(transferLog, api, fanartName, fanart, dirCid, null)
+            changed = true
         }
 
         var wroteStills = 0
@@ -875,17 +1063,61 @@ class MetadataScraper(
                 android.util.Log.w(TAG, "extrafanart 目录建不出来，剧照跳过")
             }
         }
+        if (wroteStills > 0) changed = true
 
         onStep("正在写入 nfo…")
-        Uploader.uploadSmallLogged(
-            transferLog, api, nfoName, NfoWriter.build(meta).toByteArray(Charsets.UTF_8), dirCid, null,
-        )
+        var addedFields = 0
+        if (supplement && existingNfo != null) {
+            // 合并：现有文档原样保留，只追加它没有的字段。
+            // 读不到 / 解析失败 / 没有可补的字段都**不动原文件** —— 宁可这次不补，也不能覆盖掉唯一一份元数据。
+            val existingText = existingNfo.pc?.takeIf { it.isNotBlank() }?.let { downloadNfoText(it) }
+            val merged = existingText?.let { NfoMerger.merge(it, NfoWriter.build(meta)) }
+            when {
+                merged == null ->
+                    android.util.Log.w(TAG, "现有 nfo 读不到或无法解析，补充模式跳过 nfo（原文件保持不动）")
+                merged.added <= 0 ->
+                    android.util.Log.i(TAG, "现有 nfo 内容已齐全，无需补充")
+                else -> {
+                    addedFields = merged.added
+                    // 同名上传会生成「（1）」：替换前先回收旧文件（进回收站，可还原）
+                    existingNfo.fid?.takeIf { it.isNotBlank() }?.let { fid ->
+                        runCatching { api.deleteFiles(fid, dirCid) }
+                            .onFailure { android.util.Log.w(TAG, "补充 nfo 前回收旧文件失败（可能生成副本）", it) }
+                    }
+                    Uploader.uploadSmallLogged(
+                        transferLog, api, nfoName, merged.xml.toByteArray(Charsets.UTF_8), dirCid, null,
+                    )
+                    wroteNfoNow = true
+                    changed = true
+                }
+            }
+        } else {
+            // 没有 nfo（补充模式下这就是"缺的内容"）或覆盖模式：整份写入
+            Uploader.uploadSmallLogged(
+                transferLog, api, nfoName, NfoWriter.build(meta).toByteArray(Charsets.UTF_8), dirCid, null,
+            )
+            wroteNfoNow = true
+            changed = true
+        }
 
         // 剧集分集：本目录 + 一层季子目录里的分集文件，按 SxxExx 对到 TMDB 的集，逐集写同名 .nfo
         // （每集真名/简介/首播/季集号）。尽力而为，认不上的集跳过。
         var wroteEpisodes = 0
         if (withEpisodes && plan.kind == ScrapeKind.TV) {
-            wroteEpisodes = writeEpisodeNfos(src, candidate, meta, dirCid, listing, onStep)
+            wroteEpisodes = writeEpisodeNfos(src, candidate, meta, dirCid, listing, supplement, onStep)
+            if (wroteEpisodes > 0) changed = true
+        }
+
+        // 补充模式下整部片已经齐全：不用确认、不用重扫（文件一个都没动）
+        if (!changed) {
+            onStep("没有需要补充的内容")
+            return WriteResult(
+                newKey = null,
+                wrotePoster = false,
+                wroteFanart = false,
+                wroteNfo = false,
+                changed = false,
+            )
         }
 
         // 上传完成到"列目录可见"之间可能有几秒延迟：轻确认一下再重扫，免得白扫一轮
@@ -917,14 +1149,20 @@ class MetadataScraper(
             }
         }
 
-        // 写完带 tmdbid 的 nfo，扫描器会把键变成 tmdb-<id>（番号式行不吃 nfo 的 id，键不变）
-        val newKey = if (plan.isEpisodeLike) null else meta.tmdbId?.takeIf { it.isNotBlank() }?.let { "tmdb-$it" }
+        // 写完带 tmdbid 的 nfo，扫描器会把键变成 tmdb-<id>（番号式行不吃 nfo 的 id，键不变）。
+        // 补充模式不预测新键：现有 nfo 里的 id 可能被原样保留，跟这次搜到的候选不一定一致；
+        // 上层用 videoPickCode 反查更稳（见 resolveCard）。
+        val newKey = if (supplement || plan.isEpisodeLike) null
+        else meta.tmdbId?.takeIf { it.isNotBlank() }?.let { "tmdb-$it" }
         return WriteResult(
             newKey = newKey,
             wrotePoster = poster != null,
             wroteFanart = fanart != null,
             wroteStills = wroteStills,
             wroteEpisodes = wroteEpisodes,
+            wroteNfo = wroteNfoNow,
+            changed = true,
+            addedFields = addedFields,
         )
     }
 
@@ -940,6 +1178,7 @@ class MetadataScraper(
         meta: ScrapedMetadata,
         dirCid: String,
         topListing: List<FileItem>,
+        supplement: Boolean = false,
         onStep: (String) -> Unit,
     ): Int {
         // 候选目录：本目录 + 一层子目录（排除侧挂素材目录），季子目录布局也能覆盖
@@ -964,11 +1203,16 @@ class MetadataScraper(
                 }
                 val ep = season?.episodes?.firstOrNull { it.episode == se.second } ?: continue
                 val epBase = fileBasePrefix(v.fn)?.takeIf { it.isNotBlank() } ?: continue
-                // 同名旧 nfo 先回收（115 同名上传会变「（1）」副本）
+                // 同名旧 nfo：覆盖模式先回收（115 同名上传会变「（1）」副本）；
+                // 补充模式已有这一集就整条跳过，保持用户现有内容不动
                 val old = items.filter { !it.isDir && it.fn.substringAfterLast('.', "").equals("nfo", true) && fileBasePrefix(it.fn) == epBase }
                     .mapNotNull { it.fid }
-                if (old.isNotEmpty()) runCatching { api.deleteFiles(old.joinToString(","), cid) }
-                    .onFailure { android.util.Log.w(TAG, "清理旧分集 nfo 失败（$epBase）", it) }
+                if (supplement) {
+                    if (old.isNotEmpty()) continue
+                } else if (old.isNotEmpty()) {
+                    runCatching { api.deleteFiles(old.joinToString(","), cid) }
+                        .onFailure { android.util.Log.w(TAG, "清理旧分集 nfo 失败（$epBase）", it) }
+                }
                 val xml = NfoWriter.buildEpisode(meta.title, ep)
                 runCatching {
                     Uploader.uploadSmallLogged(transferLog, api, "$epBase.nfo", xml.toByteArray(Charsets.UTF_8), cid, null)

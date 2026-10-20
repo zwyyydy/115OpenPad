@@ -76,6 +76,7 @@ import com.open115.pad.data.envOk
 import com.open115.pad.data.parseOfflineQuota
 import com.open115.pad.data.parseOfflineTasks
 import com.open115.pad.ui.components.FolderPickerDialog
+import com.open115.pad.ui.components.MagnetShotPreview
 import com.open115.pad.util.Format
 import com.open115.pad.util.Torrent
 import kotlinx.coroutines.Dispatchers
@@ -261,6 +262,18 @@ class OfflineViewModel(
             on && token.isNotBlank()
         }
             .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), false)
+
+    // ---- 磁力预览（第三方预览服务）：与搜索开关独立，也不需要 Token ----
+
+    val magnetPreviewEnabled: StateFlow<Boolean> =
+        (playerPrefs?.labMagnetPreviewEnabled ?: MutableStateFlow(false)).stateIn(
+            viewModelScope, SharingStarted.WhileSubscribed(5_000), false,
+        )
+
+    val magnetPreviewEndpoint: StateFlow<String> =
+        (playerPrefs?.labMagnetPreviewEndpoint ?: MutableStateFlow("")).stateIn(
+            viewModelScope, SharingStarted.WhileSubscribed(5_000), "",
+        )
 
     suspend fun addUrls(urls: String, wpPathId: String): String? {
         // 与剪贴板识别、外部唤起的提交共用同一套实现与错误提示
@@ -461,6 +474,9 @@ private fun OfflineBody(
 ) {
     val ui by vm.ui.collectAsState()
     val saveLocation by vm.saveLocation.collectAsState()
+    // 「添加任务」里选完种子的画面预览：与磁力搜索浮层共用同一份配置
+    val magnetPreviewEnabled by vm.magnetPreviewEnabled.collectAsState()
+    val magnetPreviewEndpoint by vm.magnetPreviewEndpoint.collectAsState()
     val scope = rememberCoroutineScope()
     var deleteTarget by remember { mutableStateOf<OfflineTask?>(null) }
 
@@ -702,6 +718,9 @@ private fun OfflineBody(
                 scope.launch { notify(vm.addUrls(urls, cid)) }
             },
             onMagnetSearch = onMagnetOpen,
+            previewEnabled = magnetPreviewEnabled,
+            previewEndpoint = magnetPreviewEndpoint,
+            http = vm.okHttpClient,
         )
     }
     // ★ 浮层必须在 `if (showAdd)` **之外**：入口点击是「关掉添加任务、开磁力搜索」
@@ -923,6 +942,10 @@ private fun AddTaskDialog(
     onConfirm: (urls: String, wpPathId: String, wpName: String) -> Unit,
     /** 磁力搜索入口（磁力源就绪才非空）：关掉本对话框、打开搜索 */
     onMagnetSearch: (() -> Unit)? = null,
+    /** 选完种子后的画面预览（第三方，实验室可关）：开关或 http 缺失就不显示 */
+    previewEnabled: Boolean = false,
+    previewEndpoint: String = "",
+    http: OkHttpClient? = null,
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
@@ -997,6 +1020,18 @@ private fun AddTaskDialog(
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.primary,
                     )
+                    // 选完种子顺手给几张画面（第三方预览，实验室可关）——本地解析给的是"多大/几个文件"，
+                    // 这里补的是"长什么样"，推之前能对一眼
+                    val client = http
+                    if (previewEnabled && client != null) {
+                        Spacer(Modifier.height(6.dp))
+                        MagnetShotPreview(
+                            magnet = Torrent.buildMagnet(t),
+                            enabled = true,
+                            endpoint = previewEndpoint,
+                            http = client,
+                        )
+                    }
                 }
                 torrentError?.let {
                     Spacer(Modifier.height(4.dp))

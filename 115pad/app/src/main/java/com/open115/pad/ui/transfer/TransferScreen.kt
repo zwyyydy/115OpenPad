@@ -61,6 +61,7 @@ import androidx.compose.ui.unit.dp
 import com.open115.pad.appContainer
 import com.open115.pad.data.UploadRecord
 import com.open115.pad.data.resumeUploadRecord
+import com.open115.pad.player.MusicPlayerActivity
 import com.open115.pad.player.PlayerActivity
 import com.open115.pad.ui.components.isLocalPlayable
 import com.open115.pad.ui.offline.OfflineEmbedded
@@ -402,15 +403,19 @@ fun TransferScreen(
                         speeds = speeds,
                         startedAtById = startedAtById,
                         onPlay = { t ->
-                            // 交给应用内播放器：下载的 VR180 也能直接用上反投影/手势/字幕
+                            // 视频交给播放器（VR180 能用反投影/手势/字幕）；音频进简易音乐播放器
                             val uri = localUriOf(context, t.id)
                             if (uri == null) {
                                 notify("文件不存在或已被移动")
                             } else {
-                                context.startActivity(
+                                val intent = if (t.name.substringAfterLast('.', "").lowercase() in
+                                    com.open115.pad.ui.components.audioExts
+                                ) {
+                                    MusicPlayerActivity.localIntent(context, uri, t.name)
+                                } else {
                                     PlayerActivity.localIntent(context, uri, t.name)
-                                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
-                                )
+                                }
+                                context.startActivity(intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
                             }
                         },
                         onOpenExternal = { t ->
@@ -658,7 +663,11 @@ private fun UploadRow(
                     val timing = when {
                         // 分片上传进行中：显示已传字节（小文件直传没有过程，uploaded 一直是 0）
                         record.ok == null && record.paused ->
-                            "已传 ${Format.size(record.uploaded)} / ${Format.size(record.size)} · 已暂停，可继续"
+                            if (record.uploaded > 0) {
+                                "已传 ${Format.size(record.uploaded)} / ${Format.size(record.size)} · 已暂停，可继续"
+                            } else {
+                                "已暂停 · 继续后重新上传"
+                            }
                         record.ok == null && queuedPos != null ->
                             "排在第 $queuedPos 位 · 开始 ${timeText(record.startedAt)}"
                         record.ok == null && record.uploaded > 0 ->
@@ -690,29 +699,36 @@ private fun UploadRow(
                     else -> Triple("已上传", AppColors.GreenBg, AppColors.GreenFg)
                 }
                 StatusBadge(label, bg = bg, fg = fg)
-                // 操作按钮：排队中→取消；上传中→暂停；已暂停→继续+取消；失败且有文件来源→重试
+                // 操作按钮：有文件来源才能暂停/继续（无 uri 的内存上传没有续传落点，只给取消/移除）
                 when {
-                    // 排队中还没开始传（无断点可留），只有取消；与上传中取消共用确认框链路
+                    // 排队中：可在真正开传前暂停（保留记录，轮到时不再抢许可），也能直接取消
                     record.ok == null && queuedPos != null -> {
+                        if (record.uri != null) {
+                            IconButton(onClick = onPause) {
+                                Icon(Icons.Outlined.Pause, contentDescription = "暂停", tint = AppColors.AmberFg)
+                            }
+                        }
                         IconButton(onClick = onCancel) {
                             Icon(Icons.Outlined.Close, contentDescription = "取消", tint = AppColors.RedFg)
                         }
                     }
-                    record.ok == null && !record.paused -> {
-                        IconButton(onClick = onPause) {
-                            Icon(
-                                Icons.Outlined.Pause,
-                                contentDescription = "暂停",
-                                tint = AppColors.AmberFg,
-                            )
-                        }
-                    }
-                    record.ok == null && record.paused -> {
+                    record.ok == null && record.paused && record.uri != null -> {
                         IconButton(onClick = onResume) {
                             Icon(Icons.Outlined.PlayArrow, contentDescription = "继续", tint = AppColors.BlueFg)
                         }
                         IconButton(onClick = onCancel) {
                             Icon(Icons.Outlined.Close, contentDescription = "取消", tint = AppColors.RedFg)
+                        }
+                    }
+                    // 旧记录可能没有 uri（那时小文件不落 uri），只留取消
+                    record.ok == null && record.paused -> {
+                        IconButton(onClick = onCancel) {
+                            Icon(Icons.Outlined.Close, contentDescription = "取消", tint = AppColors.RedFg)
+                        }
+                    }
+                    record.ok == null && record.uri != null -> {
+                        IconButton(onClick = onPause) {
+                            Icon(Icons.Outlined.Pause, contentDescription = "暂停", tint = AppColors.AmberFg)
                         }
                     }
                     record.ok == false && record.uri != null -> {

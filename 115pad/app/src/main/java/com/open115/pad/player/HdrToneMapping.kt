@@ -143,9 +143,10 @@ private fun requestSdrOutput(mediaFormat: MediaFormat, format: Format?): Boolean
 }
 
 /** 色彩三要素 + 位深，给人看的短描述（排障时一眼能认出片源到底是什么色彩） */
-private fun colorDesc(i: ColorInfo): String {
+internal fun colorDesc(i: ColorInfo): String {
     val space = when (i.colorSpace) {
         C.COLOR_SPACE_BT709 -> "BT709"
+        C.COLOR_SPACE_BT601 -> "BT601"
         C.COLOR_SPACE_BT2020 -> "BT2020"
         else -> "space=${i.colorSpace}"
     }

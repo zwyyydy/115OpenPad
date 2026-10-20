@@ -155,8 +155,9 @@ class TransferLog(private val context: Context) {
 
     /**
      * 取走"中断待续传"的上传记录（进程被杀时 finishUpload 没跑，记录停留在上传中）。
-     * 只认领带会话信息（pickCode/ossUploadId）且当前不在进行中的记录；认领结果在
-     * 进程内记账，重复调用（反复进出文件页）不会二次接管同一条。
+     * 只认领带文件来源（uri）且当前不在进行中的记录——分片记录按会话跳片续传，
+     * 小文件记录重读文件从头传；没有 uri 的内存上传（刮削/字幕/备份）无法恢复，略过。
+     * 认领结果在进程内记账，重复调用（反复进出文件页）不会二次接管同一条。
      */
     suspend fun claimPendingUploads(): List<UploadRecord> {
         val p = context.transferDataStore.data.first()
@@ -164,7 +165,6 @@ class TransferLog(private val context: Context) {
             .filter {
                 it.finishedAt == null &&
                     !it.paused && // 用户主动暂停的记录重启后保持暂停，不自动恢复
-                    (it.ossUploadId != null || it.pickCode != null) &&
                     it.uri != null &&
                     it.id !in activeUploads &&
                     resuming.add(it.id)

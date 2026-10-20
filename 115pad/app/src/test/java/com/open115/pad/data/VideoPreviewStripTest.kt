@@ -205,6 +205,25 @@ class VideoPreviewStripTest {
         assertTrue(store.has("pc-b"))
     }
 
+    @Test
+    fun `按 pick_code 批量删除时认文件不认索引`() {
+        val store = VideoPreviewStore(newTempDir())
+        store.put("pc-1", bytes(300))
+        store.putStrip("pc-1", List(2) { bytes(100) })
+        store.put("pc-2", bytes(300))
+        store.putStrip("pc-2", List(3) { bytes(100) })
+        store.put("pc-3", bytes(300))
+
+        // 故意一次都不问 stripCount（内存索引还没建起来）就删 —— 删除按文件名认哈希，
+        // 不依赖那个索引：文件页/回收站一次删一批，索引没热起来也得删干净
+        // 封面 2 + 预览条 5 = 7 个文件
+        assertEquals(7, store.deleteFor(listOf("pc-1", "pc-2")))
+        assertEquals(0, store.stripCount("pc-1"))
+        assertEquals(0, store.stripCount("pc-2"))
+        assertTrue(store.has("pc-3"))
+        assertEquals(300L, store.sizeBytes())
+    }
+
     private fun bytes(n: Int) = ByteArray(n) { 7 }
     private fun newTempDir(): File =
         File(System.getProperty("java.io.tmpdir"), "vstrip-test-" + UUID.randomUUID()).apply {

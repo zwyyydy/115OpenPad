@@ -38,6 +38,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Add
+import androidx.compose.material.icons.outlined.BubbleChart
 import androidx.compose.material.icons.outlined.Close
 import androidx.compose.material.icons.outlined.History
 import androidx.compose.material.icons.outlined.MoreVert
@@ -102,6 +103,7 @@ import androidx.compose.ui.window.PopupProperties
 import coil.compose.AsyncImage
 import com.open115.pad.appContainer
 import com.open115.pad.data.FileItem
+import com.open115.pad.data.media.ActorAvatarRef
 import com.open115.pad.data.media.MEDIA_NO_LIMIT
 import com.open115.pad.data.media.MediaLibraryEntity
 import com.open115.pad.data.media.MediaScanner
@@ -112,13 +114,16 @@ import com.open115.pad.data.media.MediaPrefs
 import com.open115.pad.data.media.WatchHistoryRow
 import com.open115.pad.data.media.WorksSort
 import com.open115.pad.data.media.autoScanModeOrDefault
+import com.open115.pad.data.media.decodePickCodes
 import com.open115.pad.data.media.label
 import com.open115.pad.player.PlayerActivity
+import com.open115.pad.player.PlayerCache
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import com.open115.pad.ui.components.GlassCard
 import com.open115.pad.ui.components.MetaChip
 import com.open115.pad.ui.components.auroraBackdrop
 import com.open115.pad.ui.components.dissolve
-import com.open115.pad.ui.history.WatchHistoryScreen
 import com.open115.pad.ui.history.displaySubtitle
 import com.open115.pad.ui.history.displayTitle
 import com.open115.pad.ui.history.isFinished
@@ -325,11 +330,14 @@ fun MediaLibraryScreen(api: com.open115.pad.data.OpenApi) {
     var scrapeAsk by remember { mutableStateOf<MediaLibraryEntity?>(null) }
     var scrapeCount by remember { mutableStateOf(-1) }
     var scrapeExtras by remember { mutableStateOf(false) }
+    // 补充模式（默认开）：已有 nfo 的片照旧跳过；没有 nfo 但已有海报/背景的，也不再覆盖
+    var scrapeSupplement by remember { mutableStateOf(true) }
 
     fun askScrape(lib: MediaLibraryEntity) {
         scrapeAsk = lib
         scrapeCount = -1
         scrapeExtras = false
+        scrapeSupplement = true
         scope.launch {
             scrapeCount = runCatching { container.metadataScraper.countTargets(lib) }.getOrDefault(0)
         }
@@ -438,16 +446,16 @@ fun MediaLibraryScreen(api: com.open115.pad.data.OpenApi) {
                         .padding(horizontal = 4.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    // 扫描记录：媒体库自己的流水（何时扫的哪个库、结果、新增影片带图）——
-                    // 不放文件页那份「操作记录」（那是文件操作的流水），也不占导航栏
-                    IconButton(onClick = { pushOverlay(MediaOverlay.ScanLog) }) {
-                        Icon(Icons.Outlined.Update, contentDescription = "扫描记录")
+                    // 记录：扫描 / 迁移 / 观影历史三条流水收在一个浮层里（页头三个页签）。
+                    // 三条都是"媒体库这条线自己的账"，一个入口既够用、也省顶栏的位置
+                    IconButton(onClick = { pushOverlay(MediaOverlay.Records) }) {
+                        Icon(Icons.Outlined.History, contentDescription = "记录")
                     }
                     TopActionDivider()
-                    // 观影历史：入口放在媒体库页（它是"媒体库看到哪儿了"，不属于文件页 ——
-                    // 文件页的播放记录在操作记录里，两处不重复）
-                    IconButton(onClick = { pushOverlay(MediaOverlay.History) }) {
-                        Icon(Icons.Outlined.History, contentDescription = "观影历史")
+                    // 标签球：把全库的演员 + 标签摆成一个球（画质/编码类标签剔除），
+                    // 点一个词进它的作品页 —— 是"逛库"的入口，和下面两个"看记录"的分开摆
+                    IconButton(onClick = { pushOverlay(MediaOverlay.TagBall) }) {
+                        Icon(Icons.Outlined.BubbleChart, contentDescription = "标签球")
                     }
                     TopActionDivider()
                     IconButton(onClick = { showCreate = true }) {
@@ -632,7 +640,7 @@ fun MediaLibraryScreen(api: com.open115.pad.data.OpenApi) {
                             SectionHeaderRow(
                                 "最近新增",
                                 actionText = "查看全部",
-                                onAction = { pushOverlay(MediaOverlay.ScanLog) },
+                                onAction = { pushOverlay(MediaOverlay.Records) },
                             )
                         }
                         item(key = "recent-row") {
@@ -731,16 +739,27 @@ fun MediaLibraryScreen(api: com.open115.pad.data.OpenApi) {
         contentKey = { it?.id ?: -1L },
     ) { lib ->
         Box(Modifier.fillMaxSize()) {
-            if (lib != null) PosterWallScreen(
-                library = lib,
-                dao = dao,
-                refreshKey = wallTick,
-                onChanged = { wallTick++ },
-                onBack = { openedLib = null },
-                onOpenMovie = { card, list, index ->
-                    pushOverlay(MediaOverlay.Detail(card, list, index))
-                },
-            )
+            if (lib != null) {
+                // 这个库的扫描跑完 → 墙重查一次。
+                //
+                // 墙只看 refreshKey（wallTick），而索引还会被**别的链路**改：文件页刮削回写排的
+                // 定向重扫、文件页的移入/移出/删除触发的重扫。那时库里已经变了（新片、新元数据、
+                // 少了几部），墙却还挂着旧卡片 —— 用户看到的就是"刮削完媒体库没更新"。
+                // 只认这个库自己那一轮（刚扫完的是别的库就不必白查一次）。
+                LaunchedEffect(scanProgress.finishedAt, lib.id) {
+                    if (scanProgress.finishedAt > 0 && scanProgress.libraryId == lib.id) wallTick++
+                }
+                PosterWallScreen(
+                    library = lib,
+                    dao = dao,
+                    refreshKey = wallTick,
+                    onChanged = { wallTick++ },
+                    onBack = { openedLib = null },
+                    onOpenMovie = { card, list, index ->
+                        pushOverlay(MediaOverlay.Detail(card, list, index))
+                    },
+                )
+            }
         }
     }
 
@@ -812,14 +831,16 @@ fun MediaLibraryScreen(api: com.open115.pad.data.OpenApi) {
             )
         }
 
-        is MediaOverlay.History -> WatchHistoryScreen(
-            container = container,
+        is MediaOverlay.Records -> MediaRecordsScreen(
+            dao = dao,
+            onOpenMovie = { card, list, index -> pushOverlay(MediaOverlay.Detail(card, list, index)) },
             onBack = { popOverlay() },
         )
 
-        is MediaOverlay.ScanLog -> MediaScanLogScreen(
+        is MediaOverlay.TagBall -> MediaTagBallScreen(
             dao = dao,
-            onOpenMovie = { card, list, index -> pushOverlay(MediaOverlay.Detail(card, list, index)) },
+            // 球上点一个词 = 压一层作品页（与详情页点演员/标签走同一条路、同一个查询）
+            onOpenWorks = { kind, name -> pushOverlay(MediaOverlay.Works(kind, name)) },
             onBack = { popOverlay() },
         )
 
@@ -906,6 +927,17 @@ fun MediaLibraryScreen(api: com.open115.pad.data.OpenApi) {
                     )
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Checkbox(
+                            checked = scrapeSupplement,
+                            onCheckedChange = { scrapeSupplement = it },
+                        )
+                        Text(
+                            "补充模式：只补缺失的字段/图片；没有 nfo 但已有海报/背景的也不覆盖",
+                            fontSize = 12.sp,
+                            modifier = Modifier.weight(1f),
+                        )
+                    }
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Checkbox(
                             checked = scrapeExtras,
                             onCheckedChange = { scrapeExtras = it },
                         )
@@ -923,8 +955,9 @@ fun MediaLibraryScreen(api: com.open115.pad.data.OpenApi) {
                     onClick = {
                         val target = scrapeAsk ?: return@TextButton
                         val extras = scrapeExtras
+                        val supplement = scrapeSupplement
                         scrapeAsk = null
-                        container.metadataScraper.startBatch(target, withStills = extras)
+                        container.metadataScraper.startBatch(target, withStills = extras, supplement = supplement)
                     },
                 ) { Text("开始搜索") }
             },
@@ -936,6 +969,9 @@ fun MediaLibraryScreen(api: com.open115.pad.data.OpenApi) {
 
 /**
  * 彻底删除一个媒体库：撤掉它的扫描（正在跑的停掉、排队里的移出）→ 清索引 → 清该库对应的落盘缓存。
+ *
+ * 缓存范围：nfo 文本、海报/背景/缩略图（media_img）、剧照、画廊里看过的原图（huge_img）、
+ * 视频预览图，以及**只被这个库引用**的演员头像 —— 一律按 pick_code 精确清，不碰别的库。
  *
  * 顺序不能反：
  * - 先停扫描再清索引 —— 扫描是协程，清完索引它还会继续 upsert，条目又回来了；
@@ -958,6 +994,8 @@ private suspend fun deleteLibraryFully(
     val nfoCodes = mutableListOf<String>()
     val imageCodes = mutableListOf<String>()
     val videoCodes = mutableListOf<String>()
+    // 这个库的影片用到、且**有头像**的演员。清完索引就问不出"这个库用了谁"了，先收着。
+    val avatarsInPath = mutableListOf<ActorAvatarRef>()
     // 逐根处理而不是拼 5 参数 SQL：多根库本来就少见，循环更简单也不会踩 SQLite 变量上限
     paths.forEach { prefix ->
         dao.pickCodesInPath(prefix).forEach { p ->
@@ -966,7 +1004,10 @@ private suspend fun deleteLibraryFully(
             p.fanartPickCode?.let(imageCodes::add)
             p.thumbPickCode?.let(imageCodes::add)
             p.videoPickCode?.let(videoCodes::add)
+            // 剧照也按 pick_code 缓存（详情页看过的），漏了它就成了查不到的孤儿字节
+            decodePickCodes(p.extraFanartPickCodes).forEach(imageCodes::add)
         }
+        avatarsInPath += dao.actorAvatarsInPath(prefix)
         dao.deleteLibraryContent(prefix)
     }
     dao.deleteScanLogsForLibrary(lib.id)
@@ -979,7 +1020,29 @@ private suspend fun deleteLibraryFully(
     container.mediaCache.invalidateAll(nfoCodes.distinct().map { MediaScanner.nfoCachePrefix(it) })
     container.imageUrlResolver.evictPosterCache(imageCodes, container.cacheDir)
     // 预览图缓存（封面 + 预览条）按视频 pick_code 键，不删的话整库永久变垃圾（只能等上限淘汰）
-    if (videoCodes.isNotEmpty()) container.videoPreviews.deleteFor(videoCodes)
+    if (videoCodes.isNotEmpty()) {
+        container.videoPreviews.deleteFor(videoCodes)
+        // 播放缓存：直链档按 pick_code 清；转码分片 key 是文件 sha1，库里没存，留给上限淘汰
+        val freed = withContext(Dispatchers.IO) { PlayerCache.purge(videoCodes) }
+        if (freed > 0) android.util.Log.i("PlayerCacheIO", "删库：清掉播放缓存 ${freed / 1024 / 1024}MB")
+    }
+
+    // 演员头像：**只被这个库引用**的演员，头像引用与落盘字节一起清（别的库还在用的留着复用）。
+    // 判据放在清完索引之后 —— 那时 movie_actors 里剩下的关联都来自别的库。
+    // 云端 `.actors/` 文件不动（本操作就不删云盘文件），以后重新建库扫一次会自动再挂上。
+    val avatarCandidates = avatarsInPath.distinctBy { it.id }
+    if (avatarCandidates.isNotEmpty()) {
+        val stillLinked = avatarCandidates.map { it.id }.chunked(300)
+            .flatMap { dao.actorIdsStillLinked(it) }.toSet()
+        val doomedAvatars = avatarCandidates.filterNot { it.id in stillLinked }
+        if (doomedAvatars.isNotEmpty()) {
+            dao.clearActorAvatars(doomedAvatars.map { it.id })
+            container.imageUrlResolver.evictPosterCache(
+                doomedAvatars.map { it.avatarPickCode },
+                container.cacheDir,
+            )
+        }
+    }
 }
 
 /**
@@ -2072,14 +2135,24 @@ private sealed interface MediaOverlay {
         override val id: Long = newOverlayId(),
     ) : MediaOverlay
 
-    /** 观影历史（媒体库这一库线自己的记录；文件页的播放不走这里，那边看操作记录） */
-    object History : MediaOverlay {
+    /**
+     * 记录：**扫描 / 迁移 / 观影历史**三条流水合成的一个浮层（页头三个页签）。
+     *
+     * 三条都是"媒体库这条线自己的账" —— 扫了哪些库、搬过哪些片、看到哪儿了。
+     * 原来扫描记录与观影历史各占顶栏一个图标，再加上迁移记录就是三个，收成一个入口更清爽；
+     * 各页自己的小动作（清空 / 只看未看完）跟着页签摆在页头那一行，不再各占一个位置。
+     */
+    object Records : MediaOverlay {
         override val id: Long = 1L
     }
 
-    /** 扫描记录（何时扫的哪个库、结果、新增了哪些片——带海报图） */
-    object ScanLog : MediaOverlay {
-        override val id: Long = 2L
+    /**
+     * 标签球（演员 + 标签，画质/编码类已剔除）。
+     *
+     * 它在栈里的位置和别的浮层一样：球上点一个词会**再压一层** [Works]，返回逐层退。
+     */
+    object TagBall : MediaOverlay {
+        override val id: Long = 3L
     }
 }
 

@@ -58,12 +58,15 @@ import com.open115.pad.data.DirCache
 import com.open115.pad.data.OpenApi
 import com.open115.pad.data.RecycleItem
 import com.open115.pad.data.VideoPreviewStore
+import com.open115.pad.player.PlayerCache
 import com.open115.pad.data.envData
 import com.open115.pad.data.envMsg
 import com.open115.pad.data.envOk
 import com.open115.pad.data.parseRecycleList
 import com.open115.pad.util.Format
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -157,14 +160,19 @@ class RecycleViewModel(
      * 拿不到 pick_code 的条目（不该有）跳过，剩下的交给上限淘汰。
      * **注意这里只覆盖"已经列出来的那些"**：列表只取第一页 200 条，更深的那批要等下次进页面
      * 拉出来、或由缓存上限淘汰 —— 清空回收站不额外翻页拉全（那几个 KB 不值得多打请求）。
+     *
+     * 播放缓存同理，只清得到直链那份（回收站条目没有文件 sha1，转码分片留给上限淘汰）。
      */
-    private fun dropPreviews(ids: Collection<String>) {
-        val store = videoPreviews ?: return
+    private suspend fun dropPreviews(ids: Collection<String>) {
         val idSet = ids.toSet()
         val pcs = _ui.value.items.filter { it.id in idSet }.mapNotNull { it.pickCode?.takeIf(String::isNotBlank) }
         if (pcs.isEmpty()) return
-        val n = store.deleteFor(pcs)
-        if (n > 0) android.util.Log.i("VPreview", "回收站彻底删除：清掉 ${pcs.size} 个 pick_code 的预览图 $n 个文件")
+        videoPreviews?.let { store ->
+            val n = withContext(Dispatchers.IO) { store.deleteFor(pcs) }
+            if (n > 0) android.util.Log.i("VPreview", "回收站彻底删除：清掉 ${pcs.size} 个 pick_code 的预览图 $n 个文件")
+        }
+        val freed = withContext(Dispatchers.IO) { PlayerCache.purge(pcs) }
+        if (freed > 0) android.util.Log.i("PlayerCacheIO", "回收站彻底删除：清掉播放缓存 ${freed / 1024 / 1024}MB")
     }
 
     /**

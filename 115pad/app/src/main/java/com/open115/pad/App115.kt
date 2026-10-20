@@ -479,6 +479,51 @@ class AppContainer(context: Context) {
     )
 
     /**
+     * 影片迁移（媒体库 A → B，云端真搬）。
+     *
+     * 与分类整理同一类：**逐条云端移动的长任务**，所以同样走 `bulkOpenApi` + 自己的分级限速
+     * （不许把前台的文件页/详情页一起拖慢），跑在 transferScope 上、切页不断；
+     * 它接进了 taskActivity，任务期间前台服务会保命。
+     *
+     * 声明位置有讲究：它依赖 bulkOpenApi(257) / opLog(128) / dirCache(101) / transferScope(122)
+     * / mediaDatabase(316) / mediaScanner(346)，又必须排在引用它的 taskActivity 之前。
+     */
+    /**
+     * 迁移队列（落盘）。为什么要它：批量迁移中途被杀会留下"云端搬了、索引没跟"的中间态，
+     * 得能接着跑完；顺带它也是「迁移记录」浮层的数据源。
+     * 与重命名队列同一套做法（DataStore、逐条落盘、finishedAt/paused 约定），不动数据库版本。
+     */
+    val migrationQueue = com.open115.pad.data.media.MigrationQueue(context)
+
+    val mediaMigrator = com.open115.pad.data.media.MediaMigrator(
+        api = bulkOpenApi,
+        dao = mediaDatabase.mediaDao(),
+        scanner = mediaScanner,
+        queue = migrationQueue,
+        opLog = opLog,
+        dirCache = dirCache,
+        scope = transferScope,
+    )
+
+    /**
+     * 批量删除（海报墙多选）。
+     *
+     * 与迁移同一类（逐条云端写、长任务），所以同样跑在 transferScope 上、接进 taskActivity；
+     * 但**不落盘**：删除是"删一条少一条"，中途被杀最坏是没删完，剩下的还在库里、再选一次就行。
+     * 走**限速的那份接口**（与单部删除同一条链路）—— 删除不可逆，宁慢勿撞频控。
+     */
+    val mediaBatchDeleter = com.open115.pad.data.media.MediaBatchDeleter(
+        api = openApi,
+        dao = mediaDatabase.mediaDao(),
+        mediaCache = mediaCache,
+        imageUrlResolver = imageUrlResolver,
+        cacheDir = cacheDir,
+        videoPreviews = videoPreviews,
+        opLog = opLog,
+        scope = transferScope,
+    )
+
+    /**
      * 重复文件查找（文件页「查找重复」）：按列表响应自带的 sha1 分组，只读不写。
      *
      * 同样走 `bulkOpenApi` + 自己的分级限速（它要把目录一层层列一遍，属于后台批量）；
@@ -526,31 +571,54 @@ class AppContainer(context: Context) {
      * "除了查重之外的任务在跑什么"：原来的五路合并原样留着（那段逻辑调过很多次，不动它）。
      * `combine` 的类型化重载只到 5 路，第 6 路（查重）在下面套一层 —— 比改成 vararg
      * 数组形式（要统一成 `Flow<Any?>`，可读性反而差）清楚。
+     *
+     * 影片迁移也走 [baseTaskActivity]（它是"逐条云端移动"的长任务，与分类整理同一类），
+     * 所以这里从五路变六路：**再套一层**而不是挤进来（重载就到 5 路），与查重同一手法。
      */
     private val baseTaskActivity: StateFlow<String?> = combine(
-        mediaScanner.progress,
-        mediaScanner.pending,
-        transferLog.uploads,
-        renameWorker.activeTaskId,
-        fileOrganizer.progress,
-    ) { scanning, pending, uploads, renaming, organizing ->
-        val bits = buildList {
-            if (scanning.running) {
-                add(
-                    if (scanning.libraryName.isNotBlank()) "正在扫描「${scanning.libraryName}」"
-                    else "正在扫描媒体库",
-                )
-                if (scanning.totalDirs > 0) add("${scanning.doneDirs}/${scanning.totalDirs} 个目录")
-                // 防频控休息时进度一动不动，通知/前台服务上要说一句，不然看着像卡死
-                if (scanning.restingUntil > System.currentTimeMillis()) add("休息中（防频控）")
+        combine(
+            mediaScanner.progress,
+            mediaScanner.pending,
+            transferLog.uploads,
+            renameWorker.activeTaskId,
+            fileOrganizer.progress,
+        ) { scanning, pending, uploads, renaming, organizing ->
+            val bits = buildList {
+                if (scanning.running) {
+                    add(
+                        if (scanning.libraryName.isNotBlank()) "正在扫描「${scanning.libraryName}」"
+                        else "正在扫描媒体库",
+                    )
+                    if (scanning.totalDirs > 0) add("${scanning.doneDirs}/${scanning.totalDirs} 个目录")
+                    // 防频控休息时进度一动不动，通知/前台服务上要说一句，不然看着像卡死
+                    if (scanning.restingUntil > System.currentTimeMillis()) add("休息中（防频控）")
+                }
+                if (pending.isNotEmpty()) add("${pending.size} 个扫描排队")
+                val uploading = uploads.count { it.finishedAt == null && !it.paused }
+                if (uploading > 0) add("正在上传 $uploading 个文件")
+                if (renaming != null) add("正在重命名文件")
+                if (organizing.running) add("正在分类整理文件")
             }
-            if (pending.isNotEmpty()) add("${pending.size} 个扫描排队")
-            val uploading = uploads.count { it.finishedAt == null && !it.paused }
-            if (uploading > 0) add("正在上传 $uploading 个文件")
-            if (renaming != null) add("正在重命名文件")
-            if (organizing.running) add("正在分类整理文件")
+            bits.takeIf { it.isNotEmpty() }?.joinToString(" · ")
+        },
+        mediaMigrator.progress,
+    ) { base, migrating ->
+        val extra = if (migrating.running) {
+            "正在迁移影片 ${migrating.done}/${migrating.total}"
+        } else {
+            null
         }
-        bits.takeIf { it.isNotEmpty() }?.joinToString(" · ")
+        if (extra == null) base else listOfNotNull(base, extra).joinToString(" · ")
+    }.let { inner ->
+        // 再套一层给批量删除：combine 的类型化重载只到 5 路，每多一路就再套一层（同查重那处的手法）
+        combine(inner, mediaBatchDeleter.progress) { base, deleting ->
+            val extra = if (deleting.running) {
+                "正在删除影片 ${deleting.done}/${deleting.total}"
+            } else {
+                null
+            }
+            if (extra == null) base else listOfNotNull(base, extra).joinToString(" · ")
+        }
     }.stateIn(scope, SharingStarted.Eagerly, null)
 
     val taskActivity: StateFlow<String?> = combine(
@@ -785,6 +853,9 @@ class AppContainer(context: Context) {
             session.loggedInFlow.collect { loggedIn ->
                 if (!loggedIn) return@collect
                 mediaScanner.restoreQueue()
+                // 迁移队列同样"登录即恢复"：没跑完的那一批会被 worker 接着跑完（每条都会先过
+                // 一遍校验；续跑时"行已经不在原目录了"的那些直接标成功，不会对云端重复发移动）。
+                mediaMigrator.ensureWorkerStarted()
                 val dao = mediaDatabase.mediaDao()
                 val now = System.currentTimeMillis()
                 dao.libraries().first()

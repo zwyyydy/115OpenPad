@@ -104,6 +104,7 @@ import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.open115.pad.appContainer
 import com.open115.pad.data.DirCache
+import com.open115.pad.data.CloudTorrent
 import com.open115.pad.data.FileItem
 import com.open115.pad.data.FilesPrefs
 import com.open115.pad.data.JsonObject
@@ -122,6 +123,8 @@ import com.open115.pad.data.PathNode
 import com.open115.pad.data.PlaylistEntry
 import com.open115.pad.data.RecycleItem
 import com.open115.pad.data.Uploader
+import com.open115.pad.data.VideoPreviewStore
+import com.open115.pad.player.PlayerCache
 import com.open115.pad.data.resumeUploadRecord
 import com.open115.pad.data.uploadFolder
 import com.open115.pad.data.parseFilesResponse
@@ -129,6 +132,9 @@ import com.open115.pad.data.parseRecycleList
 import com.open115.pad.data.parseSearchResponse
 import com.open115.pad.data.media.scrape.ScrapePlan
 import androidx.compose.material3.OutlinedTextField
+import com.open115.pad.data.media.ChangedDir
+import com.open115.pad.data.media.CloudEdits
+import com.open115.pad.data.media.syncAfterCloudEdits
 import com.open115.pad.data.media.scrape.MetadataScraper
 import com.open115.pad.data.envData
 import com.open115.pad.data.envMsg
@@ -139,9 +145,11 @@ import com.open115.pad.ui.components.ConfirmDialog
 import com.open115.pad.ui.components.DownloadDialog
 import com.open115.pad.ui.components.FolderPickerDialog
 import com.open115.pad.ui.components.ImageGalleryDialog
+import com.open115.pad.ui.components.MagnetShotPreview
 import com.open115.pad.ui.components.SidePaneWidth
 import com.open115.pad.ui.components.TextEntryDialog
 import com.open115.pad.ui.components.TextFileEditorDialog
+import com.open115.pad.ui.components.isAudioItem
 import com.open115.pad.ui.components.isImageItem
 import com.open115.pad.ui.media.MediaScrapeDialog
 import com.open115.pad.ui.media.ScrapeBatchPanel
@@ -150,6 +158,7 @@ import androidx.compose.ui.window.DialogProperties
 import com.open115.pad.ui.settings.UserInfoCard
 import com.open115.pad.util.Downloader
 import com.open115.pad.util.Format
+import com.open115.pad.util.Torrent
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -197,6 +206,15 @@ class FilesViewModel(
      */
     private val invalidateMediaDir: suspend (cid: String) -> Unit = {},
     /**
+     * 文件页改动了云端内容（移动 / 复制 / 删除）：通知媒体库收尾（见 `syncAfterCloudEdits`）。
+     *
+     * 与 [invalidateMediaDir] 同一个道理走容器注入 —— 文件页不该认识媒体库那套表。
+     * 三个入口都要发：**移出**（源目录少了几项，库里那几行得清掉）、**移入**（目标目录多出来的片
+     * 该入库；文件页只有它的 cid，完整路径由媒体库侧自己认）、**删除**（少掉的片/整个目录）。
+     * 库里认不出这些路径就什么都不做。
+     */
+    private val onCloudEdits: suspend (CloudEdits) -> Unit = {},
+    /**
      * 目录栈的存档位（未注入 = 原来的纯内存行为）。
      *
      * 为什么需要它：文件页"在哪一层"只存在这个 ViewModel 里，而播放器是**另一个 Activity** ——
@@ -215,6 +233,15 @@ class FilesViewModel(
      * 写回缓存，等于删了还在。空集合 = 目录内容整体变了，只作废缓存。未注入则忽略。
      */
     private val dirRemovals: Flow<Map<String, Set<String>>>? = null,
+    /**
+     * 视频预览图缓存（列表里那些缩略图 / 预览条）。
+     *
+     * 文件页的删除把文件扔进了网盘回收站、云端文件就没了（本地索引也跟着清，见 [onCloudEdits]），
+     * 那些视频的预览图再没人引用，跟着一起清 —— 与媒体库「彻底删除」、回收站「彻底删除/清空」
+     * 同一条口径（见 [VideoPreviewStore.deleteFor]）。代价是从回收站还原回来要重新抓帧，
+     * 那几条路同样如此。未注入则不清，行为与从前一致。
+     */
+    private val videoPreviews: VideoPreviewStore? = null,
 ) : ViewModel() {
 
     /** 目录栈的一层：目录 cid + 显示名（面包屑与"全部文件"用得上） */
@@ -969,6 +996,9 @@ class FilesViewModel(
         if (ids.isEmpty()) return null
         val fromCid = currentCid()
         val fromName = _ui.value.stack.last().name
+        // 删掉的是哪些条目：目录型的要在媒体库里**按路径整棵清**（见 CloudEdits.removedDirPaths）
+        val curPath = currentCloudPath()
+        val items = _ui.value.items.filter { it.fid in ids }
         return runOp {
             val resp = api.deleteFiles(ids.joinToString(","), parentId = fromCid)
             val ok = resp.envOk()
@@ -976,6 +1006,32 @@ class FilesViewModel(
                 // 置顶的文件夹被删掉后，置顶记录已无意义——顺手清理，避免记录无限累积
                 pinnedPrefs?.unpinAll(ids)
                 opLog?.log(OpType.DELETE, selectionNames(ids), "移入回收站", fromCid, fromName)
+                // 媒体库联动：删掉的东西在索引里得跟着消失（海报墙上不该再挂着它）。
+                // 父目录浅扫一遍 = 删的是**文件**时把那部片的行清掉；删的是**目录**时重扫够不着
+                // （库里按目录清、而它已经不在了），所以另把目录路径交出去按路径清。
+                onCloudEdits(
+                    CloudEdits(
+                        dirs = listOf(ChangedDir(fromCid, curPath, deep = false)),
+                        removedDirPaths = items.filter { it.isDir }
+                            .map { listOf(curPath, it.fn).filter(String::isNotBlank).joinToString("/") },
+                    ),
+                )
+                // 预览图缓存跟着删。按被删条目自己的 pick_code 认：非视频的哈希对不上任何缓存、
+                // 自然跳过；删的是**目录**时这里认不出里面的视频（要递归列目录，代价不值），
+                // 那种情况由媒体库侧按路径清索引时一并清（见 syncAfterCloudEdits）
+                val pcs = items.filter { !it.isDir }.mapNotNull { it.pc?.takeIf(String::isNotBlank) }
+                if (pcs.isNotEmpty()) {
+                    val n = withContext(Dispatchers.IO) { videoPreviews?.deleteFor(pcs) } ?: 0
+                    if (n > 0) {
+                        android.util.Log.i("VPreview", "文件页删除：清掉 ${pcs.size} 个 pick_code 的预览图 $n 个文件")
+                    }
+                    // 播放缓存：只清直链档（按 pick_code 一份文件一个 key）。转码分片按内容 sha1
+                    // 共享，删一个文件清它可能连带抹掉仍在用的副本 → 留给上限淘汰
+                    val freed = withContext(Dispatchers.IO) { PlayerCache.purge(pcs) }
+                    if (freed > 0) {
+                        android.util.Log.i("PlayerCacheIO", "文件页删除：清掉播放缓存 ${freed / 1024 / 1024}MB")
+                    }
+                }
                 clearSelection()
                 refresh()
             }
@@ -1033,6 +1089,8 @@ class FilesViewModel(
     suspend fun moveSelected(toCid: String, toName: String): String? {
         val ids = _ui.value.selection.toList()
         if (ids.isEmpty()) return null
+        val fromCid = currentCid()
+        val fromPath = currentCloudPath()
         // 移动成功后条目从当前目录消失，"少了几项"很容易被忽略，所以明确告知去处
         return runOp(onSuccess = "已移动到「$toName」") {
             val resp = api.moveFiles(ids.joinToString(","), toCid)
@@ -1044,6 +1102,18 @@ class FilesViewModel(
                 // 目标目录的缓存脏了（多出这几条），但它不在当前视图里，只能显式失效。
                 // 先失效再 refresh：万一 toCid 就是当前目录，后面那次重取会把新数据重新写回去。
                 cache?.invalidateDir(toCid)
+                // 媒体库联动：**移入的目标**（多出来的片要入库 —— deep 递归，搬进来的可能是一整个
+                // 剧集目录）与**移出的源**（库里那几行得清掉）都可能落在库里，两边都报；
+                // 认不出来的一侧由媒体库侧跳过。目标只有 cid（选择器只给 cid + 名字），
+                // 它的完整路径由媒体库侧自己认
+                onCloudEdits(
+                    CloudEdits(
+                        dirs = listOf(
+                            ChangedDir(toCid, null, deep = true),
+                            ChangedDir(fromCid, fromPath, deep = false),
+                        ),
+                    ),
+                )
                 // 当前目录强制重取，顺带把它的缓存刷成最新
                 refresh()
             }
@@ -1064,6 +1134,8 @@ class FilesViewModel(
                 opLog?.log(OpType.COPY, selectionNames(ids), "复制到「$toName」", toCid, toName)
                 clearSelection()
                 cache?.invalidateDir(toCid)
+                // 媒体库联动：只有**目标**要重扫（复制不动源目录）。路径同上交给媒体库侧认
+                onCloudEdits(CloudEdits(dirs = listOf(ChangedDir(toCid, null, deep = true))))
                 // 复制不动源目录，所以只有"目标就是当前目录"（当场多出副本）时才需要重取；
                 // 其余情况这一跳请求是白花的，缓存机制顺手把它省掉
                 if (toCid == fromCid) refresh()
@@ -1079,6 +1151,14 @@ class FilesViewModel(
     }
 
     fun currentCid(): String = _ui.value.stack.last().cid
+
+    /**
+     * 当前目录的**云盘路径**（去掉栈首那层"全部文件"）。
+     *
+     * 库里认路径用（[ChangedDir.path]）：与刮削那条路是同一个拼法 —— 库根的两种写法
+     * （`/下载目录` 与 `下载目录`）由 `libraryForPath` 归一化，这里不用管。
+     */
+    fun currentCloudPath(): String = _ui.value.stack.drop(1).joinToString("/") { it.name }
 
     /**
      * 批量重命名的目标：已选中项，**按列表显示顺序**返回。
@@ -1238,6 +1318,8 @@ fun FilesScreen(
     expanded: Boolean,
     snackbarHostState: SnackbarHostState,
     onPlayVideo: (item: FileItem, playlist: List<PlaylistEntry>, index: Int, opLogCid: String?, opLogPath: String?) -> Unit,
+    /** 点音频文件：把当前目录里的音频作为一个队列交给简易音乐播放器 */
+    onPlayMusic: (tracks: List<com.open115.pad.player.MusicTrack>, index: Int) -> Unit = { _, _ -> },
     onOpenGallery: (items: List<ImageMediaItem>, index: Int, sourcePath: String) -> Unit,
     onPreviewText: (item: FileItem) -> Unit,
     /** 多选时进批量重命名面板；入参里带上了整个目录的列表，面板可一键扩到全目录 */
@@ -1269,6 +1351,16 @@ fun FilesScreen(
     var showDeleteConfirm by remember { mutableStateOf(false) }
     var moveMode by remember { mutableStateOf<String?>(null) }
     var downloadTarget by remember { mutableStateOf<FileItem?>(null) }
+    // ---- 云盘上的 .torrent：读回种子 → 显示内容 → 转磁力推进云下载 ----
+    var torrentInfo by remember { mutableStateOf<Torrent.TorrentInfo?>(null) }
+    var torrentNote by remember { mutableStateOf<String?>(null) }
+    var torrentReading by remember { mutableStateOf(false) }
+    var torrentSubmitting by remember { mutableStateOf(false) }
+    // 种子画面的第三方预览（实验室「磁力预览」开关控制；关掉就一个请求都不发）
+    val shotPreviewEnabled by context.appContainer.playerPrefs.labMagnetPreviewEnabled
+        .collectAsState(initial = true)
+    val shotPreviewEndpoint by context.appContainer.playerPrefs.labMagnetPreviewEndpoint
+        .collectAsState(initial = com.open115.pad.data.PlayerPrefs.MAGNET_PREVIEW_ENDPOINT_DEFAULT)
     // 分类整理：任务挂在应用级 FileOrganizer 上（切页不停、前台服务跟着亮），
     // 这里只负责"弹确认框、发车、攒一句结束语"
     val organizer = context.appContainer.fileOrganizer
@@ -1316,7 +1408,19 @@ fun FilesScreen(
             invalidateMediaDir = { cid ->
                 appContainer.mediaDatabase.mediaDao().invalidateScanState(cid)
             },
+            // 文件页的移动/复制/删除 → 媒体库把受影响的目录重扫一遍（同主栏那份）
+            onCloudEdits = { edits ->
+                syncAfterCloudEdits(
+                    dao = appContainer.mediaDatabase.mediaDao(),
+                    scanner = appContainer.mediaScanner,
+                    api = appContainer.openApi,
+                    edits = edits,
+                    videoPreviews = appContainer.videoPreviews,
+                )
+            },
             dirRemovals = appContainer.dirRemovals,
+            // 删除的文件：预览图缓存跟着清（同主栏那份）
+            videoPreviews = appContainer.videoPreviews,
         )
     })
     // 右栏的 UI 状态：返回键分级处理在双栏时要拿它判断"活动栏"的层级深度/多选
@@ -1414,7 +1518,7 @@ fun FilesScreen(
      * 前置「规范化清单」确认后真正开跑：逐条备 plan，把标题**覆盖成用户定的规范名**
      * （规范名 = 搜索词 = 最终文件名），[renameOn] 时写回顺手按规范名重命名。
      */
-    fun launchScrapeMany(items: List<FileItem>, cleanNames: List<String>, renameOn: Boolean) {
+    fun launchScrapeMany(items: List<FileItem>, cleanNames: List<String>, renameOn: Boolean, supplement: Boolean) {
         val parentPath = ui.stack.drop(1).joinToString("/") { it.name }
         val curName = ui.stack.last().name
         scope.launch {
@@ -1442,7 +1546,8 @@ fun FilesScreen(
             }
             if (batchItems.isEmpty()) { notify("这些条目都没能识别出可刮的影片"); return@launch }
             appContainer.metadataScraper.startBatchFromItems(
-                batchItems, curName.ifBlank { "所选条目" }, withStills = false, renameToClean = renameOn,
+                batchItems, curName.ifBlank { "所选条目" }, withStills = false,
+                renameToClean = renameOn, supplement = supplement,
             )
             scrapePanelShown = true
             if (skipped > 0) notify("已跳过 $skipped 个无法识别的条目")
@@ -1569,7 +1674,7 @@ fun FilesScreen(
                     val targetCid = vm.currentTargetCid()
                     // 传输中心要能回答"传到哪个目录了"，这里给面包屑全路径最直观
                     val targetPath = ui.stack.joinToString(" / ") { it.name }
-                    val smallLimit = 32L * 1024 * 1024 // 超过 32MB 走分片上传（流式不占内存）
+                    val smallLimit = Uploader.SMALL_UPLOAD_LIMIT // 超过 32MB 走分片上传（流式不占内存）
                     val pfd = context.contentResolver.openFileDescriptor(uri, "r")
                         ?: error("无法读取所选文件")
                     pfd.use {
@@ -1585,6 +1690,8 @@ fun FilesScreen(
                                 bytes = bytes,
                                 targetCid = targetCid,
                                 targetName = targetPath,
+                                // 落库 uri：暂停后点「继续」/进程重启时要按它重新读文件
+                                uri = uri.toString(),
                             )
                         } else {
                             // 大文件：流式分片上传（SHA1 流式算，不占内存，无大小上限）；
@@ -1702,6 +1809,14 @@ fun FilesScreen(
             // cid/path 除了写操作记录，还要带给播放器：播放器内切集时补的记录
             // 用同一对值，文件页「最近浏览」的时间才会跟着切集走
             onPlayVideo(item, entries, index, vmX.currentTargetCid(), uiX.stack.last().name)
+        } else if (isAudioItem(item)) {
+            // 音频：当前视图里的音频按列表顺序组成队列，交给简易音乐播放器。
+            // 没有 pick_code 的文件退回下载对话框（拿不到直链就播不了）
+            val tracks = uiX.items
+                .filter { isAudioItem(it) }
+                .mapNotNull { f -> f.pc?.let { pc -> com.open115.pad.player.MusicTrack(name = f.fn, pickCode = pc) } }
+            val idx = tracks.indexOfFirst { it.pickCode == item.pc }.coerceAtLeast(0)
+            if (tracks.isEmpty()) downloadTarget = item else onPlayMusic(tracks, idx)
         } else if (isImageItem(item)) {
             // 传"图片序列 + 索引"给大图画廊，才能左右翻页；同时带上归一化后的元数据
             // 把"图片序列 + 索引"上抛，画廊在应用根层级渲染（才能盖住侧栏）
@@ -2076,10 +2191,10 @@ fun FilesScreen(
                 if (prompt.isBlank()) null else appContainer.aiQueryClient.suggest(name, prompt)
             },
             onDismiss = { scrapeManyItems = null },
-            onConfirm = { cleanNames, renameOn ->
+            onConfirm = { cleanNames, renameOn, supplement ->
                 scrapeManyItems = null
                 scope.launch { appContainer.mediaPrefs.setScrapeRenameMode(if (renameOn) "ON" else "OFF") }
-                launchScrapeMany(items, cleanNames, renameOn)
+                launchScrapeMany(items, cleanNames, renameOn, supplement)
             },
         )
     }
@@ -2108,11 +2223,91 @@ fun FilesScreen(
             },
         )
     }
+    // 点开 .torrent 就把种子读回来（几十 KB）：弹窗里先给出"含 N 个文件 · 多大"再让用户决定推不推，
+    // 解析结果顺便留给「云下载」按钮提交，避免点一次读两遍。读不到也不挡「下载」。
+    val torrentTarget = downloadTarget?.takeIf { it.fn.endsWith(".torrent", ignoreCase = true) }
+    LaunchedEffect(torrentTarget?.fid) {
+        val target = torrentTarget ?: return@LaunchedEffect
+        torrentInfo = null
+        torrentNote = null
+        torrentReading = true
+        val pc = target.pc
+        if (pc.isNullOrBlank()) {
+            torrentNote = "该文件缺少提取码，读不到种子"
+        } else {
+            runCatching {
+                CloudTorrent.read(context.appContainer.okHttpClient, vm.getDownloadUrl(pc).getOrThrow())
+            }.onSuccess { torrentInfo = it }
+                .onFailure { torrentNote = it.message ?: "读取种子失败" }
+        }
+        torrentReading = false
+    }
     downloadTarget?.let { item ->
+        val isTorrent = item.fn.endsWith(".torrent", ignoreCase = true)
+        val info = torrentInfo
         DownloadDialog(
             name = item.fn,
             sizeText = "大小：${Format.size(item.fs)}",
-            onDismiss = { downloadTarget = null },
+            extraLabel = if (isTorrent) (if (torrentSubmitting) "提交中…" else "云下载") else null,
+            extraEnabled = isTorrent && info != null && !torrentReading && !torrentSubmitting,
+            extraNote = if (!isTorrent) null else when {
+                torrentReading -> "正在读取种子…"
+                torrentNote != null -> torrentNote
+                // 推之前先看内容：文件数/总大小直接来自种子，不经过任何第三方
+                info != null -> "含 ${info.fileCount} 个文件 · ${Format.size(info.totalSize)}" +
+                    if (info.trackers.isEmpty()) "（种子没带 tracker，只能靠 115 的 DHT 找源）"
+                    else "（带 ${info.trackers.size} 个 tracker）"
+                else -> null
+            },
+            onExtra = {
+                val pc = item.pc
+                if (!pc.isNullOrBlank() && info != null && !torrentSubmitting) {
+                    torrentSubmitting = true
+                    torrentNote = null
+                    scope.launch {
+                        // 保存位置 = 种子所在的目录，推出来的东西就落在种子旁边
+                        val cid = vm.currentTargetCid()
+                        val err = context.appContainer.downloadSubmitter
+                            .submit(vm.api, Torrent.buildMagnet(info), cid)
+                        torrentSubmitting = false
+                        if (err == null) {
+                            val summary = "${info.name ?: item.fn}（${info.fileCount} 个文件 · " +
+                                "${Format.size(info.totalSize)}）"
+                            downloadTarget = null
+                            torrentInfo = null
+                            context.appContainer.opLog.log(
+                                OpType.OFFLINE,
+                                item.fn,
+                                "转磁力云离线 · ${info.fileCount} 个文件",
+                                cid,
+                                ui.stack.lastOrNull()?.name.orEmpty(),
+                            )
+                            notify("已提交云下载：$summary")
+                        } else {
+                            // 提交失败留在弹窗里（snackbar 一闪就没了，这里用户还要改主意）
+                            torrentNote = err
+                        }
+                    }
+                }
+            },
+            onDismiss = {
+                downloadTarget = null
+                torrentInfo = null
+                torrentNote = null
+            },
+            // 本地算出的结构（文件数/大小）+ 第三方的画面，一起构成"推之前先看内容"
+            footer = if (isTorrent) {
+                {
+                    MagnetShotPreview(
+                        magnet = info?.let { Torrent.buildMagnet(it) },
+                        enabled = shotPreviewEnabled,
+                        endpoint = shotPreviewEndpoint,
+                        http = context.appContainer.okHttpClient,
+                    )
+                }
+            } else {
+                null
+            },
             onDownload = {
                 downloadTarget = null
                 scope.launch {
@@ -2743,11 +2938,13 @@ private fun ScrapeNormalizeDialog(
     defaultClean: (FileItem) -> String,
     onAiClean: suspend (String) -> String?,
     onDismiss: () -> Unit,
-    onConfirm: (List<String>, Boolean) -> Unit,
+    onConfirm: (List<String>, Boolean, Boolean) -> Unit,
 ) {
     val scope = androidx.compose.runtime.rememberCoroutineScope()
     val names = remember(items) { androidx.compose.runtime.mutableStateListOf(*items.map(defaultClean).toTypedArray()) }
     var renameOn by remember { mutableStateOf(initialRenameOn) }
+    // 补充模式（默认开）：只补缺失的字段/图片，不覆盖已有内容；也不改文件名
+    var supplement by remember { mutableStateOf(true) }
     var aiBusy by remember { mutableStateOf(false) }
     var aiDone by remember { mutableStateOf(0 to items.size) }
     var sourceMenu by remember { mutableStateOf(false) }
@@ -2814,16 +3011,28 @@ private fun ScrapeNormalizeDialog(
                 }
                 Spacer(Modifier.height(8.dp))
                 Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
-                    androidx.compose.material3.Switch(checked = renameOn, onCheckedChange = { renameOn = it })
+                    androidx.compose.material3.Switch(checked = supplement, onCheckedChange = { supplement = it })
                     Spacer(Modifier.size(8.dp))
-                    Text("刮完按规范名重命名文件", style = MaterialTheme.typography.bodyMedium)
+                    Text("补充模式：只补缺失的字段/图片，不覆盖已有内容", style = MaterialTheme.typography.bodyMedium)
+                }
+                Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
+                    androidx.compose.material3.Switch(
+                        checked = renameOn && !supplement,
+                        onCheckedChange = { renameOn = it },
+                        enabled = !supplement,
+                    )
+                    Spacer(Modifier.size(8.dp))
+                    Text(
+                        if (supplement) "补充模式下不改文件名" else "刮完按规范名重命名文件",
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
                 }
             }
         },
         confirmButton = {
             TextButton(
                 enabled = names.any { it.isNotBlank() } && !aiBusy,
-                onClick = { onConfirm(names.toList(), renameOn) },
+                onClick = { onConfirm(names.toList(), renameOn && !supplement, supplement) },
             ) { Text("开始刮削") }
         },
         dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } },

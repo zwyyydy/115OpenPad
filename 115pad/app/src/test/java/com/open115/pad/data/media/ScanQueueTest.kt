@@ -340,4 +340,33 @@ class ScanQueueTest {
         val t = pendingToRestore(MediaScanner.queueJson.decodeFromString<ScanQueueSnapshot>(raw)).single()
         assertFalse(t.noRecurse)
     }
+
+    @Test
+    fun `老快照没有 silent 字段_读回来照旧弹完成提示`() {
+        val raw = """{"pending":[{"libraryId":3,"libraryName":"库3","rootCids":["c3"],
+            "rootPaths":["/p3"],"incremental":false,"rateLimitMs":0,"minVideoSizeMb":0}]}"""
+        val t = pendingToRestore(MediaScanner.queueJson.decodeFromString<ScanQueueSnapshot>(raw)).single()
+        assertFalse(t.silent)
+    }
+
+    @Test
+    fun `队列里没别的任务时_安静标记原样带过去`() {
+        assertTrue(mergedTargetedSilent(next = true, queued = null))
+        assertFalse(mergedTargetedSilent(next = false, queued = null))
+    }
+
+    @Test
+    fun `合并进来的那条是用户看得见的扫描_就不安静`() {
+        // 迁移（安静）并进一条流水线同步（要报）→ 这轮照常报：宁可多弹一次，
+        // 也不能让用户以为那轮同步没跑
+        assertFalse(mergedTargetedSilent(next = true, queued = false))
+        assertFalse(mergedTargetedSilent(next = false, queued = false))
+    }
+
+    @Test
+    fun `两条都是顺手扫的_才闭嘴`() {
+        assertTrue(mergedTargetedSilent(next = true, queued = true))
+        // 用户点的扫描并进迁移那条 → 照常报
+        assertFalse(mergedTargetedSilent(next = false, queued = true))
+    }
 }

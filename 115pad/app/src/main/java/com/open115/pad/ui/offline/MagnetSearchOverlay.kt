@@ -38,7 +38,16 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.layout.ContentScale
 import androidx.activity.compose.BackHandler
+import coil.compose.AsyncImage
+import com.open115.pad.data.magnet.WhatsLinkClient
+import kotlinx.coroutines.async
 
 /**
  * 磁力搜索对话框：关键词 → MCP `magnet_search` → 结果列表 → 看文件结构（`magnet_files`）→
@@ -55,6 +64,8 @@ fun MagnetSearchOverlay(
     val scope = rememberCoroutineScope()
     val endpoint by vm.magnetEndpoint.collectAsState()
     val token by vm.magnetToken.collectAsState()
+    val previewEnabled by vm.magnetPreviewEnabled.collectAsState()
+    val previewEndpoint by vm.magnetPreviewEndpoint.collectAsState()
 
     var query by remember { mutableStateOf("") }
     var loading by remember { mutableStateOf(false) }
@@ -66,6 +77,12 @@ fun MagnetSearchOverlay(
     var detailLoading by remember { mutableStateOf(false) }
     var submitting by remember { mutableStateOf(false) }
     var note by remember { mutableStateOf<String?>(null) }
+    // 预览（第三方服务）：截图与文件结构并行取，任何一步失败都只少显示一块
+    var preview by remember { mutableStateOf<WhatsLinkClient.Preview?>(null) }
+    var previewError by remember { mutableStateOf<String?>(null) }
+    var previewLoading by remember { mutableStateOf(false) }
+    // 非 null = 正在放大看某张截图
+    var zoomUrl by remember { mutableStateOf<String?>(null) }
 
     fun search() {
         val q = query.trim()
@@ -97,7 +114,23 @@ fun MagnetSearchOverlay(
         detailItem = item
         detailInfo = null
         detailLoading = true
+        preview = null
+        previewError = null
+        previewLoading = previewEnabled
         scope.launch {
+            // 截图和文件结构互不依赖，并行取——都慢的话不至于串成两倍等待
+            val previewJob = if (previewEnabled) {
+                async {
+                    runCatching {
+                        WhatsLinkClient(
+                            base = previewEndpoint.ifBlank { WhatsLinkClient.DEFAULT_BASE },
+                            http = vm.okHttpClient ?: fallbackHttp,
+                        ).preview(item.magnet)
+                    }
+                }
+            } else {
+                null
+            }
             try {
                 detailInfo = MagnetSearchClient(
                     endpoint = endpoint.ifBlank { MagnetSearchClient.DEFAULT_ENDPOINT },
@@ -110,6 +143,10 @@ fun MagnetSearchOverlay(
             } finally {
                 detailLoading = false
             }
+            previewJob?.await()
+                ?.onSuccess { preview = it }
+                ?.onFailure { previewError = it.message ?: it.javaClass.simpleName }
+            previewLoading = false
         }
     }
 
@@ -126,7 +163,10 @@ fun MagnetSearchOverlay(
     // ★ 页面内全屏浮层，不是 Dialog 窗口——这台设备的 Dialog 新窗口首帧绘制不落地
     //   （窗口建了、画面全透明，要等下一次界面变化才显形：用户实测「点放大镜没反应、
     //   再点添加任务才出现」），剧照浏览/画廊踩过同一个坑后改的浮层，这里照方抓药。
-    BackHandler(onBack = onDismiss)
+    BackHandler {
+        // 放大态优先退（与画廊同规矩），别一步就把整个浮层关掉
+        if (zoomUrl != null) zoomUrl = null else onDismiss()
+    }
     Box(
         Modifier
             .fillMaxSize()
@@ -239,6 +279,76 @@ fun MagnetSearchOverlay(
                             modifier = Modifier.weight(1f),
                         )
                     }
+                    // ---- 预览（第三方服务，实验室可关）：摘要 + 抽样截图 ----
+                    when {
+                        previewLoading -> Row(
+                            Modifier.padding(vertical = 6.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            CircularProgressIndicator(Modifier.size(14.dp), strokeWidth = 2.dp)
+                            Spacer(Modifier.width(8.dp))
+                            Text(
+                                "正在取预览图…",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+
+                        previewError != null -> Text(
+                            "预览暂不可用：" + previewError.orEmpty(),
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+
+                        preview?.let { it.resolved } == false -> Text(
+                            "预览服务解析不了这条种子（可能太冷门或已失效）。",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+
+                        preview != null -> {
+                            val p = preview!!
+                            val summary = listOfNotNull(
+                                p.kindLabel,
+                                p.sizeText,
+                                p.count?.takeIf { it > 1 }?.let { "$it 个文件" },
+                            ).joinToString(" · ")
+                            if (summary.isNotBlank()) {
+                                Text(
+                                    summary,
+                                    style = MaterialTheme.typography.labelMedium,
+                                    color = MaterialTheme.colorScheme.primary,
+                                )
+                            }
+                            if (p.screenshots.isEmpty()) {
+                                Spacer(Modifier.height(4.dp))
+                                Text(
+                                    "这个种子没有可预览的画面。",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            } else {
+                                Spacer(Modifier.height(6.dp))
+                                Row(
+                                    Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                ) {
+                                    p.screenshots.forEach { url ->
+                                        AsyncImage(
+                                            model = url,
+                                            contentDescription = null,
+                                            contentScale = ContentScale.Crop,
+                                            modifier = Modifier
+                                                .size(width = 132.dp, height = 78.dp)
+                                                .clip(RoundedCornerShape(8.dp))
+                                                .clickable { zoomUrl = url },
+                                        )
+                                    }
+                                }
+                            }
+                            Spacer(Modifier.height(8.dp))
+                        }
+                    }
                     when {
                         detailLoading -> Row(
                             Modifier.fillMaxWidth().padding(vertical = 24.dp),
@@ -307,6 +417,23 @@ fun MagnetSearchOverlay(
                     }
                 }
             }
+        }
+    }
+    // 截图放大：盖在整个浮层之上。自带手势把点击吃掉，不然会穿透到幕布把浮层一起关了
+    zoomUrl?.let { url ->
+        Box(
+            Modifier
+                .fillMaxSize()
+                .background(Color.Black.copy(alpha = 0.92f))
+                .pointerInput(Unit) { detectTapGestures { zoomUrl = null } },
+            contentAlignment = Alignment.Center,
+        ) {
+            AsyncImage(
+                model = url,
+                contentDescription = null,
+                contentScale = ContentScale.Fit,
+                modifier = Modifier.fillMaxWidth().padding(24.dp),
+            )
         }
     }
 }

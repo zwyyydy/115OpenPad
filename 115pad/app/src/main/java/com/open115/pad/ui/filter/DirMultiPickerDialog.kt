@@ -40,7 +40,7 @@ import androidx.compose.ui.unit.dp
 import com.open115.pad.data.FileItem
 import com.open115.pad.data.FilterRules
 import com.open115.pad.data.OpenApi
-import com.open115.pad.data.parseFilesResponse
+import com.open115.pad.data.listDirPaged
 import kotlinx.coroutines.launch
 import com.open115.pad.ui.components.FadeAlertDialog
 
@@ -63,11 +63,16 @@ private data class PickerDir(val cid: String, val name: String)
 fun DirMultiPickerDialog(
     api: OpenApi,
     title: String = "选择生效目录",
+    /** 从哪个目录开始（null = 云盘根目录）。传了它，回传的 [FilterRules.BoundDir.fullPath] 就是**相对这个目录**的路径 */
+    startCid: String? = null,
+    startName: String = "根目录",
     onDismiss: () -> Unit,
     onConfirm: (List<FilterRules.BoundDir>) -> Unit,
 ) {
     // 根 → 当前 的下钻路径（面包屑数据源，也是 fullPath 的来源）
-    var stack by remember { mutableStateOf(listOf(PickerDir("0", "根目录"))) }
+    var stack by remember {
+        mutableStateOf(listOf(PickerDir(startCid ?: "0", if (startCid == null) "根目录" else startName)))
+    }
     var dirs by remember { mutableStateOf<List<FileItem>>(emptyList()) }
     var loading by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
@@ -80,8 +85,9 @@ fun DirMultiPickerDialog(
             loading = true
             error = null
             try {
-                // show_dir=1 拉全量再在客户端过滤文件夹：目录数远小于文件数，一次请求足够
-                val page = parseFilesResponse(api.files(cid = cid, limit = 500, order = "file_name", asc = 1))
+                // 拉全量再在客户端过滤文件夹（接口没有"只给目录"的开关）：一次请求仍覆盖绝大多数
+                // 目录，**大目录得翻页** —— 少列的目录用户在选择器里根本点不到
+                val page = listDirPaged(api, cid, order = "file_name", asc = 1)
                 dirs = page.items.filter { it.isDir }
             } catch (e: Exception) {
                 error = e.message

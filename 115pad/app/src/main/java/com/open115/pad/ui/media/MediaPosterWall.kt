@@ -45,11 +45,13 @@ import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextFieldDefaults
 import androidx.compose.runtime.Composable
@@ -93,6 +95,7 @@ import com.open115.pad.data.media.WorksSort
 import com.open115.pad.data.media.MediaDao
 import com.open115.pad.data.media.MEDIA_NO_LIMIT
 import com.open115.pad.data.media.MediaLibraryEntity
+import com.open115.pad.data.media.MediaMigrator
 import com.open115.pad.data.media.WorksFilter
 import com.open115.pad.data.media.facetsOf
 import com.open115.pad.data.media.CardFacets
@@ -142,6 +145,17 @@ fun PosterWallScreen(
     val container = (context.applicationContext as com.open115.pad.App115).container
     val snackbarHostState = remember { SnackbarHostState() }
     var deleteTarget by remember { mutableStateOf<MovieCard?>(null) }
+    /**
+     * 多选（勾的是 mediaKey）。长按一张进选择态、再点别的加减，与文件页同一套手势。
+     *
+     * 为什么把"长按删除"改成"长按进多选"：批量迁移必须有选择态，而一张卡上放不下两套长按语义。
+     * 删除没有消失 —— 选择态工具条上还留着（只勾了一部时给），另外详情页里一直有。
+     */
+    var selection by remember { mutableStateOf<Set<String>>(emptySet()) }
+    // 打开迁移对话框的入参（null = 没开）
+    var migrateKeys by remember { mutableStateOf<List<String>?>(null) }
+    /** 批量删除确认框里要删几部（0 = 没开） */
+    var batchDeleteCount by remember { mutableStateOf(0) }
     // 手机（窄屏）排版：顶栏一行放不下「标题列 + 3 个图标 + 搜索框」，把搜索框换到第二行；
     // 海报网格从 2 列调到 3 列。平板（>=600dp）保持原样
     val compact = LocalConfiguration.current.screenWidthDp < 600
@@ -217,9 +231,11 @@ fun PosterWallScreen(
         }
     }
 
-    // 系统返回键 = 逐层退：有搜索词先清搜索，否则退回媒体库列表
+    // 系统返回键 = 逐层退：先退多选、再有搜索词清搜索、否则退回媒体库列表
     androidx.activity.compose.BackHandler(enabled = query.isNotBlank()) { query = "" }
     androidx.activity.compose.BackHandler(enabled = query.isBlank()) { onBack() }
+    // 注册在最后 = 优先级最高：多选着的时候返回键先退多选
+    androidx.activity.compose.BackHandler(enabled = selection.isNotEmpty()) { selection = emptySet() }
 
     // 底色仍是**不透明**的：这两级"页"是浮在媒体库列表页之上的浮层，没有底色会把下层透出来
     // （轮播图没加载出来、或者这个库一张 fanart 都没有时，就只剩这层底色）
@@ -338,6 +354,90 @@ fun PosterWallScreen(
                     )
                 }
 
+                // 多选工具条：长按一张卡进来，与文件页同一套语义（全选 / 取消 / 动作）
+                if (selection.isNotEmpty()) {
+                    Row(
+                        Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        IconButton(onClick = { selection = emptySet() }) {
+                            Icon(Icons.Outlined.Close, contentDescription = "取消选择")
+                        }
+                        Text("已选 ${selection.size} 部", style = MaterialTheme.typography.titleSmall)
+                        Spacer(Modifier.weight(1f))
+                        TextButton(onClick = { selection = list.map { it.mediaKey }.toSet() }) { Text("全选") }
+                        TextButton(onClick = { migrateKeys = selection.toList() }) { Text("迁移…") }
+                        // 删除：勾一部走原来的单部流程（保留它那条"旧数据没存 fid"的专门提示），
+                        // 勾多部走批量确认框 → 应用级任务（逐条、可停、结果汇总）
+                        TextButton(onClick = {
+                            if (selection.size == 1) {
+                                list.firstOrNull { it.mediaKey in selection }?.let { deleteTarget = it }
+                            } else {
+                                batchDeleteCount = selection.size
+                            }
+                        }) { Text("删除") }
+                    }
+                }
+
+                // 迁移 / 批量删除的进度：都跑在应用级任务上（不随页面生灭），这里只是看它 + 能停
+                val migrateProgress by container.mediaMigrator.progress.collectAsState()
+                if (migrateProgress.running) {
+                    BatchProgressCard(
+                        title = "正在迁移到「${migrateProgress.targetName}」",
+                        current = migrateProgress.currentTitle,
+                        done = migrateProgress.done,
+                        total = migrateProgress.total,
+                        counters = listOfNotNull(
+                            "已搬 ${migrateProgress.moved}",
+                            if (migrateProgress.skipped > 0) "跳过 ${migrateProgress.skipped}" else null,
+                            if (migrateProgress.failed > 0) "失败 ${migrateProgress.failed}" else null,
+                        ),
+                        notes = migrateProgress.notes,
+                        onStop = { container.mediaMigrator.stop() },
+                    )
+                }
+                // 一次批量结束：报一句 + 刷新（迁走的那几部已经不在这个库里了）。
+                // 汇总是"一次性消费"的，免得换个库再进墙又弹一遍同一句话
+                LaunchedEffect(migrateProgress.finishedAt) {
+                    val summary = container.mediaMigrator.takeSummary()
+                    if (summary != null) {
+                        onChanged()
+                        snackbarHostState.showSnackbar(summary)
+                    }
+                }
+
+                val deleteProgress by container.mediaBatchDeleter.progress.collectAsState()
+                if (deleteProgress.running) {
+                    BatchProgressCard(
+                        title = if (deleteProgress.alsoCloud) "正在彻底删除" else "正在从媒体库移除",
+                        current = deleteProgress.currentTitle,
+                        done = deleteProgress.done,
+                        total = deleteProgress.total,
+                        counters = listOfNotNull(
+                            "已删 ${deleteProgress.deleted}",
+                            if (deleteProgress.failed > 0) "失败 ${deleteProgress.failed}" else null,
+                        ),
+                        notes = deleteProgress.notes,
+                        onStop = { container.mediaBatchDeleter.stop() },
+                    )
+                }
+                LaunchedEffect(deleteProgress.finishedAt) {
+                    val summary = container.mediaBatchDeleter.takeSummary()
+                    if (summary != null) {
+                        selection = emptySet()
+                        onChanged()
+                        snackbarHostState.showSnackbar(summary)
+                    }
+                }
+
+                // 勾选的片被搬走/删掉了就把它从选择集里摘掉（否则工具条上会挂着"已选 3 部"却一张都没亮）
+                LaunchedEffect(list) {
+                    val alive = list.map { it.mediaKey }.toSet()
+                    if (selection.any { it !in alive }) {
+                        selection = selection.filter { it in alive }.toSet()
+                    }
+                }
+
                 if (list.isEmpty()) {
                     Column(
                         Modifier.fillMaxSize().padding(32.dp),
@@ -366,8 +466,19 @@ fun PosterWallScreen(
                         items(list, key = { it.mediaKey }) { card ->
                             PosterCard(
                                 card = card,
-                                onClick = { onOpenMovie(card, list, list.indexOf(card)) },
-                                onLongClick = { deleteTarget = card },
+                                selected = card.mediaKey in selection,
+                                onClick = {
+                                    if (selection.isEmpty()) {
+                                        onOpenMovie(card, list, list.indexOf(card))
+                                    } else {
+                                        selection = if (card.mediaKey in selection) {
+                                            selection - card.mediaKey
+                                        } else {
+                                            selection + card.mediaKey
+                                        }
+                                    }
+                                },
+                                onLongClick = { selection = selection + card.mediaKey },
                             )
                         }
                     }
@@ -417,6 +528,104 @@ fun PosterWallScreen(
             },
         )
     }
+
+    migrateKeys?.let { keys ->
+        MovieMigrateDialog(
+            mediaKeys = keys,
+            title = if (keys.size == 1) {
+                list.firstOrNull { it.mediaKey == keys[0] }?.title ?: library.name
+            } else {
+                "已选 ${keys.size} 部"
+            },
+            dao = dao,
+            // 取消只是关掉对话框：选择集留着，用户可以改主意再点一次「迁移…」
+            onDismiss = { migrateKeys = null },
+            // 单部就地跑完（批量走进度卡那条路，不会回调到这里）：搬走的那部已经不在这个库里了，
+            // 这里必须跟着刷一次 —— 不刷的话它还挂在这面墙上（用户报的"迁完了界面没动"）
+            onMigrated = {
+                migrateKeys = null
+                selection = emptySet()
+                onChanged()
+            },
+        )
+    }
+
+    if (batchDeleteCount > 0) {
+        MovieBatchDeleteDialog(
+            count = batchDeleteCount,
+            onDismiss = { batchDeleteCount = 0 },
+            onDelete = { alsoCloud ->
+                batchDeleteCount = 0
+                // 交给应用级任务：逐条删、可停、结果汇总（选择集先留着，进度卡上看得见在删哪些）
+                container.mediaBatchDeleter.start(selection.toList(), alsoCloud)
+            },
+        )
+    }
+}
+
+/**
+ * 批量任务的进度卡（迁移与批量删除共用）：正在做什么、做到哪一部、计数、失败原因，外加「停止」。
+ *
+ * 与媒体库页那张扫描进度卡同一套样子 —— 同一类东西摆在一起得像一个产品。
+ * 它读的是**应用级任务**的状态：页面切走任务照跑，回到任何一面墙都能看到同一条进度。
+ */
+@Composable
+private fun BatchProgressCard(
+    title: String,
+    current: String,
+    done: Int,
+    total: Int,
+    counters: List<String>,
+    notes: List<String>,
+    onStop: () -> Unit,
+) {
+    Surface(
+        color = MaterialTheme.colorScheme.surface,
+        shape = RoundedCornerShape(12.dp),
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
+    ) {
+        Column(Modifier.padding(12.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    title,
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                Spacer(Modifier.width(8.dp))
+                Text(
+                    current,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f),
+                )
+                TextButton(onClick = onStop) { Text("停止") }
+            }
+            Spacer(Modifier.height(6.dp))
+            LinearProgressIndicator(
+                progress = { if (total <= 0) 0f else done.toFloat() / total },
+                modifier = Modifier.fillMaxWidth().height(4.dp),
+            )
+            Spacer(Modifier.height(6.dp))
+            Text(
+                // 拼接里带条件的段一律 listOfNotNull：字符串里的 if 会把后面几段一起吞掉（踩过的坑）
+                listOf("$done/$total").plus(counters).joinToString(" · "),
+                style = MaterialTheme.typography.bodySmall,
+            )
+            notes.forEach { note ->
+                Text(
+                    note,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+        }
+    }
 }
 
 /**
@@ -430,7 +639,13 @@ fun PosterWallScreen(
  */
 @OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
 @Composable
-fun PosterCard(card: MovieCard, onClick: () -> Unit, onLongClick: (() -> Unit)? = null) {
+fun PosterCard(
+    card: MovieCard,
+    onClick: () -> Unit,
+    onLongClick: (() -> Unit)? = null,
+    /** 多选态下这张卡被勾上了：压一层暗幕 + 左上角一个勾 */
+    selected: Boolean = false,
+) {
     // 深色海报上水波纹几乎看不见：按压缩放承担「按到了」
     val interaction = remember { MutableInteractionSource() }
     Column(
@@ -507,6 +722,22 @@ fun PosterCard(card: MovieCard, onClick: () -> Unit, onLongClick: (() -> Unit)? 
                         fontSize = 11.sp,
                         fontWeight = FontWeight.SemiBold,
                         modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp),
+                    )
+                }
+            }
+            // 多选：压一层暗幕 + 左上角勾（放左边，右上角是评分胶囊的地盘）
+            if (selected) {
+                Box(Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.45f)))
+                Surface(
+                    color = MaterialTheme.colorScheme.primary,
+                    shape = RoundedCornerShape(50),
+                    modifier = Modifier.align(Alignment.TopStart).padding(6.dp),
+                ) {
+                    Icon(
+                        Icons.Outlined.Check,
+                        contentDescription = "已选中",
+                        tint = Color.White,
+                        modifier = Modifier.padding(3.dp).size(16.dp),
                     )
                 }
             }

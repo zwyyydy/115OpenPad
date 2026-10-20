@@ -25,13 +25,10 @@ import androidx.compose.material.icons.outlined.Delete
 import androidx.compose.material.icons.outlined.History
 import androidx.compose.material.icons.outlined.Movie
 import androidx.compose.material.icons.outlined.PlayArrow
-import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Scaffold
-import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -45,7 +42,6 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -54,9 +50,7 @@ import com.open115.pad.data.media.WatchHistoryRow
 import com.open115.pad.player.PlayerActivity
 import com.open115.pad.ui.components.GlassCard
 import com.open115.pad.ui.components.MetaChip
-import com.open115.pad.ui.components.auroraBackdrop
 import com.open115.pad.ui.media.PickCodeImage
-import com.open115.pad.ui.theme.AdaptiveBody
 import com.open115.pad.util.Format
 import kotlinx.coroutines.launch
 import com.open115.pad.ui.components.FadeAlertDialog
@@ -89,25 +83,29 @@ private const val NEAR_END_MS = 15_000L
  *
  * @param onBack 非空 = 作为浮层嵌在媒体库页里，顶栏左上角给一个返回
  */
+/**
+ * 观影历史的**列表本体**。
+ *
+ * 页头（标题/副标题/页签/「只看未看完」/清空）全在「记录」页上 —— 三个记录页面合成了一个入口，
+ * 各页自己的小动作也跟着页签走；这里只管列表本身：点一行续播、长按删这一条。
+ *
+ * [rows] 由外面的记录页查好传进来（副标题的"N 条 · 未看完 M 条"和清空按钮的可用性都要用），
+ * 免得同一个查询在一页里查两遍。
+ */
 @Composable
-fun WatchHistoryScreen(
+fun WatchHistoryContent(
     container: AppContainer,
-    onBack: (() -> Unit)? = null,
+    rows: List<WatchHistoryRow>,
+    /** 「只看未看完」的开关状态（按钮在记录页的页签那一行） */
+    onlyUnfinished: Boolean,
+    /** 借外面记录页的 snackbar host 报一句"已从观影历史里删除" */
+    snackbarHostState: SnackbarHostState,
+    modifier: Modifier = Modifier,
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
-    // 作为浮层嵌在媒体库页时，系统返回键 = 出栈（没有这一句 BACK 会穿透到应用级
-    // 导航、直接跳到「文件」页）。独立使用时 onBack 为 null，不注册、保持系统默认行为。
-    androidx.activity.compose.BackHandler(enabled = onBack != null) { onBack?.invoke() }
-    // 自己起一个 host：这个页现在只作为媒体库的浮层出现（见 MediaLibraryScreen 的 overlays），
-    // 外面的 Scaffold 在浮层之上，不该借它的 host
-    val snackbarHostState = remember { SnackbarHostState() }
     val dao = remember { container.mediaDatabase.mediaDao() }
-    val rows by dao.watchHistoryRows().collectAsState(initial = emptyList())
-
-    var onlyUnfinished by remember { mutableStateOf(false) }
     var pendingDelete by remember { mutableStateOf<WatchHistoryRow?>(null) }
-    var confirmClear by remember { mutableStateOf(false) }
 
     val shown = remember(rows, onlyUnfinished) {
         if (onlyUnfinished) rows.filterNot { isFinished(it) } else rows
@@ -130,48 +128,7 @@ fun WatchHistoryScreen(
         context.startActivity(intent)
     }
 
-    Scaffold(
-        // 背景交给下面的极光底（与库列表页/扫描记录同一套）
-        containerColor = Color.Transparent,
-        snackbarHost = { SnackbarHost(snackbarHostState) },
-    ) { scrim ->
-    Box(Modifier.fillMaxSize().auroraBackdrop()) {
-    AdaptiveBody(modifier = Modifier.fillMaxSize()) {
-    Column(Modifier.fillMaxSize().padding(scrim)) {
-        Row(
-            Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            if (onBack != null) {
-                IconButton(onClick = onBack) {
-                    Icon(Icons.AutoMirrored.Outlined.ArrowBack, contentDescription = "返回")
-                }
-            } else {
-                Icon(Icons.Outlined.History, contentDescription = null)
-                Spacer(Modifier.width(8.dp))
-            }
-            Column(Modifier.weight(1f)) {
-                Text("观影历史", style = MaterialTheme.typography.titleLarge)
-                Text(
-                    if (rows.isEmpty()) "在媒体库里播过的片会出现在这里"
-                    else "${rows.size} 条记录 · 未看完 ${rows.count { !isFinished(it) }} 条",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-            }
-            FilterChip(
-                selected = onlyUnfinished,
-                onClick = { onlyUnfinished = !onlyUnfinished },
-                label = { Text("只看未看完") },
-            )
-            IconButton(
-                onClick = { confirmClear = true },
-                enabled = rows.isNotEmpty(),
-            ) {
-                Icon(Icons.Outlined.Delete, contentDescription = "清空观影历史")
-            }
-        }
-
+    Box(modifier.fillMaxSize()) {
         if (shown.isEmpty()) {
             Column(
                 Modifier.fillMaxSize().padding(32.dp),
@@ -186,6 +143,7 @@ fun WatchHistoryScreen(
                 Spacer(Modifier.height(10.dp))
                 Text(
                     if (rows.isEmpty()) {
+                        // 这里刻意换行：两句话是"是什么"与"怎么来的"，挤一行会读成一句
                         "还没有观看记录。\n在媒体库里播一部片，这里就会出现它 —— 下次点一下直接接着看。"
                     } else {
                         "没有未看完的片（关掉上面的筛子看全部）"
@@ -210,9 +168,6 @@ fun WatchHistoryScreen(
             }
         }
     }
-    }
-    }
-    }
 
     pendingDelete?.let { row ->
         FadeAlertDialog(
@@ -235,24 +190,6 @@ fun WatchHistoryScreen(
                 }) { Text("删除") }
             },
             dismissButton = { TextButton(onClick = { pendingDelete = null }) { Text("取消") } },
-        )
-    }
-
-    if (confirmClear) {
-        FadeAlertDialog(
-            onDismissRequest = { confirmClear = false },
-            title = { Text("清空观影历史？") },
-            text = { Text("${rows.size} 条记录会全部删除。播放进度不受影响，只是这份列表清空。") },
-            confirmButton = {
-                TextButton(onClick = {
-                    confirmClear = false
-                    scope.launch {
-                        dao.clearWatchHistory()
-                        snackbarHostState.showSnackbar("观影历史已清空")
-                    }
-                }) { Text("清空") }
-            },
-            dismissButton = { TextButton(onClick = { confirmClear = false }) { Text("取消") } },
         )
     }
 }

@@ -213,6 +213,9 @@ private const val DEF_ORIGINAL_FILE = 999
 /** 续播位置距片尾不足这么多毫秒就认为"已经播完"，从头开始（见 resumePos） */
 private const val RESUME_END_MARGIN_MS = 1000L
 
+/** 打开播过的片时，「从头开始」提示停留多久后自动淡出（不点 = 继续续播） */
+private const val RESUME_PROMPT_MS = 5_000L
+
 private fun defLabel(def: Int): String = when (def) {
     1 -> "标清"; 2 -> "高清"; 3 -> "超清"; 4 -> "1080P"; 5 -> "4K"
     100 -> "原画"; DEF_ORIGINAL_FILE -> "原盘"; else -> "清晰度 $def"
@@ -453,6 +456,40 @@ private fun isDeadOriginalLink(err: PlaybackException): Boolean = when (err.erro
 
     else -> false
 }
+
+/** 失败的那个请求地址（只有 HTTP 类错误带得出 URL），判"是谁挂了"用 */
+internal fun failingUrlOf(err: PlaybackException): String? =
+    (err.cause as? androidx.media3.datasource.HttpDataSource.InvalidResponseCodeException)
+        ?.dataSpec?.uri?.toString()
+
+/**
+ * 是不是"字幕解析器"报的错。
+ *
+ * media3 的文案固定是 `SubtitleParser failed.{contentIsMalformed=…, dataType=…}`；
+ * 容器/轨道的解析失败不会带这个词（两边 dataType 都是 MEDIA，只能认文案）。
+ */
+internal fun isSubtitleParserFailure(err: PlaybackException): Boolean =
+    (err.cause as? androidx.media3.common.ParserException)
+        ?.message?.contains("SubtitleParser") == true
+
+/**
+ * 归因：这次播放失败是不是**挂上去的字幕**引起的（而不是视频地址/档位的问题）。
+ *
+ * 侧挂字幕（115 官方 / 在线搜索 / 本地）与视频共用同一条媒体准备：字幕取不到（404）
+ * 或解不了（ASS 当 WebVTT 喂）都会让整条媒体 **准备失败**，报出来的是 IO / 容器类错误。
+ * 不区分的话就会"为字幕失效去换视频地址"——换四次、黑屏十几秒，原盘档还一直弹
+ * 「原盘地址已刷新」，而换完地址挂的还是同一条坏字幕，纯属空转。
+ *
+ * 判据两条（[failingUrl] 与 [subtitleParserFailed] 由调用方从错误里取，见上面两个函数）：
+ * ① HTTP 失败且失败地址就是某条字幕地址 —— 确定性判据，优先用它（能精确到哪一条，
+ *    调用方据此只摘那一路）；
+ * ② 没有地址（解析类错误）时才看是不是字幕解析器报的错 —— 这种分不出是哪一条。
+ */
+internal fun isSubtitleFailure(
+    failingUrl: String?,
+    subtitleParserFailed: Boolean,
+    subtitleUrls: List<String>,
+): Boolean = if (failingUrl != null) failingUrl in subtitleUrls else subtitleParserFailed
 
 /**
  * 从当前档往下找"下一档"（严格更低，所以不会来回横跳）。
@@ -850,12 +887,6 @@ fun PlayerScreen(
     var rebuffering by remember { mutableStateOf(false) }
     var showBuffering by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
-    /**
-     * 本次会话从**本机缓存**读到的字节数。
-     * 起播十几秒后拿它提示一句"已从本机缓存读取 N MB" —— 用户最想知道的就是缓存到底有没有用
-     * （否则只能看到网速在动，分不清是读盘还是重新下载）。
-     */
-    var cacheHitBytes by remember { mutableStateOf(0L) }
     var qualityMenuOpen by remember { mutableStateOf(false) }
     var audioMenuOpen by remember { mutableStateOf(false) }
     var speedMenuOpen by remember { mutableStateOf(false) }
@@ -1217,6 +1248,16 @@ fun PlayerScreen(
             labDanmuDensity = container.playerPrefs.labDanmuDensity.first(),
             labDanmuCacheDays = container.playerPrefs.labDanmuCacheDays.first(),
         )
+        // 记忆上次播放亮度：进播放器时把上次手势调好的值套到窗口上。
+        // 关着 / 没调过（-1）就什么都不做，跟随系统亮度。
+        if (container.playerPrefs.rememberBrightness.first()) {
+            val saved = container.playerPrefs.lastBrightness.first()
+            if (saved in 0.01f..1f) {
+                (context as? Activity)?.window?.let { win ->
+                    win.attributes = win.attributes.apply { screenBrightness = saved }
+                }
+            }
+        }
     }
     val prefs = pv
     if (prefs == null) {
@@ -1483,7 +1524,6 @@ fun PlayerScreen(
                                 "PlayerCacheIO",
                                 "命中缓存 ${bytesRead}B（缓存共 ${cacheSizeBytes / 1024 / 1024}MB）",
                             )
-                            cacheHitBytes += bytesRead
                         }
 
                         override fun onCacheIgnored(reason: Int) {
@@ -1614,6 +1654,26 @@ fun PlayerScreen(
         }
     }
 
+    // 亮度手势每帧都回调，停下来 400ms 再落库（DataStore 每次 edit 都是一次事务）。
+    // 只记录手势值；开关关着也照记，以后重新打开就能用上最后一次调好的亮度。
+    var brightnessToSave by remember { mutableStateOf<Float?>(null) }
+    LaunchedEffect(brightnessToSave) {
+        val v = brightnessToSave ?: return@LaunchedEffect
+        delay(400)
+        runCatching { container.playerPrefs.setLastBrightness(v) }
+    }
+
+    // 续播提示：只在「打开播放器后的第一次起播」弹一次（切集/切清晰度/切软解都不弹）。
+    // 起播位置 > 0 时浮出「从头开始」，几秒后自动淡出；不点就保持从上次进度继续。
+    var resumePromptMs by remember { mutableStateOf<Long?>(null) }
+    var resumePromptArmed by remember { mutableStateOf(true) }
+    LaunchedEffect(resumePromptMs) {
+        val shown = resumePromptMs ?: return@LaunchedEffect
+        delay(RESUME_PROMPT_MS)
+        // 期间若被新的一次起播替换（理论上一开只有一次），别把新的提前清掉
+        if (resumePromptMs == shown) resumePromptMs = null
+    }
+
     /**
      * 续播位置贴着片尾时直接从头播。
      *
@@ -1691,22 +1751,47 @@ fun PlayerScreen(
         return def to buildMediaItem(trackUrl, mime, cacheKey)
     }
 
-    /** 拉 115 官方字幕列表。失败返回空列表——字幕拿不到不该影响播放（起播与「还原官方字幕」共用） */
+    /**
+     * 拉 115 官方字幕列表。失败返回空列表——字幕拿不到不该影响播放（起播与「还原官方字幕」共用）。
+     *
+     * ⚠️ 这个接口是**按目录**给的，不是按文件，解析时必须做两件事，否则会把播放带崩：
+     *
+     * ① 丢掉占位条目。这个视频自己没有配套字幕时，115 不返回空 list，而是给一条
+     *    "空壳"（实测：`sid="___"`、`type`/`title`/`sha1` 全空、url 形如 `.../?type=`）。
+     *    它指向一个不存在的转码地址 —— 挂给播放器就是 404 或解析失败，**整条媒体准备
+     *    跟着失败**，表面上变成"播放地址坏了"：连换四次地址、黑屏十几秒（在原盘档还一直
+     *    弹「原盘地址已刷新」），最后才轮到"关掉字幕重试"。
+     * ② 只挑本视频自己那条。同一季目录里的字幕会**整季**都列出来（实测某剧 S01E01 拿回
+     *    9 集的 ass），全挂上去等于每集都带着整季的字幕轨道。
+     *
+     * mime 按 type 给准：ASS/SSA 要 `text/x-ssa`（media3 有 SsaParser），当 WebVTT 喂进去
+     * 会 SubtitleParser failed（实测就是这么炸的）；认不出的类型（sub/smi…）播放器解不了，
+     * 直接不挂——挂上去只会把播放带崩。
+     */
     suspend fun fetchOfficialSubs(): List<SubtitleCfg> = runCatching {
         val sub = container.openApi.videoSubtitles(currentPickCode)
         val list = sub.envData()?.get("list") as? JsonArray ?: return@runCatching emptyList()
-        list.mapNotNull { el ->
+        val entries = list.mapNotNull { el ->
             val o = el as? JsonObject ?: return@mapNotNull null
             fun s(k: String) = (o[k] as? JsonPrimitive)?.takeIf { it !is JsonNull }?.content
             val url = s("url") ?: return@mapNotNull null
-            val type = s("type")?.lowercase()
-            SubtitleCfg(
-                url = url,
-                mime = if (type == "srt") "application/x-subrip" else "text/vtt",
-                language = s("language"),
-                title = s("title"),
-            )
+            val type = s("type")?.lowercase().orEmpty()
+            // 占位条目的判据：type 与 sha1 都空（真字幕一定有类型和内容 sha1）
+            if (type.isBlank() || s("sha1").isNullOrBlank()) return@mapNotNull null
+            val mime = when (type) {
+                "srt", "vtt", "ass", "ssa" -> mimeForSubtitleExt(type)
+                else -> return@mapNotNull null
+            }
+            SubtitleCfg(url = url, mime = mime, language = s("language"), title = s("title"))
         }
+        // 与本视频同名的（`<片名>.chi.zh-cn.ass` / `<片名>.srt` 这类）优先；
+        // 一条都对不上时退回列表第一条——接口是按相关度给的，第一条就是它认的那个。
+        // 片名拿不到（外部调用没传 name）时不比名字，同样只取第一条，别把整季都挂上。
+        val base = currentName.substringBeforeLast('.').takeIf(String::isNotBlank)
+        val matched = base
+            ?.let { b -> entries.filter { it.title?.startsWith(b, ignoreCase = true) == true } }
+            .orEmpty()
+        matched.ifEmpty { entries.take(1) }
     }.getOrDefault(emptyList())
 
     // 本机文件专用的媒体源工厂：与主播放器同一套上游参数但不挂缓存——文件本来就在
@@ -1798,9 +1883,43 @@ fun PlayerScreen(
                 // 115 每次 downUrl 给的地址可能落到不同 CDN，换一次往往就好了。换完还不行才降档。
                 val linkFail = httpFail ||
                     (currentDef == DEF_ORIGINAL_FILE && isDeadOriginalLink(err))
+                val subUrls = (subtitles + onlineSubs).map { it.url }
+                val badUrl = failingUrlOf(err)
+                val subFail = isSubtitleFailure(badUrl, isSubtitleParserFailure(err), subUrls)
+                // 排障线索：这一档到底为什么挂的（归因/错误码/重试预算）。
+                // adb logcat -s PlayerError
+                android.util.Log.w(
+                    "PlayerError",
+                    "code=${err.errorCodeName} def=$currentDef 归因=${if (subFail) "字幕" else "视频/链路"}" +
+                        " attempts=$refreshAttempts useSubs=$useSubs" +
+                        " official=${subtitles.size} online=${onlineSubs.size}" +
+                        " url=${failingUrlOf(err)} cause=${err.cause?.message?.take(120)}",
+                )
                 val now = System.currentTimeMillis()
                 // 距上次自愈足够久 → 视为新一轮故障，补满重试预算
                 if (now - lastAddressRefreshAt > REFRESH_NEW_ROUND_GAP_MS) refreshAttempts = 0
+                if (subFail) {
+                    // 字幕把媒体准备带崩了：换地址/降档都救不了（挂上去的还是同一条坏字幕）。
+                    // 从这里摘掉坏的那一路重试，别去动视频地址——以前这条排在四轮换地址之后，
+                    // 用户要黑屏十几秒、原盘档还一直弹「原盘地址已刷新」才等到它。
+                    if (badUrl != null) {
+                        // 404：能精确定位是哪一条字幕，只摘它
+                        subtitles = subtitles.filterNot { it.url == badUrl }
+                        onlineSubs = onlineSubs.filterNot { it.url == badUrl }
+                        toast("这条路字幕地址失效，已跳过")
+                    } else {
+                        // 解析失败：分不出是哪一条（同格式的都会炸），整路关掉。
+                        // 两路都清空：只清官方那路的话，用户再打开字幕开关又把坏的外挂挂回去
+                        useSubs = false
+                        subtitles = emptyList()
+                        onlineSubs = emptyList()
+                        toast("字幕播放器解不了，已关掉字幕")
+                    }
+                    scope.launch {
+                        if (!rebuildCurrentMedia()) error = "播放失败（${err.errorCodeName}）"
+                    }
+                    return
+                }
                 if (linkFail && refreshAttempts < REFRESH_MAX_ATTEMPTS) {
                     // 播放地址/分片签名过期（HTTP 403）→ 换新地址续播。
                     // 带重试预算 + 递退间隔：上游抖动常在几秒内自愈，
@@ -2174,6 +2293,10 @@ fun PlayerScreen(
             pendingKeepDef = null
             val resumeMs = forcedStart
                 ?: runCatching { container.playerPrefs.localResumeOf(localUri) }.getOrDefault(0L)
+            val startAt = resumePos(resumeMs)
+            // 本次打开只在首播提示；内部重建（切软/硬解）时 armed 早已用完
+            val promptOnce = resumePromptArmed
+            resumePromptArmed = false
             runCatching {
                 // mime 交给 mimeOfFileName：认得出的给准确值，认不出的给 null 让
                 // ExoPlayer 嗅探容器（和「原盘」直链同一条路，mkv/m2ts 都能吃）。
@@ -2182,9 +2305,10 @@ fun PlayerScreen(
                 val source = noCacheMediaFactory.createMediaSource(
                     buildMediaItem(localUri, mimeOfFileName(currentName)),
                 )
-                player.setMediaSource(source, resumePos(resumeMs))
+                player.setMediaSource(source, startAt)
                 player.prepare()
                 player.playWhenReady = true
+                if (promptOnce && startAt > 0) resumePromptMs = startAt
             }.onFailure { e ->
                 // 最常见的是 Uri 读权限失效（ACTION_VIEW 授的读权限不跨进程死亡，
                 // 冷启动恢复后就打不开了）。要提示而不是崩。
@@ -2214,6 +2338,9 @@ fun PlayerScreen(
             // 切集时的 0 是业务强制值，不走这个逻辑。
             val startPos = if (forcedStart != null) forcedStart
             else resumePos(rawStart, parsed.playLong * 1000)
+            // 本次打开只在首播提示；切集/切清晰度/切软解都会消费掉 armed
+            val promptOnce = resumePromptArmed
+            resumePromptArmed = false
 
             val d = parsed
             // 重建播放器（切换软/硬解）时保留用户当前看的档位：重算会退回默认最高档
@@ -2266,6 +2393,7 @@ fun PlayerScreen(
             player.setMediaItem(item, startPos)
             player.prepare()
             player.playWhenReady = true
+            if (promptOnce && startPos > 0) resumePromptMs = startPos
             loading = false
             pulseControlRow()
         } catch (e: Exception) {
@@ -2343,17 +2471,6 @@ fun PlayerScreen(
             if (durationMs > 0L) {
                 saveWatchHistory(currentPickCode, currentName, positionMs, durationMs)
             }
-        }
-    }
-
-    // 起播十几秒后报一下"这次从本机缓存读了多少"。门槛刻意压得低（3MB）：数字本身就是答案 ——
-    // 只要不是 0，就说明上次看的那些确实是从本机读回来的、没重新下载。
-    LaunchedEffect(itemKey, currentDef) {
-        cacheHitBytes = 0L
-        delay(12_000)
-        val hit = cacheHitBytes
-        if (hit > 3L * 1024 * 1024) {
-            setIndicator("起播已从本机缓存读取 ${hit / 1024 / 1024}MB（没重新下载）")
         }
     }
 
@@ -2799,8 +2916,22 @@ fun PlayerScreen(
                     toast("删除失败：" + (resp.envMsg() ?: "接口返回失败"))
                     return@launch // 失败不改队列，播放不中断
                 }
+                // 源文件进了网盘回收站：它的预览图缓存（文件页的缩略图 / 预览条）跟着清，
+                // 别留成没人引用的垃圾（与文件页删除同一条口径）。清失败不影响删除本身的结论
+                if (entry.pc.isNotBlank()) {
+                    runCatching {
+                        withContext(Dispatchers.IO) { container.videoPreviews.deleteFor(listOf(entry.pc)) }
+                    }.onFailure { android.util.Log.w("VPreview", "清播放队列删除项的预览图失败：${it.message}") }
+                }
                 val newList = playQueue.toMutableList().apply { removeAt(index) }
                 val wasCurrent = index == currentIndex
+                // 播放缓存：删的是**非当前项**才清（直链按 pick_code；转码分片映射不出 sha1，
+                // 留给上限淘汰）。当前项不清 —— 播放器可能还在读它，等顺延切集后也没必要专门清。
+                if (!wasCurrent && entry.pc.isNotBlank()) {
+                    runCatching {
+                        withContext(Dispatchers.IO) { PlayerCache.purge(listOf(entry.pc)) }
+                    }.onFailure { android.util.Log.w("PlayerCacheIO", "清播放队列删除项的播放缓存失败：${it.message}") }
+                }
                 playQueue = newList
                 when {
                     newList.isEmpty() -> {
@@ -2952,12 +3083,22 @@ fun PlayerScreen(
         }
         val codecs = (vf?.codecs ?: "").lowercase()
         val codec = when {
-            "dvh1" in codecs || "dva1" in codecs -> "DV"
+            // dvhe / dvh1 = HEVC 承载的杜比视界；dva1 = AVC 承载的（早先只认 dvh1/dva1，
+            // 而 WEB-DL 里最常见的是 dvhe，于是 DV 片源被显示成 HEVC）
+            "dvh1" in codecs || "dvhe" in codecs || "dva1" in codecs -> "DV"
             "hvc1" in codecs || "hev1" in codecs -> "HEVC"
             "avc1" in codecs || "avc3" in codecs -> "AVC"
             "av01" in codecs -> "AV1"
             else -> ""
         }
+        // 排障用（adb logcat -s PlayerColor）：这一档到底是什么 —— 杜比视界的 profile 就在
+        // codecs 里（dvh1.05 / dvhe.08），配 colorInfo 就能分清"色彩异常出在源头还是本机链路"。
+        android.util.Log.i(
+            "PlayerColor",
+            "视频格式 res=$res def=$currentDef codecs=${vf?.codecs ?: "-"} " +
+                "mime=${vf?.sampleMimeType ?: "-"} " +
+                "color=${vf?.colorInfo?.let { colorDesc(it) } ?: "无"}",
+        )
         specBadge = (res + hdr).let { if (codec.isNotBlank()) "$it · $codec" else it }
     }
 
@@ -3056,6 +3197,14 @@ fun PlayerScreen(
                 player.pause()
                 if (durationMs > 0L && localUri == null) {
                     saveWatchHistory(currentPickCode, currentName, positionMs, durationMs)
+                }
+                // 亮度兜底：调完 400ms 内就退出时，上面的去抖还没来得及落库。
+                // 挂在 transferScope 上而不是组合作用域——ON_STOP 之后组合随时可能被拆掉。
+                val winBright = (context as? Activity)?.window?.attributes?.screenBrightness ?: -1f
+                if (winBright in 0.01f..1f) {
+                    container.transferScope.launch {
+                        runCatching { container.playerPrefs.setLastBrightness(winBright) }
+                    }
                 }
             }
         }
@@ -3391,6 +3540,7 @@ fun PlayerScreen(
                 onBrightness = { v ->
                     pulseControlRow()
                     setGestureHud(1, "亮度 ${(v * 100).toInt()}%", v)
+                    brightnessToSave = v
                 },
                 onVolume = { cur, max ->
                     pulseControlRow()
@@ -4301,12 +4451,10 @@ fun PlayerScreen(
         }
     } else {
         // ---- 竖屏布局 ----
-        // ① 横屏片：满宽、高度按比例，**整体垂直居中**（不再钉在屏幕顶部）；
-        // ② 竖屏片：直接占满状态栏以下的可用高度、宽度按比例收窄——等效全屏
-        //    且不裁切内容（左右仅留极窄黑边）；③ VR 仍满屏；④ 标题/时长/集数
-        //  chips 贴屏幕底部的悬浮层（渐变遮罩）：画面没占满整屏高时与控制排同进同出
-        //    （与横屏顶栏一致）；占满时（控制排压在屏幕底沿）互斥且 4 秒自淡出，
-        //    避免盖住压在视频底沿的进度条/按钮排。
+        // 控制层（VideoSurface）**铺满整屏**，画面由它内部按比例居中留黑（见下面 surfaceModifier）；
+        // boxW/boxH 现在只给 VR 用：① 横屏片满宽、高度按比例居中；② 竖屏片占满可用高度、
+        // 宽度按比例收窄；③ VR 按档位收窄长边（视窗）。
+        // ④ 标题/时长/集数 chips 贴屏幕底的悬浮层（渐变遮罩）：与控制排同区域 → 互斥且 4 秒自淡出。
         // 系统栏已全沉浸（上方 DisposableEffect），无需再让出状态栏/导航栏空间
         BoxWithConstraints(
             Modifier
@@ -4356,18 +4504,26 @@ fun PlayerScreen(
                     boxW = (maxH.toFloat() * vw / vh).roundToInt().coerceIn(1, maxW)
                 }
             }
-            VideoSurface(
+            // ★ 普通播放：整个 VideoSurface 铺满**屏幕**，不再缩进 boxW×boxH 那条画面框。
+            //   控制排/左右圆钮/字幕/手势都以框为界的话，横屏片竖屏看时框只有几百 px 高，
+            //   图标被压扁、几行控件叠在一起（"挤成一团"）——旧版就是这样。画面本身仍按比例
+            //   居中：VideoSurface 内部自己按它的约束算 letterbox（见里面的 surfaceW/surfaceH）。
+            //   VR 例外：视窗收窄正是靠这个框实现的，必须保持原尺寸。
+            val surfaceModifier = if (vrMode == null) {
+                Modifier.fillMaxSize()
+            } else {
                 Modifier
                     .align(Alignment.Center)
-                    .size(with(density) { boxW.toDp() }, with(density) { boxH.toDp() }),
-                onSubSearch = { showSubSearch = true },
-            )
+                    .size(with(density) { boxW.toDp() }, with(density) { boxH.toDp() })
+            }
+            VideoSurface(surfaceModifier, onSubSearch = { showSubSearch = true })
             // 底部悬浮信息层：标题 + 时长画质 + 集数 chips（有队列才显示）。
-            // 画面没占满整屏高（横片竖看，上下留黑）：控制排贴视频底沿、在屏幕中部，
-            // 与贴屏幕底的这块互不相干 —— 同进同出，4 秒无操作一起淡出（与横屏顶栏一致）。
-            // 画面占满整屏高（竖片）：控制排压在屏幕底沿、与这块同区域，只能互斥 ——
-            // 但出场 4 秒后自己收掉，不再"控制排一藏就常显"（竖屏信息层常驻的老 bug）。
-            val infoMustYield = boxH >= maxH
+            // 控制排现在也压在**屏幕底**（不再缩进画面框），两者同区域 → **一律互斥**：
+            // 控制排显示时信息层让位，控制排收掉后信息层自显 4 秒（与竖片原有行为一致）。
+            // 「横片竖看时两者同进同出」那条老前提，是建立在"控制排贴在画面框底沿、位于屏幕中部"
+            // 之上的，而上面那条改动已经取消了那个前提。
+            // 不丢功能：标题也显示在顶栏，集数列表另有顶栏右侧的「播放列表」按钮。
+            val infoMustYield = true
             var yieldInfoShown by remember { mutableStateOf(false) }
             LaunchedEffect(controlRowVisible, screenLocked, infoMustYield) {
                 if (infoMustYield && !controlRowVisible && !screenLocked) {
@@ -4468,6 +4624,47 @@ fun PlayerScreen(
             }
         }
     }
+
+        // ---- 续播提示：打开播过的片时浮出「从头开始」，几秒后自动淡出 ----
+        // 不点就保持从上次位置继续；放在播放列表抽屉之前，抽屉打开时盖在它上面
+        FadePresence(
+            resumePromptMs.takeIf { !screenLocked },
+            modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 118.dp),
+            enterMillis = 220,
+            exitMillis = 400,
+        ) { resumeAt ->
+            Surface(
+                shape = RoundedCornerShape(12.dp),
+                color = Color.Black.copy(alpha = 0.72f),
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.padding(start = 16.dp, end = 6.dp, top = 4.dp, bottom = 4.dp),
+                ) {
+                    Column(Modifier.widthIn(max = 260.dp)) {
+                        Text(
+                            "已从上次位置继续",
+                            color = Color.White,
+                            style = MaterialTheme.typography.titleSmall,
+                        )
+                        Text(
+                            "上次看到 ${Format.playTime(resumeAt)}",
+                            color = Color.White.copy(alpha = 0.65f),
+                            style = MaterialTheme.typography.labelSmall,
+                        )
+                    }
+                    Spacer(Modifier.width(8.dp))
+                    TextButton(
+                        onClick = {
+                            player.seekTo(0L)
+                            player.play()
+                            positionMs = 0L
+                            resumePromptMs = null
+                        },
+                    ) { Text("从头开始") }
+                }
+            }
+        }
 
         // ---- 模块 B：播放列表抽屉（右侧滑出，约 35% 宽，暗色半透明）----
         // 遮罩：点列表外区域收起

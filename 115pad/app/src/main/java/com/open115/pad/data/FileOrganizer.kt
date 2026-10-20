@@ -349,7 +349,8 @@ class FileOrganizer(
     }
 
     companion object {
-        private const val PAGE_SIZE = 200
+        /** 与 [LIST_PAGE_SIZE] 同源（115 一页的上限 = 1150，实测）；本类的封顶另由 MAX_ITEMS_PER_DIR 管 */
+        private const val PAGE_SIZE = LIST_PAGE_SIZE
         private const val MAX_ITEMS_PER_DIR = 20_000
         private const val MOVE_BATCH = 50
 

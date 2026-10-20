@@ -65,10 +65,13 @@ import androidx.compose.material.icons.outlined.Search
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import com.open115.pad.data.media.MediaPrefs
+import com.open115.pad.data.media.NfoMeta
 import com.open115.pad.data.media.scrape.MetadataScraper
 import com.open115.pad.data.media.scrape.ScrapeCandidate
 import com.open115.pad.data.media.scrape.ScrapeKind
 import com.open115.pad.data.media.scrape.ScrapePlan
+import com.open115.pad.data.media.scrape.ScrapedActor
+import com.open115.pad.data.media.scrape.ScrapedMetadata
 
 /** 「搜完自动刮第一条」的无操作等待时长（开了设置才生效） */
 private const val AUTO_SCRAPE_DELAY_MS = 5_000L
@@ -184,6 +187,8 @@ private fun CandidateRow(
 @Composable
 fun MediaScrapeDialog(
     plan: ScrapePlan,
+    /** 现有 nfo 的解析结果（详情页传）：手动编辑用它预填表单；文件页拿不到时为 null */
+    prefill: NfoMeta? = null,
     scraper: MetadataScraper,
     aiClient: com.open115.pad.data.media.scrape.AiQueryClient,
     mediaPrefs: com.open115.pad.data.media.MediaPrefs,
@@ -198,6 +203,13 @@ fun MediaScrapeDialog(
     var userInteracted by remember(plan.key) { mutableStateOf(false) }
     // 单片入口默认带剧照（批量那条在确认框里默认关）
     var withStills by remember { mutableStateOf(true) }
+    // 补充模式（默认开）：只补现有 nfo 缺的字段与缺失的图片，不覆盖已有内容
+    var supplement by remember { mutableStateOf(true) }
+    // 手动编辑视图：把搜索/候选那套换成表单（只写 nfo，不动图片）。
+    // 已有 nfo 但没有解析结果时不给入口：表单会是空的，保存等于把原有字段清掉。
+    // 文件页拿不到 nfoJson，这种情况请从媒体库详情页进来编辑。
+    var manualMode by remember { mutableStateOf(false) }
+    val canManualEdit = prefill != null || plan.oldNfoFid.isNullOrBlank()
     // 剧集：默认带分集（每集真名/简介/首播）；电影不显示这个勾选
     var withEpisodes by remember { mutableStateOf(true) }
     var aiWorking by remember { mutableStateOf(false) }
@@ -228,7 +240,7 @@ fun MediaScrapeDialog(
     // 开了「自动刮第一条」：搜出结果后 5 秒没手动选，就选第一条直接写回。
     // 只在对话框开着时计时（关框 → 组合离开 → 自动取消，挂后台搜索不会自动落笔）；
     // userInteracted 进 key：用户一点候选/点写入，这个 effect 立即重启并因条件不满足而退出。
-    LaunchedEffect(autoFirst, mine?.finishedAt, userInteracted) {
+    LaunchedEffect(autoFirst, mine?.finishedAt, userInteracted, supplement) {
         if (!autoFirst || userInteracted) return@LaunchedEffect
         val s = mine ?: return@LaunchedEffect
         if (s.running || s.error != null || s.results.isEmpty()) return@LaunchedEffect
@@ -238,7 +250,7 @@ fun MediaScrapeDialog(
         val cand = s.results.firstOrNull() ?: return@LaunchedEffect
         picked = cand
         userInteracted = true
-        scraper.startWrite(plan = plan, candidate = cand, withStills = withStills, withEpisodes = withEpisodes)
+        scraper.startWrite(plan = plan, candidate = cand, withStills = withStills, withEpisodes = withEpisodes, supplement = supplement)
     }
 
     // 源切换：这里选的源就是全局"当前源"（刮削/批量都用它），切了立即刷新注册表生效
@@ -316,6 +328,15 @@ fun MediaScrapeDialog(
             modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp),
         ) {
             Column(Modifier.padding(16.dp)) {
+                if (manualMode) {
+                    ManualEditForm(
+                        plan = plan,
+                        prefill = prefill,
+                        picked = picked,
+                        scraper = scraper,
+                        onBack = { manualMode = false },
+                    )
+                } else {
                 val isTv = plan.kind == ScrapeKind.TV
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text("刮削元数据${if (isTv) " · 剧集" else ""}", fontWeight = FontWeight.SemiBold, fontSize = 16.sp, modifier = Modifier.weight(1f))
@@ -367,6 +388,22 @@ fun MediaScrapeDialog(
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     Checkbox(
+                        checked = supplement,
+                        enabled = !writing,
+                        onCheckedChange = { supplement = it },
+                    )
+                    Text(
+                        "补充模式：只补现有 nfo 缺的字段和没有的图片，不覆盖已有内容",
+                        fontSize = 12.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.weight(1f),
+                    )
+                }
+                Row(
+                    Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Checkbox(
                         checked = withStills,
                         enabled = !writing,
                         onCheckedChange = { withStills = it },
@@ -396,9 +433,20 @@ fun MediaScrapeDialog(
                         )
                     }
                 }
-                plan.overwriteNote?.let { note ->
-                    Spacer(Modifier.height(6.dp))
-                    Text(note, fontSize = 12.sp, color = MaterialTheme.colorScheme.error)
+                if (supplement) {
+                    if (plan.overwriteNote != null) {
+                        Spacer(Modifier.height(6.dp))
+                        Text(
+                            "这个目录已经有 nfo：补充模式会保留它现有的字段，只补缺的部分；已有的海报/背景/剧照也不会覆盖。",
+                            fontSize = 12.sp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                } else {
+                    plan.overwriteNote?.let { note ->
+                        Spacer(Modifier.height(6.dp))
+                        Text(note, fontSize = 12.sp, color = MaterialTheme.colorScheme.error)
+                    }
                 }
                 if (!plan.inLibrary) {
                     Spacer(Modifier.height(6.dp))
@@ -503,8 +551,16 @@ fun MediaScrapeDialog(
                             color = MaterialTheme.colorScheme.error,
                             fontSize = 13.sp,
                         )
+                        finished?.changed == false -> Text(
+                            "没有需要补充的内容（现有 nfo / 图片都已齐全）。",
+                            fontSize = 13.sp,
+                        )
                         finished?.wroteNfo == true -> Column {
-                            Text("已写入云端并排入重扫。", fontSize = 13.sp)
+                            Text(
+                                if (finished.addedFields > 0) "已补齐 nfo 缺的 ${finished.addedFields} 项，并排入重扫。"
+                                else "已写入云端并排入重扫。",
+                                fontSize = 13.sp,
+                            )
                             val wrote = buildList {
                                 if (finished.wrotePoster) add("海报")
                                 if (finished.wroteFanart) add("背景图")
@@ -523,6 +579,11 @@ fun MediaScrapeDialog(
 
                 Spacer(Modifier.height(14.dp))
                 Row(horizontalArrangement = Arrangement.End, modifier = Modifier.fillMaxWidth()) {
+                    // 手动编辑：不依赖搜索/候选，自己填字段写回 nfo
+                    if (!writing && !searching && canManualEdit) {
+                        TextButton(onClick = { manualMode = true }) { Text("手动编辑") }
+                        Spacer(Modifier.weight(1f))
+                    }
                     // 写回中/搜索中都给"后台"挡：关掉框、任务照跑（红点跟进度，跑完弹提示），不清状态；
                     // 写回的那条是原有行为，搜索这条是新增（慢源不必守着对话框等）
                     if (writing) {
@@ -533,7 +594,9 @@ fun MediaScrapeDialog(
                         Spacer(Modifier.width(8.dp))
                     } else {
                         // 关掉时顺手清掉这一轮（搜索/写入）的已完成状态：下次打开不该看到上一轮的结果
-                        TextButton(onClick = { closeDialog() }) { Text(if (finished?.wroteNfo == true) "完成" else "取消") }
+                        TextButton(onClick = { closeDialog() }) {
+                            Text(if (finished?.changed == false || finished?.wroteNfo == true) "完成" else "取消")
+                        }
                         Spacer(Modifier.width(8.dp))
                     }
                     Button(
@@ -543,18 +606,197 @@ fun MediaScrapeDialog(
                             userInteracted = true
                             // 候选已经选定，这一轮的搜索没用了：带旧错误行的一并清掉，别写在进度上面看着像失败
                             if (mine?.error != null) scraper.clearSearch()
-                            scraper.startWrite(plan = plan, candidate = cand, withStills = withStills, withEpisodes = withEpisodes)
+                            scraper.startWrite(
+                                plan = plan, candidate = cand,
+                                withStills = withStills, withEpisodes = withEpisodes,
+                                supplement = supplement,
+                            )
                         },
-                    ) { Text("写入云端") }
+                    ) { Text(if (supplement) "补充写入" else "覆盖写入") }
                 }
+                } // else（手动编辑 / 搜索视图）
             }
         }
     }
 }
 
 /**
- * 批量复核面板：搜索进度 → 逐条勾选（可换候选）→ 写入进度 → 汇总。
+ * 手动编辑的表单字段（顺序即界面顺序）。
  *
+ * 只列**写回 nfo 时需要人改的字段**：votes/sorttitle/outline/tag 等要么不参与展示，
+ * 要么由扫描器自己补；把它们放进表单只会让页面更长。海报/背景/剧照不在这里改。
+ */
+private enum class ManualField(val label: String, val multiline: Boolean = false, val hint: String = "") {
+    TITLE("标题"),
+    ORIGINAL_TITLE("原名"),
+    YEAR("年份"),
+    RATING("评分（0-10）"),
+    RUNTIME("时长（分钟）"),
+    PREMIERED("首映日期", hint = "yyyy-MM-dd"),
+    CONTENT_RATING("分级"),
+    TAGLINE("标语"),
+    PLOT("简介", multiline = true),
+    GENRES("类型", hint = "逗号分隔"),
+    COUNTRIES("国家", hint = "逗号分隔"),
+    LANGUAGES("语言", hint = "逗号分隔"),
+    STUDIOS("制片公司", hint = "逗号分隔"),
+    DIRECTORS("导演", hint = "逗号分隔"),
+    WRITERS("编剧", hint = "逗号分隔"),
+    ACTORS("演员", multiline = true, hint = "每行一个：名字|角色"),
+    TMDB_ID("TMDB ID"),
+    IMDB_ID("IMDb ID"),
+    SET("合集"),
+    TRAILER("预告片 URL"),
+}
+
+/** 表单初值：优先现有 nfo（详情页传进来的），否则退到计划标题/年份 + 已选候选 */
+private fun manualInitialValues(plan: ScrapePlan, prefill: NfoMeta?, cand: ScrapeCandidate?): List<String> {
+    fun ratingText(v: Double?) = v?.let { String.format(java.util.Locale.US, "%.1f", it) }.orEmpty()
+    if (prefill != null) return listOf(
+        prefill.title ?: plan.title,
+        prefill.originalTitle.orEmpty(),
+        prefill.year?.toString() ?: plan.year?.toString().orEmpty(),
+        ratingText(prefill.rating),
+        prefill.runtimeMinutes?.toString().orEmpty(),
+        prefill.premiered.orEmpty(),
+        prefill.contentRating.orEmpty(),
+        prefill.tagline.orEmpty(),
+        prefill.plot.orEmpty(),
+        prefill.genres.joinToString("，"),
+        prefill.countries.joinToString("，"),
+        prefill.languages.joinToString("，"),
+        prefill.studios.joinToString("，"),
+        prefill.directors.joinToString("，"),
+        prefill.writers.joinToString("，"),
+        prefill.actorPairs.joinToString("\n") { (n, r) -> if (r.isBlank()) n else "$n|$r" },
+        prefill.uniqueTmdbid.orEmpty(),
+        prefill.imdbId.orEmpty(),
+        prefill.set.orEmpty(),
+        prefill.trailer.orEmpty(),
+    )
+    return listOf(
+        cand?.title?.takeIf { it.isNotBlank() } ?: plan.title,
+        cand?.originalTitle.orEmpty(),
+        (cand?.year ?: plan.year)?.toString().orEmpty(),
+        ratingText(cand?.rating),
+        "", "", "", "",
+        cand?.overview.orEmpty(),
+        "", "", "", "", "", "", "",
+        "", "", "", "",
+    )
+}
+
+private fun splitManualList(raw: String): List<String> =
+    raw.split(',', '，', '/', '、', ';', '；', '\n').map { it.trim() }.filter { it.isNotEmpty() }
+
+private fun parseManualActors(raw: String): List<ScrapedActor> = raw.lines().mapNotNull { line ->
+    val s = line.trim()
+    if (s.isEmpty()) return@mapNotNull null
+    val parts = s.split('|', '｜', limit = 2)
+    val name = parts[0].trim()
+    if (name.isEmpty()) null
+    else ScrapedActor(name, parts.getOrNull(1)?.trim()?.takeIf { it.isNotEmpty() })
+}
+
+private fun buildManualMeta(plan: ScrapePlan, values: List<String>): ScrapedMetadata {
+    fun at(f: ManualField) = values.getOrElse(f.ordinal) { "" }.trim()
+    return ScrapedMetadata(
+        sourceId = "manual",
+        sourceKey = "manual",
+        kind = plan.kind,
+        title = at(ManualField.TITLE).ifBlank { plan.title },
+        originalTitle = at(ManualField.ORIGINAL_TITLE).ifBlank { null },
+        year = at(ManualField.YEAR).toIntOrNull(),
+        rating = at(ManualField.RATING).toDoubleOrNull()?.coerceIn(0.0, 10.0),
+        runtimeMinutes = at(ManualField.RUNTIME).toIntOrNull()?.takeIf { it > 0 },
+        premiered = at(ManualField.PREMIERED).ifBlank { null },
+        contentRating = at(ManualField.CONTENT_RATING).ifBlank { null },
+        tagline = at(ManualField.TAGLINE).ifBlank { null },
+        plot = at(ManualField.PLOT).ifBlank { null },
+        genres = splitManualList(at(ManualField.GENRES)),
+        countries = splitManualList(at(ManualField.COUNTRIES)),
+        languages = splitManualList(at(ManualField.LANGUAGES)),
+        studios = splitManualList(at(ManualField.STUDIOS)),
+        directors = splitManualList(at(ManualField.DIRECTORS)),
+        writers = splitManualList(at(ManualField.WRITERS)),
+        actors = parseManualActors(at(ManualField.ACTORS)),
+        tmdbId = at(ManualField.TMDB_ID).ifBlank { null },
+        imdbId = at(ManualField.IMDB_ID).ifBlank { null },
+        set = at(ManualField.SET).ifBlank { null },
+        trailer = at(ManualField.TRAILER).ifBlank { null },
+    )
+}
+
+/**
+ * 手动编辑视图：表单预填现有 nfo（没有就从片名/候选起步），保存时只写 nfo。
+ *
+ * 与"刮削"的分工：这里不搜源、不选候选、不动图片；适合"源码里没有 / 刮到的标题是错的 /
+ * 想把简介换成自己写的那段"这类场景。
+ */
+@Composable
+private fun ManualEditForm(
+    plan: ScrapePlan,
+    prefill: NfoMeta?,
+    picked: ScrapeCandidate?,
+    scraper: MetadataScraper,
+    onBack: () -> Unit,
+) {
+    val initial = remember(plan.key, prefill, picked?.id) { manualInitialValues(plan, prefill, picked) }
+    val values = remember(initial) { androidx.compose.runtime.mutableStateListOf(*initial.toTypedArray()) }
+    val writeState by scraper.writeState.collectAsState()
+    val mine = writeState?.takeIf { it.key == plan.key }
+    val writing = mine?.running == true
+    val finished = mine?.takeIf { !it.running }
+
+    Column(Modifier.fillMaxWidth().heightIn(max = 540.dp).verticalScroll(rememberScrollState())) {
+        Text("手动编辑元数据", fontWeight = FontWeight.SemiBold, fontSize = 16.sp)
+        Spacer(Modifier.height(2.dp))
+        Text(
+            "只更新 nfo（标题/简介/演员等），不动海报/背景/剧照；表单里没有的原 nfo 标签会保留。",
+            fontSize = 12.sp,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Spacer(Modifier.height(10.dp))
+        ManualField.values().forEach { f ->
+            OutlinedTextField(
+                value = values.getOrElse(f.ordinal) { "" },
+                onValueChange = { if (f.ordinal < values.size) values[f.ordinal] = it },
+                label = { Text(f.label, fontSize = 12.sp) },
+                placeholder = if (f.hint.isNotBlank()) {
+                    { Text(f.hint, fontSize = 12.sp) }
+                } else null,
+                singleLine = !f.multiline,
+                minLines = if (f.multiline) 3 else 1,
+                enabled = !writing,
+                modifier = Modifier.fillMaxWidth().padding(vertical = 3.dp),
+            )
+        }
+        if (writing) {
+            Spacer(Modifier.height(8.dp))
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
+                Spacer(Modifier.width(10.dp))
+                Text(mine?.step ?: "保存中…", fontSize = 13.sp)
+            }
+        }
+        finished?.error?.let {
+            Spacer(Modifier.height(8.dp))
+            Text("保存失败：$it", color = MaterialTheme.colorScheme.error, fontSize = 13.sp)
+        }
+        Spacer(Modifier.height(12.dp))
+        Row(horizontalArrangement = Arrangement.End, modifier = Modifier.fillMaxWidth()) {
+            TextButton(onClick = onBack, enabled = !writing) { Text("返回") }
+            Spacer(Modifier.width(8.dp))
+            Button(
+                enabled = !writing,
+                onClick = { scraper.startWriteManual(plan, buildManualMeta(plan, values.toList())) },
+            ) { Text("保存到云端") }
+        }
+    }
+}
+
+/**
+ * 批量复核面板：搜索进度 → 逐条勾选（可换候选）→ 写入进度 → 汇总。
  * 面板本身不持有任务：数据都在 [MetadataScraper.session] 里 —— 切页回来它还在，
  * 所以这里只负责"画出来 + 把用户动作转给 scraper"。
  */
@@ -607,8 +849,16 @@ fun ScrapeBatchPanel(scraper: MetadataScraper, onClose: () -> Unit) {
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
             )
-            // 改名方式在多选进入刮削前就已选定（文件页的设置弹框），这里只读显示
-            if (s.renameToClean) {
+            // 改名方式在多选进入刮削前就已选定（文件页的设置弹框），这里只读显示。
+            // 补充模式不改文件名、不动已有文件，优先展示这条口径。
+            if (s.supplement) {
+                Text(
+                    "补充模式：只补缺失的字段 / 图片，不覆盖已有内容",
+                    fontSize = 12.sp,
+                    color = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.padding(horizontal = 12.dp),
+                )
+            } else if (s.renameToClean) {
                 Text(
                     "写回时会把文件按规范名重命名",
                     fontSize = 12.sp,

@@ -15,8 +15,8 @@ android {
         minSdk = 26
         targetSdk = 35
         // 这里的版本号 = **最近一次发布的版本**（发版提交在 release 线上做，见 tools/release_notes）
-        versionCode = 7
-        versionName = "0.7.0"
+        versionCode = 8
+        versionName = "0.7.5"
     }
 
     signingConfigs {
@@ -27,7 +27,7 @@ android {
             isMinifyEnabled = false
             signingConfig = signingConfigs.getByName("debug")
         }
-        // 从源码直接装的 debug 包在「关于」里带 -dev 后缀（0.7.0-dev）：master 的版本号只在
+        // 从源码直接装的 debug 包在「关于」里带 -dev 后缀（0.7.5-dev）：master 的版本号只在
         // 发版时前进，不加后缀的话"开发版"和"已发布的同名版本"在界面上完全分不出来，
         // 装机后看着像"没更新"。发布用的包在 release 线上构建、不受这里影响。
         debug {

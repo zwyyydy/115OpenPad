@@ -6,7 +6,10 @@ import com.open115.pad.data.OpenApi
 import com.open115.pad.data.envMsg
 import com.open115.pad.data.envOk
 import com.open115.pad.data.VideoPreviewStore
-import com.open115.pad.data.parseFilesResponse
+import com.open115.pad.data.listDirPaged
+import com.open115.pad.player.PlayerCache
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import java.io.File
 
 private const val TAG = "MovieDeleter"
@@ -156,6 +159,14 @@ suspend fun deleteMovie(
     if (alsoCloud) {
         val n = videoPreviews?.deleteFor(files.mapNotNull { it.videoPickCode }) ?: 0
         if (n > 0) Log.i(TAG, "清掉 ${files.size} 部片的预览图缓存：$n 个文件")
+        // 播放缓存：直链档按 pick_code 精确清；转码档分片 key 是文件 sha1，媒体库行里没存，
+        // 这里只清得到直链那份，分片留给上限淘汰。
+        runCatching {
+            val freed = withContext(Dispatchers.IO) {
+                PlayerCache.purge(files.mapNotNull { it.videoPickCode })
+            }
+            if (freed > 0) Log.i(TAG, "清掉这些片的播放缓存 ${freed / 1024 / 1024}MB")
+        }.onFailure { Log.w(TAG, "清播放缓存失败：${it.message}") }
     }
     // 头像文件真删掉了的那些演员，引用也要清（不然详情页拿着一个不存在的文件反复解析直链）。
     // 只在**云端真的删了**时清：只删本地索引时云端文件还在，引用留着下次还能用。
@@ -186,7 +197,7 @@ private suspend fun imageIdsInDir(
     onlyPickCodes: Set<String> = emptySet(),
     exceptPickCodes: Set<String> = emptySet(),
 ): List<String> {
-    val page = runCatching { parseFilesResponse(api.files(cid = dirCid, limit = 500)) }.getOrNull()
+    val page = runCatching { listDirPaged(api, dirCid) }.getOrNull()
         ?: return emptyList()
     return page.items.filter { !it.isDir && isArtImageFile(it.fn) }
         .filter { shouldDeleteImage(it.pc.orEmpty(), onlyPickCodes, exceptPickCodes) }
@@ -230,7 +241,7 @@ private suspend fun sweepOrphanArt(
 ) {
     for (cid in dirKeys) {
         if (dao.rowsInDir(cid) > 0) continue
-        val page = runCatching { parseFilesResponse(api.files(cid = cid, limit = 500)) }.getOrNull()
+        val page = runCatching { listDirPaged(api, cid) }.getOrNull()
             ?: continue
         val ids = page.items
             .filter { it.fc != 0 && isArtImageFile(it.fn) }
@@ -289,7 +300,7 @@ private suspend fun resolveMissingFids(
     val out = mutableMapOf<String, String>()
     for ((cid, pcs) in missing.groupBy({ it.first }, { it.second })) {
         val wanted = pcs.toSet()
-        val page = runCatching { parseFilesResponse(api.files(cid = cid, limit = 500)) }.getOrNull()
+        val page = runCatching { listDirPaged(api, cid) }.getOrNull()
             ?: continue
         for (item in page.items) {
             val pc = item.pc ?: continue

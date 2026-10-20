@@ -41,6 +41,9 @@ object Uploader {
 
     private const val TAG = "OSSUploader"
 
+    /** ≤ 该阈值走一次性 PUT，超过走分片上传。调用方与断点续传分流共用这一个值 */
+    const val SMALL_UPLOAD_LIMIT = 32L * 1024 * 1024
+
     data class UploadResult(
         val fileId: String,
         val pickCode: String,
@@ -62,12 +65,13 @@ object Uploader {
         bytes: ByteArray,
         targetCid: String,
         targetName: String?,
+        uri: String? = null,
     ): UploadResult {
-        val id = log.beginUpload(fileName, bytes.size.toLong(), targetCid, targetName)
+        val id = log.beginUpload(fileName, bytes.size.toLong(), targetCid, targetName, uri)
         currentCoroutineContext()[Job]?.let { log.registerJob(id, it) }
         return try {
             // 并发闸：超限排队等许可（传输中心显示「排队中」）。排队中取消走下面
-            // catch 清记录——小文件没有会话/进度可保留，语义与上传中取消一致
+            // catch 分类：有 uri 的记暂停，没 uri 的（刮削/字幕等内存上传）清记录
             log.acquireUploadSlot(id)
             try {
                 val r = uploadSmall(api, fileName, bytes, target = "U_1_$targetCid")
@@ -77,11 +81,56 @@ object Uploader {
                 log.releaseUploadSlot()
             }
         } catch (e: Exception) {
-            // 小文件没有可续传的会话，取消（用户/外部）直接清记录，不留「已取消」尸体；
+            // 一次性 PUT 没有分片会话，但小文件从头再传代价很小：先把记录留住
+            // （paused），等用户点「继续」重新读 uri 上传；取消才清记录。
             // 协程已取消，落库必须包 NonCancellable，否则 DataStore edit 被取消打断
             if (e is kotlinx.coroutines.CancellationException) {
-                withContext(kotlinx.coroutines.NonCancellable) { log.removeUpload(id) }
+                withContext(kotlinx.coroutines.NonCancellable) {
+                    when {
+                        log.consumeCancelRequest(id) -> log.removeUpload(id)
+                        uri != null -> log.pauseUpload(id)
+                        else -> log.removeUpload(id)
+                    }
+                }
             } else log.finishUpload(id, ok = false, error = e.message)
+            throw e
+        }
+    }
+
+    /**
+     * 继续/重启后恢复一条小文件上传：一次性 PUT 无法断点，直接按落库的 uri
+     * 重新读文件从头传（≤32MB，代价可接受）。记录 id 沿用，传输中心里是同一条。
+     */
+    suspend fun resumeSmallLogged(
+        log: TransferLog,
+        api: OpenApi,
+        rec: UploadRecord,
+        bytes: ByteArray,
+    ): UploadResult {
+        if (bytes.size.toLong() != rec.size) {
+            error("文件大小与中断记录不一致（${bytes.size} ≠ ${rec.size}），放弃续传")
+        }
+        currentCoroutineContext()[Job]?.let { log.registerJob(rec.id, it) }
+        return try {
+            log.acquireUploadSlot(rec.id)
+            try {
+                log.updateUploadProgress(rec.id, 0)
+                val r = uploadSmall(api, rec.name, bytes, target = "U_1_${rec.targetCid}")
+                log.finishUpload(rec.id, ok = true, reused = r.reused)
+                r
+            } finally {
+                log.releaseUploadSlot()
+            }
+        } catch (e: Exception) {
+            if (e is kotlinx.coroutines.CancellationException) {
+                withContext(kotlinx.coroutines.NonCancellable) {
+                    when {
+                        log.consumeCancelRequest(rec.id) -> log.removeUpload(rec.id)
+                        rec.uri != null -> log.pauseUpload(rec.id)
+                        else -> log.removeUpload(rec.id)
+                    }
+                }
+            } else log.finishUpload(rec.id, ok = false, error = e.message)
             throw e
         }
     }
@@ -208,7 +257,17 @@ object Uploader {
                 conn.setRequestProperty("x-oss-callback", cbB64)
                 conn.setRequestProperty("x-oss-callback-var", cbvB64)
                 conn.setFixedLengthStreamingMode(bytes.size)
-                conn.outputStream.use { it.write(bytes) }
+                // 分块写出并在块间检查协程取消：一次性 write(bytes) 要等整包发完才返回，
+                // 暂停一个大一点的小文件时会迟迟停不下来
+                conn.outputStream.use { out ->
+                    var off = 0
+                    while (off < bytes.size) {
+                        currentCoroutineContext().ensureActive()
+                        val n = minOf(64 * 1024, bytes.size - off)
+                        out.write(bytes, off, n)
+                        off += n
+                    }
+                }
                 val code = conn.responseCode
                 val body = (if (code in 200..299) conn.inputStream else conn.errorStream)
                     ?.bufferedReader()?.use { it.readText() } ?: ""
@@ -223,6 +282,8 @@ object Uploader {
                 }
                 error("OSS 上传失败 HTTP $code：${body.take(200)}")
             } catch (e: Exception) {
+                // 暂停/取消靠协程取消，不能当成"换 http 再试一次"
+                if (e is kotlinx.coroutines.CancellationException) throw e
                 lastError = e
             }
         }

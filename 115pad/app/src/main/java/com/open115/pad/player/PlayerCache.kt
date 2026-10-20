@@ -158,24 +158,33 @@ object PlayerCache {
         return (fileSize * DYNAMIC_RATIO).toLong().coerceIn(min, max)
     }
 
-    /** 当前占用的字节数（缓存自己维护的计数，比扫目录快） */
-    internal fun spaceBytes(): Long = instance?.cacheSpace ?: 0L
-
     /**
-     * 缓存里"最近被用过"的时刻（[prefix] 非空时只看这些 key，即某一部片）。
-     * 用来判断"现在这部片是不是就是缓存里最近在看的那部"——是就别动它。
+     * 删掉这些视频在本机的播放缓存。云端文件被删掉（回收站 / 彻底删除）时调用，
+     * 别让已经没人引用的内容白占空间。
+     *
+     * 只清**直链档**（原盘 / 原画原始文件）：key = `115file:<pick_code>`，一份文件一个 key，
+     * 删得精确。转码档（HLS）的分片是按内容 sha1 寻址的 —— 同一份内容可能还有别的副本在用，
+     * 删一个文件就按 sha1 清会连带抹掉仍在用的那份，所以分片一律留给上限淘汰。
+     *
+     * 只动**已经初始化过**的缓存实例：播放器没在本进程打开过就不存在实例，此时连缓存索引
+     * 都没打开，不为了删几个 key 新建一份（空间由上限兜底）。
+     *
+     * @return 释放的字节数（0 = 没有实例 / 没命中 / 参数全空）
      */
-    internal fun newestTouchOf(prefix: String?): Long {
+    fun purge(pickCodes: Collection<String>): Long {
         val c = instance ?: return 0L
-        var newest = 0L
-        for (key in c.keys) {
-            if (prefix != null && !key.startsWith(prefix)) continue
-            val spans = c.getCachedSpans(key)
-            if (spans.isEmpty()) continue
-            val t = spans.maxOf { it.lastTouchTimestamp }
-            if (t > newest) newest = t
+        val fileKeys = pickCodes.mapNotNullTo(HashSet()) {
+            it.takeIf(String::isNotBlank)?.let(::fileKey)
         }
-        return newest
+        if (fileKeys.isEmpty()) return 0L
+        var freed = 0L
+        // keys 是快照（toList）：边遍历边 removeResource 时不依赖它返回集合的迭代行为
+        for (key in c.keys.toList()) {
+            if (key !in fileKeys) continue
+            freed += c.getCachedSpans(key).sumOf { it.length }
+            c.removeResource(key)
+        }
+        return freed
     }
 
     /**
@@ -193,9 +202,12 @@ object PlayerCache {
      */
     internal fun evictOldestExcept(keepKeyPrefix: String?, targetBytes: Long): Pair<Int, Long> {
         val c = instance ?: return 0 to 0L
+        // null 不是"没有要保护的"，而是"认不出哪一份是当前这部片" —— 照删会把正在播的
+        // 那部一起清掉（见 PrefetchPlan.keepKeyPrefix 的约定），所以一个都不动。
+        if (keepKeyPrefix == null) return 0 to 0L
         val victims = ArrayList<Triple<String, Long, Long>>()   // key, 字节, 最近访问时间
         for (key in c.keys) {
-            if (keepKeyPrefix != null && key.startsWith(keepKeyPrefix)) continue
+            if (key.startsWith(keepKeyPrefix)) continue
             val spans = c.getCachedSpans(key)
             if (spans.isEmpty()) continue
             victims += Triple(key, spans.sumOf { it.length }, spans.maxOf { it.lastTouchTimestamp })
