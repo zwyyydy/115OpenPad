@@ -1,6 +1,7 @@
 package com.open115.pad.ui.files
 
-import android.util.Log
+import com.open115.pad.ui.theme.AppSwitch
+import com.open115.pad.util.AppLog as Log
 import android.widget.Toast
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateColorAsState
@@ -104,6 +105,8 @@ import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.open115.pad.appContainer
 import com.open115.pad.data.DirCache
+import com.open115.pad.data.purgeRecycleEntries
+import com.open115.pad.data.BtTask
 import com.open115.pad.data.CloudTorrent
 import com.open115.pad.data.FileItem
 import com.open115.pad.data.FilesPrefs
@@ -122,8 +125,11 @@ import com.open115.pad.data.PinnedPrefs
 import com.open115.pad.data.PathNode
 import com.open115.pad.data.PlaylistEntry
 import com.open115.pad.data.RecycleItem
+import com.open115.pad.data.SearchFilters
 import com.open115.pad.data.Uploader
 import com.open115.pad.data.VideoPreviewStore
+import com.open115.pad.cast.CastPickerOverlay
+import com.open115.pad.cast.startCastFrom
 import com.open115.pad.player.PlayerCache
 import com.open115.pad.data.resumeUploadRecord
 import com.open115.pad.data.uploadFolder
@@ -151,6 +157,7 @@ import com.open115.pad.ui.components.TextEntryDialog
 import com.open115.pad.ui.components.TextFileEditorDialog
 import com.open115.pad.ui.components.isAudioItem
 import com.open115.pad.ui.components.isImageItem
+import com.open115.pad.ui.offline.BtFileSelectDialog
 import com.open115.pad.ui.media.MediaScrapeDialog
 import com.open115.pad.ui.media.ScrapeBatchPanel
 import androidx.compose.ui.window.Dialog
@@ -242,6 +249,8 @@ class FilesViewModel(
      * 那几条路同样如此。未注入则不清，行为与从前一致。
      */
     private val videoPreviews: VideoPreviewStore? = null,
+    /** 搜索历史（未注入时搜索照常、只是不记） */
+    private val searchHistory: com.open115.pad.data.SearchHistory? = null,
 ) : ViewModel() {
 
     /** 目录栈的一层：目录 cid + 显示名（面包屑与"全部文件"用得上） */
@@ -270,6 +279,10 @@ class FilesViewModel(
         val starOnly: Boolean = false,
         val searching: Boolean = false,
         val searchQuery: String = "",
+        /** 搜索范围：true = 只搜当前目录（含子目录），false = 全盘 */
+        val searchInCurrent: Boolean = false,
+        /** 搜索时间范围：null = 不限；7/30/365 = 最近 N 天（服务端按 gte_day 过滤） */
+        val searchDays: Int? = null,
         /**
          * 非空 = 当前这层目录是从**这条搜索**的结果里点进来的（值是那次的关键词）。
          * 界面据此显示"回到结果"条；返回键/返回箭头也是同一个动作（见 [popDir]）。
@@ -324,6 +337,8 @@ class FilesViewModel(
         val count: Long,
         val query: String,
         val typeFilter: Int?,
+        val inCurrent: Boolean = false,
+        val days: Int? = null,
     )
 
     private var searchReturn: SearchReturn? = null
@@ -357,6 +372,10 @@ class FilesViewModel(
 
     private val _ui = MutableStateFlow(UiState())
     val ui = _ui.asStateFlow()
+
+    /** 最近搜索（搜索框下方的 chips 用；未注入时为空） */
+    val searchHistoryFlow: kotlinx.coroutines.flow.Flow<List<String>> =
+        searchHistory?.files ?: kotlinx.coroutines.flow.flowOf(emptyList())
 
     // ---- 高级过滤状态 ----
     private val _schemes = MutableStateFlow(emptyList<FilterRules.FilterScheme>())
@@ -531,6 +550,26 @@ class FilesViewModel(
     private fun cacheKey(s: UiState): String? =
         cache?.key(s.stack.last().cid, s.order, s.asc, s.typeFilter, s.starOnly)
 
+    /** 搜索结果的"视角"键：换筛选条件等于换了一份列表，滚动位置不能串 */
+    private fun searchDataKey(s: UiState): String = searchDataKey(
+        query = s.searchQuery,
+        inCurrent = s.searchInCurrent,
+        currentCid = s.stack.last().cid,
+        days = s.searchDays,
+        typeFilter = s.typeFilter,
+    )
+
+    private fun searchDataKey(
+        query: String,
+        inCurrent: Boolean,
+        currentCid: String,
+        days: Int?,
+        typeFilter: Int?,
+    ): String {
+        val scope = if (inCurrent) "dir:$currentCid" else "all"
+        return "search:$query:$scope:days=${days ?: 0}:type=${typeFilter ?: 0}"
+    }
+
     private fun load(offset: Int, more: Boolean, force: Boolean = false) {
         viewModelScope.launch {
             // 只读一次快照：缓存 key 与请求参数都取自它，保证两者永远指向同一个目录/同一组条件。
@@ -574,13 +613,26 @@ class FilesViewModel(
             }
             try {
                 if (s.searching) {
-                    val page = parseSearchResponse(api.search(s.searchQuery, offset = offset, type = s.typeFilter))
+                    // 时间范围必须成对传：实测只给 gte_day 服务端会静默忽略（见 SearchFilters）
+                    val days = s.searchDays?.let { SearchFilters.range(it) }
+                    val page = parseSearchResponse(
+                        api.search(
+                            keyword = s.searchQuery,
+                            offset = offset,
+                            type = s.typeFilter,
+                            // 目录范围：只传当前 cid；0/不传 = 全盘
+                            cid = if (s.searchInCurrent) s.stack.last().cid else null,
+                            gteDay = days?.first,
+                            lteDay = days?.second,
+                        )
+                    )
                     val mapped = page.data.map { it.toItem() }
                     _ui.update {
                         it.copy(
                             items = if (more) it.items + mapped else mapped,
                             count = page.count,
-                            dataKey = "search:" + s.searchQuery,
+                            // 不同筛选条件下的结果是不同的一份列表，滚动记忆要分开记
+                            dataKey = searchDataKey(s),
                         )
                     }
                 } else {
@@ -668,6 +720,8 @@ class FilesViewModel(
                     count = s.count,
                     query = s.searchQuery,
                     typeFilter = s.typeFilter,
+                    inCurrent = s.searchInCurrent,
+                    days = s.searchDays,
                 ),
             )
         } else {
@@ -726,6 +780,13 @@ class FilesViewModel(
         if (_ui.value.stack.size != r.enteredPath.size) return false
         pendingPathAdopt = null
         setSearchReturn(null)
+        val restoredKey = searchDataKey(
+            query = r.query,
+            inCurrent = r.inCurrent,
+            currentCid = r.stack.last().cid,
+            days = r.days,
+            typeFilter = r.typeFilter,
+        )
         _ui.update {
             it.copy(
                 stack = r.stack,
@@ -733,11 +794,13 @@ class FilesViewModel(
                 searching = true,
                 searchQuery = r.query,
                 typeFilter = r.typeFilter,
+                searchInCurrent = r.inCurrent,
+                searchDays = r.days,
                 items = r.items,
                 count = r.count,
                 error = null,
                 highlight = null,
-                dataKey = "search:" + r.query,
+                dataKey = restoredKey,
             )
         }
         return true
@@ -868,9 +931,16 @@ class FilesViewModel(
                 highlight = if (query.isNotBlank()) null else it.highlight,
             )
         }
+        if (query.isNotBlank()) {
+            viewModelScope.launch { searchHistory?.add(com.open115.pad.data.SearchHistory.Scope.FILES, query) }
+        }
         // 搜索不进缓存（key 为 null），这里用 loadCurrent 只是"不强制重取"，
         // 效果与刷新一致：真的会去请求
         loadCurrent()
+    }
+
+    fun clearSearchHistory() {
+        viewModelScope.launch { searchHistory?.clear(com.open115.pad.data.SearchHistory.Scope.FILES) }
     }
 
     fun exitSearch() {
@@ -880,6 +950,20 @@ class FilesViewModel(
         setSearchReturn(null)
         // 退出搜索回到目录浏览：大概率能命中缓存，回来即刻就有内容
         loadCurrent()
+    }
+
+    /** 搜索范围：当前目录 / 全盘。搜索中改条件 = 立刻按新条件重搜。 */
+    fun setSearchScope(inCurrent: Boolean) {
+        if (_ui.value.searchInCurrent == inCurrent) return
+        _ui.update { it.copy(searchInCurrent = inCurrent) }
+        if (_ui.value.searching) loadCurrent()
+    }
+
+    /** 搜索时间范围：null = 不限；7/30/365 天。搜索中改条件 = 立刻重搜。 */
+    fun setSearchDays(days: Int?) {
+        if (_ui.value.searchDays == days) return
+        _ui.update { it.copy(searchDays = days) }
+        if (_ui.value.searching) loadCurrent()
     }
 
     fun toggleSelect(id: String?) {
@@ -991,7 +1075,11 @@ class FilesViewModel(
         return if (names.size == 1) names[0] else "${names[0]} 等 ${names.size} 项"
     }
 
-    suspend fun deleteSelected(): String? {
+    /**
+     * 删除选中的条目。[alsoPurge] = 彻底删除：`ufile/delete` 只是进回收站（开放平台没有
+     * "直接删干净"的口子），进站之后再按名字把刚删的那批找出来 `rb/del` 掉（见 [purgeFromRecycle]）。
+     */
+    suspend fun deleteSelected(alsoPurge: Boolean = false): String? {
         val ids = _ui.value.selection.toList()
         if (ids.isEmpty()) return null
         val fromCid = currentCid()
@@ -999,13 +1087,14 @@ class FilesViewModel(
         // 删掉的是哪些条目：目录型的要在媒体库里**按路径整棵清**（见 CloudEdits.removedDirPaths）
         val curPath = currentCloudPath()
         val items = _ui.value.items.filter { it.fid in ids }
-        return runOp {
+        return runOp(onSuccess = if (alsoPurge) "已彻底删除 ${ids.size} 项" else null) {
             val resp = api.deleteFiles(ids.joinToString(","), parentId = fromCid)
             val ok = resp.envOk()
             if (ok) {
+                if (alsoPurge) purgeFromRecycle(fromCid, items.map { it.fn })
                 // 置顶的文件夹被删掉后，置顶记录已无意义——顺手清理，避免记录无限累积
                 pinnedPrefs?.unpinAll(ids)
-                opLog?.log(OpType.DELETE, selectionNames(ids), "移入回收站", fromCid, fromName)
+                opLog?.log(OpType.DELETE, selectionNames(ids), if (alsoPurge) "彻底删除" else "移入回收站", fromCid, fromName)
                 // 媒体库联动：删掉的东西在索引里得跟着消失（海报墙上不该再挂着它）。
                 // 父目录浅扫一遍 = 删的是**文件**时把那部片的行清掉；删的是**目录**时重扫够不着
                 // （库里按目录清、而它已经不在了），所以另把目录路径交出去按路径清。
@@ -1023,13 +1112,13 @@ class FilesViewModel(
                 if (pcs.isNotEmpty()) {
                     val n = withContext(Dispatchers.IO) { videoPreviews?.deleteFor(pcs) } ?: 0
                     if (n > 0) {
-                        android.util.Log.i("VPreview", "文件页删除：清掉 ${pcs.size} 个 pick_code 的预览图 $n 个文件")
+                        com.open115.pad.util.AppLog.i("VPreview", "文件页删除：清掉 ${pcs.size} 个 pick_code 的预览图 $n 个文件")
                     }
                     // 播放缓存：只清直链档（按 pick_code 一份文件一个 key）。转码分片按内容 sha1
                     // 共享，删一个文件清它可能连带抹掉仍在用的副本 → 留给上限淘汰
                     val freed = withContext(Dispatchers.IO) { PlayerCache.purge(pcs) }
                     if (freed > 0) {
-                        android.util.Log.i("PlayerCacheIO", "文件页删除：清掉播放缓存 ${freed / 1024 / 1024}MB")
+                        com.open115.pad.util.AppLog.i("PlayerCacheIO", "文件页删除：清掉播放缓存 ${freed / 1024 / 1024}MB")
                     }
                 }
                 clearSelection()
@@ -1037,6 +1126,17 @@ class FilesViewModel(
             }
             ok to (resp.envMsg() ?: "删除失败")
         }
+    }
+
+    /**
+     * 把刚删的一批从回收站里再彻底删掉（「彻底删除」的第二跳，[deleteSelected] 专用）。
+     *
+     * 匹配走共享助手 [purgeRecycleEntries]：原目录 cid + 删除时间窗（前 2 分钟起）+ 名字精确
+     * —— 同目录同名的**旧**回收条目绝不能顺手带走。失败模式是"留在回收站"，安全。
+     */
+    private suspend fun purgeFromRecycle(cid: String, names: List<String>) {
+        val since = System.currentTimeMillis() / 1000 - 120
+        purgeRecycleEntries(api, listOf(cid), since, names = names.toSet())
     }
 
     /**
@@ -1102,14 +1202,20 @@ class FilesViewModel(
                 // 目标目录的缓存脏了（多出这几条），但它不在当前视图里，只能显式失效。
                 // 先失效再 refresh：万一 toCid 就是当前目录，后面那次重取会把新数据重新写回去。
                 cache?.invalidateDir(toCid)
-                // 媒体库联动：**移入的目标**（多出来的片要入库 —— deep 递归，搬进来的可能是一整个
-                // 剧集目录）与**移出的源**（库里那几行得清掉）都可能落在库里，两边都报；
-                // 认不出来的一侧由媒体库侧跳过。目标只有 cid（选择器只给 cid + 名字），
-                // 它的完整路径由媒体库侧自己认
+                // 媒体库联动。★ 搬来的**每个目录逐个报**（deep=true：新内容要整棵索引），
+                // 目标目录只报**一层**（deep=false：它只是多了几行，列一层就够）——
+                // 早先把目标报成 deep=true，目标若是库根/演员目录，一次移动就是整棵子树
+                // 全列全重索引，"移一部片进来扫了几百个目录"就是这么来的（真机实测踩到）。
+                // 移动不改 fid，选中的目录项 id 就是它们在新位置的 cid；moved=true 是让媒体库侧
+                // 别信 scan_state 里的旧路径。目标只有 cid（选择器只给 cid + 名字），
+                // 它的完整路径由媒体库侧自己认；认不出来的一侧由媒体库侧跳过。
+                val movedDirCids = _ui.value.items
+                    .filter { it.isDir && it.fid in ids }
+                    .mapNotNull { it.fid }
                 onCloudEdits(
                     CloudEdits(
-                        dirs = listOf(
-                            ChangedDir(toCid, null, deep = true),
+                        dirs = movedDirCids.map { ChangedDir(it, moved = true) } + listOf(
+                            ChangedDir(toCid, null, deep = false),
                             ChangedDir(fromCid, fromPath, deep = false),
                         ),
                     ),
@@ -1134,7 +1240,10 @@ class FilesViewModel(
                 opLog?.log(OpType.COPY, selectionNames(ids), "复制到「$toName」", toCid, toName)
                 clearSelection()
                 cache?.invalidateDir(toCid)
-                // 媒体库联动：只有**目标**要重扫（复制不动源目录）。路径同上交给媒体库侧认
+                // 媒体库联动：只有**目标**要重扫（复制不动源目录）。路径同上交给媒体库侧认。
+                // ★ 这里只能整个目标 deep=true，与移动不一样：复制出来的条目是**新 fid**，
+                //   响应里拿不到，没法按副本逐个报 —— 只好把目标整棵交给扫描（复制用得少，
+                //   多扫这一下的代价可接受）
                 onCloudEdits(CloudEdits(dirs = listOf(ChangedDir(toCid, null, deep = true))))
                 // 复制不动源目录，所以只有"目标就是当前目录"（当场多出副本）时才需要重取；
                 // 其余情况这一跳请求是白花的，缓存机制顺手把它省掉
@@ -1350,12 +1459,24 @@ fun FilesScreen(
     var renameTarget by remember { mutableStateOf<FileItem?>(null) }
     var showDeleteConfirm by remember { mutableStateOf(false) }
     var moveMode by remember { mutableStateOf<String?>(null) }
+    /** 长按选中一个视频文件后从多选栏点「投屏」：先选设备（浮层在下面），选中即投 */
+    var castTarget by remember { mutableStateOf<FileItem?>(null) }
     var downloadTarget by remember { mutableStateOf<FileItem?>(null) }
     // ---- 云盘上的 .torrent：读回种子 → 显示内容 → 转磁力推进云下载 ----
     var torrentInfo by remember { mutableStateOf<Torrent.TorrentInfo?>(null) }
+    var torrentBytes by remember { mutableStateOf<ByteArray?>(null) }
     var torrentNote by remember { mutableStateOf<String?>(null) }
     var torrentReading by remember { mutableStateOf(false) }
     var torrentSubmitting by remember { mutableStateOf(false) }
+    // ---- BT 按文件勾选（offline/torrent → add_task_bt）----
+    var btParsed by remember { mutableStateOf<BtTask.Parsed?>(null) }
+    var btBusy by remember { mutableStateOf(false) }
+    var btError by remember { mutableStateOf<String?>(null) }
+    var btSha1 by remember { mutableStateOf("") }
+    var btPickCode by remember { mutableStateOf("") }
+    var btSavePath by remember { mutableStateOf("") }
+    var btSaveCid by remember { mutableStateOf("0") }
+    var btFileName by remember { mutableStateOf("") }
     // 种子画面的第三方预览（实验室「磁力预览」开关控制；关掉就一个请求都不发）
     val shotPreviewEnabled by context.appContainer.playerPrefs.labMagnetPreviewEnabled
         .collectAsState(initial = true)
@@ -1421,6 +1542,8 @@ fun FilesScreen(
             dirRemovals = appContainer.dirRemovals,
             // 删除的文件：预览图缓存跟着清（同主栏那份）
             videoPreviews = appContainer.videoPreviews,
+            // 搜索历史（与主栏共享同一份）
+            searchHistory = appContainer.searchHistory,
         )
     })
     // 右栏的 UI 状态：返回键分级处理在双栏时要拿它判断"活动栏"的层级深度/多选
@@ -1914,6 +2037,7 @@ fun FilesScreen(
                 onStar = { scope.launch { notify(vm.toggleStarItem(it)) } },
                 onScrape = { startScrape(it) },
                 onScrapeMany = { startScrapeMany(it) },
+                onCast = { castTarget = it },
                 onPin = { scope.launch { notify(vm.togglePins(it)) } },
                 onDownload = {
                     val files = ui.items.filter { it.fid in ui.selection && !it.isDir }
@@ -2002,6 +2126,7 @@ fun FilesScreen(
                 onStar = { scope.launch { notify(vm.toggleStarItem(it)) } },
                 onScrape = { startScrape(it) },
                 onScrapeMany = { startScrapeMany(it) },
+                onCast = { castTarget = it },
                 onPin = { scope.launch { notify(vm.togglePins(it)) } },
                 onDownload = {
                     val files = ui.items.filter { it.fid in ui.selection && !it.isDir }
@@ -2199,15 +2324,33 @@ fun FilesScreen(
         )
     }
     if (showDeleteConfirm) {
+        // 勾选状态跟着弹窗走：弹窗关掉（确认或取消）就重置，下次打开默认是普通删除
+        var deletePurge by remember(showDeleteConfirm) { mutableStateOf(false) }
         ConfirmDialog(
             title = "删除 ${ui.selection.size} 项",
             text = "文件将被移入回收站，可在回收站中还原。",
-            confirmText = "删除",
+            confirmText = if (deletePurge) "彻底删除" else "删除",
             onConfirm = {
                 showDeleteConfirm = false
-                scope.launch { notify(vm.deleteSelected()) }
+                scope.launch { notify(vm.deleteSelected(deletePurge)) }
             },
             onDismiss = { showDeleteConfirm = false },
+            extra = {
+                Row(
+                    Modifier
+                        .fillMaxWidth()
+                        .clickable { deletePurge = !deletePurge }
+                        .padding(vertical = 2.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Checkbox(checked = deletePurge, onCheckedChange = { deletePurge = it })
+                    Text(
+                        "同时彻底删除（并清掉回收站里对应的项，不可恢复）",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            },
         )
     }
     moveMode?.let { mode ->
@@ -2223,35 +2366,107 @@ fun FilesScreen(
             },
         )
     }
+    // 文件页直达投屏：设备选择用通用浮层，投的是这个文件的原始直链（与播放页同一条链路）
+    castTarget?.let { target ->
+        CastPickerOverlay(
+            http = context.appContainer.castHttpClient,
+            onDismiss = { castTarget = null },
+            onPicked = { device ->
+                val pc = target.pc
+                val name = target.fn
+                castTarget = null
+                if (pc.isNullOrBlank()) {
+                    notify("这个文件没有提取码，无法投屏")
+                } else {
+                    scope.launch {
+                        val err = startCastFrom(
+                            context = context,
+                            http = context.appContainer.castHttpClient,
+                            api = context.appContainer.openApi,
+                            device = device,
+                            pickCode = pc,
+                            title = name,
+                        )
+                        notify(err ?: "已投屏到 ${device.name} · 平板可退出（控制面板在播放页与通知里）")
+                    }
+                }
+            },
+        )
+    }
     // 点开 .torrent 就把种子读回来（几十 KB）：弹窗里先给出"含 N 个文件 · 多大"再让用户决定推不推，
     // 解析结果顺便留给「云下载」按钮提交，避免点一次读两遍。读不到也不挡「下载」。
     val torrentTarget = downloadTarget?.takeIf { it.fn.endsWith(".torrent", ignoreCase = true) }
     LaunchedEffect(torrentTarget?.fid) {
         val target = torrentTarget ?: return@LaunchedEffect
         torrentInfo = null
+        torrentBytes = null
         torrentNote = null
         torrentReading = true
+        btParsed = null
+        btError = null
         val pc = target.pc
         if (pc.isNullOrBlank()) {
             torrentNote = "该文件缺少提取码，读不到种子"
         } else {
             runCatching {
-                CloudTorrent.read(context.appContainer.okHttpClient, vm.getDownloadUrl(pc).getOrThrow())
-            }.onSuccess { torrentInfo = it }
-                .onFailure { torrentNote = it.message ?: "读取种子失败" }
+                val bytes = CloudTorrent.readBytes(
+                    context.appContainer.okHttpClient,
+                    vm.getDownloadUrl(pc).getOrThrow(),
+                )
+                bytes to Torrent.parse(bytes)
+            }.onSuccess { (bytes, info) ->
+                torrentBytes = bytes
+                torrentInfo = info
+            }.onFailure { torrentNote = it.message ?: "读取种子失败" }
         }
         torrentReading = false
     }
+
+    /** 老路径：转磁力链整包提交。云端解析失败时作为兜底入口。 */
+    val submitMagnet: (FileItem, Torrent.TorrentInfo) -> Unit = { item, info ->
+        val pc = item.pc
+        if (!pc.isNullOrBlank() && !torrentSubmitting) {
+            torrentSubmitting = true
+            torrentNote = null
+            scope.launch {
+                // 保存位置 = 种子所在的目录，推出来的东西就落在种子旁边
+                val cid = vm.currentTargetCid()
+                val err = context.appContainer.downloadSubmitter
+                    .submit(vm.api, Torrent.buildMagnet(info), cid)
+                torrentSubmitting = false
+                if (err == null) {
+                    val summary = "${info.name ?: item.fn}（${info.fileCount} 个文件 · " +
+                        "${Format.size(info.totalSize)}）"
+                    downloadTarget = null
+                    torrentInfo = null
+                    torrentBytes = null
+                    context.appContainer.opLog.log(
+                        OpType.OFFLINE,
+                        item.fn,
+                        "转磁力云离线 · ${info.fileCount} 个文件",
+                        cid,
+                        ui.stack.lastOrNull()?.name.orEmpty(),
+                    )
+                    notify("已提交云下载：$summary")
+                } else {
+                    // 提交失败留在弹窗里（snackbar 一闪就没了，这里用户还要改主意）
+                    torrentNote = err
+                }
+            }
+        }
+    }
+
     downloadTarget?.let { item ->
         val isTorrent = item.fn.endsWith(".torrent", ignoreCase = true)
         val info = torrentInfo
         DownloadDialog(
             name = item.fn,
             sizeText = "大小：${Format.size(item.fs)}",
-            extraLabel = if (isTorrent) (if (torrentSubmitting) "提交中…" else "云下载") else null,
-            extraEnabled = isTorrent && info != null && !torrentReading && !torrentSubmitting,
+            extraLabel = if (isTorrent) (if (btBusy) "准备中…" else "云下载") else null,
+            extraEnabled = isTorrent && info != null && !torrentReading && !btBusy && !torrentSubmitting,
             extraNote = if (!isTorrent) null else when {
                 torrentReading -> "正在读取种子…"
+                btError != null -> btError
                 torrentNote != null -> torrentNote
                 // 推之前先看内容：文件数/总大小直接来自种子，不经过任何第三方
                 info != null -> "含 ${info.fileCount} 个文件 · ${Format.size(info.totalSize)}" +
@@ -2261,31 +2476,29 @@ fun FilesScreen(
             },
             onExtra = {
                 val pc = item.pc
-                if (!pc.isNullOrBlank() && info != null && !torrentSubmitting) {
-                    torrentSubmitting = true
-                    torrentNote = null
+                val bytes = torrentBytes
+                if (!pc.isNullOrBlank() && info != null && !btBusy) {
+                    btBusy = true
+                    btError = null
                     scope.launch {
-                        // 保存位置 = 种子所在的目录，推出来的东西就落在种子旁边
-                        val cid = vm.currentTargetCid()
-                        val err = context.appContainer.downloadSubmitter
-                            .submit(vm.api, Torrent.buildMagnet(info), cid)
-                        torrentSubmitting = false
-                        if (err == null) {
-                            val summary = "${info.name ?: item.fn}（${info.fileCount} 个文件 · " +
-                                "${Format.size(info.totalSize)}）"
-                            downloadTarget = null
-                            torrentInfo = null
-                            context.appContainer.opLog.log(
-                                OpType.OFFLINE,
-                                item.fn,
-                                "转磁力云离线 · ${info.fileCount} 个文件",
-                                cid,
-                                ui.stack.lastOrNull()?.name.orEmpty(),
-                            )
-                            notify("已提交云下载：$summary")
-                        } else {
-                            // 提交失败留在弹窗里（snackbar 一闪就没了，这里用户还要改主意）
-                            torrentNote = err
+                        try {
+                            // 文件列表自带的 sha1 就是种子文件本身的 SHA1；没有就本地算
+                            val sha1 = item.sha1?.takeIf { it.length == 40 }
+                                ?: bytes?.let { BtTask.sha1Hex(it) }
+                                ?: throw IllegalArgumentException("读不到种子 SHA1，请重新打开")
+                            val parsed = BtTask.parseOnCloud(vm.api, pc, sha1)
+                            // 解析期间用户把下载弹窗关了：这份结果已经没有落点
+                            if (downloadTarget?.fid != item.fid) return@launch
+                            btSha1 = sha1
+                            btPickCode = pc
+                            btSavePath = BtTask.savePathFor(parsed.name)
+                            btSaveCid = vm.currentTargetCid()
+                            btFileName = item.fn
+                            btParsed = parsed
+                        } catch (e: Exception) {
+                            btError = e.message ?: "解析种子失败"
+                        } finally {
+                            btBusy = false
                         }
                     }
                 }
@@ -2293,17 +2506,28 @@ fun FilesScreen(
             onDismiss = {
                 downloadTarget = null
                 torrentInfo = null
+                torrentBytes = null
                 torrentNote = null
+                btParsed = null
+                btError = null
             },
             // 本地算出的结构（文件数/大小）+ 第三方的画面，一起构成"推之前先看内容"
             footer = if (isTorrent) {
                 {
-                    MagnetShotPreview(
-                        magnet = info?.let { Torrent.buildMagnet(it) },
-                        enabled = shotPreviewEnabled,
-                        endpoint = shotPreviewEndpoint,
-                        http = context.appContainer.okHttpClient,
-                    )
+                    Column {
+                        // 云端解析失败（种子被删/校验不一致）时仍能给整包提交一条退路
+                        if (btError != null && info != null) {
+                            TextButton(onClick = { submitMagnet(item, info) }) {
+                                Text("改用磁力链提交（整包下载）")
+                            }
+                        }
+                        MagnetShotPreview(
+                            magnet = info?.let { Torrent.buildMagnet(it) },
+                            enabled = shotPreviewEnabled,
+                            endpoint = shotPreviewEndpoint,
+                            http = context.appContainer.okHttpClient,
+                        )
+                    }
                 }
             } else {
                 null
@@ -2322,6 +2546,55 @@ fun FilesScreen(
                                 notify("已加入系统下载队列")
                             }
                             .onFailure { notify(it.message) }
+                    }
+                }
+            },
+        )
+    }
+
+    // BT 勾选面板压在下载弹窗之上：取消回到下载弹窗，提交成功则两个一起收起
+    btParsed?.let { parsed ->
+        BtFileSelectDialog(
+            parsed = parsed,
+            busy = btBusy,
+            error = btError,
+            onDismiss = {
+                if (!btBusy) {
+                    btParsed = null
+                    btError = null
+                }
+            },
+            onConfirm = { selection ->
+                btBusy = true
+                btError = null
+                scope.launch {
+                    val err = BtTask.add(
+                        api = vm.api,
+                        parsed = parsed,
+                        selection = selection,
+                        savePath = btSavePath,
+                        wpPathId = btSaveCid,
+                        torrentSha1 = btSha1,
+                        pickCode = btPickCode,
+                    )
+                    btBusy = false
+                    if (err == null) {
+                        val summary = "${parsed.name}（${selection.size} 个文件 · " +
+                            "${Format.size(parsed.selectedSize(selection))}）"
+                        btParsed = null
+                        downloadTarget = null
+                        torrentInfo = null
+                        torrentBytes = null
+                        context.appContainer.opLog.log(
+                            OpType.OFFLINE,
+                            btFileName,
+                            "BT 勾选云离线 · ${selection.size}/${parsed.fileCount} 个文件",
+                            btSaveCid,
+                            ui.stack.lastOrNull()?.name.orEmpty(),
+                        )
+                        notify("已提交云下载：$summary")
+                    } else {
+                        btError = err
                     }
                 }
             },
@@ -2825,7 +3098,16 @@ private fun FilesSidePane(
             Spacer(Modifier.height(8.dp))
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Icon(Icons.Outlined.ChevronRight, contentDescription = null, modifier = Modifier.size(16.dp))
-                Text("搜索「${ui.searchQuery}」结果", style = MaterialTheme.typography.bodyMedium)
+                val scope = buildString {
+                    if (ui.searchInCurrent) append(" · 当前目录")
+                    ui.searchDays?.let { append(" · 最近 $it 天") }
+                }
+                Text(
+                    "搜索「${ui.searchQuery}」结果$scope",
+                    style = MaterialTheme.typography.bodyMedium,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                )
             }
         }
     }
@@ -3011,12 +3293,12 @@ private fun ScrapeNormalizeDialog(
                 }
                 Spacer(Modifier.height(8.dp))
                 Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
-                    androidx.compose.material3.Switch(checked = supplement, onCheckedChange = { supplement = it })
+                    AppSwitch(checked = supplement, onCheckedChange = { supplement = it })
                     Spacer(Modifier.size(8.dp))
                     Text("补充模式：只补缺失的字段/图片，不覆盖已有内容", style = MaterialTheme.typography.bodyMedium)
                 }
                 Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
-                    androidx.compose.material3.Switch(
+                    AppSwitch(
                         checked = renameOn && !supplement,
                         onCheckedChange = { renameOn = it },
                         enabled = !supplement,

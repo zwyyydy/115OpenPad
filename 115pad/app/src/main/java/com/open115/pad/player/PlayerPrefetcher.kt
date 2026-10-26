@@ -188,7 +188,8 @@ internal fun isDirectFileUrl(url: String): Boolean {
  * 预下载/缓存状态（UI 只读它）。
  *
  * [rangesMs] 是"已完整落在本机"的时间区间（含**播放器自己下下来的**那些，不只是预下载下的），
- * 进度条画淡蓝那层；[cachedBytes] 是同一口径的字节数，播放器状态栏显示"缓存 N MB"。
+ * 进度条画淡蓝那层；[cachedBytes] 是缓存里**当前实际还在**的字节数（每轮按缓存实况重算，
+ * 不是累计写入量 —— 否则被 LRU 淘汰的旧分片不会回扣，读数会一直涨）。
  */
 internal data class PrefetchState(
     val rangesMs: List<LongRange> = emptyList(),
@@ -280,6 +281,15 @@ internal interface PrefetchPlan {
      */
     fun releaseBefore(cache: SimpleCache, beforeMs: Long): Long
 
+    /**
+     * 按缓存里**实际还在**的分片重算"这部片已缓存多少字节"，顺手把已被淘汰的段标记回落。
+     *
+     * ★ 不能靠写入时累加：media3 的 LRU 在缓存满时会淘汰最旧的 span（包括这部片自己的），
+     *   那种删除不会回调到我们这里，累计值只增不减 —— 右上角「缓存 N MB」会一直涨。
+     * ★ 直链档的多个块共用一个 key，只能整份取一次（按块重复相加会翻好几倍）。
+     */
+    fun reconcileCached(cache: SimpleCache, cached: BooleanArray, sizes: LongArray): Long
+
     /** 每轮取样时告知（直链计划靠它把字节换算成时间，HLS 用不到） */
     fun onDuration(durationMs: Long) {}
 }
@@ -333,6 +343,24 @@ internal class HlsPrefetchPlan(
             cache.removeResource(key)
         }
         return freed
+    }
+
+    /** 一片一个 key：只查标记为已缓存的那些；查不到说明已被 LRU 淘汰，标记回落 */
+    override fun reconcileCached(cache: SimpleCache, cached: BooleanArray, sizes: LongArray): Long {
+        var total = 0L
+        for (i in 0 until minOf(count, cached.size)) {
+            if (!cached[i]) continue
+            val c = chunkAt(i) ?: continue
+            val bytes = cache.getCachedSpans(c.key).sumOf { it.length }
+            if (bytes <= 0L) {
+                cached[i] = false
+                sizes[i] = 0L
+            } else {
+                sizes[i] = bytes
+                total += bytes
+            }
+        }
+        return total
     }
 }
 
@@ -427,6 +455,16 @@ internal class FilePrefetchPlan(
         }
         return freed
     }
+
+    /** 直链一个 key 管全片：整份取一次；为 0 说明全被淘汰，标记一起清掉 */
+    override fun reconcileCached(cache: SimpleCache, cached: BooleanArray, sizes: LongArray): Long {
+        val total = cache.getCachedSpans(PlayerCache.fileKey(pickCode)).sumOf { it.length }
+        if (total <= 0L && cached.isNotEmpty()) {
+            cached.fill(false)
+            sizes.fill(0L)
+        }
+        return total
+    }
 }
 
 /**
@@ -469,14 +507,14 @@ internal class PlayerPrefetcher(
     suspend fun run(player: Player) = withContext(Dispatchers.IO) {
         val n = plan.count
         if (dynamicKeepBytes > 0L) {
-            android.util.Log.i(
+            com.open115.pad.util.AppLog.i(
                 TAG,
                 "动态挡位：这部片的目标缓存 ${dynamicKeepBytes / 1024 / 1024}MB" +
                     "（整库上限 ${maxCacheBytes / 1024 / 1024}MB）",
             )
         }
         if (n <= 0) {
-            android.util.Log.i(TAG, "没有可预下载的内容（${plan.describe}），跳过")
+            com.open115.pad.util.AppLog.i(TAG, "没有可预下载的内容（${plan.describe}），跳过")
             return@withContext
         }
         // 起点：位置 → 第几段。直链计划要靠"时长"把位置换算成字节，而起播那一刻时长可能还没到
@@ -510,7 +548,7 @@ internal class PlayerPrefetcher(
             }
         }
         _state.value = PrefetchState(mergeCachedRanges(starts, ends, cached), knownBytes)
-        android.util.Log.i(
+        com.open115.pad.util.AppLog.i(
             TAG,
             "开始：${plan.describe} 已缓存=${cached.count { it }} 段 上限=${maxCacheBytes / 1024 / 1024}MB",
         )
@@ -524,7 +562,7 @@ internal class PlayerPrefetcher(
         if (cache.cacheSpace >= fullAt) {
             val used = cache.cacheSpace
             if (knownBytes * 2 >= used) {
-                android.util.Log.i(
+                com.open115.pad.util.AppLog.i(
                     TAG,
                     "缓存到水位：这部片自己占了 ${knownBytes / 1024 / 1024}MB（共 ${used / 1024 / 1024}MB），" +
                         "按重进同一部片处理：沿用现有缓存、不清理旧片",
@@ -534,7 +572,7 @@ internal class PlayerPrefetcher(
                     plan.keepKeyPrefix,
                     (maxCacheBytes * CLEAN_TO_RATIO).toLong(),
                 )
-                android.util.Log.i(
+                com.open115.pad.util.AppLog.i(
                     TAG,
                     "缓存到水位：清掉 $n 个旧缓存条目、腾出 ${freed / 1024 / 1024}MB" +
                         "（现 ${cache.cacheSpace / 1024 / 1024}MB / 上限 ${maxCacheBytes / 1024 / 1024}MB）",
@@ -546,7 +584,6 @@ internal class PlayerPrefetcher(
         var lastRefreshAt = 0L
         val failures = AtomicInteger(0)
         val addedBytes = AtomicLong(0L)
-        val cachedBytes = AtomicLong(knownBytes)
         val rate = RateWindow(MAX_BYTES_PER_SEC)
         val stateLock = Mutex()
         // 固定 1 条：实测 115 的额外连接拿不到带宽（几十 KB 就停），并发在这里没意义；
@@ -563,7 +600,11 @@ internal class PlayerPrefetcher(
         var waitTicks = 0
 
         suspend fun pushState() = stateLock.withLock {
-            val next = PrefetchState(mergeCachedRanges(starts, ends, cached), cachedBytes.get())
+            // 按"缓存里实际还在的分片"重算字节数，而不是写入时累加：缓存满后 media3 的 LRU
+            // 会淘汰当前片最旧的区间，那种删除不回调给我们，累计值只增不减 —— 右上角
+            // 「缓存 N MB」会一直涨（用户报的"设了上限还在涨"就是这个读数）。
+            val actual = plan.reconcileCached(cache, cached, sizes)
+            val next = PrefetchState(mergeCachedRanges(starts, ends, cached), actual)
             if (next != _state.value) _state.value = next
         }
 
@@ -580,7 +621,7 @@ internal class PlayerPrefetcher(
                         if (now - lastLogAt > 8_000L && newBytes > 0L) {
                             lastLogAt = now
                             val rate = if (now > t0) newBytes * 1000 / (now - t0) / 1024 else 0
-                            android.util.Log.i(
+                            com.open115.pad.util.AppLog.i(
                                 TAG,
                                 "块进度：${cached / 1024}KB/${reqLen / 1024}KB 平均 ${rate}KB/s（key=${key.take(32)}）",
                             )
@@ -593,10 +634,10 @@ internal class PlayerPrefetcher(
                         delay(CHUNK_RETRY_DELAY_MS)
                         return@repeat
                     }
-                    android.util.Log.i(TAG, "下载失败：${e.javaClass.simpleName}: ${e.message}")
+                    com.open115.pad.util.AppLog.i(TAG, "下载失败：${e.javaClass.simpleName}: ${e.message}")
                     return false
                 }
-                if (err > 10_000L) android.util.Log.i(TAG, "一块写了 ${err / 1000}s（key=${key.take(40)}）")
+                if (err > 10_000L) com.open115.pad.util.AppLog.i(TAG, "一块写了 ${err / 1000}s（key=${key.take(40)}）")
                 return true
             }
             return false
@@ -608,7 +649,10 @@ internal class PlayerPrefetcher(
                 val s = sample(player)
                 plan.onDuration(s.durationMs)
                 // 每轮顺手把"当前位置往后这一窗"的缓存状态重扫一遍（播放器自己下的也算进去）
-                rescan(starts, ends, cached, sizes, s) { cachedBytes.addAndGet(it) }
+                rescan(cached, sizes, s)
+                // 每轮都重算一次读数（内部只查已标记的段，代价很小）：
+                // 播放器自己写的分片、以及被 LRU 淘汰的段都在这里对齐
+                pushState()
                 // 对齐：只在"播放器自己的缓冲前沿追上来"时把游标往前推。
                 // ⚠️ 绝不能反过来在我们走远时把游标拽回来 —— 那等于每轮重置一次，
                 //    预下载永远超不出"前沿 + gap"（实测：前面有几百 MB 已缓存时循环空转、一块不下）。
@@ -616,7 +660,7 @@ internal class PlayerPrefetcher(
                 val at = firstCursor(s)
                 if (at > cursor) cursor = at
                 if (cursor > plan.count - 1) {
-                    android.util.Log.i(TAG, "停手：已到片尾")
+                    com.open115.pad.util.AppLog.i(TAG, "停手：已到片尾")
                     break
                 }
                 // 循环缓存：到水位 / 超出这部片的预算时，以**当前进度**为锚点滚动 ——
@@ -624,20 +668,19 @@ internal class PlayerPrefetcher(
                 // 之前播放的不全部舍弃：保留的那一小段给小幅回退，退回来还能立即命中缓存。
                 // 裁剪发生在写路径之外 ⇒ 不会触发"边写边淘汰"那种吞吐塌陷。
                 if (cache.cacheSpace >= fullAt ||
-                    (dynamicKeepBytes > 0L && cachedBytes.get() > dynamicKeepBytes)
+                    (dynamicKeepBytes > 0L && _state.value.cachedBytes > dynamicKeepBytes)
                 ) {
                     val keepBack = keepBackMsFor(s.durationMs)
                     val before = s.posMs - keepBack
                     val freed = if (before > 0L) plan.releaseBefore(cache, before) else 0L
                     if (freed > 0L) {
-                        cachedBytes.addAndGet(-freed)
                         stateLock.withLock {
                             for (i in 0 until n) {
                                 if (cached[i] && ends[i] <= before) cached[i] = false
                             }
                         }
                         pushState()
-                        android.util.Log.i(
+                        com.open115.pad.util.AppLog.i(
                             TAG,
                             "循环缓存：舍弃进度之前的 ${freed / 1024 / 1024}MB（保留回退 ${keepBack / 1000}s）" +
                                 "（现 ${cache.cacheSpace / 1024 / 1024}MB / 上限 ${maxCacheBytes / 1024 / 1024}MB）",
@@ -655,7 +698,7 @@ internal class PlayerPrefetcher(
                                 (maxCacheBytes * CLEAN_TO_RATIO).toLong(),
                             )
                             if (freedOld > 0) {
-                                android.util.Log.i(
+                                com.open115.pad.util.AppLog.i(
                                     TAG,
                                     "循环缓存：这部片没有可舍弃的旧内容，改清 $n 个最久没用到的旧缓存条目、" +
                                         "腾出 ${freedOld / 1024 / 1024}MB",
@@ -667,7 +710,7 @@ internal class PlayerPrefetcher(
                         lastDoneAt.set(now)
                         waitTicks++
                         if (waitTicks % 120 == 1) {
-                            android.util.Log.i(
+                            com.open115.pad.util.AppLog.i(
                                 TAG,
                                 "循环缓存：已到水位、进度之前暂无可舍弃的旧内容，等播放继续推进" +
                                     "（已灌 ${addedBytes.get() / 1024 / 1024}MB / 进度 ${s.posMs / 1000}s）",
@@ -680,7 +723,7 @@ internal class PlayerPrefetcher(
 
                 // 连续一段时间一块都下不完 → 预下载这条连接被饿着，收手（不加锁、不占位）
                 if (android.os.SystemClock.elapsedRealtime() - lastDoneAt.get() > NO_PROGRESS_GIVE_UP_MS) {
-                    android.util.Log.i(
+                    com.open115.pad.util.AppLog.i(
                         TAG,
                         "停手：预下载连接长时间没有进展（已灌 ${addedBytes.get() / 1024 / 1024}MB），" +
                             "缓存交给播放器自己那一路灌",
@@ -691,7 +734,7 @@ internal class PlayerPrefetcher(
                 if (s.buffering || s.bufferedEndMs - s.posMs < MIN_BUFFER_AHEAD_MS) {
                     yieldTicks++
                     if (yieldTicks % 60 == 1) {
-                        android.util.Log.i(
+                        com.open115.pad.util.AppLog.i(
                             TAG,
                             "让路中（第 $yieldTicks 次）：缓冲余量=${(s.bufferedEndMs - s.posMs) / 1000}s " +
                                 "buffering=${s.buffering}",
@@ -709,13 +752,13 @@ internal class PlayerPrefetcher(
                         lastRefreshAt = now
                         if (plan.refresh()) {
                             failures.set(0)
-                            android.util.Log.i(TAG, "地址已刷新（第 $refreshes 次）")
+                            com.open115.pad.util.AppLog.i(TAG, "地址已刷新（第 $refreshes 次）")
                         } else {
-                            android.util.Log.i(TAG, "刷新地址失败，停手")
+                            com.open115.pad.util.AppLog.i(TAG, "刷新地址失败，停手")
                             break
                         }
                     } else {
-                        android.util.Log.i(TAG, "停手：连续失败且刷不动了")
+                        com.open115.pad.util.AppLog.i(TAG, "停手：连续失败且刷不动了")
                         break
                     }
                 }
@@ -744,7 +787,6 @@ internal class PlayerPrefetcher(
                             failures.set(0)
                             addedBytes.addAndGet(written)
                             rate.add(written)
-                            cachedBytes.addAndGet(written)
                             stateLock.withLock {
                                 cached[idx] = true
                                 sizes[idx] = written
@@ -752,7 +794,7 @@ internal class PlayerPrefetcher(
                             lastDoneAt.set(android.os.SystemClock.elapsedRealtime())
                             val done = doneChunks.incrementAndGet()
                             if (done % 20 == 0) {
-                                android.util.Log.i(
+                                com.open115.pad.util.AppLog.i(
                                     TAG,
                                     "预下载：已灌 ${addedBytes.get() / 1024 / 1024}MB（第 $idx 段）",
                                 )
@@ -773,37 +815,24 @@ internal class PlayerPrefetcher(
     }
 
     /**
-     * 重扫一窗（当前位置 → 缓冲前沿 + gap 再往后一点），把**播放器自己下的**也算进来，
-     * 并把新变"已缓存"的那些字节数累进 [cachedBytes]（进度条的淡蓝与状态栏的读数靠它）。
+     * 重扫一窗（当前位置 → 缓冲前沿 + gap 再往后一点），把**播放器自己下的**也算进来。
+     * 这里只负责标记 [cached]；字节数与 UI 由随后的 [pushState] 按缓存实况统一重算。
      */
     private fun rescan(
-        starts: LongArray,
-        ends: LongArray,
         cached: BooleanArray,
         sizes: LongArray,
         s: Sample,
-        addBytes: (Long) -> Unit,
     ) {
         val from = plan.indexAt(s.posMs).coerceAtLeast(0)
         val to = (firstCursor(s) + RESCAN_LOOKAHEAD).coerceAtMost(cached.lastIndex)
-        var changed = false
         for (i in from..to) {
             if (cached[i]) continue
             val c = plan.chunkAt(i) ?: continue
             if (isChunkCached(cache, c)) {
                 cached[i] = true
                 if (sizes[i] == 0L) sizes[i] = chunkBytes(c)
-                addBytes(sizes[i])
-                changed = true
             }
         }
-        if (changed) mergeAndPush(starts, ends, cached)
-    }
-
-    /** 状态推送：只有真的变了才写（免得每 0.5 秒重组一次 UI）*/
-    private fun mergeAndPush(starts: LongArray, ends: LongArray, cached: BooleanArray) {
-        val next = _state.value.copy(rangesMs = mergeCachedRanges(starts, ends, cached))
-        if (next != _state.value) _state.value = next
     }
 
     /**

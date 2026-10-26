@@ -3,6 +3,7 @@ package com.open115.pad.ui.settings
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Backup
 import androidx.compose.material.icons.outlined.Bolt
+import androidx.compose.material.icons.outlined.BugReport
 import androidx.compose.material.icons.outlined.CloudDownload
 import androidx.compose.material.icons.outlined.FolderOpen
 import androidx.compose.material.icons.outlined.Info
@@ -72,6 +73,8 @@ data class ChoiceItem<T>(
  *
  * [confirm] 非空则先弹二次确认 —— **破坏性操作必须给**（清空缓存这类原来点一下就真删了）。
  * [danger] 只影响文字配色（退出登录、清空），不影响是否确认。
+ * [progress] 非空 = 这行下面画一根 0..1 的细进度条（备份这类"点了就跑几分钟"的动作，
+ * 副标题里只有文字百分比不够直观）。
  */
 data class ActionItem(
     override val id: String,
@@ -81,6 +84,7 @@ data class ActionItem(
     val danger: Boolean = false,
     val confirm: String? = null,
     val confirmText: String = "确定",
+    val progress: Float? = null,
     val onClick: () -> Unit,
 ) : SettingItem
 
@@ -129,6 +133,7 @@ enum class SettingsCategory(
     PIPELINE("流水线同步", Icons.Outlined.Sync, "服务器刮削完自动更新媒体库"),
     BACKUP("备份", Icons.Outlined.Backup, "配置、媒体库与操作记录定时备份到云端，换设备不用重来"),
     LAB("实验室", Icons.Outlined.Science, "尝鲜功能，不稳定，随时可以关掉"),
+    DIAG("诊断", Icons.Outlined.BugReport, "崩溃与运行日志，只保存在本机"),
     ACCOUNT("账号", Icons.Outlined.PersonOutline, "授权信息与退出登录"),
     ABOUT("关于", Icons.Outlined.Info, "版本与说明"),
 }
@@ -200,9 +205,10 @@ class SettingsSectionBuilder(private val category: SettingsCategory) {
         danger: Boolean = false,
         confirm: String? = null,
         confirmText: String = "确定",
+        progress: Float? = null,
         onClick: () -> Unit,
     ) {
-        current += ActionItem(id, title, subtitle, detail, danger, confirm, confirmText, onClick)
+        current += ActionItem(id, title, subtitle, detail, danger, confirm, confirmText, progress, onClick)
     }
 
     fun text(

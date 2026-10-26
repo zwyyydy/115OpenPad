@@ -1,5 +1,6 @@
 package com.open115.pad.ui.filter
 
+import com.open115.pad.ui.theme.AppSwitch
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -44,7 +45,6 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
-import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
@@ -247,7 +247,7 @@ private fun SchemeCard(
                 overflow = TextOverflow.Ellipsis,
                 modifier = Modifier.weight(1f),
             )
-            Switch(checked = scheme.enabled, onCheckedChange = { onToggle() })
+            AppSwitch(checked = scheme.enabled, onCheckedChange = { onToggle() })
         }
 
         // 中部：配置状态彩色徽章行
@@ -376,7 +376,7 @@ private fun SchemeEditor(
             )
             Spacer(Modifier.height(6.dp))
             Row(verticalAlignment = Alignment.CenterVertically) {
-                Switch(checked = enabled, onCheckedChange = { enabled = it })
+                AppSwitch(checked = enabled, onCheckedChange = { enabled = it })
                 Spacer(Modifier.width(8.dp))
                 Text("启用该方案", style = MaterialTheme.typography.bodyMedium)
             }

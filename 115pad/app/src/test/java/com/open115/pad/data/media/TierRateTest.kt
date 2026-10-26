@@ -100,8 +100,26 @@ class TierRateTest {
         assertTrue(task.rateTiered)
         assertEquals(3, task.tierRestMinutes)
         // 单目录任务（流水线同步）也一样：频控是按账号算的，与任务类型无关
-        val targeted = QueuedScan.targeted(lib, listOf("c" to "/p"))
+        val targeted = QueuedScan.targeted(lib, listOf(TargetedDir("c", "/p", deep = false)))
         assertTrue(targeted.rateTiered)
         assertEquals(3, targeted.tierRestMinutes)
+    }
+
+    @Test
+    fun `定向任务_每目录的递归标记与老快照兜底`() {
+        // 逐目录报 deep（移动入库：搬来的整棵扫、目标只列一层）→ dirDeep 原样落进任务
+        val lib = MediaLibraryEntity(name = "库", rootCid = "c", rootPath = "/p")
+        val task = QueuedScan.targeted(
+            lib,
+            listOf(TargetedDir("a", "/p/a", deep = true), TargetedDir("b", "/p/b", deep = false)),
+        )
+        assertEquals(listOf(true, false), task.dirDeep)
+        // 老快照（没有 dirDeep 字段）→ 空列表，runTask 侧回退到整任务的 deep
+        val legacy = MediaScanner.queueJson.decodeFromString<QueuedScan>(
+            """{"libraryId":1,"libraryName":"库","rootCids":["c"],"rootPaths":["/p"],
+               "incremental":false,"noRecurse":true,"deep":true}""",
+        )
+        assertTrue(legacy.dirDeep.isEmpty())
+        assertTrue(legacy.deep)
     }
 }

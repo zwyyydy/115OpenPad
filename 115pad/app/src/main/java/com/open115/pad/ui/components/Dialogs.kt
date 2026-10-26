@@ -57,11 +57,18 @@ fun ConfirmDialog(
     confirmText: String = "确定",
     onConfirm: () -> Unit,
     onDismiss: () -> Unit,
+    /** 附加内容（勾选项这类）画在说明文字与按钮之间；null = 没有附加 */
+    extra: (@Composable () -> Unit)? = null,
 ) {
     FadeAlertDialog(
         onDismissRequest = onDismiss,
         title = { Text(title) },
-        text = { Text(text) },
+        text = {
+            Column {
+                Text(text)
+                extra?.invoke()
+            }
+        },
         confirmButton = { Button(onClick = onConfirm) { Text(confirmText) } },
         dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } },
     )

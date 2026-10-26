@@ -12,6 +12,7 @@ import android.os.Build
 import android.os.Bundle
 import android.view.View
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -63,6 +64,8 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.QueueMusic
 import androidx.compose.material.icons.outlined.Audiotrack
+import androidx.compose.material.icons.outlined.Cast
+import androidx.compose.material.icons.outlined.FitScreen
 import androidx.compose.material.icons.outlined.Forum
 import androidx.compose.material.icons.outlined.LightMode
 import androidx.compose.material.icons.filled.Lock
@@ -96,6 +99,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -108,9 +112,11 @@ import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
@@ -162,11 +168,20 @@ import com.open115.pad.ui.components.FadePresence
 import com.open115.pad.data.envOk
 import com.open115.pad.data.parseVideoPlayResponse
 import com.open115.pad.data.parseFileDownloadUrl
+import com.open115.pad.cast.CastDevice
+import com.open115.pad.cast.CastSubtitle
+import com.open115.pad.cast.CastSession
+import com.open115.pad.cast.CastTarget
+import com.open115.pad.cast.CastUiState
+import com.open115.pad.cast.discoverCastDevices
+import com.open115.pad.cast.discoverPadTvHosts
 import com.open115.pad.ui.theme.Open115Theme
 import com.open115.pad.util.APP_USER_AGENT
 import com.open115.pad.util.Format
 import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.json.Json
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.Dispatchers
@@ -553,14 +568,14 @@ private fun ensurePreviewThumb(
         if (coverOk && stripOk) return@launch
         val set = runCatching { container.videoFrames.grabPreviewSet(pickCode, count) }.getOrNull().orEmpty()
         if (set.isEmpty()) {
-            android.util.Log.i("VPreview", "自动生成预览失败（多半是没转码档）pc=$pickCode")
+            com.open115.pad.util.AppLog.i("VPreview", "自动生成预览失败（多半是没转码档）pc=$pickCode")
             return@launch
         }
         set.firstOrNull()?.let { container.videoPreviews.put(pickCode, it) }
         // 空列表千万别喂给 putStrip：它会把这组之外的尾巴全删掉，等于把别处抓好的预览条清空
         val written = if (withStrip) container.videoPreviews.putStrip(pickCode, set.drop(1)) else 0
         // 上限的淘汰由 store 自己管（写在 put/putStrip 里），这里不再显式 prune
-        android.util.Log.i(
+        com.open115.pad.util.AppLog.i(
             "VPreview",
             "自动生成预览 pc=$pickCode 封面=${set.firstOrNull()?.size ?: 0}B" +
                 if (withStrip) {
@@ -744,7 +759,7 @@ private val SOFTWARE_FIRST_DECODER = MediaCodecSelector { mime, secure, tunnelin
     val sorted = infos.sortedBy { it.hardwareAccelerated }
     // 候选与最终顺序是排障的关键线索（花屏/黑屏时要能确认到底走的哪个解码器）。
     // 只在解码器初始化时打一行：adb logcat -s PlayerDecode
-    android.util.Log.d(
+    com.open115.pad.util.AppLog.d(
         "PlayerDecode",
         "软解优先 $mime 候选=[${infos.joinToString { "${it.name}(hw=${it.hardwareAccelerated})" }}]" +
             " 顺序=[${sorted.joinToString { it.name }}]",
@@ -917,6 +932,8 @@ fun PlayerScreen(
     var subOrigin by remember { mutableStateOf(SubOrigin.OFFICIAL) }
     var subOffsetMs by remember { mutableStateOf(0L) }
     var showSubSearch by remember { mutableStateOf(false) }
+    /** 投屏遥控界面的在线字幕搜索：结果推给电视端加载，与本地 [showSubSearch] 互不相干 */
+    var castSubSearchOpen by remember { mutableStateOf(false) }
     var subsEnabled by androidx.compose.runtime.saveable.rememberSaveable { mutableStateOf(true) }
     var subsMenuOpen by remember { mutableStateOf(false) }
 
@@ -1008,6 +1025,19 @@ fun PlayerScreen(
     var vrGyroOn by remember { mutableStateOf(false) }
     var vrHudText by remember { mutableStateOf<String?>(null) }
     var vrMenuOpen by remember { mutableStateOf(false) }
+
+    // ---- 投屏（DLNA，非 VR）----
+    /** 会话状态（Idle / Connecting / Casting）；电视侧进度不在这里，避免每 2 秒重组整页 */
+    val castState by CastSession.state.collectAsState()
+    val castCasting = castState is CastUiState.Casting
+    val castConnecting = castState is CastUiState.Connecting
+    var castMenuOpen by remember { mutableStateOf(false) }
+    var castDevices by remember { mutableStateOf(emptyList<CastDevice>()) }
+    var castScanning by remember { mutableStateOf(false) }
+    var castError by remember { mutableStateOf<String?>(null) }
+    // 投屏状态与进度由 CastSession 自己轮询（见其 startPolling 注释）：
+    // 这里不再挂 effect —— 用户离开播放页后，屏幕上只剩浮标/通知，那时仍然需要有人
+    // 去发现"电视端退出了播放"，而播放页的 effect 那时候早就不在了。
     /**
      * 滑杆显示值。必须单独放一份 Compose 状态：`VrViewState` 里的字段是普通变量
      * （故意不走快照系统，免得每帧都触发重组），Slider 是受控组件，
@@ -1028,6 +1058,31 @@ fun PlayerScreen(
     val vrStoredGyro by container.playerPrefs.vrGyro.collectAsState(initial = null)
     /** 边缘畸变抑制强度（Pannini d） */
     val vrStoredPannini by container.playerPrefs.vrPanniniD.collectAsState(initial = null)
+
+    // ---- 双指缩放画面（非 VR）----
+    /** 缩放/平移状态：画面框那一层用 graphicsLayer 应用；TextureView 参与 View 变换 */
+    val videoZoom = remember { VideoZoomState() }
+    /** 只在"是否放大"翻转时触发重组（缩放过程中每帧读 scale 会把整列按钮都重组一遍） */
+    val zoomActive by remember { derivedStateOf { videoZoom.isZoomed } }
+    // 换片 / 进出 VR / 旋转画面：缩放归位（旋转后继续套旧偏移会歪出画面）
+    LaunchedEffect(currentPickCode, vrMode, videoRotation) { videoZoom.resetNow() }
+
+    /** 画面还原：逐帧动画缩回 1 倍（直接 snap 回去在放大 3~4 倍时很生硬） */
+    fun resetZoomAnimated() {
+        val s0 = videoZoom.scale
+        if (s0 <= VideoZoomState.MIN_SCALE + 0.001f) return
+        val x0 = videoZoom.panX
+        val y0 = videoZoom.panY
+        scope.launch {
+            androidx.compose.animation.core.animate(
+                0f,
+                1f,
+                animationSpec = tween(280),
+            ) { t, _ ->
+                videoZoom.set(s0 + (1f - s0) * t, x0 * (1f - t), y0 * (1f - t))
+            }
+        }
+    }
     /** 竖屏 VR 视窗档位名（`VrWindow.name`） */
     val vrStoredWindow by container.playerPrefs.vrWindow.collectAsState(initial = null)
     /** 分辨率能不能猜出 VR 布局（决定 VR 按钮是否出现） */
@@ -1105,7 +1160,7 @@ fun PlayerScreen(
     LaunchedEffect(itemKey, vrMode) {
         if (vrMode == null) return@LaunchedEffect
         // 视角自己"跳"回正前方时能一眼看出是谁干的：adb logcat -s PlayerVr
-        android.util.Log.d("PlayerVr", "视角归位 item=$itemKey mode=${vrMode?.name}")
+        com.open115.pad.util.AppLog.d("PlayerVr", "视角归位 item=$itemKey mode=${vrMode?.name}")
         vrState.resetView()
         vrGyro.recenter()
         pushVrParams()
@@ -1314,6 +1369,10 @@ fun PlayerScreen(
     val filterActive = prefs.labFilterEnabled && !filterGlFailed &&
         !filterParams.isNeutral() && vrMode == null
 
+    // 滤镜走 GLSurfaceView（SurfaceView 子类），画面对 View 变换不生效：进滤镜前把缩放归位，
+    // 免得还原键对着看不见的缩放做动画、退出滤镜时画面又"突然放大"。
+    LaunchedEffect(filterActive) { if (filterActive) videoZoom.resetNow() }
+
     /** 把滤镜参数与画面几何推给 GL 线程：只换 uniform，不重建任何东西 */
     fun pushFilterState() {
         val v = filterViewRef.get() ?: return
@@ -1352,7 +1411,10 @@ fun PlayerScreen(
     // 进 VR 时收起滤镜面板：VR 里滤镜不生效（画面由 VR 视窗自己画），
     // 面板留在屏幕上只会让人以为"点了没反应"
     LaunchedEffect(vrMode) {
-        if (vrMode != null) filterMenuOpen = false
+        if (vrMode != null) {
+            filterMenuOpen = false
+            castMenuOpen = false
+        }
     }
 
     // ---- 实验室：弹幕 ----
@@ -1492,7 +1554,7 @@ fun PlayerScreen(
      * 面板贴底且很高，横屏下正好盖住那两列，留着就是被压在面板底下的"影子按钮"。
      * VR 菜单较矮不在此列（它一直在旁边挂着，也一直是能点的）。
      */
-    val sideColumnsHidden = filterMenuOpen || danmuMenuOpen
+    val sideColumnsHidden = filterMenuOpen || danmuMenuOpen || castMenuOpen
 
     val player = remember(prefs) {
         // 独立带宽计：状态栏实时网速的数据源（Builder.setBandwidthMeter 注入后全程累计估算）
@@ -1520,14 +1582,14 @@ fun PlayerScreen(
                     // "这次请求是读了缓存还是走了网络"一目了然。
                     .setEventListener(object : CacheDataSource.EventListener {
                         override fun onCachedBytesRead(cacheSizeBytes: Long, bytesRead: Long) {
-                            android.util.Log.d(
+                            com.open115.pad.util.AppLog.d(
                                 "PlayerCacheIO",
                                 "命中缓存 ${bytesRead}B（缓存共 ${cacheSizeBytes / 1024 / 1024}MB）",
                             )
                         }
 
                         override fun onCacheIgnored(reason: Int) {
-                            android.util.Log.w("PlayerCacheIO", "缓存被忽略 reason=$reason")
+                            com.open115.pad.util.AppLog.w("PlayerCacheIO", "缓存被忽略 reason=$reason")
                         }
                     })
                     .setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR)
@@ -1866,7 +1928,7 @@ fun PlayerScreen(
                 // 判定/重建 GL 视图，那里归位推参数可能早于 GL 视图与视频流就绪，
                 // 首帧时序覆盖所有装载路径（首次进入 / 切集 / 手动开 VR / 切清晰度）。
                 // 只在 VR 模式生效，普通模式不受影响。
-                android.util.Log.d(
+                com.open115.pad.util.AppLog.d(
                     "PlayerVr",
                     "首帧 vrMode=${vrMode?.name} 等待归位=${vrCenterPending.get()}",
                 )
@@ -1888,7 +1950,7 @@ fun PlayerScreen(
                 val subFail = isSubtitleFailure(badUrl, isSubtitleParserFailure(err), subUrls)
                 // 排障线索：这一档到底为什么挂的（归因/错误码/重试预算）。
                 // adb logcat -s PlayerError
-                android.util.Log.w(
+                com.open115.pad.util.AppLog.w(
                     "PlayerError",
                     "code=${err.errorCodeName} def=$currentDef 归因=${if (subFail) "字幕" else "视频/链路"}" +
                         " attempts=$refreshAttempts useSubs=$useSubs" +
@@ -2052,6 +2114,114 @@ fun PlayerScreen(
         controlRowVisible = true
     }
 
+    // ---- 投屏：搜索 / 开始 ----
+    /**
+     * 搜同一 Wi-Fi 下的投屏目标：DLNA 渲染器（通用通道）与「115 openpad电视端」（免中转通道）
+     * 并行搜、合并成一个列表，**电视端排前面**（装了电视端的用户多半就想投它）。
+     *
+     * 扫描期间重入直接忽略（面板上有「重新搜索」）。结果回来时续命一次控制排 ——
+     * 否则用户盯着转圈，4 秒到点整排连面板一起淡出。
+     */
+    fun scanCastDevices() {
+        if (castScanning) return
+        castScanning = true
+        castError = null
+        scope.launch {
+            val list = runCatching {
+                coroutineScope {
+                    val padTv = async {
+                        runCatching { discoverPadTvHosts() }.getOrDefault(emptyList())
+                    }
+                    val dlna = async {
+                        runCatching { discoverCastDevices(context, container.castHttpClient) }
+                            .getOrDefault(emptyList())
+                    }
+                    padTv.await() + dlna.await()
+                }
+            }.getOrDefault(emptyList())
+            castDevices = list
+            castScanning = false
+            if (list.isEmpty()) castError = "没找到可投屏设备（电视与本机需在同一 Wi-Fi）"
+            pulseControlRow()
+        }
+    }
+
+    /**
+     * 开始投屏。两条通道：
+     * - DLNA：取原盘直链 → 起本机中转补 UA → 推给电视（平板要保活，现实约束是老电视没法装我们的 App）；
+     * - 115 openpad电视端：原盘直链与 UA 一条指令交给电视、它自己拉流，平板发完就能退。
+     *
+     * 两条都只投**原始文件**（不走 115 转码）：画质最好、链路最短；
+     * 代价是电视得自己解 MKV/HEVC，放不了时会黑屏/报错。转码档留作以后再说。
+     */
+    fun startCasting(target: CastDevice) {
+        if (castState is CastUiState.Casting || castState is CastUiState.Connecting) return
+        if (vrMode != null) {
+            toast("VR 模式下不支持投屏")
+            return
+        }
+        if (localUri != null) {
+            toast("本机文件暂不支持投屏")
+            return
+        }
+        val pickCode = currentPickCode
+        if (pickCode.isBlank()) {
+            toast("没有可投屏的云盘视频")
+            return
+        }
+        castMenuOpen = false
+        val wasPlaying = player.isPlaying
+        val fromMs = player.currentPosition
+        // 先停本地：中转起好到电视出画之间有好几秒，不停会出现"平板和电视一起响"
+        player.pause()
+        setIndicator("正在连接 ${target.name}…")
+        scope.launch {
+            // 直链与字幕并行取：字幕接口慢一拍也不该拖住出画；字幕失败不挡投屏
+            val (url, castSubs) = coroutineScope {
+                val urlDeferred = async { fetchOriginalUrl(pickCode) }
+                val subsDeferred = async {
+                    // 字幕开关跟随播放器当前设置：用户在平板上关了字幕，投到电视也不强行挂
+                    if (!subsEnabled) emptyList()
+                    else runCatching {
+                        fetchOfficialSubs().map { CastSubtitle(it.url, it.mime, it.title) }
+                    }.getOrDefault(emptyList())
+                }
+                urlDeferred.await() to subsDeferred.await()
+            }
+            if (url == null) {
+                toast("取播放地址失败（115 频控或权限），稍后再试")
+                if (wasPlaying) player.play()
+                return@launch
+            }
+            val err = CastSession.start(
+                context = context.applicationContext,
+                http = container.castHttpClient,
+                device = target,
+                sourceUrl = url,
+                fileName = currentName,
+                title = data?.fileName ?: currentName,
+                pickCode = pickCode,
+                startMs = fromMs,
+                // 凭据：电视自己取清晰度档 / 直链过期后自愈。只在局域网传，电视端不落盘
+                token = runCatching { container.session.currentAccessToken() }.getOrNull(),
+                // 连播队列：把当前切到后面的几集一起交给电视（直链由会话在后台逐条解析）
+                upcoming = playQueue.drop(currentIndex + 1),
+                resolveUrl = { pc -> fetchOriginalUrl(pc) },
+                subtitles = castSubs,
+            )
+            if (err != null) {
+                toast(err)
+                castError = err
+                if (wasPlaying) player.play()
+            } else if (target.target == CastTarget.PadTv) {
+                // 电视端直拉：平板这边的使命到此结束，提示用户可以走了
+                setIndicator("已投屏到 ${target.name} · 平板可以退出")
+            } else {
+                setIndicator("已投屏到 ${target.name}")
+            }
+        }
+    }
+
     // ---- 截图（按钮在锁屏键上方，与右侧 VR 键对称）----
     /** 渲染视图引用，由 VideoSurface 组合时透出（见 [FrameRefs] 注释） */
     val frameRefs = remember { FrameRefs() }
@@ -2158,7 +2328,7 @@ fun PlayerScreen(
                         )
                         true
                     }.getOrElse {
-                        android.util.Log.w("PlayerShot", "预览图上传失败: ${it.message}")
+                        com.open115.pad.util.AppLog.w("PlayerShot", "预览图上传失败: ${it.message}")
                         false
                     }
                 }
@@ -2278,6 +2448,41 @@ fun PlayerScreen(
         }
     }
 
+    /**
+     * 投屏从**界面之外**被停掉时（通知栏「停止投屏」），把本地播放接回电视停下的位置。
+     *
+     * 播放页自己点「停止投屏」那条路已经接过一次，这里等于第二遍 —— 位置取自同一个
+     * [CastSession.lastPositionMs]，重复 seek 到同一处无副作用；少了这段的话，
+     * 从通知栏停掉后平板会一直停在暂停态，看起来像"投屏没了、片也没了"。
+     */
+    var castPickForResume by remember { mutableStateOf("") }
+    LaunchedEffect(castState) {
+        when (castState) {
+            is CastUiState.Casting -> castPickForResume = CastSession.sourcePickCode
+
+            is CastUiState.Idle -> {
+                val pick = castPickForResume
+                castPickForResume = ""
+                // 电视可能已经自动连播到下一集：那就不再是本地手上这一集，
+                // 按旧集接进度会把本地拽到错的片上（换成新的那一集留给连播面板/再投屏）
+                val remotePick = CastSession.lastRemotePickCode.ifBlank { pick }
+                // 投的是别的片就别把本地拽过去：用户手上这部没被投过
+                if (pick.isNotEmpty() && remotePick == currentPickCode) {
+                    val target = CastSession.lastPositionMs
+                    if (target > 0) {
+                        val dur = player.duration
+                        player.seekTo(
+                            if (dur > 0) target.coerceAtMost((dur - 1000).coerceAtLeast(0)) else target,
+                        )
+                        player.play()
+                    }
+                }
+            }
+
+            else -> Unit
+        }
+    }
+
     // 首次进入与切集共用同一条加载链路：itemKey 一变就整套重载。
     // key 用 player 而不是 prefs：播放器实例一换（切换软/硬解）新实例上还没有媒体，
     // 必须重挂一遍，等价于原来的 prefs key。
@@ -2307,7 +2512,8 @@ fun PlayerScreen(
                 )
                 player.setMediaSource(source, startAt)
                 player.prepare()
-                player.playWhenReady = true
+                // 投屏还活着时（重新进入播放页）绝不起播本地：否则平板和电视同时出声
+                player.playWhenReady = !CastSession.isActive()
                 if (promptOnce && startAt > 0) resumePromptMs = startAt
             }.onFailure { e ->
                 // 最常见的是 Uri 读权限失效（ACTION_VIEW 授的读权限不跨进程死亡，
@@ -2392,7 +2598,8 @@ fun PlayerScreen(
             currentDef = def
             player.setMediaItem(item, startPos)
             player.prepare()
-            player.playWhenReady = true
+            // 同上一处：投屏中重新进入播放页只Prepare不起播，避免"平板电视双声道"
+            player.playWhenReady = !CastSession.isActive()
             if (promptOnce && startPos > 0) resumePromptMs = startPos
             loading = false
             pulseControlRow()
@@ -2484,11 +2691,11 @@ fun PlayerScreen(
         if (!p.prefetchEnabled || !p.cacheEnabled || localUri != null) return@LaunchedEffect
         val d = data ?: return@LaunchedEffect
         if (d.fileSize <= 0L) {
-            android.util.Log.i("PlayerPreload", "拿不到文件大小，跳过预下载")
+            com.open115.pad.util.AppLog.i("PlayerPreload", "拿不到文件大小，跳过预下载")
             return@LaunchedEffect
         }
         if (!prefetchNetworkAllowed(context)) {
-            android.util.Log.i("PlayerPreload", "当前是蜂窝网络，跳过预下载")
+            com.open115.pad.util.AppLog.i("PlayerPreload", "当前是蜂窝网络，跳过预下载")
             return@LaunchedEffect
         }
         // 原盘与"原画=原始文件"走直链：按字节区间灌；转码档走 HLS：按分片灌
@@ -2497,13 +2704,13 @@ fun PlayerScreen(
         val directDef = currentDef == DEF_ORIGINAL_FILE
         val tierUrl = if (directDef) null else tierUrlOf(d, currentDef)
         if (!directDef && tierUrl == null) {
-            android.util.Log.i("PlayerPreload", "档位还没定或没有地址，等下一轮 def=$currentDef")
+            com.open115.pad.util.AppLog.i("PlayerPreload", "档位还没定或没有地址，等下一轮 def=$currentDef")
             return@LaunchedEffect
         }
         val plan: PrefetchPlan = if (directDef || isDirectFileUrl(tierUrl!!)) {
             val url = if (directDef) fetchOriginalUrl(currentPickCode) else tierUrl
             if (url == null) {
-                android.util.Log.i("PlayerPreload", "拿不到直链，跳过预下载")
+                com.open115.pad.util.AppLog.i("PlayerPreload", "拿不到直链，跳过预下载")
                 return@LaunchedEffect
             }
             FilePrefetchPlan(
@@ -2517,7 +2724,7 @@ fun PlayerScreen(
             )
         } else {
             val playlist = container.videoFrames.playlistFor(tierUrl) ?: run {
-                android.util.Log.i("PlayerPreload", "拉不到分片列表，跳过预下载")
+                com.open115.pad.util.AppLog.i("PlayerPreload", "拉不到分片列表，跳过预下载")
                 return@LaunchedEffect
             }
             if (playlist.segments.isEmpty()) return@LaunchedEffect
@@ -2715,7 +2922,7 @@ fun PlayerScreen(
                 }
                 toast("切换 ${labelOf(d)} 失败：$why")
                 // 排障线索：adb logcat -s PlayerSwitch（切档耗时/失败原因是这套等待逻辑的唯一实测依据）
-                android.util.Log.w(
+                com.open115.pad.util.AppLog.w(
                     "PlayerSwitch",
                     "切档失败 def=$d outcome=$outcome err=${preloadError?.errorCodeName}" +
                         " 耗时=${System.currentTimeMillis() - switchStartedAt}ms",
@@ -2742,7 +2949,7 @@ fun PlayerScreen(
             player.playWhenReady = true
             // 预载器清干净，下次切档再用
             // 预载器清干净，下次切档再用（日志要赶在 stop 之前打：stop 会把缓冲位置清零）
-            android.util.Log.d(
+            com.open115.pad.util.AppLog.d(
                 "PlayerSwitch",
                 "切档完成 def=$d 预载耗时=${System.currentTimeMillis() - switchStartedAt}ms" +
                     " 缓冲=${pre.bufferedPosition - newPos}ms 位置=${newPos}ms",
@@ -2921,7 +3128,7 @@ fun PlayerScreen(
                 if (entry.pc.isNotBlank()) {
                     runCatching {
                         withContext(Dispatchers.IO) { container.videoPreviews.deleteFor(listOf(entry.pc)) }
-                    }.onFailure { android.util.Log.w("VPreview", "清播放队列删除项的预览图失败：${it.message}") }
+                    }.onFailure { com.open115.pad.util.AppLog.w("VPreview", "清播放队列删除项的预览图失败：${it.message}") }
                 }
                 val newList = playQueue.toMutableList().apply { removeAt(index) }
                 val wasCurrent = index == currentIndex
@@ -2930,7 +3137,7 @@ fun PlayerScreen(
                 if (!wasCurrent && entry.pc.isNotBlank()) {
                     runCatching {
                         withContext(Dispatchers.IO) { PlayerCache.purge(listOf(entry.pc)) }
-                    }.onFailure { android.util.Log.w("PlayerCacheIO", "清播放队列删除项的播放缓存失败：${it.message}") }
+                    }.onFailure { com.open115.pad.util.AppLog.w("PlayerCacheIO", "清播放队列删除项的播放缓存失败：${it.message}") }
                 }
                 playQueue = newList
                 when {
@@ -3093,7 +3300,7 @@ fun PlayerScreen(
         }
         // 排障用（adb logcat -s PlayerColor）：这一档到底是什么 —— 杜比视界的 profile 就在
         // codecs 里（dvh1.05 / dvhe.08），配 colorInfo 就能分清"色彩异常出在源头还是本机链路"。
-        android.util.Log.i(
+        com.open115.pad.util.AppLog.i(
             "PlayerColor",
             "视频格式 res=$res def=$currentDef codecs=${vf?.codecs ?: "-"} " +
                 "mime=${vf?.sampleMimeType ?: "-"} " +
@@ -3385,9 +3592,23 @@ fun PlayerScreen(
                             with(vsDensity) { boxW.toDp() },
                             with(vsDensity) { boxH.toDp() },
                         )
+                        .onSizeChanged {
+                            // 双指平移按**屏幕上看到的**画面尺寸夹范围：画面旋转 90/270 时
+                            // Box 的布局尺寸是转置前的，而 translationX/Y 是屏幕方向（不随 rotationZ 转）
+                            val visW = if (rotated) it.height else it.width
+                            val visH = if (rotated) it.width else it.height
+                            videoZoom.updateViewport(Size(visW.toFloat(), visH.toFloat()))
+                        }
                         .then(
                             if (filterActive) Modifier
-                            else Modifier.graphicsLayer { rotationZ = videoRotation.toFloat() },
+                            else Modifier.graphicsLayer {
+                                rotationZ = videoRotation.toFloat()
+                                // 双指缩放/拖动：TextureView 参与 View 变换，这里真的生效
+                                scaleX = videoZoom.scale
+                                scaleY = videoZoom.scale
+                                translationX = videoZoom.panX
+                                translationY = videoZoom.panY
+                            },
                         ),
                 ) {
                     if (filterActive) {
@@ -3514,6 +3735,10 @@ fun PlayerScreen(
                 modifier = Modifier.fillMaxSize(),
                 enabled = !screenLocked && vrMode == null,
                 player = player,
+                zoom = videoZoom,
+                // 滤镜走 GLSurfaceView（SurfaceView 子类），graphicsLayer 对它不生效：
+                // 只把双指手势吃掉，别让单指逻辑误判成快进
+                zoomEnabled = !filterActive,
                 config = doubleTapConfig,
                 longPressSpeed = prefs.speedBoost,
                 onSpeedChange = { s -> currentSpeed = s },
@@ -3630,6 +3855,7 @@ fun PlayerScreen(
                                         // 锁定 = 要一块干净画面：贴底的面板跟着收起
                                         filterMenuOpen = false
                                         danmuMenuOpen = false
+                                        castMenuOpen = false
                                     }
                                 },
                             contentAlignment = Alignment.Center,
@@ -3677,6 +3903,7 @@ fun PlayerScreen(
                                     if (filterMenuOpen) {
                                         vrMenuOpen = false
                                         danmuMenuOpen = false
+                                        castMenuOpen = false
                                     }
                                     pulseControlRow()
                                 },
@@ -3704,6 +3931,7 @@ fun PlayerScreen(
                                         if (vrMenuOpen) {
                                             filterMenuOpen = false
                                             danmuMenuOpen = false
+                                            castMenuOpen = false
                                         }
                                         pulseControlRow()
                                     },
@@ -3752,6 +3980,55 @@ fun PlayerScreen(
                                     tint = Color.White,
                                     modifier = Modifier.size(20.dp),
                                 )
+                            }
+                        }
+                        // 投屏键：非 VR 才出现。投屏中这里不显示 —— 底部控制条已经接管，
+                        // 同一时刻也只投一台设备。
+                        if (vrMode == null && !castCasting && !castConnecting) {
+                            Spacer(Modifier.height(12.dp))
+                            CircleIconButton(
+                                icon = Icons.Outlined.Cast,
+                                description = "投屏",
+                                color = if (castMenuOpen) VrActiveColor
+                                else Color.Black.copy(alpha = 0.55f),
+                                onClick = {
+                                    castMenuOpen = !castMenuOpen
+                                    if (castMenuOpen) {
+                                        vrMenuOpen = false
+                                        filterMenuOpen = false
+                                        danmuMenuOpen = false
+                                        scanCastDevices()
+                                    }
+                                    pulseControlRow()
+                                },
+                            )
+                        }
+                        // 画面还原：双指放大过才出现（单击唤出控制排时跟这一列一起显隐）
+                        if (zoomActive && vrMode == null) {
+                            Spacer(Modifier.height(12.dp))
+                            Surface(
+                                color = Color.Black.copy(alpha = 0.55f),
+                                shape = CircleShape,
+                            ) {
+                                Box(
+                                    modifier = Modifier
+                                        .size(44.dp)
+                                        .clickable(
+                                            interactionSource = remember { MutableInteractionSource() },
+                                            indication = null,
+                                        ) {
+                                            resetZoomAnimated()
+                                            pulseControlRow()
+                                        },
+                                    contentAlignment = Alignment.Center,
+                                ) {
+                                    Icon(
+                                        Icons.Outlined.FitScreen,
+                                        contentDescription = "画面还原",
+                                        tint = Color.White,
+                                        modifier = Modifier.size(20.dp),
+                                    )
+                                }
                             }
                         }
                     }
@@ -3806,8 +4083,10 @@ fun PlayerScreen(
                 )
             }
             // 控制栏：形态 A 交互式进度条 + 按钮排；单击唤出，4 秒无操作整体淡出
+            // 投屏时整排让位：本地播放是暂停的，进度条/画质/选集都在操作一个"不发声的播放器"，
+            // 底部改由 CastControlBar 接管（播放/暂停发给电视）
             AnimatedVisibility(
-                visible = controlRowVisible && !screenLocked,
+                visible = controlRowVisible && !screenLocked && !castCasting && !castConnecting,
                 enter = fadeIn(tween(160)),
                 exit = fadeOut(tween(200)),
                 modifier = Modifier.align(Alignment.BottomCenter).fillMaxWidth(),
@@ -3997,6 +4276,28 @@ fun PlayerScreen(
                             },
                             onDismiss = { danmuMenuOpen = false },
                             modifier = Modifier,
+                        )
+                    }
+                    // 投屏面板：与 VR/滤镜/弹幕同一个位置、同一套交互
+                    AnimatedVisibility(
+                        visible = castMenuOpen && !castCasting && !castConnecting,
+                        enter = fadeIn(tween(140)) + expandVertically(tween(140)),
+                        exit = fadeOut(tween(120)) + shrinkVertically(tween(120)),
+                        modifier = Modifier.align(Alignment.CenterHorizontally),
+                    ) {
+                        CastMenu(
+                            devices = castDevices,
+                            scanning = castScanning,
+                            error = castError,
+                            onPick = { d -> startCasting(d) },
+                            onRescan = {
+                                scanCastDevices()
+                                pulseControlRow()
+                            },
+                            onDismiss = {
+                                castMenuOpen = false
+                                pulseControlRow()
+                            },
                         )
                     }
                     // 状态行（时长 / 当前画质 / 缓存 / 解码方式）：挂在控制排上方。
@@ -4283,6 +4584,7 @@ fun PlayerScreen(
                                         if (danmuMenuOpen) {
                                             filterMenuOpen = false
                                             vrMenuOpen = false
+                                            castMenuOpen = false
                                         }
                                         pulseControlRow()
                                     }) {
@@ -4330,9 +4632,11 @@ fun PlayerScreen(
                     }
                 }
             }
+            // 投屏中的界面搬到主 Box 最末尾（整屏遥控层），这里不再有底部条
             // 形态 B：常驻底部迷你进度条。控制栏隐藏时淡入，与形态 A 互斥，不会同时出现两条进度
             AnimatedVisibility(
-                visible = prefs.miniProgress && !controlRowVisible && !screenLocked,
+                visible = prefs.miniProgress && !controlRowVisible && !screenLocked &&
+                    !castCasting && !castConnecting,
                 enter = fadeIn(tween(200)),
                 exit = fadeOut(tween(160)),
                 modifier = Modifier.align(Alignment.BottomCenter),
@@ -4525,8 +4829,10 @@ fun PlayerScreen(
             // 不丢功能：标题也显示在顶栏，集数列表另有顶栏右侧的「播放列表」按钮。
             val infoMustYield = true
             var yieldInfoShown by remember { mutableStateOf(false) }
-            LaunchedEffect(controlRowVisible, screenLocked, infoMustYield) {
-                if (infoMustYield && !controlRowVisible && !screenLocked) {
+            // 投屏时底部是常驻的投屏控制条，信息层让位（否则叠在它上面）
+            val infoSuppressed = castCasting || castConnecting
+            LaunchedEffect(controlRowVisible, screenLocked, infoMustYield, infoSuppressed) {
+                if (infoMustYield && !controlRowVisible && !screenLocked && !infoSuppressed) {
                     yieldInfoShown = true
                     delay(4000L)
                     yieldInfoShown = false
@@ -4535,7 +4841,8 @@ fun PlayerScreen(
                 }
             }
             AnimatedVisibility(
-                visible = if (infoMustYield) yieldInfoShown else (controlRowVisible && !screenLocked),
+                visible = !infoSuppressed &&
+                    if (infoMustYield) yieldInfoShown else (controlRowVisible && !screenLocked),
                 enter = fadeIn(tween(200)),
                 exit = fadeOut(tween(160)),
                 modifier = Modifier
@@ -4780,6 +5087,90 @@ fun PlayerScreen(
                 }
             }
         }
+        // 投屏中的整屏遥控界面：盖住暂停的本地画面，把平板变成一台遥控器。
+        // 放在主 Box 的最后发射——视频面、标题栏、各种提示都被它盖住；只有 dialog（独立窗口）在它之上。
+        AnimatedVisibility(
+            visible = castCasting || castConnecting,
+            enter = fadeIn(tween(220)),
+            exit = fadeOut(tween(180)),
+        ) {
+            CastRemoteScreen(
+                deviceName = when (val s = castState) {
+                    is CastUiState.Casting -> s.device.name
+                    is CastUiState.Connecting -> s.device.name
+                    else -> ""
+                },
+                title = data?.fileName ?: currentName,
+                playing = (castState as? CastUiState.Casting)?.playing ?: false,
+                connecting = castConnecting,
+                supportsExtras = CastSession.device?.target == CastTarget.PadTv,
+                onTogglePlay = {
+                    val s = castState
+                    if (s is CastUiState.Casting) {
+                        scope.launch { CastSession.setPlaying(!s.playing) }
+                    }
+                },
+                onStop = {
+                    scope.launch {
+                        val srcPick = CastSession.sourcePickCode
+                        val pos = CastSession.stopAndPosition(context.applicationContext)
+                        // 还在同一部片上才把本地接回电视的进度；换过片就别乱跳
+                        if (srcPick.isNotEmpty() && srcPick == currentPickCode) {
+                            val target = pos ?: CastSession.lastPositionMs
+                            if (target > 0) {
+                                val dur = player.duration
+                                if (dur > 0) {
+                                    player.seekTo(target.coerceAtMost((dur - 1000).coerceAtLeast(0)))
+                                } else {
+                                    player.seekTo(target)
+                                }
+                            }
+                            player.play()
+                        }
+                        toast("已停止投屏")
+                    }
+                },
+                onSeek = { ms -> scope.launch { CastSession.seekTo(ms) } },
+                onSpeed = { s -> scope.launch { CastSession.setSpeed(s) } },
+                onVolumeDown = { scope.launch { CastSession.volumeDown() } },
+                onVolumeUp = { scope.launch { CastSession.volumeUp() } },
+                // 解码方式与播放器：改的是电视端的播放行为（软解能救硬解花屏的片；
+                // "电视自带播放器"是内置播放器放不了时的兜底，代价是遥控会失效）
+                onDecode = { m -> scope.launch { CastSession.setDecode(m) } },
+                onPlayer = { m -> scope.launch { CastSession.setPlayer(m) } },
+                // 画质与字幕：与电视端画质面板/字幕键同一条路径；搜索字幕由这里代下载后推给电视
+                onQuality = { def -> scope.launch { CastSession.setQuality(def) } },
+                onSubtitle = { on -> scope.launch { CastSession.setSubtitle(on) } },
+                onSearchSubtitle = { castSubSearchOpen = true },
+            )
+        }
+    }
+
+    // 投屏中按返回：先交代一句"投屏没停"，再退出——通知栏里有回到遥控器的入口
+    BackHandler(enabled = castCasting || castConnecting) {
+        toast("投屏继续；通知栏里可回到遥控器")
+        onBack()
+    }
+
+    // 遥控界面的在线字幕搜索：结果下载后不走本地挂载，base64 推给电视端落盘加载
+    if (castSubSearchOpen) {
+        SubtitleSearchDialog(
+            client = container.okHttpClient,
+            api = container.openApi,
+            videoDurationMs = durationMs,
+            initialKeyword = (data?.fileName ?: currentName).substringBefore('.').ifBlank { currentName },
+            uploadTargetCid = null,
+            uploadBaseName = (data?.fileName ?: currentName).substringBeforeLast('.'),
+            onLoad = { cfg, bytes, _ ->
+                castSubSearchOpen = false
+                scope.launch {
+                    // 与本地挂载同一套 GBK→UTF-8 归一：电视端按 UTF-8 解
+                    val ok = CastSession.pushSubtitle(cfg.title, cfg.mime, normalizeSubtitleEncoding(bytes))
+                    toast(if (ok) "已推送给电视加载" else "推送失败（电视端失联？）")
+                }
+            },
+            onDismiss = { castSubSearchOpen = false },
+        )
     }
 
     if (showSubSearch) {

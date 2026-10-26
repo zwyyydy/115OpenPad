@@ -211,7 +211,7 @@ internal class DanmakuRenderView(context: Context) : View(context) {
     override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
         super.onSizeChanged(w, h, oldw, oldh)
         // 排障用（弹幕区高度、轨道数、「显示区域」到底生效没）：adb logcat -s DanmuDbg
-        android.util.Log.d("DanmuDbg", "size ${w}x$h 行数=${(h / lineH).toInt()} 行高=$lineH")
+        com.open115.pad.util.AppLog.d("DanmuDbg", "size ${w}x$h 行数=${(h / lineH).toInt()} 行高=$lineH")
         // 尺寸变了轨道数就变了：清空调度状态，下一帧按新尺寸重来
         channels = FloatArray(0)
         active.clear()

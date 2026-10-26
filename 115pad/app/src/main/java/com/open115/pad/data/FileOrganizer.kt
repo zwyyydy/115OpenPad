@@ -305,7 +305,7 @@ class FileOrganizer(
             if (empty) {
                 val r = runCatching { api.deleteFiles(cid) }
                 if (r.getOrNull()?.envOk() == true) removed++
-                else android.util.Log.w("FileOrganizer", "删空目录失败 $cid：${r.exceptionOrNull()?.message ?: "接口返回失败"}")
+                else com.open115.pad.util.AppLog.w("FileOrganizer", "删空目录失败 $cid：${r.exceptionOrNull()?.message ?: "接口返回失败"}")
             }
             throttle()
         }

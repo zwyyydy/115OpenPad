@@ -1,6 +1,6 @@
 package com.open115.pad.data
 
-import android.util.Log
+import com.open115.pad.util.AppLog as Log
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -11,6 +11,7 @@ import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.io.File
+import kotlin.math.roundToInt
 
 /**
  * 图片直链解析：三级降级链 + downurl 防频控缓存。
@@ -35,6 +36,11 @@ class ImageUrlResolver(
      */
     private val mediaCacheMaxBytes: () -> Long = { MEDIA_CACHE_MAX_BYTES },
     private val mediaCacheEnabled: () -> Boolean = { true },
+    /**
+     * 兜底海报手动裁剪的规格（可选）。传 null 时一律按默认"右半张 2:3"裁 ——
+     * 单元测试/纯解析场景不需要 Context，也就不需要这个存储。
+     */
+    private val cropStore: PosterCropStore? = null,
 ) {
 
     private data class Entry(val at: Long, val url: String)
@@ -287,7 +293,12 @@ class ImageUrlResolver(
      */
     suspend fun croppedPosterIfCached(backgroundPickCode: String?, cacheDir: File): Any? {
         if (backgroundPickCode.isNullOrBlank() || !mediaCacheEnabled()) return null
-        val file = derivedPosterFile(File(cacheDir, MEDIA_DIR), backgroundPickCode)
+        val rev = cropStore?.get(backgroundPickCode)?.rev ?: 0
+        return cachedDerivedFile(File(cacheDir, MEDIA_DIR), backgroundPickCode, rev)
+    }
+
+    private suspend fun cachedDerivedFile(dir: File, code: String, rev: Int): Any? {
+        val file = derivedPosterFile(dir, code, rev)
         return withContext(Dispatchers.IO) {
             if (!file.exists() || file.length() <= 0L) return@withContext null
             // 同 cachedPoster：命中要顶 mtime，否则常看的兜底海报会被当成最旧的先淘汰
@@ -296,24 +307,31 @@ class ImageUrlResolver(
         }
     }
 
+    /** 兜底海报当前的裁剪规格（null = 默认右半张 2:3） */
+    suspend fun posterCrop(backgroundPickCode: String?): PosterCropRect? =
+        backgroundPickCode?.takeIf { it.isNotBlank() }?.let { cropStore?.get(it)?.rect }
+
     /**
      * 确保有兜底海报：背景图字节不在本地就先按正常链路取回来（[posterFor]），
-     * 再从它裁出右半部分落盘。**已经在本地就纯文件判断**，不会重复裁、也不会重复下。
+     * 再按**当前裁剪规格**（没有就是默认右半张 2:3）裁一块落盘。
+     * **已经在本地就纯文件判断**，不会重复裁、也不会重复下。
      *
      * 裁失败（图太大解不动、缓存关掉只能拿到直链、源图损坏）一律返回 null ——
      * 兜底海报是锦上添花，不该让详情页因此报错。
      */
     suspend fun ensureCroppedPoster(backgroundPickCode: String?, cacheDir: File): Any? {
         if (backgroundPickCode.isNullOrBlank()) return null
-        croppedPosterIfCached(backgroundPickCode, cacheDir)?.let { return it }
+        val entry = cropStore?.get(backgroundPickCode)
+        val rev = entry?.rev ?: 0
+        val dir = File(cacheDir, MEDIA_DIR)
+        cachedDerivedFile(dir, backgroundPickCode, rev)?.let { return it }
         if (!mediaCacheEnabled()) return null
         val srcPath = posterFor(backgroundPickCode, cacheDir) as? String ?: return null
-        val dir = File(cacheDir, MEDIA_DIR)
-        val target = derivedPosterFile(dir, backgroundPickCode)
+        val target = derivedPosterFile(dir, backgroundPickCode, rev)
         val made = withContext(Dispatchers.IO) {
             runCatching {
                 if (target.exists() && target.length() > 0L) return@runCatching target.absolutePath
-                cropRightHalfTo(File(srcPath), target)
+                cropTo(File(srcPath), target, entry?.rect)
                 target.absolutePath
             }.onFailure { Log.w(TAG, "背景图裁海报失败 pickCode=$backgroundPickCode: ${it.message}") }
                 .getOrNull()
@@ -324,13 +342,36 @@ class ImageUrlResolver(
     }
 
     /**
-     * 裁右半部分并落盘（先写临时文件再改名，同 [fetchBytesToCache]：
+     * 保存手动裁剪：写规格 → 版本 +1 → 删旧文件 → 按新规格重裁。null = 恢复默认。
+     *
+     * 版本号让落盘文件名变化：Coil 按路径缓存，覆盖同一个文件的话会继续显示旧构图。
+     */
+    suspend fun savePosterCrop(
+        backgroundPickCode: String,
+        rect: PosterCropRect?,
+        cacheDir: File,
+    ): Boolean {
+        if (backgroundPickCode.isBlank() || cropStore == null) return false
+        if (!mediaCacheEnabled()) return false
+        val oldRev = cropStore.get(backgroundPickCode)?.rev ?: 0
+        cropStore.put(backgroundPickCode, rect)
+        val dir = File(cacheDir, MEDIA_DIR)
+        withContext(Dispatchers.IO) {
+            // 旧版本文件不会再被读到；顺手删掉，不占缓存额度
+            derivedPosterFile(dir, backgroundPickCode, oldRev).delete()
+            if (oldRev != 0) derivedPosterFile(dir, backgroundPickCode, 0).delete()
+        }
+        return ensureCroppedPoster(backgroundPickCode, cacheDir) != null
+    }
+
+    /**
+     * 按规格裁一块并落盘（先写临时文件再改名，同 [fetchBytesToCache]：
      * 中途被杀不会留下半个文件被当成有效海报）。
      *
      * 解码时按 inSampleSize 把宽度压到 [CROP_MAX_SRC_WIDTH] 以内：4K 背景图整张解出来是
      * 33MB 内存，而海报显示宽度最多几百像素，没必要。
      */
-    private fun cropRightHalfTo(src: File, target: File) {
+    private fun cropTo(src: File, target: File, spec: PosterCropRect?) {
         val bounds = android.graphics.BitmapFactory.Options().apply { inJustDecodeBounds = true }
         android.graphics.BitmapFactory.decodeFile(src.absolutePath, bounds)
         if (bounds.outWidth <= 0 || bounds.outHeight <= 0) error("背景图解不出尺寸")
@@ -339,21 +380,27 @@ class ImageUrlResolver(
 
         val opts = android.graphics.BitmapFactory.Options().apply { inSampleSize = sample }
         val full = android.graphics.BitmapFactory.decodeFile(src.absolutePath, opts) ?: error("背景图解码失败")
-        val half = android.graphics.Bitmap.createBitmap(full, full.width / 2, 0, full.width / 2, full.height)
+        // 没手动调过 → 默认右半张 2:3（与旧版在 2:3 海报框里实际显示的区域一致）
+        val rect = (spec ?: defaultPosterCrop(full.width, full.height)).clamped()
+        val x = (rect.left * full.width).roundToInt().coerceIn(0, full.width - 1)
+        val y = (rect.top * full.height).roundToInt().coerceIn(0, full.height - 1)
+        val w = (rect.width * full.width).roundToInt().coerceIn(1, full.width - x)
+        val h = (rect.height * full.height).roundToInt().coerceIn(1, full.height - y)
+        val cropped = android.graphics.Bitmap.createBitmap(full, x, y, w, h)
         try {
             // 临时名带纳秒后缀：同一个 pickCode 并发裁两次（快速进出详情页）时不会往
             // 同一个临时文件里交错写。谁最后改名成功谁算数，内容一样。
             val tmp = File(target.parentFile, "${target.name}.${System.nanoTime()}.tmp")
             tmp.outputStream().use { out ->
                 @Suppress("DEPRECATION")
-                half.compress(android.graphics.Bitmap.CompressFormat.JPEG, CROP_JPEG_QUALITY, out)
+                cropped.compress(android.graphics.Bitmap.CompressFormat.JPEG, CROP_JPEG_QUALITY, out)
             }
             if (!tmp.renameTo(target)) {
                 tmp.copyTo(target, overwrite = true)
                 tmp.delete()
             }
         } finally {
-            half.recycle()
+            cropped.recycle()
             full.recycle()
         }
     }
@@ -361,9 +408,16 @@ class ImageUrlResolver(
     /**
      * 兜底海报的落盘文件：键是**背景图的 pickCode**（不是影片的 key）。
      * 这样背景图换了（重刮）就是另一个文件，旧的自然被 LRU 淘汰 —— 不会拿着一张过期截图当海报。
+     *
+     * 手动裁剪过的带 `|r<版本>` 后缀：版本一变路径就变，Coil 才会真的重新解码。
+     * rev=0 沿用旧命名，老用户的兜底海报不用重裁一遍。
      */
-    private fun derivedPosterFile(dir: File, backgroundPickCode: String): File =
-        targetOf(dir, "$DERIVED_PREFIX$backgroundPickCode")
+    private fun derivedPosterFile(dir: File, backgroundPickCode: String, rev: Int): File =
+        targetOf(
+            dir,
+            if (rev <= 0) "$DERIVED_PREFIX$backgroundPickCode"
+            else "$DERIVED_PREFIX$backgroundPickCode|r$rev",
+        )
 
     /**
      * 已落盘的海报文件；命中时把 mtime 顶到现在。**调用方负责判缓存开关**。
@@ -409,8 +463,10 @@ class ImageUrlResolver(
         val hugeDir = File(cacheDir, HUGE_DIR)
         pickCodes.filter { it.isNotBlank() }.distinct().forEach { pc ->
             targetOf(mediaDir, pc).delete()
-            // 由这张背景图裁出来的兜底海报也一起删（它的键是背景图 pickCode）
-            derivedPosterFile(mediaDir, pc).delete()
+            // 由这张背景图裁出来的兜底海报也一起删（键是背景图 pickCode；手动裁剪过会带版本号）
+            val rev = cropStore?.get(pc)?.rev ?: 0
+            derivedPosterFile(mediaDir, pc, rev).delete()
+            if (rev != 0) derivedPosterFile(mediaDir, pc, 0).delete()
             // 同一张图在画廊里看过的原图（huge_img），键同为 pickCode
             targetOf(hugeDir, pc).delete()
         }
@@ -522,7 +578,7 @@ class ImageUrlResolver(
                     val len = f.length()
                     if (f.delete()) total -= len
                 }
-            }.onFailure { android.util.Log.w(TAG, "海报缓存 LRU 淘汰失败（缓存可能一直超出上限）", it) }
+            }.onFailure { com.open115.pad.util.AppLog.w(TAG, "海报缓存 LRU 淘汰失败（缓存可能一直超出上限）", it) }
         }
     }
 }

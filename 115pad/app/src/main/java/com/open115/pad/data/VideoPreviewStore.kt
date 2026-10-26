@@ -93,7 +93,7 @@ class VideoPreviewStore(
             prune()
             f
         } catch (e: Exception) {
-            android.util.Log.w("VideoPreviewStore", "写预览封面失败 $pickCode（磁盘满/权限？）", e)
+            com.open115.pad.util.AppLog.w("VideoPreviewStore", "写预览封面失败 $pickCode（磁盘满/权限？）", e)
             null
         }
     }
@@ -116,7 +116,7 @@ class VideoPreviewStore(
                 f.setLastModified(System.currentTimeMillis())
                 true
             } catch (e: Exception) {
-                android.util.Log.w("VideoPreviewStore", "写预览条失败 $pickCode#$i（磁盘满/权限？）", e)
+                com.open115.pad.util.AppLog.w("VideoPreviewStore", "写预览条失败 $pickCode#$i（磁盘满/权限？）", e)
                 false
             }
             if (ok) written++
@@ -220,7 +220,7 @@ class VideoPreviewStore(
         }
         if (removed > 0) {
             _version.value++
-            android.util.Log.i(
+            com.open115.pad.util.AppLog.i(
                 "VPreview",
                 "预览缓存淘汰 $removed 个文件，剩 ${total / 1024} KB / 上限 ${limit / 1024} KB",
             )

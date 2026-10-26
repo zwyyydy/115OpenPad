@@ -141,6 +141,15 @@ class AppPrefs(private val context: Context) {
 
     suspend fun setApiRateIntervalMs(ms: Long) = context.appDataStore.edit { it[KEY_API_RATE] = ms }
 
+    // ---- 诊断日志（设置 → 诊断）----
+    /**
+     * 是否把日志写到本机文件。默认开：崩溃/异常时才有东西可查；关掉后连崩溃记录也不写。
+     * 只影响文件，logcat 不受影响（adb 调试照旧）。
+     */
+    val logToFile: Flow<Boolean> = context.appDataStore.data.map { it[KEY_LOG_TO_FILE] ?: true }
+
+    suspend fun setLogToFile(on: Boolean) = context.appDataStore.edit { it[KEY_LOG_TO_FILE] = on }
+
     companion object {
         /** 「全局请求间隔」的档位（设置页直接渲染这一份） */
         val API_RATE_OPTIONS = listOf(
@@ -165,5 +174,6 @@ class AppPrefs(private val context: Context) {
         private val KEY_GLASS_RADIUS = intPreferencesKey("glass_radius_dp")
         private val KEY_KEEP_ALIVE = booleanPreferencesKey("keep_alive")
         private val KEY_API_RATE = longPreferencesKey("api_rate_interval_ms")
+        private val KEY_LOG_TO_FILE = booleanPreferencesKey("log_to_file")
     }
 }

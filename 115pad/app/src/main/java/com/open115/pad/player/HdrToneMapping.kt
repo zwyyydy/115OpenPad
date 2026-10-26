@@ -4,7 +4,7 @@ import android.content.Context
 import android.media.MediaFormat
 import android.os.Build
 import android.os.Handler
-import android.util.Log
+import com.open115.pad.util.AppLog as Log
 import androidx.media3.common.C
 import androidx.media3.common.ColorInfo
 import androidx.media3.common.Format

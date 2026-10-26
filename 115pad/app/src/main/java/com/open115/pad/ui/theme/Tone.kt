@@ -114,6 +114,50 @@ private val toneCache = LruCache<String, Color>(64)
  *
  * ★ 颜色是**渐变过去的**，不是跳过去的：图先到、色后到，跳变会让详情页开场闪一下。
  */
+/**
+ * 取色缓存里已经算过的值（同步、无副作用）。
+ * 图片骨架/占位用它做底色：同一张海报在墙和详情页之间来回时，首帧就是主色而不是白闪。
+ */
+fun cachedTone(key: String?): Color? = key?.let { toneCache[it] }
+
+/** 记下一个主色（加载成功后调用，下次出现时占位就能用上） */
+fun rememberToneColor(key: String, color: Color) {
+    if (toneCache[key] == null) toneCache.put(key, color)
+}
+
+/**
+ * 从任意 Coil model 里算主色（不读缓存）。
+ * 用应用里**同一份** ImageLoader（已配 OkHttpClient + 鉴权链），并关掉硬件位图。
+ */
+suspend fun computeTone(ctx: android.content.Context, model: Any?): Color? = withContext(Dispatchers.Default) {
+    runCatching {
+        // model 本身可能就是调用方配好的 ImageRequest（如文件预览帧带 memoryCacheKey），
+        // 再包一层 data(request) 会丢掉那份配置
+        val base = if (model is ImageRequest) {
+            // ★ 取色用的 72px 缩略图不能和原图共用 memoryCacheKey：
+            //   否则小图会把原图那条内存缓存覆盖掉，列表缩略图变糊
+            val key = model.memoryCacheKey?.key ?: model.data.toString()
+            model.newBuilder().memoryCacheKey("$key|tone")
+        } else {
+            ImageRequest.Builder(ctx).data(model)
+        }
+        val req = base
+            // ☠ 硬件位图**读不到像素**（getPixels 直接抛）。这一行漏了的话取色恒失败，
+            //   而表现只是「底色一直是默认的」，不报错
+            .allowHardware(false)
+            .size(72, 72)
+            .build()
+        val drawable = (ctx.imageLoader.execute(req) as? SuccessResult)?.drawable
+        val bmp = (drawable as? BitmapDrawable)?.bitmap ?: return@runCatching null
+        val small = if (bmp.width > 72 || bmp.height > 72) {
+            Bitmap.createScaledBitmap(bmp, 48, 48, true)
+        } else bmp
+        val px = IntArray(small.width * small.height)
+        small.getPixels(px, 0, small.width, 0, 0, small.width, small.height)
+        pickTone(px)?.let { Color(0xFF000000.toInt() or it) }
+    }.getOrNull()
+}
+
 @Composable
 fun rememberTone(model: Any?, fallback: Color): Color {
     val ctx = LocalContext.current
@@ -122,27 +166,7 @@ fun rememberTone(model: Any?, fallback: Color): Color {
 
     LaunchedEffect(key) {
         if (key.isNullOrEmpty() || raw != null) return@LaunchedEffect
-        val got = withContext(Dispatchers.Default) {
-            runCatching {
-                val req = ImageRequest.Builder(ctx)
-                    .data(model)
-                    // ☠ 硬件位图**读不到像素**（getPixels 直接抛）。这一行漏了的话取色恒失败，
-                    //   而表现只是「底色一直是默认的」，不报错
-                    .allowHardware(false)
-                    .size(72, 72)
-                    .build()
-                // 用 Coil 的**同一份** ImageLoader（应用里已配好 OkHttpClient + 鉴权链），
-                // 而不是 new 一个 —— 否则 115 的图片（要带 UA/鉴权）在这里会取不到
-                val drawable = (ctx.imageLoader.execute(req) as? SuccessResult)?.drawable
-                val bmp = (drawable as? BitmapDrawable)?.bitmap ?: return@runCatching null
-                val small = if (bmp.width > 72 || bmp.height > 72) {
-                    Bitmap.createScaledBitmap(bmp, 48, 48, true)
-                } else bmp
-                val px = IntArray(small.width * small.height)
-                small.getPixels(px, 0, small.width, 0, 0, small.width, small.height)
-                pickTone(px)?.let { Color(0xFF000000.toInt() or it) }
-            }.getOrNull()
-        }
+        val got = computeTone(ctx, model)
         if (got != null) {
             toneCache.put(key, got)
             raw = got

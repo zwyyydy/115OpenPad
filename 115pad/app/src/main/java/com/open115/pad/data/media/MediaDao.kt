@@ -66,6 +66,9 @@ data class EpisodeRow(
  */
 const val MEDIA_NO_LIMIT = -1
 
+/** 搜索结果每页条数：界面滚到底再要下一页，不再一次拉全库（见 searchAll 的 offset） */
+const val SEARCH_PAGE_SIZE = 60
+
 /**
  * 批量刮削的候选行：只要"够用来搜索 + 够用来写回"的字段。
  *
@@ -266,6 +269,18 @@ data class AncestorRow(
     val fanartPickCode: String?,
 )
 
+/**
+ * 一个 mediaKey 现在归谁：落在哪个目录 + 它的**物理身份**（视频 / nfo 的 pick_code）。
+ *
+ * 只取三列、不读整行：跨库同名影片的判据每条都要查（见 `MediaScanner.KeyScope`），
+ * 而 `nfoJson` 那种几 KB 的长列在这条路上一点用都没有。
+ */
+data class MovieKeyOwner(
+    val dirPath: String?,
+    val videoPickCode: String?,
+    val nfoPickCode: String?,
+)
+
 @Dao
 interface MediaDao {
     @Upsert
@@ -354,49 +369,91 @@ interface MediaDao {
     // 不该在海报墙或搜索结果里各出一次。
 
     /**
-     * **全局搜索**：片名 / 演员 / 标签，一网打尽，**不按媒体库过滤**（跨所有库）。
+     * **全局搜索**：片名 / 拼音 / 首字母 / 演员 / 标签，一网打尽，**不按媒体库过滤**（跨所有库）。
      *
-     * 三个来源合并成"命中集合"再取顶层条目：
-     *  - 片名 `LIKE`（片名不分词，子串匹配就够；用户搜的是"示例影片"这种短词）
-     *  - 演员名 `LIKE` → 命中分集时用 `COALESCE(seriesKey, mediaKey)` 归到它所属的系列卡
-     *    （演员挂在分集行上，直接拿 mediaKey 去比会一张卡都出不来）
-     *  - 标签名 `LIKE` → 同上
+     * 形态：先在子查询里算出"命中的顶层 key 集合"（三条 UNION），外层再 `mediaKey IN (...)`。
+     * **不要改成逐行 EXISTS**：`COALESCE(x.seriesKey, x.mediaKey) = m.mediaKey` 里带表达式，
+     * SQLite 用不上 seriesKey 索引，大库会退化成 O(n²)（平板上实测 2000+ 部时首次搜索要多等几秒）。
+     * 现在的写法只对 movies 做一次标题/拼音扫描，演员与标签从各自的小表 join 过来，
+     * UNION 的集合很小，外层走主键。
      *
-     * 用 UNION（去重）而不是三个 OR 子查询：一部片同时命中片名和演员时只出一张卡。
+     * 分集标题（含拼音）也通过 `COALESCE(seriesKey, mediaKey)` 归到系列卡 —— 与演员/标签同一口径。
+     *
+     * `:pinyin` 是调用方归一化后的拼音串（小写字母数字）；为空时跳过拼音条件，
+     * 否则 `LIKE '%%'` 会把整库都匹配上。
+     *
+     * 分页：`LIMIT :limit OFFSET :offset`，界面按 60 条一页往下要，不再一次拉全库。
      */
     @Query(
-        "SELECT mediaKey, title, year, rating, posterPickCode, fanartPickCode, extraFanartPickCodes, " +
-            "isEpisodeLike, videoPickCode, genre, videoName FROM movies " +
-            "WHERE seriesKey IS NULL AND mediaKey IN (" +
-            "SELECT mediaKey FROM movies WHERE title LIKE '%' || :keyword || '%' " +
+        "SELECT m.mediaKey, m.title, m.year, m.rating, m.posterPickCode, m.fanartPickCode, " +
+            "m.extraFanartPickCodes, m.isEpisodeLike, m.videoPickCode, m.genre, m.videoName " +
+            "FROM movies m WHERE m.seriesKey IS NULL AND m.mediaKey IN (" +
+            // 片名 / 拼音 / 首字母（分集命中归到系列）
+            "SELECT COALESCE(x.seriesKey, x.mediaKey) FROM movies x " +
+            "WHERE x.title LIKE '%' || :keyword || '%' " +
+            "   OR (:pinyin <> '' AND (x.titlePinyin LIKE '%' || :pinyin || '%' " +
+            "       OR x.titleInitials LIKE '%' || :pinyin || '%')) " +
             "UNION " +
+            // 演员（挂在分集行上，归到系列）
             "SELECT COALESCE(x.seriesKey, x.mediaKey) FROM movies x " +
             "JOIN movie_actors ma ON x.mediaKey = ma.mediaKey " +
-            "JOIN actors a ON ma.actorId = a.id WHERE a.name LIKE '%' || :keyword || '%' " +
+            "JOIN actors a ON ma.actorId = a.id " +
+            "WHERE a.name LIKE '%' || :keyword || '%' " +
             "UNION " +
+            // 标签
             "SELECT COALESCE(x.seriesKey, x.mediaKey) FROM movies x " +
             "JOIN movie_tags mt ON x.mediaKey = mt.mediaKey " +
-            "JOIN tags t ON mt.tagId = t.id WHERE t.name LIKE '%' || :keyword || '%') " +
+            "JOIN tags t ON mt.tagId = t.id " +
+            "WHERE t.name LIKE '%' || :keyword || '%'" +
+            ") " +
             "ORDER BY " +
                 // 排序按序号分派（见 WorksSort）：一条查询管全部，不写六条几乎一样的 SQL。
                 // DESC 的分支里 NULL 在 SQLite 自然沉底；ASC 的分支里 NULL 会顶到最前，
                 // 所以每个 ASC 都配一个 `(x IS NULL)` 前置项（0/1）把没值的行压到最后 ——
                 // 不用 NULLS LAST：老设备自带的 SQLite（3.30 之前）没有这个语法。
-                "CASE WHEN :sort = 0 THEN rating END DESC, " +
-                "CASE WHEN :sort = 5 THEN (rating IS NULL) END ASC, " +
-                "CASE WHEN :sort = 5 THEN rating END ASC, " +
-                "CASE WHEN :sort = 1 THEN premiered END DESC, " +
-                "CASE WHEN :sort = 6 THEN (premiered IS NULL) END ASC, " +
-                "CASE WHEN :sort = 6 THEN premiered END ASC, " +
-                "CASE WHEN :sort = 2 THEN COALESCE(dateAdded, scannedAt) END DESC, " +
-                "CASE WHEN :sort = 7 THEN (COALESCE(dateAdded, scannedAt) IS NULL) END ASC, " +
-                "CASE WHEN :sort = 7 THEN COALESCE(dateAdded, scannedAt) END ASC, " +
-                "CASE WHEN :sort = 3 THEN title END ASC, " +
-                "CASE WHEN :sort = 8 THEN title END DESC, " +
+                "CASE WHEN :sort = 0 THEN m.rating END DESC, " +
+                "CASE WHEN :sort = 5 THEN (m.rating IS NULL) END ASC, " +
+                "CASE WHEN :sort = 5 THEN m.rating END ASC, " +
+                "CASE WHEN :sort = 1 THEN m.premiered END DESC, " +
+                "CASE WHEN :sort = 6 THEN (m.premiered IS NULL) END ASC, " +
+                "CASE WHEN :sort = 6 THEN m.premiered END ASC, " +
+                "CASE WHEN :sort = 2 THEN COALESCE(m.dateAdded, m.scannedAt) END DESC, " +
+                "CASE WHEN :sort = 7 THEN (COALESCE(m.dateAdded, m.scannedAt) IS NULL) END ASC, " +
+                "CASE WHEN :sort = 7 THEN COALESCE(m.dateAdded, m.scannedAt) END ASC, " +
+                "CASE WHEN :sort = 3 THEN m.title END ASC, " +
+                "CASE WHEN :sort = 8 THEN m.title END DESC, " +
                 "CASE WHEN :sort = 4 THEN RANDOM() END, " +
-                "title ASC LIMIT :limit",
+                "m.title ASC LIMIT :limit OFFSET :offset",
     )
-    suspend fun searchAll(keyword: String, limit: Int = 200, sort: Int = 0): List<MovieCard>
+    suspend fun searchAll(
+        keyword: String,
+        pinyin: String = "",
+        limit: Int = 200,
+        offset: Int = 0,
+        sort: Int = 0,
+    ): List<MovieCard>
+
+    // ---- 拼音回填：老库升级到 v21 时列是空的，启动后分批补齐 ----
+
+    data class PinyinRow(val mediaKey: String, val title: String)
+
+    /** 回填行：算好的拼音与首字母 */
+    data class PinyinUpdate(val key: String, val pinyin: String, val initials: String)
+
+    @Query("SELECT mediaKey, title FROM movies WHERE titlePinyin = '' AND title <> '' LIMIT :limit")
+    suspend fun moviesWithoutPinyin(limit: Int = 500): List<PinyinRow>
+
+    @Query("UPDATE movies SET titlePinyin = :pinyin, titleInitials = :initials WHERE mediaKey = :key")
+    suspend fun setMoviePinyin(key: String, pinyin: String, initials: String)
+
+    /**
+     * 一批回填放在**同一个事务**里：逐条 update 各开一次事务时，2000 部片会在 WAL 上
+     * 排 2000 次提交，升级后的第一次搜索能被它拖到好几秒；合批后只剩每 500 行一次。
+     */
+    @Transaction
+    suspend fun setMoviePinyinBatch(updates: List<PinyinUpdate>) {
+        updates.forEach { setMoviePinyin(it.key, it.pinyin, it.initials) }
+    }
 
     /** 全库按评分排（当前无调用方，留着当通用入口）。同样只出顶层条目 */
     @Query(
@@ -816,6 +873,23 @@ interface MediaDao {
     @Query("SELECT * FROM movies WHERE mediaKey = :mediaKey")
     suspend fun movie(mediaKey: String): MovieEntity?
 
+    /** 这个键现在落在哪个目录（跨库同片：判"这行是不是本库的"） */
+    @Query("SELECT dirPath, videoPickCode, nfoPickCode FROM movies WHERE mediaKey = :mediaKey")
+    suspend fun movieKeyOwner(mediaKey: String): MovieKeyOwner?
+
+    /**
+     * 按**播的那个文件**反查键：跨库冲突时用来认"这是同一份文件被搬了地方"（迁移 / 目录改名）。
+     *
+     * `videoPickCode` 没有索引 —— 只允许在**冲突路径**上查（两个不相交的库都有同一部片时才走到），
+     * 别放进逐条入库的常规路径。
+     */
+    @Query("SELECT mediaKey FROM movies WHERE videoPickCode = :pickCode LIMIT 1")
+    suspend fun movieKeyByVideoPickCode(pickCode: String): String?
+
+    /** 同上，给没有视频的合成行（分 CD 的基名行）用 */
+    @Query("SELECT mediaKey FROM movies WHERE nfoPickCode = :pickCode AND nfoPickCode != '' LIMIT 1")
+    suspend fun movieKeyByNfoPickCode(pickCode: String): String?
+
     /**
      * 这部**作品**的全部索引行：`mediaKey` 自己 + `seriesKey` 指向它的（分集、分 CD 的各张盘）。
      *
@@ -1131,6 +1205,13 @@ interface MediaDao {
             "(:wantFanart AND extraFanartDirCid IS NULL) OR (:wantActors AND actorsDirCid IS NULL))",
     )
     suspend fun rowsMissingSideArt(dirKey: String, wantFanart: Boolean, wantActors: Boolean): Int
+
+    /** 写 AI 译文（只写新列，原 title/plot 一个字段都不动） */
+    @Query(
+        "UPDATE movies SET titleZh = :titleZh, plotZh = :plotZh, " +
+            "zhSourceHash = :hash, zhAt = :at WHERE mediaKey = :key",
+    )
+    suspend fun updateTranslation(key: String, titleZh: String?, plotZh: String?, hash: String, at: Long)
 
     @Query(
         "UPDATE movies SET extraFanartPickCodes = :fanartCodes, extraFanartDirCid = :fanartDirCid, " +

@@ -66,6 +66,13 @@ interface OpenApi {
         @Query("limit") limit: Int = 200,
         @Query("offset") offset: Int = 0,
         @Query("type") type: Int? = null,
+        // 目录范围：0/不传 = 全盘；具体 cid = 只搜该目录（含子目录）
+        @Query("cid") cid: String? = null,
+        // 时间范围（YYYY-MM-DD）；只传开始日期即可，服务端按">= gte_day"
+        @Query("gte_day") gteDay: String? = null,
+        @Query("lte_day") lteDay: String? = null,
+        // 1=只文件夹 2=只文件 0=全部
+        @Query("fc") fc: Int? = null,
     ): JsonObject
 
     @FormUrlEncoded
@@ -141,6 +148,37 @@ interface OpenApi {
 
     @GET("open/offline/get_quota_info")
     suspend fun offlineQuota(): JsonObject
+
+    /** 清空任务。flag：0 已完成 / 1 全部 / 2 失败 / 3 进行中 / 4 已完成并删源文件 / 5 全部并删源文件 */
+    @FormUrlEncoded
+    @POST("open/offline/clear_task")
+    suspend fun offlineClear(@Field("flag") flag: Int): JsonObject
+
+    /**
+     * 解析已上传到云盘的种子：返回文件名、总大小、info_hash 与**完整文件清单**。
+     * `torrent_sha1` 是种子文件本身的 SHA1（不是 info_hash），必须与上传的字节一致。
+     */
+    @FormUrlEncoded
+    @POST("open/offline/torrent")
+    suspend fun offlineTorrent(
+        @Field("torrent_sha1") torrentSha1: String,
+        @Field("pick_code") pickCode: String,
+    ): JsonObject
+
+    /**
+     * 按已解析的种子建 BT 任务。
+     * `wanted` 是**从 0 开始**的文件索引，逗号分隔；`save_path` 是相对 `wp_path_id` 的路径。
+     */
+    @FormUrlEncoded
+    @POST("open/offline/add_task_bt")
+    suspend fun offlineAddBt(
+        @Field("info_hash") infoHash: String,
+        @Field("wanted") wanted: String,
+        @Field("save_path") savePath: String,
+        @Field("torrent_sha1") torrentSha1: String,
+        @Field("pick_code") pickCode: String,
+        @Field("wp_path_id") wpPathId: String,
+    ): JsonObject
 
     // ---------------- 上传 ----------------
 

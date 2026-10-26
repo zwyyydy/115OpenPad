@@ -454,7 +454,7 @@ object NfoParser {
             // ★ 这条日志不能省：**只有它能把"这个 nfo 本来就是空的"和"解析在中途断了"分开** ——
             //   两者返回的 NfoMeta 长得一模一样（都可能是全 null），没有日志就只能靠猜。
             //   2026-09-22 排查"元数据全是 null"时正是靠它才没走偏。
-            android.util.Log.w("NfoParser", "nfo 结构畸形，已收字段照常返回：${e.message}")
+            com.open115.pad.util.AppLog.w("NfoParser", "nfo 结构畸形，已收字段照常返回：${e.message}")
         }
 
         // 音轨/字幕语言是在 <audio>/<subtitle> 块里收的，出块时才知道归哪类

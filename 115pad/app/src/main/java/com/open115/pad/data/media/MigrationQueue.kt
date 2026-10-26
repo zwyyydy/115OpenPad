@@ -303,7 +303,7 @@ class MigrationQueue(private val context: Context) {
     private suspend fun read(): List<MigrationTask> {
         val raw = context.migrationDataStore.data.first()[KEY] ?: return emptyList()
         return runCatching { json.decodeFromString<List<MigrationTask>>(raw) }
-            .onFailure { android.util.Log.w("MigrationQueue", "迁移队列解析失败，按空队列处理", it) }
+            .onFailure { com.open115.pad.util.AppLog.w("MigrationQueue", "迁移队列解析失败，按空队列处理", it) }
             .getOrDefault(emptyList())
     }
 

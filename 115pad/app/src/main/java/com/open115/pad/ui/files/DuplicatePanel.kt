@@ -171,9 +171,9 @@ fun DuplicatePanel(
         val codes = pcs.filterNotNull().filter { it.isNotBlank() }
         if (codes.isEmpty()) return
         runCatching { withContext(Dispatchers.IO) { previewStore.deleteFor(codes) } }
-            .onFailure { android.util.Log.w("VPreview", "清查重删除项的预览图缓存失败：${it.message}") }
+            .onFailure { com.open115.pad.util.AppLog.w("VPreview", "清查重删除项的预览图缓存失败：${it.message}") }
         runCatching { withContext(Dispatchers.IO) { PlayerCache.purge(codes) } }
-            .onFailure { android.util.Log.w("PlayerCacheIO", "清查重删除项的播放缓存失败：${it.message}") }
+            .onFailure { com.open115.pad.util.AppLog.w("PlayerCacheIO", "清查重删除项的播放缓存失败：${it.message}") }
     }
 
     fun deletePicked() {

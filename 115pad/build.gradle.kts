@@ -4,4 +4,6 @@ plugins {
     id("org.jetbrains.kotlin.plugin.compose") version "2.0.21" apply false
     id("org.jetbrains.kotlin.plugin.serialization") version "2.0.21" apply false
     id("com.google.devtools.ksp") version "2.0.21-1.0.28" apply false
+    // baseline profile 生成/打包插件；版本与 androidx.benchmark 保持一致
+    id("androidx.baselineprofile") version "1.4.0" apply false
 }

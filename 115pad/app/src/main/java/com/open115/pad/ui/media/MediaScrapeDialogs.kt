@@ -324,7 +324,8 @@ fun MediaScrapeDialog(
     FadeDialog(onDismissRequest = { closeDialog() }) {
         Surface(
             shape = RoundedCornerShape(16.dp),
-            color = MaterialTheme.colorScheme.surface,
+            // 弹窗必须实底：壁纸模式下 surface 是半透明的，会把下面的文件行透进弹窗里
+            color = MaterialTheme.colorScheme.surfaceContainerHigh,
             modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp),
         ) {
             Column(Modifier.padding(16.dp)) {
@@ -806,7 +807,15 @@ fun ScrapeBatchPanel(scraper: MetadataScraper, onClose: () -> Unit) {
     var pickerIndex by remember { mutableStateOf<Int?>(null) }
     val s = session ?: return
 
-    Surface(color = MaterialTheme.colorScheme.surface, modifier = Modifier.fillMaxSize()) {
+    // 整屏覆盖层：壁纸模式下 surface 是半透明的，会整页透出下面的文件列表；
+    // 非壁纸（含媒体库深色）仍用 surface，保持原有底色层次
+    val panelColor =
+        if (com.open115.pad.ui.theme.LocalWallpaperGlass.current.active) {
+            MaterialTheme.colorScheme.surfaceContainerHigh
+        } else {
+            MaterialTheme.colorScheme.surface
+        }
+    Surface(color = panelColor, modifier = Modifier.fillMaxSize()) {
         Column(Modifier.fillMaxSize()) {
             // 顶栏
             Row(
@@ -952,7 +961,10 @@ fun ScrapeBatchPanel(scraper: MetadataScraper, onClose: () -> Unit) {
             pickerIndex = null
         } else {
             FadeDialog(onDismissRequest = { pickerIndex = null }) {
-                Surface(shape = RoundedCornerShape(16.dp), color = MaterialTheme.colorScheme.surface) {
+                Surface(
+                    shape = RoundedCornerShape(16.dp),
+                    color = MaterialTheme.colorScheme.surfaceContainerHigh,
+                ) {
                     Column(Modifier.padding(14.dp).fillMaxWidth()) {
                         Text("为《${item.title}》选择元数据", fontWeight = FontWeight.SemiBold, fontSize = 15.sp)
                         Spacer(Modifier.height(10.dp))

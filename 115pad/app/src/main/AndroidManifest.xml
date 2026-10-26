@@ -5,6 +5,16 @@
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
 
     <!--
+      投屏（DLNA）：
+      - ACCESS_WIFI_STATE 读 Wi-Fi 状态、创建组播锁（SSDP 发现设备）；
+      - CHANGE_WIFI_MULTICAST_STATE 收发 SSDP 组播；
+      - WAKE_LOCK 中转期间持唤醒锁 + Wi-Fi 锁（锁屏后电视的流不能断）。
+    -->
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+    <!--
       任务常驻（设置 → 后台任务 → 「任务进行时防止被杀」）：
       扫描媒体库 / 上传 / 重命名期间挂一个前台服务，系统就不会随手回收进程。
       dataSync 对应"数据同步"这一类任务；Android 14 起这个类型要单独声明下面那条权限。
@@ -37,6 +47,17 @@
         android:networkSecurityConfig="@xml/network_security_config"
         android:supportsRtl="true"
         android:theme="@style/Theme.Open115">
+
+        <!-- 诊断日志导出：把 cache/diag 下的 zip 通过系统分享面板发出去 -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
 
         <activity
             android:name=".MainActivity"
@@ -134,6 +155,15 @@
         -->
         <service
             android:name=".data.KeepAliveService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+
+        <!--
+          投屏保活服务：投屏期间挂常驻通知 + 唤醒锁/Wi-Fi 锁，保证本机中转不断流。
+          dataSync 与上面同一个类型（持续的网络字节传输）。
+        -->
+        <service
+            android:name=".cast.CastService"
             android:exported="false"
             android:foregroundServiceType="dataSync" />
     </application>

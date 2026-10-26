@@ -1,6 +1,6 @@
 package com.open115.pad.data.media
 
-import android.util.Log
+import com.open115.pad.util.AppLog as Log
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock

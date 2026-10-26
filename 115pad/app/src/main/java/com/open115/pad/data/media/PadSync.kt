@@ -1,6 +1,6 @@
 package com.open115.pad.data.media
 
-import android.util.Log
+import com.open115.pad.util.AppLog as Log
 import com.open115.pad.data.FileItem
 import com.open115.pad.data.ImageUrlResolver
 import com.open115.pad.data.OpenApi

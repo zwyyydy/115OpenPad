@@ -96,6 +96,17 @@ object Format {
     fun percent(v: Double): Float = (if (v > 100) v / 100.0 else v).toFloat().coerceIn(0f, 100f)
 
     /**
+     * 进度文案：`46%` / `27.3%`。
+     * 直接插值 [percent] 会打出 `45.9954%` 这种原始浮点，进度条旁边一排小数是界面里
+     * 最像"没做完"的细节。整数就不带小数点，其余保留一位。
+     */
+    fun percentText(v: Double): String {
+        val rounded = Math.round(percent(v) * 10f) / 10f
+        return if (rounded % 1f == 0f) "${rounded.toInt()}%"
+        else String.format(Locale.CHINA, "%.1f%%", rounded)
+    }
+
+    /**
      * 相对时间：`刚刚 / 5 分钟前 / 3 小时前 / 2 天前 / 2026-09-25`。
      *
      * 「上次扫描是什么时候」「这条片多久之前看的」这类问题的答案都是"多久以前"，

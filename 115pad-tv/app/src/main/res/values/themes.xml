@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 电视界面习惯深色，这里直接用系统深色 Material 底 -->
+    <style name="Theme.Open115Tv" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/tv_background</item>
+    </style>
+</resources>

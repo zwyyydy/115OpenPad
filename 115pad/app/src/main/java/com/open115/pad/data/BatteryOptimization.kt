@@ -5,7 +5,7 @@ import android.content.Intent
 import android.net.Uri
 import android.os.PowerManager
 import android.provider.Settings
-import android.util.Log
+import com.open115.pad.util.AppLog as Log
 
 /**
  * 「忽略电池优化」白名单的查询与申请（设置 → 后台任务用它）。

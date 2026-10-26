@@ -114,7 +114,7 @@ object PlayerCache {
         val url = dataSpec.uri.toString()
         val key = contentKey(url) ?: dataSpec.key ?: url
         // 诊断：把**实际用的 key** 也打出来（"缓存为什么不命中"这类问题全靠它一眼看出）
-        android.util.Log.d("PlayerCacheIO", "请求 $url （key=$key）")
+        com.open115.pad.util.AppLog.d("PlayerCacheIO", "请求 $url （key=$key）")
         key
     }
 

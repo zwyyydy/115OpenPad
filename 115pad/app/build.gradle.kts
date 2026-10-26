@@ -4,6 +4,8 @@ plugins {
     id("org.jetbrains.kotlin.plugin.compose")
     id("org.jetbrains.kotlin.plugin.serialization")
     id("com.google.devtools.ksp")
+    // baseline profile 的生成与打包（生成模块见 :baselineprofile）
+    id("androidx.baselineprofile")
 }
 
 android {
@@ -14,9 +16,9 @@ android {
         applicationId = "com.open115.pad"
         minSdk = 26
         targetSdk = 35
-        // 这里的版本号 = **最近一次发布的版本**（发版提交在 release 线上做，见 tools/release_notes）
-        versionCode = 8
-        versionName = "0.7.5"
+        // 这里的版本号 = 本次要发布的版本（发版提交在 release 线上做，见 tools/release_notes）
+        versionCode = 9
+        versionName = "0.8.0"
     }
 
     signingConfigs {
@@ -24,14 +26,32 @@ android {
     }
     buildTypes {
         release {
+            // 2026-10-25 暂关 R8：fullMode=false 之下仍出 VerifyError（wide register
+            // 误编译，点播放必崩），先保证能用，回稳后再查 R8 具体哪步坏的字节码。
             isMinifyEnabled = false
+            isShrinkResources = false
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro",
+            )
             signingConfig = signingConfigs.getByName("debug")
         }
-        // 从源码直接装的 debug 包在「关于」里带 -dev 后缀（0.7.5-dev）：master 的版本号只在
+        // 从源码直接装的 debug 包在「关于」里带 -dev 后缀（0.8.0-dev）：master 的版本号只在
         // 发版时前进，不加后缀的话"开发版"和"已发布的同名版本"在界面上完全分不出来，
         // 装机后看着像"没更新"。发布用的包在 release 线上构建、不受这里影响。
         debug {
             versionNameSuffix = "-dev"
+        }
+    }
+    // 按 ABI 拆包。QuickJS 带四套 native 库，release 里每套约 4MB；
+    // universal 包保留一份（模拟器/老设备兜底），正式分发优先用 arm64 那个。
+    // 注意：debug 也会拆，装机时用 app-universal-debug.apk（或对应 ABI 的那个）。
+    splits {
+        abi {
+            isEnable = true
+            reset()
+            include("armeabi-v7a", "arm64-v8a", "x86", "x86_64")
+            isUniversalApk = true
         }
     }
     compileOptions {
@@ -59,6 +79,19 @@ android {
     }
 }
 
+baselineProfile {
+    // 不在每次 assemble 时生成（要跑真机/模拟器上的 Macrobenchmark，很慢）；
+    // 需要时显式执行 :app:generateReleaseBaselineProfile。
+    //
+    // ⚠️ 生成任务会重装/清理目标设备上的本 App：**登录态、媒体库、操作记录会全部丢**。
+    // 只在专用模拟器上跑，别拿存着数据的平板/日常模拟器跑（2026-10-23 已踩过）。
+    automaticGenerationDuringBuild = false
+    // 把生成结果落到源码树（app/src/release/generated/baselineProfiles），随仓库一起走
+    saveInSrc = true
+    // startup profile：Android 12+ 的 DEX 布局优化
+    dexLayoutOptimization = true
+}
+
 dependencies {
     val composeBom = platform("androidx.compose:compose-bom:2024.10.01")
     implementation(composeBom)
@@ -83,6 +116,8 @@ dependencies {
     implementation("androidx.compose.material:material-icons-extended")
     implementation("androidx.navigation:navigation-compose:2.8.4")
     implementation("androidx.datastore:datastore-preferences:1.1.1")
+    // baseline profile 的安装器：Android 12 以下靠它把 profile 交给 ART
+    implementation("androidx.profileinstaller:profileinstaller:1.4.1")
 
     implementation("com.squareup.retrofit2:retrofit:2.11.0")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
@@ -98,6 +133,10 @@ dependencies {
     // 插件化 JS 源：QuickJS（带多 ABI 的 native .so），用户在 App 内写/导入 .js 当元数据源
     implementation("io.github.taoweiji.quickjs:quickjs-android:1.4.6")
 
+    // 汉字 → 拼音（媒体库按拼音/首字母搜索）。只用于入库/回填时算一次，不参与查询。
+    // pinyin4j 是纯 Java + classpath 资源，Maven Central 有，不需要额外仓库。
+    implementation("com.belerweb:pinyin4j:2.5.1")
+
     // 媒体库（类 Yamby）：影视/季集/演员/标签都是关系型查询（标题搜索、评分排序、
     // 按演员/标签筛选），JSON 全量遍历撑不住 → Room + KSP
     implementation("androidx.room:room-runtime:2.6.1")
@@ -105,4 +144,7 @@ dependencies {
     ksp("androidx.room:room-compiler:2.6.1")
 
     debugImplementation("androidx.compose.ui:ui-tooling")
+
+    // 生成 baseline profile 的 Macrobenchmark 模块（只在生成时用到，不进 APK）
+    baselineProfile(project(":baselineprofile"))
 }

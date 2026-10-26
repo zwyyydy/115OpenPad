@@ -61,6 +61,7 @@ import kotlinx.coroutines.withContext
 import com.open115.pad.appContainer
 import com.open115.pad.data.FileItem
 import com.open115.pad.ui.theme.AppColors
+import com.open115.pad.ui.theme.AppRadius
 import com.open115.pad.ui.theme.KindBadge
 import com.open115.pad.util.Format
 import androidx.compose.ui.text.font.FontWeight
@@ -137,9 +138,11 @@ fun isAudioItem(item: FileItem): Boolean =
     !item.isDir && !isVideoItem(item) && item.ico?.lowercase() in audioExts
 
 fun thumbUrlFor(item: FileItem): String? = when {
-    item.isDir -> item.fco
-    item.thumb != null -> item.thumb
-    isImageItem(item) -> item.uo
+    // 115 对没有封面的文件夹返回的是空串而不是 null：空串交给 Coil 是一次注定失败的请求，
+    // 失败占位又会把类型角标盖住（列表里图标"消失"）。空串一律当没有。
+    item.isDir -> item.fco?.takeIf { it.isNotBlank() }
+    !item.thumb.isNullOrBlank() -> item.thumb
+    isImageItem(item) -> item.uo?.takeIf { it.isNotBlank() }
     else -> null
 }
 
@@ -166,12 +169,14 @@ internal fun Thumb(item: FileItem, modifier: Modifier = Modifier, iconSize: Int 
     Box(modifier, contentAlignment = Alignment.Center) {
         // 彩色类型视觉做底层常驻：缩略图加载失败/无缩略图时兜底，避免出现空白图标
         KindBadge(item.fn, item.isDir, Modifier.size(iconSize.dp))
-        if (model != null) {
-            AsyncImage(
-                model = model,
-                contentDescription = null,
+        val resolved = model
+        if (resolved != null) {
+            ToneAwareAsyncImage(
+                model = resolved,
                 contentScale = ContentScale.Crop,
                 modifier = Modifier.fillMaxSize().clip(RoundedCornerShape(10.dp)),
+                // 底下垫着类型角标：占位/错误色块一律不画，否则加载失败时会整块盖住图标
+                showPlaceholder = false,
             )
         }
     }
@@ -234,7 +239,7 @@ fun FileListRow(
     // 比"全都没有框"更刺眼。卡片两侧内收 12dp，行内容的内边距相应从 16 收到 4 ——
     // 合起来仍是 16dp，所以图标、标题的左边缘位置不变
     val solidCard = !glass.active
-    val cardRadius = if (solidCard) 14.dp else glassRadius
+    val cardRadius = if (solidCard) AppRadius.md else glassRadius
     val cardShape = RoundedCornerShape(cardRadius)
     // 实底卡上默认水波纹反馈太弱：按压缩放承担「按到了」（整行缩一点，graphicsLayer 不重排）
     val interaction = remember { MutableInteractionSource() }

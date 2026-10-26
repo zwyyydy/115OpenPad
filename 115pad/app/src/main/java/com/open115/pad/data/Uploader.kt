@@ -2,7 +2,7 @@ package com.open115.pad.data
 
 import android.os.ParcelFileDescriptor
 import android.util.Base64
-import android.util.Log
+import com.open115.pad.util.AppLog as Log
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.currentCoroutineContext
@@ -442,6 +442,8 @@ object Uploader {
         targetCid: String,
         targetName: String?,
         uri: String? = null,
+        /** 附加的进度回调（0..100 整数百分比，与传输中心同源）。备份的行内进度条用它 */
+        onProgress: ((Int) -> Unit)? = null,
     ): UploadResult {
         val id = log.beginUpload(fileName, size, targetCid, targetName, uri)
         currentCoroutineContext()[Job]?.let { log.registerJob(id, it) }
@@ -451,6 +453,7 @@ object Uploader {
             if (pct != lastPct) {
                 lastPct = pct
                 log.updateUploadProgress(id, uploaded)
+                onProgress?.invoke(pct.toInt())
             }
         }
         suspend fun runOnce(

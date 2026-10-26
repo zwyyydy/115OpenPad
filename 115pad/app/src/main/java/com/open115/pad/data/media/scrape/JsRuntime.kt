@@ -72,7 +72,7 @@ class JsRuntime(
                 )
             }, "__http")
             ctx.registerJavaMethod(JavaCallback { _, a ->
-                android.util.Log.i("JsSource", "[${argStr(a, 0)}] ${argStr(a, 1)}")
+                com.open115.pad.util.AppLog.i("JsSource", "[${argStr(a, 0)}] ${argStr(a, 1)}")
                 null
             }, "__log")
             // 注意：taoweiji QuickJS 的 executeXScript(code, fileName) 是「代码在前、文件名在后」
@@ -91,7 +91,7 @@ class JsRuntime(
             initError.complete(null)
             ctx
         } catch (e: Throwable) {
-            android.util.Log.e("JsRuntime", "JS 源初始化失败 id=$sourceId", e)
+            com.open115.pad.util.AppLog.e("JsRuntime", "JS 源初始化失败 id=$sourceId", e)
             initError.complete(e.message ?: e.javaClass.simpleName)
             null
         }

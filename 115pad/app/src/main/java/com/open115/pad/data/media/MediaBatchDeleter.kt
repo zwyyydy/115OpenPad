@@ -47,6 +47,8 @@ class MediaBatchDeleter(
         val deleted: Int = 0,
         val failed: Int = 0,
         val alsoCloud: Boolean = false,
+        /** 连回收站里对应的项一起清（彻底删除）。onlyCloud 的"删除"不清回收站 */
+        val alsoPurgeRecycle: Boolean = false,
         val currentTitle: String = "",
         /** 逐条失败/跳过的原因（最多 [MAX_NOTES] 条，别把卡片撑爆） */
         val notes: List<String> = emptyList(),
@@ -62,16 +64,20 @@ class MediaBatchDeleter(
     private var job: Job? = null
 
     /**
-     * 起一批删除。[alsoCloud] = true 是"彻底删除"（连云盘文件一起删，不可逆）——
-     * 调用方必须已经在对话框里二次确认过。
+     * 起一批删除。[alsoCloud] = true 连云盘文件一起删；[alsoPurgeRecycle] 再把回收站里
+     * 对应的项清掉（「彻底删除」，不可逆）—— 调用方必须已经在对话框里二次确认过。
+     * 三种模式与文件页同一套语义：仅移除 / 删除（进回收站）/ 彻底删除（清回收站）。
      */
-    fun start(mediaKeys: List<String>, alsoCloud: Boolean) {
+    fun start(mediaKeys: List<String>, alsoCloud: Boolean, alsoPurgeRecycle: Boolean = false) {
         val keys = mediaKeys.distinct()
         if (keys.isEmpty()) return
         if (_progress.value.running) return
         stopRequested = false
-        _progress.value = Progress(running = true, total = keys.size, alsoCloud = alsoCloud)
-        job = scope.launch { run(keys, alsoCloud) }
+        _progress.value = Progress(
+            running = true, total = keys.size,
+            alsoCloud = alsoCloud, alsoPurgeRecycle = alsoCloud && alsoPurgeRecycle,
+        )
+        job = scope.launch { run(keys, alsoCloud, alsoPurgeRecycle) }
     }
 
     /** 跑完当前这一部就收尾（cancel 会把本地索引清理做到一半） */
@@ -86,7 +92,7 @@ class MediaBatchDeleter(
         return s
     }
 
-    private suspend fun run(keys: List<String>, alsoCloud: Boolean) {
+    private suspend fun run(keys: List<String>, alsoCloud: Boolean, alsoPurgeRecycle: Boolean) {
         var deleted = 0
         var failed = 0
         val notes = mutableListOf<String>()
@@ -107,6 +113,7 @@ class MediaBatchDeleter(
                     cacheDir = cacheDir,
                     mediaKey = key,
                     alsoCloud = alsoCloud,
+                    alsoPurgeRecycle = alsoPurgeRecycle,
                     videoPreviews = videoPreviews,
                 )
             } catch (e: CancellationException) {
@@ -138,8 +145,13 @@ class MediaBatchDeleter(
             delay(ITEM_GAP_MS)
         }
         // 拼接里带条件的段一律走 listOfNotNull：字符串里的 if 会把后面几段一起吞掉（踩过的坑）
+        val verb = when {
+            alsoPurgeRecycle -> "已彻底删除"
+            alsoCloud -> "已删除"
+            else -> "已从媒体库移除"
+        }
         val summary = listOfNotNull(
-            if (alsoCloud) "已彻底删除 $deleted 部" else "已从媒体库移除 $deleted 部",
+            "$verb $deleted 部",
             if (failed > 0) "$failed 部失败" else null,
             if (stopped) "已停止，剩 ${keys.size - deleted - failed} 部没处理" else null,
         ).joinToString(" · ")
@@ -153,7 +165,7 @@ class MediaBatchDeleter(
         runCatching {
             opLog?.log(
                 OpType.DELETE,
-                if (alsoCloud) "彻底删除 $deleted 部影片" else "从媒体库移除 $deleted 部影片",
+                "$verb $deleted 部影片",
                 listOfNotNull(
                     "ok=$deleted",
                     if (failed > 0) "fail=$failed" else null,

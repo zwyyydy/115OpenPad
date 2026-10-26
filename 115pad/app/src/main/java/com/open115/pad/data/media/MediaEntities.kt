@@ -1,5 +1,6 @@
 package com.open115.pad.data.media
 
+import androidx.room.ColumnInfo
 import androidx.room.Entity
 import androidx.room.Index
 import androidx.room.PrimaryKey
@@ -8,7 +9,16 @@ import androidx.room.PrimaryKey
 // 数据源是 115 网盘上的 Emby 范式目录（两种实测结构：{tmdbid-…} 前缀聚类 / 演员目录番号聚类）。
 // DB 是索引缓存，权威仍是云盘上的 .nfo；scan_state 记录每个目录的扫描状态支撑手动扫描可续跑。
 
-@Entity(tableName = "movies", indices = [Index("seriesKey")])
+@Entity(
+    tableName = "movies",
+    indices = [
+        Index("seriesKey"),
+        // 拼音/首字母搜索：客户端算好存列，查询侧只做 LIKE。
+        // 索引对 `%kw%` 不生效（子串匹配没法走 B 树），但"哪些行还没回填"的扫描有索引可走。
+        Index("titlePinyin"),
+        Index("titleInitials"),
+    ],
+)
 data class MovieEntity(
     // 唯一键：tmdbid（示例影片式）或番号如 ABC-301（演员式）
     @PrimaryKey val mediaKey: String,
@@ -106,6 +116,23 @@ data class MovieEntity(
     val thumbFid: String? = null,
     val sourceDirKey: String = "",
     val scannedAt: Long = 0,
+    /**
+     * 片名的拼音串（无声调、小写、去分隔）与首字母。入库时算一次；老库由启动回填补齐。
+     * 查询见 MediaDao.searchAll；计算见 [PinyinText]。
+     *
+     * defaultValue 必须和迁移里的 `DEFAULT ''` 一致：Room 会校验列默认值，
+     * 一边有默认值一边没有会在打开数据库时直接报 schema 不一致。
+     */
+    @ColumnInfo(defaultValue = "''") val titlePinyin: String = "",
+    @ColumnInfo(defaultValue = "''") val titleInitials: String = "",
+    // ---- AI 翻译缓存（只用于显示，**绝不覆盖 title/plot**）----
+    /** 翻译后的标题；原文没变（[zhSourceHash] 命中）才有效 */
+    val titleZh: String? = null,
+    /** 翻译后的简介 */
+    val plotZh: String? = null,
+    /** 翻译时的原文哈希：重新刮削改了原文后，这份翻译自动失效 */
+    val zhSourceHash: String? = null,
+    val zhAt: Long = 0,
 ) {
     /** 剧照 pick_code 列表（存的是 \n 连接的串，见 [encodePickCodes]） */
     val extraFanartList: List<String> get() = decodePickCodes(extraFanartPickCodes)
@@ -276,7 +303,7 @@ data class MediaLibraryEntity(
      */
     val rateTiered: Boolean = false,
     /**
-     * 每扫 [TIER_REST_EVERY] 个目录**休息几分钟**（0 = 不休息）。可选设置。
+     * 每列 [TIER_REST_EVERY] 次目录**休息几分钟**（0 = 不休息）。可选设置。
      *
      * 与阶梯限速是两件事（可以只开休息）：阶梯限速是"每个请求慢一点"，休息是"连着问了几百次之后
      * 停一会儿" —— 大库一轮扫描几千次请求时，后者才是真正让 115 那边"看不出这是脚本"的那道闸。

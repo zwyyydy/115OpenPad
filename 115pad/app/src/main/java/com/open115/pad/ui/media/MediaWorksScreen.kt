@@ -12,6 +12,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
+import androidx.compose.foundation.lazy.grid.rememberLazyGridState
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Check
 import androidx.compose.material.icons.outlined.Shuffle
@@ -27,6 +28,7 @@ import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -86,9 +88,21 @@ fun MediaWorksScreen(
     onCardsLoaded: (List<MovieCard>) -> Unit = {},
     onBack: () -> Unit,
     onOpenMovie: (MovieCard, List<MovieCard>, Int) -> Unit,
+    /** 海报的共享元素修饰：由外层把当前转场 scope 包好传进来（这一页自己没有 scope） */
+    posterShared: (@Composable (MovieCard) -> Modifier)? = null,
+    /** 退回重建时的网格位置（外层按浮层 id 保存）：点开的那张海报要还在视野里，退回才飞得回去 */
+    initialGridIndex: Int = 0,
+    initialGridScrollOffset: Int = 0,
+    /** 离开时把网格位置交给外层保存 */
+    onGridSave: (index: Int, offset: Int) -> Unit = { _, _ -> },
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
+    val gridState = rememberLazyGridState(initialGridIndex, initialGridScrollOffset)
+    // 详情盖上来时这一页会销毁：离开时记住滚到哪，退回重建接上
+    DisposableEffect(Unit) {
+        onDispose { onGridSave(gridState.firstVisibleItemIndex, gridState.firstVisibleItemScrollOffset) }
+    }
     val container = (context.applicationContext as com.open115.pad.App115).container
     val snackbarHostState = remember { SnackbarHostState() }
     // 手机（窄屏）：顶栏副标题限一行、海报网格 3 列；平板保持原样
@@ -234,6 +248,7 @@ fun MediaWorksScreen(
                     } else {
                         LazyVerticalGrid(
                             columns = GridCells.Adaptive(minSize = if (compact) 110.dp else 130.dp),
+                            state = gridState,
                             contentPadding = PaddingValues(16.dp),
                             horizontalArrangement = Arrangement.spacedBy(16.dp),
                             verticalArrangement = Arrangement.spacedBy(16.dp),
@@ -244,6 +259,7 @@ fun MediaWorksScreen(
                                     card = card,
                                     onClick = { onOpenMovie(card, visible, visible.indexOf(card)) },
                                     onLongClick = { deleteTarget = card },
+                                    posterModifier = posterShared?.invoke(card) ?: Modifier,
                                 )
                             }
                         }
@@ -267,7 +283,7 @@ fun MediaWorksScreen(
             name = target.title,
             episodeCount = 0,
             onDismiss = { deleteTarget = null },
-            onDelete = { alsoCloud ->
+            onDelete = { mode ->
                 deleteTarget = null
                 scope.launch {
                     val r = deleteMovie(
@@ -277,7 +293,8 @@ fun MediaWorksScreen(
                         imageUrlResolver = container.imageUrlResolver,
                         cacheDir = container.cacheDir,
                         mediaKey = target.mediaKey,
-                        alsoCloud = alsoCloud,
+                        alsoCloud = mode != MovieDeleteMode.LibraryOnly,
+                        alsoPurgeRecycle = mode == MovieDeleteMode.Purge,
                         videoPreviews = container.videoPreviews,
                     )
                     when (r) {

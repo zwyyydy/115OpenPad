@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 通知栏小图标：只需形状（系统按 alpha 当蒙版上色），画个电视屏幕 + 闪电 -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <path
+        android:fillColor="#FFFFFF"
+        android:fillType="evenOdd"
+        android:pathData="M3,4 L21,4 L21,18 L3,18 Z M5,6 L5,16 L19,16 L19,6 Z" />
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M13,6 L9,12.5 L11.5,12.5 L10.5,18 L15,11 L12.4,11 Z" />
+</vector>

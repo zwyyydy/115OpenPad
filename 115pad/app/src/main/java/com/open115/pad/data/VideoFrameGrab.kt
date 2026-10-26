@@ -310,17 +310,17 @@ class VideoFrameGrabber(
         val tier = runCatching { previewTier(parseVideoPlayResponse(api.videoPlay(pickCode)).videoUrls) }
             .getOrNull() ?: return@withContext List(asks.size) { null }
         if (tier.definition == DEF_ORIGINAL) {
-            android.util.Log.i("VPreview", "没有转码档，改用原画（def=100）抓帧 pc=$pickCode url=${tier.url.take(140)}")
+            com.open115.pad.util.AppLog.i("VPreview", "没有转码档，改用原画（def=100）抓帧 pc=$pickCode url=${tier.url.take(140)}")
         }
         val playlist = fetchPlaylist(tier.url) ?: run {
-            android.util.Log.i("VPreview", "playlist 拉不到/解析不出 pc=$pickCode 档=${tier.definition}")
+            com.open115.pad.util.AppLog.i("VPreview", "playlist 拉不到/解析不出 pc=$pickCode 档=${tier.definition}")
             return@withContext List(asks.size) { null }
         }
         if (playlist.encrypted) {
-            android.util.Log.i("VPreview", "playlist 带加密（EXT-X-KEY）抓不了 pc=$pickCode")
+            com.open115.pad.util.AppLog.i("VPreview", "playlist 带加密（EXT-X-KEY）抓不了 pc=$pickCode")
             return@withContext List(asks.size) { null }
         }
-        android.util.Log.i(
+        com.open115.pad.util.AppLog.i(
             "VPreview",
             "playlist pc=$pickCode 档=${tier.definition} 分片=${playlist.segments.size} " +
                 "首片头=${playlist.segments.firstOrNull()?.durationSec}s 总长=${playlist.totalSec.toInt()}s",
@@ -340,7 +340,7 @@ class VideoFrameGrabber(
             val seg = playlist.segments.getOrNull(segIndex) ?: continue
             val head = fetchHead(seg.url)
             if (head == null) {
-                android.util.Log.i("VPreview", "分片头拉不到 seg=$segIndex url=${seg.url.take(120)}")
+                com.open115.pad.util.AppLog.i("VPreview", "分片头拉不到 seg=$segIndex url=${seg.url.take(120)}")
                 continue
             }
             // 这一片要出的最大尺寸：只解一次码到这个尺寸，小的那些再从它缩
@@ -348,7 +348,7 @@ class VideoFrameGrabber(
             val frame = decodeFrame(seg.url, init + head, widest)
                 ?: decodeFrameWider(seg.url, init, head, widest)
             if (frame == null) {
-                android.util.Log.i("VPreview", "解帧失败 seg=$segIndex 头=${head.size}B")
+                com.open115.pad.util.AppLog.i("VPreview", "解帧失败 seg=$segIndex 头=${head.size}B")
                 continue
             }
             try {
@@ -404,12 +404,12 @@ class VideoFrameGrabber(
             ).execute().use { r ->
                 val body = r.body
                 if (body == null) {
-                    android.util.Log.i("VPreview", "$what 无响应体 code=${r.code} url=${url.take(110)}")
+                    com.open115.pad.util.AppLog.i("VPreview", "$what 无响应体 code=${r.code} url=${url.take(110)}")
                     return null
                 }
                 val text = String(readAtMost(body, maxBytes), Charsets.UTF_8)
                 if (!r.isSuccessful || text.isBlank()) {
-                    android.util.Log.i(
+                    com.open115.pad.util.AppLog.i(
                         "VPreview",
                         "$what code=${r.code} 长度=${text.length} " +
                             "ct=${r.header("Content-Type")} url=${url.take(110)}",
@@ -418,7 +418,7 @@ class VideoFrameGrabber(
                 text
             }
         } catch (e: Exception) {
-            android.util.Log.i("VPreview", "$what 异常 ${e.javaClass.simpleName}: ${e.message} url=${url.take(110)}")
+            com.open115.pad.util.AppLog.i("VPreview", "$what 异常 ${e.javaClass.simpleName}: ${e.message} url=${url.take(110)}")
             null
         }
     }
@@ -454,7 +454,7 @@ class VideoFrameGrabber(
         if (head.size < SEGMENT_HEAD_BYTES) return null
         val wider = fetchHead(url, SEGMENT_HEAD_BYTES_RETRY) ?: return null
         if (wider.size <= head.size) return null
-        android.util.Log.i("VPreview", "原画分片头不够，扩到 ${wider.size / 1024}KB 再试 url=${url.take(80)}")
+        com.open115.pad.util.AppLog.i("VPreview", "原画分片头不够，扩到 ${wider.size / 1024}KB 再试 url=${url.take(80)}")
         return decodeFrame(url, init + wider, maxWidth)
     }
 

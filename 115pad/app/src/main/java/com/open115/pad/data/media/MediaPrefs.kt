@@ -38,6 +38,23 @@ class MediaPrefs(private val context: Context) {
         context.mediaDataStore.data.map { WorksSort.ofName(it[KEY_WORKS_SORT]) }
 
     /**
+     * 媒体库卡片的**每库大小**：`库 id → 占几列`（1 / 2 / 3）。没有条目 = **自动**（老规则）。
+     *
+     * pad 网格里"占几列"同时决定这张卡铺几张封面：1→1、2→2、3→4（用户定的映射）。
+     * 存 **DataStore 而不是 `libraries` 表新列**：这是纯展示偏好，为它加一版 Room 迁移不值当
+     * （两条工作树的 DB 版本已经各自加过列，再分叉版本号会撞）。
+     */
+    val libraryCardSpans: Flow<Map<Long, Int>> =
+        context.mediaDataStore.data.map { decodeLibraryCardSpans(it[KEY_LIB_CARD_SPANS]) }
+
+    /** 设置某个库的卡片大小；[span] 不在 1..3 就清掉（回到自动） */
+    suspend fun setLibraryCardSpan(libraryId: Long, span: Int) = context.mediaDataStore.edit { prefs ->
+        val map = decodeLibraryCardSpans(prefs[KEY_LIB_CARD_SPANS]).toMutableMap()
+        if (span in 1..3) map[libraryId] = span else map.remove(libraryId)
+        prefs[KEY_LIB_CARD_SPANS] = encodeLibraryCardSpans(map)
+    }
+
+    /**
      * 扫描队列的整份快照（JSON，结构见 [MediaScanner] 里的 ScanQueueSnapshot）。
      *
      * 存**整份**而不是逐条增删：队列最多几条，一次写清楚比逐条维护简单得多，
@@ -351,6 +368,8 @@ class MediaPrefs(private val context: Context) {
         private val KEY_CACHE_ENABLED = booleanPreferencesKey("cache_enabled")
         private val KEY_CACHE_MAX_MB = longPreferencesKey("cache_max_mb")
         private val KEY_WORKS_SORT = stringPreferencesKey("works_sort")
+        /** 每库卡片大小：`id:span,id:span`（见 [encodeLibraryCardSpans]） */
+        private val KEY_LIB_CARD_SPANS = stringPreferencesKey("lib_card_spans")
         private val KEY_SCAN_QUEUE = stringPreferencesKey("scan_queue")
         private val KEY_PAD_ENABLED = booleanPreferencesKey("pad_sync_enabled")
         private val KEY_PAD_DIR_CID = stringPreferencesKey("pad_signal_cid")
@@ -432,3 +451,22 @@ class MediaPrefs(private val context: Context) {
         fun textPoolBytes(totalMb: Long): Long = totalMb * 1024 * 1024 / 20
     }
 }
+
+/**
+ * 每库卡片大小（`库 id → 占几列`）的落盘格式：`id:span,id:span`。
+ *
+ * 不用 JSON：就三个数字、库一般十几个 —— `id:span` 一眼能读、坏一个也能跳过，
+ * 而 JSON 会为一个 map 拉进序列化器（还得为它写 @Serializable 包装）。
+ * 只有 1..3 是合法值：脏条目直接丢掉（等于回自动），别让它把整张图弄坏。
+ */
+internal fun encodeLibraryCardSpans(map: Map<Long, Int>): String =
+    map.entries.filter { it.value in 1..3 }
+        .sortedBy { it.key }
+        .joinToString(",") { "${it.key}:${it.value}" }
+
+internal fun decodeLibraryCardSpans(raw: String?): Map<Long, Int> =
+    raw?.split(',')?.mapNotNull { part ->
+        val id = part.substringBefore(':', "").trim().toLongOrNull() ?: return@mapNotNull null
+        val span = part.substringAfter(':', "").trim().toIntOrNull() ?: return@mapNotNull null
+        if (span in 1..3) id to span else null
+    }?.toMap().orEmpty()

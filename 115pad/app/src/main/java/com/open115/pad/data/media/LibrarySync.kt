@@ -1,6 +1,6 @@
 package com.open115.pad.data.media
 
-import android.util.Log
+import com.open115.pad.util.AppLog as Log
 import com.open115.pad.data.OpenApi
 import com.open115.pad.data.PathNode
 import com.open115.pad.data.VideoPreviewStore
@@ -21,9 +21,18 @@ private const val TAG = "LibSync"
  *             由这边自己认（见 [resolveDirPath]）
  * @param deep 要不要往下递归。**移入/复制要**（搬进来的可能是一整个剧集目录，只扫顶层会把
  *             `Season 1/` 里的分集漏掉，与影片迁移同一个理由）；删除后的父目录**不要** ——
- *             它只是"少了几项"，同层清陈旧条目就够了，递归一整棵树纯属浪费请求
+ *             它只是"少了几项"，同层清陈旧条目就够了，递归一整棵树纯属浪费请求。
+ *             文件页的"移动"现在按**搬来的目录逐个报**（deep=true），目标目录只报一层
+ *             （deep=false，它名下别的孩子都没变）—— 见 [MediaScanner.TargetedDir]
+ * @param moved 这个目录**刚被移动过**：`scan_state` 里记的旧路径不可信（还是移动前的），
+ *              认路径必须真列一次（[resolveDirPath] 据此跳过索引里的旧路径）
  */
-data class ChangedDir(val cid: String, val path: String? = null, val deep: Boolean = true)
+data class ChangedDir(
+    val cid: String,
+    val path: String? = null,
+    val deep: Boolean = true,
+    val moved: Boolean = false,
+)
 
 /**
  * 文件页这次在云端改了什么 —— 媒体库据此收尾（[syncAfterCloudEdits]）。
@@ -107,10 +116,10 @@ suspend fun syncAfterCloudEdits(
         }
     }
 
-    // ② 内容变了的目录：作废扫描状态 + 排一次定向重扫（深扫按 [ChangedDir.deep]）
+    // ② 内容变了的目录：作废扫描状态 + 排一次定向重扫（每个目录自带要不要递归）
     edits.dirs.distinctBy { it.cid }.forEach { dir ->
         if (dir.cid.isBlank()) return@forEach
-        val path = resolveDirPath(dao, api, dir.cid, dir.path)
+        val path = resolveDirPath(dao, api, dir.cid, dir.path, dir.moved)
         val match = path?.let { libraryForPath(it, libraries) }
         if (match == null) {
             Log.i(TAG, "文件页改动：cid=${dir.cid} path=$path 不在任何媒体库内，跳过")
@@ -121,13 +130,12 @@ suspend fun syncAfterCloudEdits(
             .onFailure { Log.w(TAG, "作废扫描状态失败 cid=${dir.cid}: ${it.message}") }
         scanner.enqueueTargeted(
             match.library,
-            listOf(dir.cid to match.path),
-            deep = dir.deep,
+            listOf(TargetedDir(dir.cid, match.path, dir.deep)),
             // 静默："文件操作顺手触发的"，不写扫描记录、不弹"扫描完成"
             //（弹出来多半是"没有新增影片"这种废话）
             silent = true,
         )
-        Log.i(TAG, "文件页改动：已排重扫「${match.library.name}」${match.path}（cid=${dir.cid} deep=${dir.deep}）")
+        Log.i(TAG, "文件页改动：已排重扫「${match.library.name}」${match.path}（cid=${dir.cid} deep=${dir.deep} moved=${dir.moved}）")
     }
 }
 
@@ -136,13 +144,23 @@ suspend fun syncAfterCloudEdits(
  *
  * ① 调用方顺手给的（文件页自己的目录栈里就有，零成本）；
  * ② 索引里记过的 —— 扫过的目录都在 `scan_state.dirPath` 留着路径，零请求；
+ *    ★ [moved] = true 时跳过这条：目录刚被移动过，里面记的还是移动前的旧路径，
+ *      拿它去 [libraryForPath] 会认错库、拿它当 rootPath 扫描会把 dirPath 写回旧值。
  * ③ 都没有就**列一次这个目录**：115 的列表响应带着 `path[]` 祖先链（末项就是它自己）。
  *
  * 三条都落空返回 null，调用方按"认不出来"处理（跳过，不做任何事）。
  */
-private suspend fun resolveDirPath(dao: MediaDao, api: OpenApi, cid: String, hint: String?): String? {
+private suspend fun resolveDirPath(
+    dao: MediaDao,
+    api: OpenApi,
+    cid: String,
+    hint: String?,
+    moved: Boolean = false,
+): String? {
     hint?.trim()?.takeIf { it.isNotEmpty() }?.let { return it }
-    runCatching { dao.scanStatePath(cid) }.getOrNull()?.takeIf { it.isNotBlank() }?.let { return it }
+    if (!moved) {
+        runCatching { dao.scanStatePath(cid) }.getOrNull()?.takeIf { it.isNotBlank() }?.let { return it }
+    }
     val page = runCatching { listDirPaged(api, cid) }.getOrNull() ?: return null
     return pathOfAncestors(page.path)
 }

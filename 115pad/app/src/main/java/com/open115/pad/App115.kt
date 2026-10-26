@@ -4,7 +4,7 @@ import android.app.Activity
 import android.app.Application
 import android.content.Context
 import android.os.Bundle
-import android.util.Log
+import com.open115.pad.util.AppLog as Log
 import com.open115.pad.data.AuthApi
 import com.open115.pad.data.AuthInterceptor
 import com.open115.pad.data.ImageUrlResolver
@@ -18,6 +18,7 @@ import com.open115.pad.data.media.autoScanModeOrDefault
 import kotlinx.serialization.json.Json
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.SharingStarted
@@ -51,6 +52,8 @@ class App115 : Application() {
 
     override fun onCreate() {
         super.onCreate()
+        // 先装日志/崩溃采集，再建 AppContainer：启动早期和容器构造里的失败也能落盘
+        com.open115.pad.util.AppLog.init(this)
         container = AppContainer(this)
         registerActivityLifecycleCallbacks(object : ActivityLifecycleCallbacks {
             override fun onActivityStarted(activity: Activity) {
@@ -90,15 +93,21 @@ class AppContainer(context: Context) {
     /** 应用级偏好（目前只有「启动首页」，设置 → 界面显示） */
     val appPrefs = com.open115.pad.data.AppPrefs(context)
 
+    /** 搜索历史：文件页 / 媒体库各一份（设置里没有开关，属于输入框附属的小数据） */
+    val searchHistory = com.open115.pad.data.SearchHistory(context)
+
     /** 文件夹置顶（本机生效，115 开放平台无对应接口） */
     val pinnedPrefs = com.open115.pad.data.PinnedPrefs(context)
 
     /**
-     * 目录列表缓存（进程级、纯内存、LRU）。
+     * 目录列表缓存（进程级、LRU，**落盘**在 filesDir/dircache.json）。
      * 放在 AppContainer 而不是 ViewModel 里：ViewModel 会随导航条目被清掉，
      * 放里面收益只剩"目录间切换"，太薄。
+     * 冷启动从盘上把上一份目录捡回来先渲染（后台再静默刷新）——空转圈的文件首页最丑（用户定的）。
      */
-    val dirCache = com.open115.pad.data.DirCache()
+    val dirCache = com.open115.pad.data.DirCache(
+        store = java.io.File(context.filesDir, "dircache.json"),
+    )
 
     /**
      * 目录内容被移除了某些条目的广播：cid → 被移除条目名集合（同目录内名字唯一，按名认不会错）。
@@ -153,6 +162,25 @@ class AppContainer(context: Context) {
      * 这些要么不是 115 的 open 接口，要么是 CDN/OSS 字节流，跟"接口被频控"不是一回事。
      */
     val okHttpClient: OkHttpClient = newHttpClient(rateLimited = false)
+
+    /**
+     * 投屏专用 client：本机 HTTP 中转回源 + DLNA 控制。
+     *
+     * 不能复用 [okHttpClient]：那条链路挂着 115 的鉴权/401 刷新，CDN 直链上的 401
+     * 会触发无谓的 token 刷新；也不挂第三方代理（投屏是大文件字节流，直连最稳）。
+     * UA 仍必须是 [com.open115.pad.util.APP_USER_AGENT] —— 115 直链与申请时的 UA 绑定。
+     */
+    val castHttpClient: OkHttpClient = OkHttpClient.Builder()
+        .addInterceptor { chain ->
+            chain.proceed(
+                chain.request().newBuilder()
+                    .header("User-Agent", com.open115.pad.util.APP_USER_AGENT)
+                    .build()
+            )
+        }
+        .connectTimeout(15, TimeUnit.SECONDS)
+        .readTimeout(30, TimeUnit.SECONDS)
+        .build()
 
     /**
      * 打 115 资源接口（proapi）的 client：比上面多一层全局限速。
@@ -258,6 +286,12 @@ class AppContainer(context: Context) {
         retrofit("https://proapi.115.com/").create(OpenApi::class.java)
 
     /**
+     * 兜底海报手动裁剪的规格（背景图 pickCode → 归一化裁剪矩形）。
+     * 放 filesDir，清媒体缓存也不丢；解析器裁图时读它，UI 编辑时写它。
+     */
+    val posterCropStore = com.open115.pad.data.PosterCropStore(context)
+
+    /**
      * 图片直链三级解析链（uo → downurl → thumb）+ downurl 防频控缓存。
      *
      * 后两个参数是**媒体库海报缓存**的上限与开关：传 lambda 而不是当场取值，
@@ -268,6 +302,7 @@ class AppContainer(context: Context) {
         okHttpClient,
         mediaCacheMaxBytes = { mediaCacheMaxBytes },
         mediaCacheEnabled = { mediaCacheEnabled },
+        cropStore = posterCropStore,
     )
 
     /**
@@ -619,6 +654,17 @@ class AppContainer(context: Context) {
             }
             if (extra == null) base else listOfNotNull(base, extra).joinToString(" · ")
         }
+    }.let { inner ->
+        // 再套一层给云端备份：手动备份跑在 transferScope、自动到点也在 App scope —— 都不依赖
+        // 界面活着，但进程退后台会被回收。并进 taskActivity 后 KeepAliveService 自动接管，
+        // 打包（MEDIA 含几百 MB 图片，分钟级）与上传全程都有前台服务保着。
+        combine(inner, backupManager.progress) { base, bp ->
+            val extra = bp.takeIf { it.running }?.let {
+                val pct = if (it.percent in 1..99) " ${it.percent}%" else ""
+                "正在备份「${it.kind?.label}」${it.phaseLabel}$pct"
+            }
+            if (extra == null) base else listOfNotNull(base, extra).joinToString(" · ")
+        }
     }.stateIn(scope, SharingStarted.Eagerly, null)
 
     val taskActivity: StateFlow<String?> = combine(
@@ -670,6 +716,15 @@ class AppContainer(context: Context) {
     }
 
     init {
+        // 诊断日志开关：DataStore 异步，启动早期先按默认（开）落盘；读到存档值后立刻应用。
+        // 关掉后连崩溃记录也不写（见 AppLog.setEnabled）。
+        scope.launch { appPrefs.logToFile.collect { com.open115.pad.util.AppLog.setEnabled(it) } }
+        // 拼音列回填：v20→v21 升级后老行的 titlePinyin 是空串，启动时在 IO 分批补齐。
+        // 新入库的行扫描时就算好了（见 MediaScanner），这里只处理存量。
+        scope.launch(Dispatchers.IO) {
+            runCatching { com.open115.pad.data.media.PinyinText.backfill(mediaDatabase.mediaDao()) }
+                .onFailure { Log.w("App115", "拼音回填失败（下次启动再试）", it) }
+        }
         session.refresher = { refreshToken ->
             try {
                 authApi.refreshToken(refreshToken)
@@ -730,7 +785,7 @@ class AppContainer(context: Context) {
             previewPrefs.maxMb.collect { mb ->
                 val oldBytes = previewCacheMaxBytes
                 previewCacheMaxBytes = mb.coerceAtLeast(0) * 1024L * 1024
-                android.util.Log.i(
+                com.open115.pad.util.AppLog.i(
                     "VPreview",
                     "预览缓存上限 → ${previewCacheMaxBytes / 1024 / 1024} MB" +
                         if (previewCacheMaxBytes < oldBytes) "（调小，立刻淘汰一次）" else "",
@@ -796,15 +851,22 @@ class AppContainer(context: Context) {
         // 改名队列按登录态启停。**启动即恢复**：worker 一跑起来就会捡起队列里所有
         // 未完成的任务，不需要额外的扫描步骤（也就不依赖用户先打开哪个页面）。
         // 登出必须停 —— 没有 token 还继续跑，只会把剩下的文件全跑成失败。
+        //
+        // 定时备份的循环单独持有一个 Job：这个 collect 每次登录发 true 都会再 launch 一个
+        // 永不结束的循环，而登出分支原来只停 worker、不取消它 —— 切一次账号就多叠一个
+        // 每小时备份，几次之后会同时打包上传。现在每次状态变化先 cancel 旧的再决定要不要起新的。
+        var autoBackupJob: Job? = null
         scope.launch {
             session.loggedInFlow.collect { loggedIn ->
+                autoBackupJob?.cancel()
+                autoBackupJob = null
                 if (loggedIn) {
                     renameWorker.start(transferScope)
                     // 流水线同步：轮询服务器写在 115 里的信号文件（幂等，重复发 true 不会起第二个循环）
                     padSync.start()
                     // 云端备份的定时检查：先避让 30 秒（不与扫描/登录抢带宽），之后每小时复查一次。
                     // 每类只查自己的开关与间隔，到点才真的打包上传（见 BackupManager.autoBackupIfDue）。
-                    scope.launch {
+                    autoBackupJob = scope.launch {
                         delay(30_000L)
                         runCatching { backupManager.autoBackupIfDue() }
                             .onFailure { Log.w("App115", "定时备份检查失败（下个小时再查）", it) }

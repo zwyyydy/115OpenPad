@@ -307,6 +307,50 @@ fun mediaKeyOf(prefix: String, nfoTmdbId: String?, isEpisodeLike: Boolean): Stri
 }
 
 /**
+ * 跨库同名影片的键后缀：`<基键>#lib<库 id>`。
+ *
+ * `movies.mediaKey` 是**全局**主键，而库归属是按 `dirPath` 前缀推的 —— 两个不相交的库里
+ * 各有一部同样的片（同一个 tmdb id / 番号）时，后扫的那个会把先扫的整行 upsert 走
+ * （dirPath 一改，前者海报墙上就少一张卡，用户说的"后者夺取前者"）。
+ *
+ * 只给**第二份及以后**的副本加后缀，基键留给先到的那份：已有库的行键一个都不变，
+ * 搜索/观看历史/详情浮层里那些按 mediaKey 的引用也就不会断。
+ */
+internal fun libraryScopedKey(baseKey: String, libraryId: Long): String = "$baseKey#lib$libraryId"
+
+/** [dirPath] 是不是 [roots] 里某个根（含根本身、任意层级之下）。路径比较只看整段，别用裸 startsWith */
+internal fun isDirUnderRoots(dirPath: String?, roots: List<String>): Boolean {
+    val p = dirPath?.trimEnd('/').orEmpty()
+    if (p.isEmpty()) return false
+    return roots.any { root ->
+        val r = root.trimEnd('/')
+        r.isNotEmpty() && (p == r || p.startsWith("$r/"))
+    }
+}
+
+/**
+ * 这个基键要不要让给 `#lib<id>` 后缀（判据纯逻辑，单测钉在 [com.open115.pad.data.media.LibraryScopedKeyTest]）。
+ *
+ * - 本库已经建过 scoped 行 → **继续用它**（基键那行后来被删了也不回到基键：键一变，
+ *   扫描记录里的新增键、详情浮层的旧卡就都指不到了）；
+ * - 基键没人占 / 就是本目录 / 在本库的另一个根下（同一库里的重复目录仍旧只出一张卡）→ 用基键；
+ * - 只剩"被**别的**库那份占着"这一种 → 本库另起一行。
+ *
+ * 物理身份（同一份文件被搬了目录）不在这里判 —— 那需要查库，见 `MediaScanner.KeyScope.resolve`。
+ */
+internal fun needsLibraryScopedKey(
+    baseOwnerPath: String?,
+    ownScopedPath: String?,
+    currentDirPath: String,
+    libraryRoots: List<String>,
+): Boolean {
+    if (ownScopedPath != null) return true
+    if (baseOwnerPath == null) return false
+    if (baseOwnerPath.trimEnd('/') == currentDirPath.trimEnd('/')) return false
+    return !isDirUnderRoots(baseOwnerPath, libraryRoots)
+}
+
+/**
  * 集号排序键：`...S01E02...` → `1*10000 + 2 = 10002`；解析不出返回 Int.MAX_VALUE（沉底）。
  *
  * 返回单个 Int 而不是 Pair：`kotlin.Pair` **不实现 Comparable**，`compareBy` 用不了它。
@@ -611,7 +655,15 @@ fun isExtraDirName(name: String): Boolean = name.trim().lowercase() in EXTRA_DIR
  * 两者处理方式不同（见 [sideArtOf]），但"不进递归、不当条目"是一样的 ——
  * 放在一起是为了不漏：新增一类要屏蔽的目录时只改这一个判断。
  */
-fun isIgnoredDirName(name: String): Boolean = isSideArtDirName(name) || isExtraDirName(name)
+fun isIgnoredDirName(name: String): Boolean {
+    val n = name.trim()
+    if (isSideArtDirName(n) || isExtraDirName(n)) return true
+    // 115 的同名重复会在目录名后补 "(1)" / "（1）"：`behind the scenes(1)`、`extrafanart（1）`
+    // 也得算屏蔽 —— 否则重复出来的花絮/素材目录会被当成影片索引出来（web-cookie 支线真机实测）。
+    // ★ 只剥一层后缀再判一次：正片目录带 (1)（`ABC-123 xxx(1)`）不受影响，照常入库。
+    val stripped = n.replace(Regex("[（(]\\d+[)）]$"), "").trim()
+    return stripped.length != n.length && (isSideArtDirName(stripped) || isExtraDirName(stripped))
+}
 
 // ---------------- 分 CD / 分片的资源：合成一条 ----------------
 

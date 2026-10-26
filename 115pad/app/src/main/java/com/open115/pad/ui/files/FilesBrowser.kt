@@ -9,10 +9,12 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.itemsIndexed
@@ -22,6 +24,7 @@ import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.grid.rememberLazyGridState
 import androidx.compose.foundation.lazy.items as listItems
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
@@ -29,7 +32,9 @@ import androidx.compose.material.icons.filled.PushPin
 import androidx.compose.material.icons.outlined.AutoFixHigh
 import androidx.compose.material.icons.outlined.Check
 import androidx.compose.material.icons.outlined.Category
+import androidx.compose.material.icons.outlined.Cast
 import androidx.compose.material.icons.outlined.ChevronRight
+import androidx.compose.material.icons.outlined.CloudOff
 import androidx.compose.material.icons.outlined.CloudDownload
 import androidx.compose.material.icons.outlined.Collections
 import androidx.compose.material.icons.outlined.ContentCopy
@@ -40,6 +45,7 @@ import androidx.compose.material.icons.outlined.Deselect
 import androidx.compose.material.icons.outlined.DriveFileMove
 import androidx.compose.material.icons.outlined.Edit
 import androidx.compose.material.icons.outlined.FilterAlt
+import androidx.compose.material.icons.outlined.FolderOpen
 import androidx.compose.material.icons.outlined.FilterList
 import androidx.compose.material.icons.outlined.GridView
 import androidx.compose.material.icons.outlined.MoreVert
@@ -90,8 +96,12 @@ import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.open115.pad.data.FileItem
+import com.open115.pad.data.SearchFilters
 import com.open115.pad.ui.components.FileGridCard
 import com.open115.pad.ui.components.FileListRow
+import com.open115.pad.ui.components.SearchHistoryRow
+import com.open115.pad.ui.components.EmptyState
+import com.open115.pad.ui.components.FileListSkeleton
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.layout.size
@@ -133,8 +143,7 @@ private fun BusyBadge(busy: Boolean, content: @Composable () -> Unit) {
 
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
 @Composable
-fun FilesBrowserPane(
-    vm: FilesViewModel,
+fun FilesBrowserPane(    vm: FilesViewModel,
     ui: FilesViewModel.UiState,
     modifier: Modifier = Modifier,
     searchMode: Boolean,
@@ -156,6 +165,8 @@ fun FilesBrowserPane(
     onScrape: (FileItem) -> Unit,
     /** 多选里选了多个可刮条目时：一次批量刮削（复核面板逐条核对再写） */
     onScrapeMany: (List<FileItem>) -> Unit,
+    /** 投屏：只对**恰好选中一个视频文件**时可点（投屏一次一部片） */
+    onCast: (FileItem) -> Unit,
     /** 置顶 / 取消置顶：传入当前选择集里可置顶的文件夹（可能为空） */
     onPin: (List<FileItem>) -> Unit,
     onDownload: () -> Unit,
@@ -200,12 +211,21 @@ fun FilesBrowserPane(
 
     // 条目最近浏览时间（播放/看图/读文本三类操作记录）：列表模式给看过的条目补一行
     val viewTimes by vm.viewTimes.collectAsState()
+    // 最近搜索：搜索框为空时铺在筛选胶囊下面
+    val searchHistory by vm.searchHistoryFlow.collectAsState(initial = emptyList())
 
     Column(modifier) {
         if (searchMode) {
             SearchBarInline(
                 initial = ui.searchQuery,
+                inCurrent = ui.searchInCurrent,
+                days = ui.searchDays,
+                currentDirName = ui.stack.last().name,
+                history = searchHistory,
                 onSearch = { vm.search(it) },
+                onScope = vm::setSearchScope,
+                onDays = vm::setSearchDays,
+                onClearHistory = { vm.clearSearchHistory() },
                 onClose = onSearchToggle,
             )
         } else {
@@ -232,11 +252,11 @@ fun FilesBrowserPane(
                     }
                 },
                 actions = {
-                    // 顶栏这一排按键分两条路走：
-                    //   · 手机窄屏：11 个 ×48dp 放不下 → 只留高频 7 个，
-                    //     「分类整理 / 查找重复 / 生成预览图 / 双面板」这四个低频的收进「⋮」溢出菜单
-                    //     （都是大动作、误触代价高，也正好让顶栏不再横向滚动）；「⋮」钉在右端不滚动。
-                    //   · 宽屏：11 个平铺，和原来一样（放不下时照样横向可滑）。
+                    // 顶栏按键按"主次"分三层，宽屏和窄屏用同一套：
+                    //   · 主操作：上传做成带文字的实心胶囊，一眼能找到（手机窄屏只留图标）；
+                    //   · 高频：过滤 / 搜索 / 排序 / 视图 / 新建 / 刷新，平铺；
+                    //   · 低频大动作：分类整理 / 查找重复 / 预览图 / 双面板，一律收进「⋮」。
+                    // 以前宽屏把 11 个图标等距排开，扫一眼分不出哪个更重要，也挤掉了标题的位置。
                     // ★ TopAppBar 会把这条量成整屏宽、贴左边摆，会盖住左上角的返回箭头（看着像
                     //   "图标重合"、箭头还点不动）—— 有返回键时左边留出它的位置，滚动只发生在留白右侧。
                     val compactWidth = LocalConfiguration.current.screenWidthDp < 600
@@ -261,7 +281,9 @@ fun FilesBrowserPane(
                                     // 过滤生效中：主色高亮（开关开 + 当前目录解析出了方案）
                                     hasScheme && filterOn && ui.activeFilter != null ->
                                         MaterialTheme.colorScheme.primary
-                                    else -> MaterialTheme.colorScheme.onSurfaceVariant
+                                    // 未生效时和同排其他图标同色（原来用 onSurfaceVariant，
+                                    // 一屏里只有它偏浅，看着像被禁用）
+                                    else -> LocalContentColor.current
                                 },
                             )
                         }
@@ -364,6 +386,63 @@ fun FilesBrowserPane(
                         }
                     }
 
+                    // ⋮ 溢出菜单：低频的大动作。查找重复 / 预览图在跑时按键挂红点
+                    // （面板关掉后红点是"还在干"的唯一指示），菜单项里也写明"运行中"。
+                    val overflowMenu: @Composable () -> Unit = {
+                        var overflowOpen by remember { mutableStateOf(false) }
+                        Box {
+                            IconButton(onClick = { overflowOpen = true }) {
+                                BusyBadge(dupBusy || previewBusy) {
+                                    Icon(Icons.Outlined.MoreVert, contentDescription = "更多")
+                                }
+                            }
+                            DropdownMenu(expanded = overflowOpen, onDismissRequest = { overflowOpen = false }) {
+                                DropdownMenuItem(
+                                    text = { Text("分类整理当前目录") },
+                                    leadingIcon = { Icon(Icons.Outlined.Category, contentDescription = null) },
+                                    onClick = {
+                                        overflowOpen = false
+                                        onOrganize()
+                                    },
+                                )
+                                DropdownMenuItem(
+                                    text = { Text(if (dupBusy) "查找重复 · 运行中" else "查找重复") },
+                                    leadingIcon = { Icon(Icons.Outlined.ContentCopy, contentDescription = null) },
+                                    onClick = {
+                                        overflowOpen = false
+                                        onFindDuplicates()
+                                    },
+                                )
+                                DropdownMenuItem(
+                                    text = {
+                                        Text(if (previewBusy) "生成视频预览图 · 运行中" else "生成视频预览图")
+                                    },
+                                    leadingIcon = { Icon(Icons.Outlined.Collections, contentDescription = null) },
+                                    onClick = {
+                                        overflowOpen = false
+                                        onGeneratePreviews()
+                                    },
+                                )
+                                HorizontalDivider()
+                                DropdownMenuItem(
+                                    text = { Text(if (dualPaneOn) "退出双面板" else "双面板模式") },
+                                    leadingIcon = {
+                                        Icon(
+                                            Icons.Outlined.Splitscreen,
+                                            contentDescription = null,
+                                            tint = if (dualPaneOn) MaterialTheme.colorScheme.primary
+                                            else LocalContentColor.current,
+                                        )
+                                    },
+                                    onClick = {
+                                        overflowOpen = false
+                                        onToggleDualPane()
+                                    },
+                                )
+                            }
+                        }
+                    }
+
                     if (compactWidth) {
                         Row(
                             modifier = Modifier.fillMaxWidth().padding(start = backInset),
@@ -373,93 +452,15 @@ fun FilesBrowserPane(
                                 modifier = Modifier.weight(1f).horizontalScroll(rememberScrollState()),
                                 verticalAlignment = Alignment.CenterVertically,
                             ) { mainActions() }
-                            // ⋮ 溢出菜单：低频的大动作。查找重复 / 预览图在跑时按键挂红点
-                            // （面板关掉后红点是"还在干"的唯一指示），菜单项里也写明"运行中"。
-                            var overflowOpen by remember { mutableStateOf(false) }
-                            Box {
-                                IconButton(onClick = { overflowOpen = true }) {
-                                    BusyBadge(dupBusy || previewBusy) {
-                                        Icon(Icons.Outlined.MoreVert, contentDescription = "更多")
-                                    }
-                                }
-                                DropdownMenu(expanded = overflowOpen, onDismissRequest = { overflowOpen = false }) {
-                                    DropdownMenuItem(
-                                        text = { Text("分类整理当前目录") },
-                                        leadingIcon = { Icon(Icons.Outlined.Category, contentDescription = null) },
-                                        onClick = {
-                                            overflowOpen = false
-                                            onOrganize()
-                                        },
-                                    )
-                                    DropdownMenuItem(
-                                        text = { Text(if (dupBusy) "查找重复 · 运行中" else "查找重复") },
-                                        leadingIcon = { Icon(Icons.Outlined.ContentCopy, contentDescription = null) },
-                                        onClick = {
-                                            overflowOpen = false
-                                            onFindDuplicates()
-                                        },
-                                    )
-                                    DropdownMenuItem(
-                                        text = {
-                                            Text(if (previewBusy) "生成视频预览图 · 运行中" else "生成视频预览图")
-                                        },
-                                        leadingIcon = { Icon(Icons.Outlined.Collections, contentDescription = null) },
-                                        onClick = {
-                                            overflowOpen = false
-                                            onGeneratePreviews()
-                                        },
-                                    )
-                                    HorizontalDivider()
-                                    DropdownMenuItem(
-                                        text = { Text(if (dualPaneOn) "退出双面板" else "双面板模式") },
-                                        leadingIcon = {
-                                            Icon(
-                                                Icons.Outlined.Splitscreen,
-                                                contentDescription = null,
-                                                tint = if (dualPaneOn) MaterialTheme.colorScheme.primary
-                                                else LocalContentColor.current,
-                                            )
-                                        },
-                                        onClick = {
-                                            overflowOpen = false
-                                            onToggleDualPane()
-                                        },
-                                    )
-                                }
-                            }
+                            overflowMenu()
                         }
                     } else {
                         Row(
                             modifier = Modifier.horizontalScroll(rememberScrollState()),
                             verticalAlignment = Alignment.CenterVertically,
                         ) {
-                            // 宽屏：低频四项平铺在最左（沿用原来顺序）
-                            // 分类整理：递归扫当前目录，把文件按类型移进本目录的六个分类文件夹 + 其他
-                            IconButton(onClick = onOrganize) {
-                                Icon(Icons.Outlined.Category, contentDescription = "分类整理")
-                            }
-                            // 查找重复文件：按 sha1 找内容完全相同的副本；面板关掉之后任务照跑，挂红点
-                            IconButton(onClick = onFindDuplicates) {
-                                BusyBadge(dupBusy) {
-                                    Icon(Icons.Outlined.ContentCopy, contentDescription = "查找重复")
-                                }
-                            }
-                            // 生成视频预览图：抓最小转码档的一帧当缩略图（只读，不动云端）
-                            IconButton(onClick = onGeneratePreviews) {
-                                BusyBadge(previewBusy) {
-                                    Icon(Icons.Outlined.Collections, contentDescription = "生成视频预览图")
-                                }
-                            }
-                            // 双面板（类 MT 管理器）：开启高亮主色，再点一次退出
-                            IconButton(onClick = onToggleDualPane) {
-                                Icon(
-                                    Icons.Outlined.Splitscreen,
-                                    contentDescription = if (dualPaneOn) "退出双面板" else "双面板模式",
-                                    tint = if (dualPaneOn) MaterialTheme.colorScheme.primary
-                                    else MaterialTheme.colorScheme.onSurfaceVariant,
-                                )
-                            }
                             mainActions()
+                            overflowMenu()
                         }
                     }
                 },
@@ -479,42 +480,45 @@ fun FilesBrowserPane(
 
             // 面包屑：像 Windows 资源管理器一样，点任意上级目录即可直接跳转。
             // 末段是当前目录（主色、不可点）；其余为可点的中间目录（带涟漪反馈）。
+            // 根目录不画：标题已经写着「全部文件」，再挂一条同样的面包屑等于把同一句话说两遍。
             val pathState = rememberLazyListState()
             LaunchedEffect(ui.stack.size, ui.stack.lastOrNull()?.cid) {
                 if (ui.stack.isNotEmpty()) pathState.animateScrollToItem(ui.stack.lastIndex)
             }
-            LazyRow(
-                state = pathState,
-                modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                itemsIndexed(ui.stack) { i, entry ->
-                    val isCurrent = i == ui.stack.lastIndex
-                    Text(
-                        entry.name,
-                        style = MaterialTheme.typography.bodyMedium,
-                        fontWeight = if (isCurrent) FontWeight.Bold else FontWeight.Normal,
-                        color = if (isCurrent) com.open115.pad.ui.theme.AppColors.AccentDeep
-                        else com.open115.pad.ui.theme.AppColors.TextSecondary,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                        modifier = Modifier
-                            .clickable(enabled = !isCurrent) { vm.jumpTo(i) }
-                            .padding(vertical = 6.dp)
-                            .let { m ->
-                                if (i < ui.stack.lastIndex) m.padding(end = 4.dp) else m
-                            }
-                            .let { m ->
-                                if (i > 0) m.padding(start = 4.dp) else m
-                            },
-                    )
-                    if (i < ui.stack.lastIndex) {
-                        Icon(
-                            Icons.Outlined.ChevronRight,
-                            contentDescription = null,
-                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                            modifier = Modifier.padding(0.dp),
+            if (ui.stack.size > 1) {
+                LazyRow(
+                    state = pathState,
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    itemsIndexed(ui.stack) { i, entry ->
+                        val isCurrent = i == ui.stack.lastIndex
+                        Text(
+                            entry.name,
+                            style = MaterialTheme.typography.bodyMedium,
+                            fontWeight = if (isCurrent) FontWeight.Bold else FontWeight.Normal,
+                            color = if (isCurrent) com.open115.pad.ui.theme.AppColors.AccentDeep
+                            else com.open115.pad.ui.theme.AppColors.TextSecondary,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier
+                                .clickable(enabled = !isCurrent) { vm.jumpTo(i) }
+                                .padding(vertical = 6.dp)
+                                .let { m ->
+                                    if (i < ui.stack.lastIndex) m.padding(end = 4.dp) else m
+                                }
+                                .let { m ->
+                                    if (i > 0) m.padding(start = 4.dp) else m
+                                },
                         )
+                        if (i < ui.stack.lastIndex) {
+                            Icon(
+                                Icons.Outlined.ChevronRight,
+                                contentDescription = null,
+                                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.padding(0.dp),
+                            )
+                        }
                     }
                 }
             }
@@ -610,33 +614,40 @@ fun FilesBrowserPane(
             }
 
             // 分类筛选：轻量分段胶囊（无粗边框）
-            LazyRow(
-                modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp),
-                horizontalArrangement = Arrangement.spacedBy(2.dp),
-            ) {
-                items(filterTypes.size) { i ->
-                    val (label, type) = filterTypes[i]
-                    com.open115.pad.ui.theme.AppChip(
-                        label = label,
-                        selected = ui.typeFilter == type,
-                        onClick = { vm.setType(type) },
-                    )
-                }
-                item {
-                    com.open115.pad.ui.theme.AppChip(
-                        label = "星标",
-                        selected = ui.starOnly,
-                        onClick = { vm.toggleStarOnly() },
-                        leading = {
-                            Icon(
-                                if (ui.starOnly) Icons.Outlined.Star else Icons.Outlined.StarBorder,
-                                contentDescription = null,
-                                tint = if (ui.starOnly) com.open115.pad.ui.theme.AppColors.AccentDeep
-                                else com.open115.pad.ui.theme.AppColors.TextSecondary,
-                                modifier = Modifier.size(14.dp),
-                            )
-                        },
-                    )
+            // 和下面的列表收进同一个 1240dp 容器：以前胶囊贴着左边缘、列表居中 960dp，
+            // 宽屏上两排从不同的 x 起头，一眼就不齐。
+            Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.TopCenter) {
+                LazyRow(
+                    modifier = Modifier
+                        .widthIn(max = 960.dp)
+                        .fillMaxWidth()
+                        .padding(horizontal = 12.dp),
+                    horizontalArrangement = Arrangement.spacedBy(2.dp),
+                ) {
+                    items(filterTypes.size) { i ->
+                        val (label, type) = filterTypes[i]
+                        com.open115.pad.ui.theme.AppChip(
+                            label = label,
+                            selected = ui.typeFilter == type,
+                            onClick = { vm.setType(type) },
+                        )
+                    }
+                    item {
+                        com.open115.pad.ui.theme.AppChip(
+                            label = "星标",
+                            selected = ui.starOnly,
+                            onClick = { vm.toggleStarOnly() },
+                            leading = {
+                                Icon(
+                                    if (ui.starOnly) Icons.Outlined.Star else Icons.Outlined.StarBorder,
+                                    contentDescription = null,
+                                    tint = if (ui.starOnly) com.open115.pad.ui.theme.AppColors.AccentDeep
+                                    else com.open115.pad.ui.theme.AppColors.TextSecondary,
+                                    modifier = Modifier.size(14.dp),
+                                )
+                            },
+                        )
+                    }
                 }
             }
         }
@@ -738,42 +749,40 @@ fun FilesBrowserPane(
             }
         }
 
-        // 宽屏防拉伸：列表/网格收进 960dp 居中容器，手机端自然占满
+        // 宽屏防拉伸：列表/网格收进 960dp 居中容器（和上方筛选胶囊同宽），手机端自然占满
         Box(Modifier.weight(1f)) {
             com.open115.pad.ui.theme.AdaptiveBody(Modifier.fillMaxSize()) {
             when {
-                ui.loading && ui.items.isEmpty() -> Box(
-                    Modifier.fillMaxSize(),
-                    contentAlignment = Alignment.Center,
-                ) { CircularProgressIndicator() }
+                // 加载：用和真实行同尺寸的骨架，数据一到原地换字，不从转圈图跳一屏
+                ui.loading && ui.items.isEmpty() -> FileListSkeleton(8)
 
-                ui.error != null && ui.items.isEmpty() -> Column(
-                    Modifier.fillMaxSize().padding(32.dp),
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                    verticalArrangement = Arrangement.Center,
-                ) {
-                    Text(ui.error!!, color = MaterialTheme.colorScheme.error)
-                    TextButton(onClick = { vm.refresh() }) { Text("重试") }
-                }
+                ui.error != null && ui.items.isEmpty() -> EmptyState(
+                    icon = Icons.Outlined.CloudOff,
+                    title = "加载失败",
+                    hint = ui.error,
+                    action = {
+                        TextButton(onClick = { vm.refresh() }) { Text("重试") }
+                    },
+                )
 
-                ui.display.isEmpty() && ui.items.isNotEmpty() -> Box(
-                    Modifier.fillMaxSize(),
-                    contentAlignment = Alignment.Center,
-                ) {
-                    // 目录里有东西但被方案筛光了：明确告诉用户，而不是误报"空文件夹"
-                    Text(
-                        "没有符合「${ui.activeFilter?.name ?: ""}」的文件",
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                // 目录里有东西但被方案筛光了：明确告诉用户，而不是误报"空文件夹"
+                ui.display.isEmpty() && ui.items.isNotEmpty() -> EmptyState(
+                    icon = Icons.Outlined.FilterAlt,
+                    title = "没有符合「${ui.activeFilter?.name ?: ""}」的文件",
+                    hint = "关掉高级过滤，或到规则里放宽条件",
+                )
+
+                ui.display.isEmpty() -> if (ui.searching) {
+                    EmptyState(
+                        icon = Icons.Outlined.Search,
+                        title = "没有找到相关文件",
+                        hint = "换个关键词，或清空搜索框",
                     )
-                }
-
-                ui.display.isEmpty() -> Box(
-                    Modifier.fillMaxSize(),
-                    contentAlignment = Alignment.Center,
-                ) {
-                    Text(
-                        if (ui.searching) "没有找到相关文件" else "这个文件夹是空的",
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                } else {
+                    EmptyState(
+                        icon = Icons.Outlined.FolderOpen,
+                        title = "这个文件夹是空的",
+                        hint = "可以上传文件，或新建文件夹",
                     )
                 }
 
@@ -822,36 +831,40 @@ fun FilesBrowserPane(
                                 if (last != null && last >= ui.display.size - 8) vm.loadMore()
                             }
                     }
-                    LazyColumn(state = listState, modifier = Modifier.fillMaxSize()) {
-                        listItems(ui.display, key = { fileItemKey(it) }) { item ->
-                            QuickDirDragSource(
-                                enabled = ui.selectMode,
-                                host = quickDirDrag,
-                                onDrop = onQuickDirDrop,
-                                snapshot = dragSnapshot,
-                            ) {
-                                FileListRow(
-                                    item = item,
-                                    showVideoStrip = showVideoStrip,
-                                    pinned = item.fid in pinnedIds,
-                                    selectMode = ui.selectMode,
-                                    selected = item.fid in ui.selection,
-                                    lastViewed = viewTimes["${ui.stack.last().cid}/${item.fn}"] ?: 0L,
-                                    highlightSeq = highlightSeqOf(item),
-                                    onClick = { onActivate(item) },
-                                    // 多选态长按让位给"拖动"（见 QuickDirDragSource 注释），增删选择走勾选框/点按
-                                    onLongClick = if (ui.selectMode) null else ({ vm.toggleSelect(item.fid) }),
-                                )
-                            }
-                        }
-                        if (ui.loadingMore) {
-                            item {
-                                LinearProgressIndicator(
-                                    Modifier.fillMaxWidth().padding(vertical = 8.dp),
-                                )
-                            }
+                    val rowContent: @Composable (com.open115.pad.data.FileItem) -> Unit = { item ->
+                        QuickDirDragSource(
+                            enabled = ui.selectMode,
+                            host = quickDirDrag,
+                            onDrop = onQuickDirDrop,
+                            snapshot = dragSnapshot,
+                        ) {
+                            FileListRow(
+                                item = item,
+                                showVideoStrip = showVideoStrip,
+                                pinned = item.fid in pinnedIds,
+                                selectMode = ui.selectMode,
+                                selected = item.fid in ui.selection,
+                                lastViewed = viewTimes["${ui.stack.last().cid}/${item.fn}"] ?: 0L,
+                                highlightSeq = highlightSeqOf(item),
+                                onClick = { onActivate(item) },
+                                // 多选态长按让位给"拖动"（见 QuickDirDragSource 注释），增删选择走勾选框/点按
+                                onLongClick = if (ui.selectMode) null else ({ vm.toggleSelect(item.fid) }),
+                            )
                         }
                     }
+
+                        LazyColumn(state = listState, modifier = Modifier.fillMaxSize()) {
+                            listItems(ui.display, key = { fileItemKey(it) }) { item ->
+                                rowContent(item)
+                            }
+                            if (ui.loadingMore) {
+                                item {
+                                    LinearProgressIndicator(
+                                        Modifier.fillMaxWidth().padding(vertical = 8.dp),
+                                    )
+                                }
+                            }
+                        }
                 }
             }
             }
@@ -891,6 +904,18 @@ fun FilesBrowserPane(
                     horizontalArrangement = Arrangement.End,
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
+                    // 投屏：长按选中**一个视频文件**后可从这儿直接投（不必先进播放页）。
+                    // 恰好一个才可用 —— 一次只投一部片，目录/多选没有意义。
+                    val castTarget = ui.items.firstOrNull {
+                        it.fid in ui.selection && !it.isDir &&
+                            (it.isv == 1 || com.open115.pad.data.media.isVideoFileName(it.fn))
+                    }
+                    IconButton(
+                        onClick = { castTarget?.let(onCast) },
+                        enabled = castTarget != null && ui.selection.size == 1,
+                    ) {
+                        Icon(Icons.Outlined.Cast, contentDescription = "投屏")
+                    }
                     IconButton(onClick = onDownload, enabled = filesSelected > 0) {
                         Icon(Icons.Outlined.CloudDownload, contentDescription = "下载")
                     }
@@ -943,27 +968,96 @@ fun FilesBrowserPane(
 }
 
 @Composable
-private fun SearchBarInline(initial: String, onSearch: (String) -> Unit, onClose: () -> Unit) {
+private fun SearchBarInline(
+    initial: String,
+    inCurrent: Boolean,
+    days: Int?,
+    currentDirName: String,
+    history: List<String> = emptyList(),
+    onSearch: (String) -> Unit,
+    onScope: (Boolean) -> Unit,
+    onDays: (Int?) -> Unit,
+    onClearHistory: () -> Unit = {},
+    onClose: () -> Unit,
+) {
     var text by remember { mutableStateOf(initial) }
-    OutlinedTextField(
-        value = text,
-        onValueChange = { text = it },
-        placeholder = { Text("搜索文件名…") },
-        singleLine = true,
-        keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
-        keyboardActions = KeyboardActions(onSearch = { onSearch(text) }),
-        trailingIcon = {
-            androidx.compose.material3.IconButton(onClick = { onSearch(text) }) {
-                Icon(Icons.Outlined.Search, contentDescription = "搜索")
+    Column {
+        OutlinedTextField(
+            value = text,
+            onValueChange = { text = it },
+            placeholder = { Text("搜索文件名…") },
+            singleLine = true,
+            keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
+            keyboardActions = KeyboardActions(onSearch = { onSearch(text) }),
+            trailingIcon = {
+                androidx.compose.material3.IconButton(onClick = { onSearch(text) }) {
+                    Icon(Icons.Outlined.Search, contentDescription = "搜索")
+                }
+            },
+            leadingIcon = {
+                androidx.compose.material3.IconButton(onClick = onClose) {
+                    Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "退出搜索")
+                }
+            },
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
+        )
+        // 范围 / 时间：服务端搜索接口原生支持 cid 与 gte_day，这里只是把它们露出来。
+        // 搜索中改任一项都会立刻按新条件重搜（见 FilesViewModel.setSearchScope/setSearchDays）。
+        Row(
+            Modifier
+                .fillMaxWidth()
+                .horizontalScroll(rememberScrollState())
+                .padding(horizontal = 16.dp),
+            horizontalArrangement = Arrangement.spacedBy(2.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            com.open115.pad.ui.theme.AppChip(
+                label = "全盘",
+                selected = !inCurrent,
+                onClick = { onScope(false) },
+            )
+            com.open115.pad.ui.theme.AppChip(
+                label = "当前目录",
+                selected = inCurrent,
+                onClick = { onScope(true) },
+            )
+            if (inCurrent) {
+                Text(
+                    currentDirName,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.padding(horizontal = 4.dp),
+                )
             }
-        },
-        leadingIcon = {
-            androidx.compose.material3.IconButton(onClick = onClose) {
-                Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "退出搜索")
+            Spacer(Modifier.width(8.dp))
+            com.open115.pad.ui.theme.AppChip(
+                label = "不限",
+                selected = days == null,
+                onClick = { onDays(null) },
+            )
+            SearchFilters.DAY_PRESETS.forEach { (d, label) ->
+                com.open115.pad.ui.theme.AppChip(
+                    label = label,
+                    selected = days == d,
+                    onClick = { onDays(d) },
+                )
             }
-        },
-        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
-    )
+        }
+        // 输入框为空时给最近搜索：点一条直接再搜一次；有输入就让位给结果
+        if (text.isBlank()) {
+            SearchHistoryRow(
+                history = history,
+                onPick = { q ->
+                    text = q
+                    onSearch(q)
+                },
+                onClear = onClearHistory,
+            )
+        }
+        Spacer(Modifier.height(6.dp))
+    }
 }
 
 /**

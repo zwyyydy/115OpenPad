@@ -1,0 +1,5 @@
+# 源码按 LF 存储（仓库约定：源码 LF；README/CHANGELOG 保持 CRLF，不在此列）
+*.kt text eol=lf
+*.kts text eol=lf
+# Windows 批处理必须 CRLF：索引存 LF、检出为 CRLF
+*.bat text eol=crlf

@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths>
+    <!-- 诊断日志导出的 zip 只放在 cache/diag，不暴露 filesDir -->
+    <cache-path name="diag" path="diag/" />
+</paths>

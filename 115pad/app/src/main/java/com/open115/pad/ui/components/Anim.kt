@@ -13,6 +13,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -30,6 +31,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
@@ -136,12 +138,18 @@ fun FadeAlertDialog(
             launch { scale.animateTo(1f, tween(200)) }
             alpha.animateTo(1f, tween(180))
         }
+        // 高度上限：长内容的弹窗不该顶出屏幕 —— 顶出去的第一个受害者就是下方的
+        // 「创建/取消」（小屏、或把 DPI 调得更大的设备上实测被截）。
+        // 配合下面内容区的 weight(fill = false)：短内容照旧按内容高，上限只在超出时生效，
+        // 超出部分由调用方自己的滚动区消化（见 LibraryEditDialog）。
+        val maxDialogHeight = LocalConfiguration.current.screenHeightDp.dp * 0.88f
         Surface(
             shape = RoundedCornerShape(28.dp),
             color = MaterialTheme.colorScheme.surfaceContainerHigh,
             tonalElevation = 0.dp,
             modifier = Modifier
                 .widthIn(min = 280.dp, max = 560.dp)
+                .heightIn(max = maxDialogHeight)
                 .graphicsLayer {
                     this.alpha = alpha.value
                     this.scaleX = scale.value
@@ -158,11 +166,14 @@ fun FadeAlertDialog(
                 }
                 text?.let {
                     Box(
-                        Modifier.padding(
-                            start = 24.dp,
-                            end = 24.dp,
-                            top = if (title != null) 16.dp else 24.dp,
-                        ),
+                        Modifier
+                            // 最多吃掉"标题与按钮之外剩下的高度"；fill = false 保证短内容不被拉高
+                            .weight(1f, fill = false)
+                            .padding(
+                                start = 24.dp,
+                                end = 24.dp,
+                                top = if (title != null) 16.dp else 24.dp,
+                            ),
                     ) {
                         CompositionLocalProvider(LocalContentColor provides MaterialTheme.colorScheme.onSurfaceVariant) {
                             ProvideTextStyle(MaterialTheme.typography.bodyMedium, content = it)

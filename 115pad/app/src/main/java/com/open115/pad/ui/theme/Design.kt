@@ -12,12 +12,14 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.RowScope
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
@@ -80,35 +82,39 @@ data class AppPalette(
     val slateBg: Color, val slateFg: Color,
 )
 
-/** 明亮 = 现行配色原样搬入（视觉基准不变） */
+/** 明亮 = macOS 中性灰底 + 纯白面板 + 系统蓝 */
 val LightAppPalette = AppPalette(
-    bg = Color(0xFFF8FAFC), card = Color(0xFFFFFFFF), cardBorder = Color(0x0D000000),
-    accent = Color(0xFF2563EB), accentDeep = Color(0xFF1D4ED8), accentSoft = Color(0xFFEFF6FF),
-    textPrimary = Color(0xFF0F172A), textSecondary = Color(0xFF64748B), textTertiary = Color(0xFF94A3B8),
-    graySoft = Color(0xFFF1F5F9), divider = Color(0xFFE2E8F0),
-    greenBg = Color(0xFFDCFCE7), greenFg = Color(0xFF16A34A),
-    redBg = Color(0xFFFEE2E2), redFg = Color(0xFFDC2626),
-    blueBg = Color(0xFFDBEAFE), blueFg = Color(0xFF2563EB),
-    purpleBg = Color(0xFFF3E8FF), purpleFg = Color(0xFF7C3AED),
-    amberBg = Color(0xFFFEF3C7), amberFg = Color(0xFFB45309),
-    slateBg = Color(0xFFF1F5F9), slateFg = Color(0xFF64748B),
+    // macOS 中性灰底 + 纯白面板：底色不带蓝调，卡片才立得起来
+    bg = Color(0xFFF5F5F7), card = Color(0xFFFFFFFF), cardBorder = Color(0x14000000),
+    // 系统蓝 #007AFF；文字/链接用深一档保证 4.5:1
+    accent = Color(0xFF007AFF), accentDeep = Color(0xFF0066CC), accentSoft = Color(0xFFE9F2FF),
+    // 近黑主文字 / 苹果两级灰
+    textPrimary = Color(0xFF1D1D1F), textSecondary = Color(0xFF6E6E73), textTertiary = Color(0xFF8E8E93),
+    graySoft = Color(0xFFF2F2F7), divider = Color(0xFFE5E5EA),
+    greenBg = Color(0xFFE8F8EE), greenFg = Color(0xFF248A3D),
+    redBg = Color(0xFFFFEBEA), redFg = Color(0xFFD70015),
+    blueBg = Color(0xFFE9F2FF), blueFg = Color(0xFF007AFF),
+    purpleBg = Color(0xFFF6EDFB), purpleFg = Color(0xFF8944AB),
+    amberBg = Color(0xFFFFF4E5), amberFg = Color(0xFFB25000),
+    slateBg = Color(0xFFF2F2F7), slateFg = Color(0xFF6E6E73),
 )
 
 /**
- * 黑暗：冷灰底 + 亮字，与媒体库深色方案（#1C1C23 系）同一气质。
- * 强调蓝提亮一档（#2563EB 在深底上偏闷）；语义徽章从"浅底深字"翻成"深底亮字"。
+ * 黑暗：苹果深色灰阶（#1C1C1E / #2C2C2E / #3A3A3C）+ 亮字。
+ * 强调蓝用系统深色档 #0A84FF；语义徽章从"浅底深字"翻成"深底亮字"。
  */
 val DarkAppPalette = AppPalette(
-    bg = Color(0xFF15171C), card = Color(0xFF1F2229), cardBorder = Color(0x1FFFFFFF),
-    accent = Color(0xFF3B82F6), accentDeep = Color(0xFF93C5FD), accentSoft = Color(0xFF1D2E4F),
-    textPrimary = Color(0xFFE6EAF0), textSecondary = Color(0xFF9AA7B8), textTertiary = Color(0xFF667588),
-    graySoft = Color(0xFF272C34), divider = Color(0xFF2D333C),
-    greenBg = Color(0xFF142A1B), greenFg = Color(0xFF4ADE80),
-    redBg = Color(0xFF3A1517), redFg = Color(0xFFF87171),
-    blueBg = Color(0xFF16294B), blueFg = Color(0xFF93C5FD),
-    purpleBg = Color(0xFF2B1C42), purpleFg = Color(0xFFC4B5FD),
-    amberBg = Color(0xFF3A2B10), amberFg = Color(0xFFFBBF24),
-    slateBg = Color(0xFF272C34), slateFg = Color(0xFF9AA7B8),
+    // 苹果深色灰阶：底 #1C1C1E / 面板 #2C2C2E / 控件 #3A3A3C
+    bg = Color(0xFF1C1C1E), card = Color(0xFF2C2C2E), cardBorder = Color(0x2EFFFFFF),
+    accent = Color(0xFF0A84FF), accentDeep = Color(0xFF6CB4FF), accentSoft = Color(0xFF142C4A),
+    textPrimary = Color(0xFFF2F2F7), textSecondary = Color(0xFFAEAEB2), textTertiary = Color(0xFF8E8E93),
+    graySoft = Color(0xFF3A3A3C), divider = Color(0xFF38383A),
+    greenBg = Color(0xFF10331B), greenFg = Color(0xFF30D158),
+    redBg = Color(0xFF3A1714), redFg = Color(0xFFFF6961),
+    blueBg = Color(0xFF102A45), blueFg = Color(0xFF64B4FF),
+    purpleBg = Color(0xFF2C1B36), purpleFg = Color(0xFFDA8FFF),
+    amberBg = Color(0xFF3A2B0C), amberFg = Color(0xFFFFD60A),
+    slateBg = Color(0xFF2C2C2E), slateFg = Color(0xFFAEAEB2),
 )
 
 /** 当前生效的调色板，由 Open115Theme(dark) 按设置提供；[AppColors] 的取值全走这里 */
@@ -190,8 +196,60 @@ object AppColors {
     val SlateFg: Color @Composable get() = LocalAppPalette.current.slateFg
 }
 
-/** 卡片圆角基准：12~16dp */
-val CardShape = RoundedCornerShape(16.dp)
+/**
+ * 圆角标尺：收敛到 4 / 8 / 12 / 16 / 24 / 50 六档。
+ * 组件里别再写 6、9、10、14、18、20 这类中间值 —— 同屏出现两种相近圆角，
+ * 看上去就是"没对齐"而不是"有层次"。
+ */
+object AppRadius {
+    /** 小徽章、勾选框 */
+    val xs = 4.dp
+
+    /** 小控件底：类型角标、菜单项 */
+    val sm = 8.dp
+
+    /** 列表行、输入框、中等容器 */
+    val md = 12.dp
+
+    /** 卡片、面板 */
+    val lg = 16.dp
+
+    /** 底部弹层 */
+    val xl = 24.dp
+}
+
+/** 字号标尺：11/12 的正文在 1000dp+ 的宽屏上偏小，二级信息统一提到 12sp */
+object AppType {
+    /** 徽章、列表元信息、时间戳 */
+    val caption = 12.sp
+
+    /** 胶囊、按钮、分组标题 */
+    val label = 13.sp
+
+    /** 正文 */
+    val body = 15.sp
+
+    /** 卡片标题 */
+    val title = 16.sp
+
+    /** 页面标题 */
+    val page = 22.sp
+}
+
+/** 卡片圆角基准：12dp（和列表行同一档，macOS 的分组面板不会比行更圆） */
+val CardShape = RoundedCornerShape(AppRadius.md)
+
+/**
+ * M3 组件共用的圆角标尺。默认 M3 的对话框/弹层圆角是 28dp、按钮是胶囊，
+ * 放在这套偏紧凑的灰白界面里显得"圆过头"；统一收到 6/8/12/16/24。
+ */
+val AppShapes = androidx.compose.material3.Shapes(
+    extraSmall = RoundedCornerShape(6.dp),
+    small = RoundedCornerShape(8.dp),
+    medium = RoundedCornerShape(12.dp),
+    large = RoundedCornerShape(16.dp),
+    extraLarge = RoundedCornerShape(24.dp),
+)
 
 /**
  * 纯白悬浮卡片：微弥散投影（≈ 0 4px 16px rgba(0,0,0,0.03)）+ 1px 微描边 + 16dp 圆角。
@@ -213,11 +271,13 @@ fun AppCard(
     val cardBg = if (glass.active) AppColors.Card.copy(alpha = glass.cardAlpha) else AppColors.Card
     val base = modifier
         .shadow(
-            elevation = 3.dp,
+            // 柔和的弥散投影：macOS 面板靠"白面 + 极淡的落影 + 发丝边"分层，
+            // 不用重阴影（重了像 Material 的浮起卡片）
+            elevation = 6.dp,
             shape = shape,
             clip = false,
-            ambientColor = Color(0x0A000000),
-            spotColor = Color(0x16000000),
+            ambientColor = Color(0x08000000),
+            spotColor = Color(0x1C000000),
         )
         .clip(shape)
         .background(cardBg)
@@ -273,7 +333,7 @@ fun AppChip(
     }
 }
 
-/** 彩色微徽章（Badges）：11sp 胶囊标签，用于状态 / 统计 / 元信息 */
+/** 彩色微徽章（Badges）：12sp 胶囊标签，用于状态 / 统计 / 元信息 */
 @Composable
 fun StatusBadge(
     text: String,
@@ -284,16 +344,104 @@ fun StatusBadge(
     Text(
         text,
         modifier = modifier
-            .clip(RoundedCornerShape(6.dp))
+            .clip(RoundedCornerShape(AppRadius.xs))
             .background(bg)
             .padding(horizontal = 8.dp, vertical = 3.dp),
         color = fg,
-        fontSize = 11.sp,
-        lineHeight = 14.sp,
+        fontSize = AppType.caption,
+        lineHeight = 15.sp,
         fontWeight = FontWeight.Medium,
         maxLines = 1,
         overflow = TextOverflow.Ellipsis,
     )
+}
+
+/** 状态语义：决定小圆点的颜色，文字一律走二级灰（只有失败/进行中允许上色） */
+enum class StatusTone { Success, Info, Warning, Error, Neutral }
+
+/**
+ * 轻量状态行：6dp 圆点 + 12sp 文字，用来取代"每行一个彩色胶囊"。
+ * 一屏几十张卡时，常驻的绿底/黄底胶囊比内容本身还抢眼；圆点既能表达状态，
+ * 又不会在列表里连成色带。
+ */
+@Composable
+fun StatusDot(
+    text: String,
+    tone: StatusTone,
+    modifier: Modifier = Modifier,
+) {
+    val dot = when (tone) {
+        StatusTone.Success -> AppColors.GreenFg
+        StatusTone.Info -> AppColors.BlueFg
+        StatusTone.Warning -> AppColors.AmberFg
+        StatusTone.Error -> AppColors.RedFg
+        StatusTone.Neutral -> AppColors.TextTertiary
+    }
+    val fg = when (tone) {
+        StatusTone.Error -> AppColors.RedFg
+        StatusTone.Info -> AppColors.BlueFg
+        else -> AppColors.TextSecondary
+    }
+    Row(modifier, verticalAlignment = Alignment.CenterVertically) {
+        Box(Modifier.size(6.dp).background(dot, CircleShape))
+        Spacer(Modifier.width(6.dp))
+        Text(
+            text,
+            fontSize = AppType.caption,
+            lineHeight = 15.sp,
+            fontWeight = FontWeight.Medium,
+            color = fg,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
+    }
+}
+
+/**
+ * 自绘开关：44×24 轨道 + 18dp 白色圆钮，和 AppCheckbox / AppSlider 同一套语言。
+ * 原生 M3 Switch 比它大一倍，在一块全是 32dp 高控件的页面里会显得突兀。
+ */
+@Composable
+fun AppSwitch(
+    checked: Boolean,
+    onCheckedChange: (Boolean) -> Unit,
+    modifier: Modifier = Modifier,
+    enabled: Boolean = true,
+) {
+    val trackW = 44.dp
+    val trackH = 24.dp
+    val thumb = 18.dp
+    val knob by androidx.compose.animation.core.animateDpAsState(
+        targetValue = if (checked) trackW - thumb - 3.dp else 3.dp,
+        animationSpec = tween(160),
+        label = "switchKnob",
+    )
+    val track by androidx.compose.animation.animateColorAsState(
+        // 关态轨道：Divider 在灰底上几乎看不见，用三级文字色压一半透明度，明暗两套都成立
+        targetValue = if (checked) AppColors.Accent else AppColors.TextTertiary.copy(alpha = 0.5f),
+        animationSpec = tween(160),
+        label = "switchTrack",
+    )
+    Box(
+        modifier
+            .size(trackW, trackH)
+            .clip(RoundedCornerShape(50))
+            .background(track)
+            .clickable(
+                enabled = enabled,
+                role = androidx.compose.ui.semantics.Role.Switch,
+                onClick = { onCheckedChange(!checked) },
+            ),
+        contentAlignment = Alignment.CenterStart,
+    ) {
+        Box(
+            Modifier
+                .offset(x = knob)
+                .size(thumb)
+                .shadow(2.dp, CircleShape)
+                .background(Color.White, CircleShape),
+        )
+    }
 }
 
 /**
@@ -306,7 +454,7 @@ fun AppCheckbox(
     onCheckedChange: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    val shape = RoundedCornerShape(6.dp)
+    val shape = RoundedCornerShape(AppRadius.xs)
     Box(
         modifier.size(32.dp),
         contentAlignment = Alignment.Center,
@@ -528,7 +676,8 @@ private val imageExtsToken = setOf("jpg", "jpeg", "png", "gif", "bmp", "webp", "
 fun kindVisualOf(name: String, isDir: Boolean): KindVisual {
     val ext = name.substringAfterLast('.', "").lowercase()
     return when {
-        isDir -> KindVisual(Icons.Outlined.Folder, Color(0xFFB45309), Color(0xFFFEF3C7))
+        // 文件夹也走调色板：深色模式下一块奶油白太扎眼
+        isDir -> KindVisual(Icons.Outlined.Folder, AppColors.AmberFg, AppColors.AmberBg)
         ext in videoExtsToken -> KindVisual(Icons.Outlined.OndemandVideo, AppColors.BlueFg, AppColors.BlueBg)
         ext in imageExtsToken -> KindVisual(Icons.Outlined.Image, AppColors.GreenFg, AppColors.GreenBg)
         ext in setOf("mp3", "flac", "aac", "ogg", "wav", "m4a", "ape", "wma") ->
@@ -551,7 +700,7 @@ fun KindBadge(name: String, isDir: Boolean, modifier: Modifier = Modifier, size:
     Box(
         modifier
             .size(size)
-            .clip(RoundedCornerShape(10.dp))
+            .clip(RoundedCornerShape(AppRadius.sm))
             .background(v.bg),
         contentAlignment = Alignment.Center,
     ) {

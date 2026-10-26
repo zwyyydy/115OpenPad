@@ -133,6 +133,12 @@ class SideArtTest {
         assertTrue(isIgnoredDirName(".actors"))
         assertTrue(isIgnoredDirName("behind the scenes"))
         assertFalse(isIgnoredDirName("Season 1"))
+        // 115 的同名重复后缀：`xxx(1)` / `xxx（1）` 剥掉后缀再判一次 ——
+        // 重复出来的花絮/素材目录也得屏蔽；正片目录带 (1) 不受影响（真机实测踩到）
+        assertTrue(isIgnoredDirName("behind the scenes(1)"))
+        assertTrue(isIgnoredDirName("extrafanart（1）"))
+        assertTrue(isIgnoredDirName(".actors (2)"))
+        assertFalse(isIgnoredDirName("ABC-123 某演员(1)"))
     }
 
     // ---------------- 分 CD 的资源合成一条 ----------------

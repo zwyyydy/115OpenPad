@@ -1,6 +1,6 @@
 package com.open115.pad.data.media
 
-import android.util.Log
+import com.open115.pad.util.AppLog as Log
 import com.open115.pad.data.FileItem
 import com.open115.pad.data.FilesPage
 import com.open115.pad.data.ImageUrlResolver
@@ -48,6 +48,14 @@ import java.io.File
 enum class ScanMode { Full, Incremental, Fast }
 
 /**
+ * 定向任务（[QueuedScan.noRecurse]）里的一个目录：扫它自己、还是连子树一起。
+ *
+ * 递归与否**按目录给**而不是整任务一个布尔 —— 见 [QueuedScan.dirDeep] 的说明
+ * （移动入库：搬来的目录要整棵扫，目标目录只列一层）。
+ */
+data class TargetedDir(val cid: String, val path: String, val deep: Boolean)
+
+/**
  * 排队等待扫描的一个任务（一个媒体库一条；多根库的各根由 worker 依次跑）。
  *
  * 库的设置（限速 / 体积过滤 / 根路径）在**入队时快照**：任务代表"按下按钮那一刻的样子"，
@@ -68,7 +76,7 @@ data class QueuedScan(
     val rateLimitMs: Long = 0,
     /** 阶梯限速（[MediaLibraryEntity.rateTiered]）。老快照没有这个字段 → false = 老行为 */
     val rateTiered: Boolean = false,
-    /** 每 [TIER_REST_EVERY] 个目录休息几分钟（0 = 不休息）。老快照没有 → 0 = 不休息 */
+    /** 每列 [TIER_REST_EVERY] 次目录休息几分钟（0 = 不休息）。老快照没有 → 0 = 不休息 */
     val tierRestMinutes: Int = 0,
     val minVideoSizeMb: Int = 0,
     /**
@@ -101,6 +109,16 @@ data class QueuedScan(
      * 老快照没有这个字段 → false = 原来的单目录行为，正好兼容。
      */
     val deep: Boolean = false,
+    /**
+     * 与 [rootCids]/[rootPaths] **平行的每目录递归标记**（定向任务用）。
+     *
+     * 为什么 [deep] 不够用：文件页"移动入库"报的是「搬来的每个目录 deep=true（新内容要整棵
+     * 索引）+ 目标目录 deep=false（它只是多了几行，列一层就够，别的孩子都没变）」—— 两类
+     * 目录经常在**同一条合并后的任务**里（同库的定向任务会并目录），而递归是整任务级的布尔
+     * 的话，合并取 or 之后目标目录也会被整棵重扫，一次移动就是全库列目录（真机实测踩到）。
+     * 老快照没有这个字段 → 空列表 = 全按 [deep]，正好兼容。
+     */
+    val dirDeep: List<Boolean> = emptyList(),
     /**
      * 这次扫描是**别的功能顺手做的**（影片迁移搬完在目标位置的重扫）：跑完不弹"扫描完成"。
      *
@@ -152,15 +170,14 @@ data class QueuedScan(
          */
         fun targeted(
             library: MediaLibraryEntity,
-            dirs: List<Pair<String, String>>,
+            dirs: List<TargetedDir>,
             withSideArt: Boolean = false,
-            deep: Boolean = false,
             silent: Boolean = false,
         ) = QueuedScan(
             libraryId = library.id,
             libraryName = library.name,
-            rootCids = dirs.map { it.first },
-            rootPaths = dirs.map { it.second },
+            rootCids = dirs.map { it.cid },
+            rootPaths = dirs.map { it.path },
             incremental = false,
             fast = false,
             rateLimitMs = library.rateLimitMs,
@@ -169,7 +186,9 @@ data class QueuedScan(
             minVideoSizeMb = library.minVideoSizeMb,
             noRecurse = true,
             withSideArt = withSideArt,
-            deep = deep,
+            // deep 只是给老快照兼容的兜底字段；runTask 认 dirDeep
+            deep = dirs.any { it.deep },
+            dirDeep = dirs.map { it.deep },
             silent = silent,
         )
     }
@@ -374,7 +393,7 @@ internal fun fastSampleSize(candidates: Int): Int =
 /**
  * **阶梯限速**的五档间隔（见 [MediaLibraryEntity.rateTiered]）：越扫越慢。
  *
- * 档位按"这一轮正在扫第几个目录"（[MediaScanner.scanDirsDone] + 1）选，用户定的就是这五档：
+ * 档位按"这一轮已经列了多少次目录"（[MediaScanner.scanDirsDone] + 1）选，用户定的就是这五档：
  * 前 10 个 500ms、11~20 个 1000ms、21~50 个 1500ms、51~100 个 2000ms、100 往上 2500ms。
  *
  * 为什么不是"请求数"而是"目录数"：一个目录可能带来好几次请求（列目录 + 每个簇一次 nfo + 海报），
@@ -395,7 +414,7 @@ internal fun tierRateLimitMs(dirsDone: Int): Long = when {
 internal const val TIER_REST_EVERY = 100
 
 /**
- * 该不该休息了：这一轮已经跨过几个 [TIER_REST_EVERY] 的整倍数（[restsDone]）比上次多的那一刻。
+ * 该不该休息了：这一轮已经列了 [TIER_REST_EVERY] 的整倍数次目录（[restsDone]）比上次多的那一刻。
  *
  * 用"跨过几个整倍数"而不是 `dirsDone % 100 == 0`：后者在续扫/多根任务里会因为计数不从 0 开始
  * 而永远不等（或者连着触发）。纯函数，单测直接打。
@@ -658,7 +677,7 @@ class MediaScanner(
     /**
      * **这一轮任务**已处理完的目录数（跨根累计，[drain] 取到任务时归零）。
      *
-     * 阶梯限速（[tierRateLimitMs]）与"每 100 个休息"（[tierRestDue]）都按它走 ——
+     * 阶梯限速（[tierRateLimitMs]）与"每 100 次列目录休息"（[tierRestDue]）都按它走 ——
      * 必须是**任务级**而不是 runScan 级：流水线同步一条任务会带 N 个目录，每个目录各调一次 runScan，
      * 按 runScan 计数的话每调一次都从 0 开始，阶梯永远停在第一档。
      */
@@ -950,19 +969,33 @@ class MediaScanner(
         withSideArt: Boolean = false,
         deep: Boolean = false,
         silent: Boolean = false,
+    ) = enqueueTargeted(library, dirs.map { TargetedDir(it.first, it.second, deep) }, withSideArt, silent)
+
+    /** 同上，但每个目录自带要不要递归（见 [TargetedDir]） */
+    fun enqueueTargeted(
+        library: MediaLibraryEntity,
+        dirs: List<TargetedDir>,
+        withSideArt: Boolean = false,
+        silent: Boolean = false,
     ) {
         if (dirs.isEmpty()) return
         val queued = synchronized(qLock) {
             _pending.value.firstOrNull { it.libraryId == library.id && it.noRecurse }
         }
-        val queuedDirs = queued?.rootCids?.zip(queued.rootPaths).orEmpty()
-        val merged = (queuedDirs + dirs).distinctBy { it.first }
+        val queuedDirs = queued?.rootCids?.zip(queued.rootPaths)?.mapIndexed { i, (cid, path) ->
+            // 老快照没有 dirDeep → 回退到整任务级的 deep
+            TargetedDir(cid, path, queued.dirDeep.getOrNull(i) ?: queued.deep)
+        }.orEmpty()
+        val merged = (queuedDirs + dirs)
+            .groupBy { it.cid }
+            .map { (_, same) ->
+                // 同一个 cid 两边都报过：路径信后给的（移动后路径才是新的），deep 取 or
+                TargetedDir(same.last().cid, same.last().path, same.any { it.deep })
+            }
         enqueue(
             QueuedScan.targeted(
                 library, merged,
                 withSideArt = withSideArt || queued?.withSideArt == true,
-                // 合并取 or：有一条要往下递归，整条就得递归（多扫一点不会错，少扫会留下半套）
-                deep = deep || queued?.deep == true,
                 silent = mergedTargetedSilent(silent, queued?.silent),
             ),
         )
@@ -1138,11 +1171,13 @@ class MediaScanner(
             // 汇总器照旧挂着（它同时挡掉 runScan 那种"一个目录一条记录"的写法），
             // 只是 [QueuedScan.silent] 的任务最后**不落盘**（见下面的说明）
             val sink = ScanLogAccumulator()
-            task.rootCids.zip(task.rootPaths).forEach { (cid, path) ->
+            task.rootCids.zip(task.rootPaths).forEachIndexed { i, entry ->
+                val (cid, path) = entry
                 runScan(
                     cid, path,
+                    // 每目录的递归标记（[QueuedScan.dirDeep]）；老快照没有 → 回退整任务的 deep。
                     // deep = 迁移那种"整个作品搬了地方"：它名下的分集/子目录都要跟着重新索引一遍
-                    includeSubDirs = task.deep,
+                    includeSubDirs = task.dirDeep.getOrNull(i) ?: task.deep,
                     withSideArt = task.withSideArt,
                     mode = task.mode,
                     rateLimitMs = task.rateLimitMs,
@@ -1311,6 +1346,9 @@ class MediaScanner(
         val first = parseFilesResponse(
             run { throttle(rateLimitMs); openApi.files(cid = cid, limit = PAGE_SIZE) },
         )
+        // 阶梯限速 / "每 N 次休息"按**真实列目录请求**计（不是按处理了几个目录）：
+        // 快速扫描里被剪掉的目录零请求，按目录计会把几分钟的扫描拖成几十分钟。
+        scanDirsDone++
         if (first.count <= first.items.size) return first
 
         val all = first.items.toMutableList()
@@ -1322,6 +1360,7 @@ class MediaScanner(
                     openApi.files(cid = cid, limit = PAGE_SIZE, offset = all.size)
                 },
             )
+            scanDirsDone++
             if (page.items.isEmpty()) break
             all += page.items
         }
@@ -1455,9 +1494,19 @@ class MediaScanner(
         /** 方式名（"全量"/"增量"/"快速"）：日志与扫描记录共用，收尾的 finally 里还要用 */
         val modeLabel = mode.label
         /** 本次**新增**的顶层影片键（分集不单列）—— 存进扫描记录，界面拿它 join 出海报与标题 */
-        val newKeys = mutableListOf<String>()
+        // ★ LinkedHashSet 去重：同一 mediaKey 可能由两个目录各产出一次（云盘上有
+        // `xxx` 与 `xxx(1)` 同名目录时），扫描记录的"新增影片"列表不去重、
+        // 记录页网格按 mediaKey 当 key 会直接崩（web-cookie 支线真机实测踩到）。
+        val newKeys = LinkedHashSet<String>()
         val startedAt = System.currentTimeMillis()
         resumeNotedAt = 0
+        // 跨库同名影片的键归属（见 [KeyScope]）：只有"这一轮属于某个库"时才需要；
+        // 直接调 runScan（没有 libraryId）的场合保持老行为 —— 键就是 mediaKeyOf 算出来的那个。
+        val keyScope = libraryId?.let { id ->
+            runCatching { dao.library(id) }.getOrNull()
+                ?.rootPaths?.takeIf { it.isNotEmpty() }
+                ?.let { KeyScope(dao, id, it) }
+        }
         try {
             // 老数据自愈：哪些目录还是"元数据与视频分成两条"的样子（`ABC-101-4K-C` + `ABC-101-U`）。
             // 合并逻辑是后加的，而指纹一致时下面的循环会跳过这个目录 —— 不特判就永远合不起来。
@@ -1483,7 +1532,7 @@ class MediaScanner(
             }
 
             /**
-             * 到了"每 [TIER_REST_EVERY] 个目录休息一次"的点就睡几分钟（防频控）。
+             * 到了"每 [TIER_REST_EVERY] 次列目录休息一次"的点就睡几分钟（防频控）。
              * 设置没开（[restMinutes] 为 0）时什么都不做。
              *
              * 睡的是**1 秒一片**的短觉、每片查一次停止位：用户点了「停止」（以及删库前的那次等待）
@@ -1499,7 +1548,7 @@ class MediaScanner(
                 val total = restMinutes * 60_000L
                 Log.i(
                     TAG,
-                    "「$roundLabel」已扫 $scanDirsDone 个目录，休息 $restMinutes 分钟（防频控）",
+                    "「$roundLabel」已列目录 $scanDirsDone 次，休息 $restMinutes 分钟（防频控）",
                 )
                 _progress.value = _progress.value.copy(
                     restingUntil = System.currentTimeMillis() + total,
@@ -1520,9 +1569,15 @@ class MediaScanner(
              * 指纹没变跳过的、真索引的）。漏一个的后果不是报错，而是阶梯比设置走得慢 ——
              * 防 ban 的那道闸悄悄失效，真机上只会以"莫名其妙被限流"的形式暴露。
              */
+            /**
+             * 一个目录处理完了：计数 → 刷进度 → 该休息就休息。
+             *
+             * ★ 这里**不再**给阶梯限速/休息的计数（[scanDirsDone]）加一：它现在在 [listFiles]
+             *   里按**真实列目录请求**计。快速扫描里被剪掉的目录一次都不列，按目录计的话
+             *   几百个零请求的目录照样触发"每 100 个休息几分钟"，扫描能被拖成几十分钟。
+             */
             suspend fun finishDir() {
                 done++
-                scanDirsDone++
                 noteProgress()
                 maybeRest()
             }
@@ -1641,9 +1696,18 @@ class MediaScanner(
                 // 分 CD / 分片的资源（`ABC-201-cd1` + `-cd2`）**合成一条**：造一个"系列"行，
                 // 各 CD 挂到它名下当分集 —— 海报墙出一张卡，点进去列 CD1/CD2。
                 // 不合并的话每张盘都是一套完整的视频+nfo+海报，墙上就是 N 张几乎一样的卡。
-                val cdBase = if (scan.isMultiVideo) cdGroupBaseOf(scan.clusters) else null
+                val cdBaseRaw = if (scan.isMultiVideo) cdGroupBaseOf(scan.clusters) else null
                 // 元数据与图取"第一张盘"（列表顺序不稳定，不能直接用 first）
-                val cdLead = if (cdBase != null) cdGroupLead(scan.clusters) else null
+                val cdLead = if (cdBaseRaw != null) cdGroupLead(scan.clusters) else null
+                // 合成行的键也要过一遍跨库归属：两个库都有这套 CD 时，各用各的键。
+                val cdBase = cdBaseRaw?.let { base ->
+                    keyScope?.resolve(
+                        base,
+                        listing.path,
+                        cdLead?.video?.pickCode,
+                        cdLead?.nfo?.pickCode,
+                    ) ?: base
+                }
                 // 合成卡的图：第一张盘优先，它没有就**借任意一张盘的** —— 实测 `ABC-204 示例演员/`
                 // 第一张盘只有视频 + nfo，海报挂在 cd2 上，不借的话合并卡是空白的
                 val cdArt = if (cdBase != null) {
@@ -1689,8 +1753,18 @@ class MediaScanner(
                     AncestorInfo(base, cdArt?.poster, cdArt?.fanart)
                 }
                 // 各 CD 的键：第一张盘要改名（见 cdChildKeys 的注释，直接叫基名会和合成行撞）
-                val cdKeys = if (cdBase != null) {
-                    scan.clusters.map { it.prefix }.let { ps -> ps.zip(cdChildKeys(cdBase, ps)).toMap() }
+                // ★ 先按**原始基键**算改名，再统一补库后缀：直接拿已 scoped 的基键去算，
+                //   "第一张盘的原始前缀 == 基键"这个前提就不成立了，它会叫回 `ABC-201`，
+                //   正好撞上另一个库的合成行（真删改线上数据的那种错）。
+                val cdKeys = if (cdBaseRaw != null) {
+                    scan.clusters.map { it.prefix }.let { ps -> ps.zip(cdChildKeys(cdBaseRaw, ps)).toMap() }
+                        .let { raw ->
+                            if (cdBase != null && cdBase != cdBaseRaw && keyScope != null) {
+                                raw.mapValues { (_, k) -> keyScope.scope(k) }
+                            } else {
+                                raw
+                            }
+                        }
                 } else {
                     emptyMap()
                 }
@@ -1703,6 +1777,7 @@ class MediaScanner(
                             listing.cid, listing.path, showCluster,
                             isEpisodeLike = false, rateLimitMs = rateLimitMs,
                             ancestor = null, sideArt = sideArt, keyOverride = null,
+                            keyScope = keyScope,
                         )
                         produced += showKey
                         movies++
@@ -1732,6 +1807,7 @@ class MediaScanner(
                             ancestor = cdAncestor ?: showAncestor ?: ancestor,
                             sideArt = sideArt,
                             keyOverride = cdKeys[cluster.prefix],
+                            keyScope = keyScope,
                         )
                         movies++
                         // 大目录（一季几十集）里让"已入库/已缓存图"跟着动，不然进度条整段不动
@@ -2027,7 +2103,7 @@ class MediaScanner(
                 // （不然一次同步几个目录就变成几条记录，见 ScanLogAccumulator）
                 val sink = logSink
                 if (sink != null) {
-                    sink.add(report, newKeys)
+                    sink.add(report, newKeys.toList())
                 } else {
                     dao.addScanLog(
                         ScanLogEntity(
@@ -2297,6 +2373,49 @@ class MediaScanner(
         return AncestorInfo(seriesKey, poster, fanart)
     }
 
+    /**
+     * 跨库同名影片的**键归属**（一轮扫描一份）。
+     *
+     * `movies.mediaKey` 是全局主键，而库归属是按 `dirPath` 前缀推的：两个**不相交**的库里
+     * 各有一部同样的片（同一个 tmdb id / 番号）时，后扫的那个以前会把先扫那行 upsert 走 ——
+     * dirPath 一改，前一个库的海报墙上就少一张卡（用户说的"后者夺取前者"）。
+     *
+     * 现在：基键**先到先得**，第二个库起用 `<基键>#lib<库 id>` 另起一行，两边各看得见各的。
+     * 同一个库里的重复目录（以及多根库的两个根）仍旧只出一张卡（后扫的赢），与以前一致。
+     *
+     * 两个例外不换键：
+     *  - **物理身份相同**（视频 / nfo 的 pick_code 对得上）= 同一份文件被搬了目录（影片迁移、
+     *    目录改名）。[MovieMigrator] 等的就是"原键那一行的 dirPath 变成新位置"，换键会让一次
+     *    成功的迁移报成失败、还在旧库留一张幽灵卡。
+     *  - 本库**已经建过** scoped 行：继续用它（基键那行后来被删了也不回基键，键一变，
+     *    扫描记录里的新增键和详情浮层的旧卡就都指不到了）。
+     */
+    private class KeyScope(
+        private val dao: MediaDao,
+        private val libraryId: Long,
+        private val roots: List<String>,
+    ) {
+        suspend fun resolve(
+            baseKey: String,
+            dirPath: String,
+            videoPickCode: String?,
+            nfoPickCode: String?,
+        ): String {
+            val scoped = libraryScopedKey(baseKey, libraryId)
+            val own = dao.movieKeyOwner(scoped)
+            val owner = dao.movieKeyOwner(baseKey)
+            if (!needsLibraryScopedKey(owner?.dirPath, own?.dirPath, dirPath, roots)) return baseKey
+            if (own != null) return scoped
+            // 基键被别的库占着：先确认是不是"同一份文件被搬过来"（迁移），不是才真的另起一行
+            val sameFile = videoPickCode?.takeIf { it.isNotBlank() }?.let { dao.movieKeyByVideoPickCode(it) }
+                ?: nfoPickCode?.takeIf { it.isNotBlank() }?.let { dao.movieKeyByNfoPickCode(it) }
+            return sameFile ?: scoped
+        }
+
+        /** 给派生键（分 CD 的子键）补同一个库后缀，保持"这一族键都属于本库" */
+        fun scope(rawKey: String): String = libraryScopedKey(rawKey, libraryId)
+    }
+
     /** 单条入库：聚类 → 下载 nfo 解析 → 一个事务。**返回入库用的 mediaKey**（调用方拿它清陈旧条目） */
     private suspend fun indexCluster(
         dirCid: String,
@@ -2323,6 +2442,8 @@ class MediaScanner(
         sideArt: SideArt? = null,
         /** 分 CD 时由调用方指定的键（第一张盘要改名，见 [cdChildKeys]）；null = 按前缀算 */
         keyOverride: String? = null,
+        /** 跨库同名影片的键归属；null = 不是在为某个库扫（键直接用 [mediaKeyOf] 的结果） */
+        keyScope: KeyScope? = null,
     ): String {
         var meta = NfoMeta()
         cluster.nfo?.let { nfo ->
@@ -2340,9 +2461,18 @@ class MediaScanner(
         }
         // 主键：影片用 nfo 的 tmdb id、分集一律用文件前缀（分集 nfo 的 id 常是整部剧的，
         // 拿它当主键会把整季覆盖成一行 —— 见 mediaKeyOf 的注释）。
-        // 分 CD 时由调用方给定（第一张盘要避开合成行的键）。
-        val key = keyOverride ?: mediaKeyOf(cluster.prefix, meta.uniqueTmdbid, isEpisodeLike)
+        // 分 CD 时由调用方给定（第一张盘要避开合成行的键，且基键已经过跨库归属）。
+        val baseKey = keyOverride ?: mediaKeyOf(cluster.prefix, meta.uniqueTmdbid, isEpisodeLike)
+        // 跨库同名影片：基键被别的库那份占着时，本库这一份用 `#lib<id>` 另起一行 ——
+        // 不这么做的话后扫的库会把先扫那行的 dirPath 改走（前者海报墙上直接少一张卡）。
+        val key = if (keyOverride == null) {
+            keyScope?.resolve(baseKey, dirPath, cluster.video?.pickCode, cluster.nfo?.pickCode) ?: baseKey
+        } else {
+            baseKey
+        }
         val title = meta.title ?: cluster.prefix.substringBeforeLast('(').trim().ifEmpty { cluster.prefix }
+        // 拼音/首字母入库时算一次（查询侧只做 LIKE，见 MediaDao.searchAll）
+        val (titlePinyin, titleInitials) = PinyinText.of(title)
         // 演员名以 **nfo 为准**；nfo 没带才退到 `.actors` 里的文件名，再没有才从目录名猜
         // （见 actorsOf 的注释：`.actors` 的文件名正是头像的键，从这里取名字头像一定配得上）
         val actors = actorsOf(
@@ -2399,6 +2529,8 @@ class MediaScanner(
             dateAdded = parseNfoDateMillis(meta.dateAdded),
             sourceDirKey = dirCid,
             scannedAt = System.currentTimeMillis(),
+            titlePinyin = titlePinyin,
+            titleInitials = titleInitials,
         )
         dao.upsertMovieWithPeople(
             movie = movie,
@@ -2459,9 +2591,11 @@ class MediaScanner(
             dirPath = listing.path,
         )
         val prev = if (sideArt == null) dao.movie(baseKey) else null
+        val mergedTitle = stripCdMarker(meta.title ?: first.prefix).ifEmpty { baseKey }
+        val (titlePinyin, titleInitials) = PinyinText.of(mergedTitle)
         val movie = MovieEntity(
             mediaKey = baseKey,
-            title = stripCdMarker(meta.title ?: first.prefix).ifEmpty { baseKey },
+            title = mergedTitle,
             year = meta.year,
             rating = meta.rating,
             plot = meta.plot,
@@ -2493,6 +2627,8 @@ class MediaScanner(
             actorsDirCid = if (sideArt != null) sideArt.actorsDirCid else prev?.actorsDirCid,
             sourceDirKey = listing.cid,
             scannedAt = System.currentTimeMillis(),
+            titlePinyin = titlePinyin,
+            titleInitials = titleInitials,
         )
         dao.upsertMovieWithPeople(
             movie = movie,

@@ -29,6 +29,7 @@ import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
+import androidx.compose.foundation.lazy.grid.rememberLazyGridState
 import androidx.compose.foundation.shape.GenericShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
@@ -58,12 +59,14 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.BlurredEdgeTreatment
@@ -80,6 +83,7 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.painter.ColorPainter
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
@@ -90,10 +94,13 @@ import kotlin.math.roundToInt
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import coil.compose.AsyncImage
+import coil.request.ImageRequest
+import com.open115.pad.data.SearchHistory
 import com.open115.pad.data.media.backgroundSourceOf
 import com.open115.pad.data.media.WorksSort
 import com.open115.pad.data.media.MediaDao
-import com.open115.pad.data.media.MEDIA_NO_LIMIT
+import com.open115.pad.data.media.PinyinText
+import com.open115.pad.data.media.SEARCH_PAGE_SIZE
 import com.open115.pad.data.media.MediaLibraryEntity
 import com.open115.pad.data.media.MediaMigrator
 import com.open115.pad.data.media.WorksFilter
@@ -104,6 +111,13 @@ import com.open115.pad.data.media.MovieCard
 import com.open115.pad.data.media.MovieDeleteResult
 import com.open115.pad.data.media.deleteMovie
 import com.open115.pad.ui.theme.AdaptiveBody
+import com.open115.pad.ui.theme.cachedTone
+import com.open115.pad.ui.theme.computeTone
+import com.open115.pad.ui.theme.rememberToneColor
+import com.open115.pad.ui.components.EmptyState
+import com.open115.pad.ui.components.SearchHistoryRow
+import com.open115.pad.ui.components.PosterGridSkeleton
+import com.open115.pad.ui.components.ToneAwareAsyncImage
 import com.open115.pad.ui.components.dissolve
 import com.open115.pad.ui.components.pressScale
 import kotlinx.coroutines.delay
@@ -139,6 +153,8 @@ fun PosterWallScreen(
     onChanged: () -> Unit = {},
     onBack: () -> Unit,
     onOpenMovie: (MovieCard, List<MovieCard>, Int) -> Unit,
+    /** 海报的共享元素修饰：由外层把当前转场 scope 包好传进来（墙自己没有 scope） */
+    posterShared: (@Composable (MovieCard) -> Modifier)? = null,
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
@@ -164,6 +180,8 @@ fun PosterWallScreen(
     // 排序方式（表头那个菜单选的）：与作品页共用同一个设置（存 MediaPrefs）
     val sort by container.mediaPrefs.worksSort.collectAsState(initial = WorksSort.DEFAULT)
     var sortMenu by remember { mutableStateOf(false) }
+    // 第一次数据到齐前显示骨架：空列表既可能是"还没查完"也可能是"这个库真的空"
+    var loaded by remember(library.id) { mutableStateOf(false) }
     val all by produceState(initialValue = emptyList(), library.rootPaths, refreshKey, sort) {
         val paths = library.rootPaths
         value = if (paths.size <= 5) {
@@ -174,6 +192,7 @@ fun PosterWallScreen(
                 .distinctBy { it.mediaKey }
                 .let { list -> sortListInMemory(list, sort) }
         }
+        loaded = true
     }
     // 背景轮播用的图：本库顶层条目的 fanart（就是详情页那张背景图）
     val backdrops by produceState(initialValue = emptyList<String>(), library.rootPaths, refreshKey) {
@@ -198,18 +217,36 @@ fun PosterWallScreen(
 
     var query by remember { mutableStateOf("") }
     /**
-     * 搜索结果 = **全局**：片名 / 演员 / 标签，跨所有媒体库（见 dao.searchAll）。
+     * 搜索结果 = **全局**：片名 / 拼音 / 首字母 / 演员 / 标签，跨所有媒体库（见 dao.searchAll）。
      *
      * 早先是"在本库内搜片名"（结果再按本库的 mediaKey 收敛）—— 演员和标签搜不到，
      * 别的库里的同演员作品也搜不到。现在搜出来的就是全库的，卡片、海报、点进去都一样。
      */
-    val hits by produceState<List<MovieCard>?>(initialValue = null, query, all, sort) {
+    // 分页：先要 60 条，滚到底再加一页（不再一次拉全库）
+    var searchLimit by remember(query) { mutableIntStateOf(SEARCH_PAGE_SIZE) }
+    val hits by produceState<List<MovieCard>?>(initialValue = null, query, all, sort, searchLimit) {
         if (query.isBlank()) {
             value = null
             return@produceState
         }
-        delay(250) // 防抖：连续输入只跑最后一次（produceState 换 key 会取消上一轮）
-        value = dao.searchAll(query, MEDIA_NO_LIMIT, sort.sql)
+        // 只有第一页防抖；翻页是用户已经滚到底的明确动作，不该再等
+        if (searchLimit == SEARCH_PAGE_SIZE) delay(250)
+        value = dao.searchAll(
+            keyword = query.trim(),
+            pinyin = PinyinText.normalizeQuery(query),
+            limit = searchLimit,
+            offset = 0,
+            sort = sort.sql,
+        )
+    }
+    // 历史：输入停 900ms 落一条（merge 会顶掉"庆"→"庆余"这种中间态）
+    val searchHistory by container.searchHistory.media.collectAsState(initial = emptyList())
+    LaunchedEffect(query) {
+        val q = query.trim()
+        if (q.isNotBlank()) {
+            delay(900)
+            container.searchHistory.add(SearchHistory.Scope.MEDIA, q)
+        }
     }
     val searching = !hits.isNullOrEmpty() || query.isNotBlank()
     // 筛选（年份/类型·标签/演员，多选）：选项从"这个库实际有的"现算，纯本地过滤
@@ -228,6 +265,20 @@ fun PosterWallScreen(
     val list = remember(hits, all, filter, extraOfKey) {
         (hits ?: all).let { base ->
             if (filter.isEmpty) base else base.filter { filter.matches(it, extraOf(it)) }
+        }
+    }
+
+    // 结果网格滚到底 → 再要一页。用**过滤后**的 list.size 判断（搜索态下网格铺的是 list）：
+    // total >= limit 才说明服务端可能还有下一页。
+    val searchGridState = rememberLazyGridState()
+    LaunchedEffect(searchGridState, query, sort) {
+        snapshotFlow {
+            val last = searchGridState.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: -1
+            Triple(last, list.size, searchLimit)
+        }.collect { (last, total, limit) ->
+            if (query.isNotBlank() && total > 0 && total >= limit && last >= total - 8) {
+                searchLimit += SEARCH_PAGE_SIZE
+            }
         }
     }
 
@@ -289,7 +340,7 @@ fun PosterWallScreen(
                                     if (filter.isEmpty) "" else " · 已筛选 ${filter.selectedCount} 项"
                             } else {
                                 // 明说跨库：搜出来的结果不限于当前这个库
-                                "片名 / 演员 / 标签 · ${list.size} 部 · 全部媒体库"
+                                "片名 / 拼音 / 演员 / 标签 · 已加载 ${list.size} 部 · 全部媒体库"
                             },
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -354,6 +405,15 @@ fun PosterWallScreen(
                     )
                 }
 
+                // 搜索框为空时铺最近搜索（输入中让位给结果）
+                if (query.isBlank()) {
+                    SearchHistoryRow(
+                        history = searchHistory,
+                        onPick = { query = it },
+                        onClear = { scope.launch { container.searchHistory.clear(SearchHistory.Scope.MEDIA) } },
+                    )
+                }
+
                 // 多选工具条：长按一张卡进来，与文件页同一套语义（全选 / 取消 / 动作）
                 if (selection.isNotEmpty()) {
                     Row(
@@ -409,7 +469,11 @@ fun PosterWallScreen(
                 val deleteProgress by container.mediaBatchDeleter.progress.collectAsState()
                 if (deleteProgress.running) {
                     BatchProgressCard(
-                        title = if (deleteProgress.alsoCloud) "正在彻底删除" else "正在从媒体库移除",
+                        title = when {
+                            deleteProgress.alsoPurgeRecycle -> "正在彻底删除"
+                            deleteProgress.alsoCloud -> "正在删除"
+                            else -> "正在从媒体库移除"
+                        },
                         current = deleteProgress.currentTitle,
                         done = deleteProgress.done,
                         total = deleteProgress.total,
@@ -438,26 +502,27 @@ fun PosterWallScreen(
                     }
                 }
 
-                if (list.isEmpty()) {
-                    Column(
-                        Modifier.fillMaxSize().padding(32.dp),
-                        horizontalAlignment = Alignment.CenterHorizontally,
-                        verticalArrangement = Arrangement.Center,
-                    ) {
-                        Text(
-                            if (query.isBlank()) {
-                                "这个库还没有影片，回列表点扫描"
-                            } else {
-                                "全部媒体库里都没有匹配「$query」的片名 / 演员 / 标签"
-                            },
-                            style = MaterialTheme.typography.bodyLarge,
+                when {
+                    !loaded -> PosterGridSkeleton(compact)
+                    list.isEmpty() -> if (query.isBlank()) {
+                        EmptyState(
+                            icon = Icons.Outlined.Movie,
+                            title = "这个库还没有影片",
+                            hint = "回列表点扫描，或先给这个库绑定云盘目录",
+                        )
+                    } else {
+                        EmptyState(
+                            icon = Icons.Outlined.Search,
+                            title = "没有匹配「$query」的影片",
+                            hint = "换个片名、拼音、演员或标签试试",
                         )
                     }
-                } else {
+                    else -> {
                     // 全屏自适应网格：手机 3 列（minSize 调小）/ 平板 4~5 列 / 2K/4K 大屏 6~8 列，
                     // 列宽由系统按 minSize 均分铺满，横向拉伸只等比放大或增列，不留死白
                     LazyVerticalGrid(
                         columns = GridCells.Adaptive(minSize = if (compact) 110.dp else 130.dp),
+                        state = searchGridState,
                         contentPadding = PaddingValues(16.dp),
                         horizontalArrangement = Arrangement.spacedBy(16.dp),
                         verticalArrangement = Arrangement.spacedBy(16.dp),
@@ -479,9 +544,11 @@ fun PosterWallScreen(
                                     }
                                 },
                                 onLongClick = { selection = selection + card.mediaKey },
+                                posterModifier = posterShared?.invoke(card) ?: Modifier,
                             )
                         }
                     }
+                }
                 }
             }
         }
@@ -504,7 +571,7 @@ fun PosterWallScreen(
             // 而它的分集要靠查询才知道数量，这里先按"是不是分集"粗略区分
             episodeCount = 0,
             onDismiss = { deleteTarget = null },
-            onDelete = { alsoCloud ->
+            onDelete = { mode ->
                 deleteTarget = null
                 scope.launch {
                     val r = deleteMovie(
@@ -514,7 +581,8 @@ fun PosterWallScreen(
                         imageUrlResolver = container.imageUrlResolver,
                         cacheDir = container.cacheDir,
                         mediaKey = target.mediaKey,
-                        alsoCloud = alsoCloud,
+                        alsoCloud = mode != MovieDeleteMode.LibraryOnly,
+                        alsoPurgeRecycle = mode == MovieDeleteMode.Purge,
                         videoPreviews = container.videoPreviews,
                     )
                     when (r) {
@@ -554,10 +622,14 @@ fun PosterWallScreen(
         MovieBatchDeleteDialog(
             count = batchDeleteCount,
             onDismiss = { batchDeleteCount = 0 },
-            onDelete = { alsoCloud ->
+            onDelete = { mode ->
                 batchDeleteCount = 0
                 // 交给应用级任务：逐条删、可停、结果汇总（选择集先留着，进度卡上看得见在删哪些）
-                container.mediaBatchDeleter.start(selection.toList(), alsoCloud)
+                container.mediaBatchDeleter.start(
+                    selection.toList(),
+                    alsoCloud = mode != MovieDeleteMode.LibraryOnly,
+                    alsoPurgeRecycle = mode == MovieDeleteMode.Purge,
+                )
             },
         )
     }
@@ -645,6 +717,8 @@ fun PosterCard(
     onLongClick: (() -> Unit)? = null,
     /** 多选态下这张卡被勾上了：压一层暗幕 + 左上角一个勾 */
     selected: Boolean = false,
+    /** 海报区域的额外修饰（共享元素转场从这里飞出去） */
+    posterModifier: Modifier = Modifier,
 ) {
     // 深色海报上水波纹几乎看不见：按压缩放承担「按到了」
     val interaction = remember { MutableInteractionSource() }
@@ -671,7 +745,8 @@ fun PosterCard(
             Modifier
                 .fillMaxWidth()
                 .aspectRatio(2f / 3f)
-                .clip(RoundedCornerShape(12.dp)),
+                .clip(RoundedCornerShape(12.dp))
+                .then(posterModifier),
         ) {
             // 浅灰底 + 图标：海报没加载出来时垫在下面，不留空白。
             // 有海报的片图上来了就盖住它；没海报的片，如果详情页已经裁好兜底海报
@@ -808,13 +883,9 @@ fun PickCodeImage(
     val model by produceState<Any?>(initialValue = null, pickCode) {
         value = container.imageUrlResolver.posterFor(pickCode, container.cacheDir)
     }
-    if (model != null) {
-        AsyncImage(
-            model = model,
-            contentDescription = null,
-            contentScale = contentScale,
-            modifier = modifier,
-        )
+    val resolved = model
+    if (resolved != null) {
+        ToneAwareAsyncImage(resolved, modifier, contentScale)
     } else {
         Spacer(modifier)
     }
@@ -854,13 +925,9 @@ fun PosterImage(
             resolver.croppedPosterIfCached(backgroundPickCode, container.cacheDir)
         }
     }
-    if (model != null) {
-        AsyncImage(
-            model = model,
-            contentDescription = null,
-            contentScale = contentScale,
-            modifier = modifier,
-        )
+    val resolved = model
+    if (resolved != null) {
+        ToneAwareAsyncImage(resolved, modifier, contentScale)
     } else {
         Spacer(modifier)
     }
@@ -963,7 +1030,7 @@ internal fun FrostedSearchField(
                 decorationBox = { inner ->
                     if (value.isEmpty()) {
                         Text(
-                            "搜索片名 / 演员 / 标签…",
+                            "搜索片名 / 拼音 / 演员 / 标签…",
                             color = Color.White.copy(alpha = 0.6f),
                             style = MaterialTheme.typography.bodyMedium,
                             maxLines = 1,

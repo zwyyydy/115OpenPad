@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 比 115pad 的图标底色更深一档：同一台设备两个 App 都装时能一眼区分 -->
+    <color name="ic_launcher_background">#0F2E52</color>
+    <color name="tv_background">#0B0B0D</color>
+</resources>

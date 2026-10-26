@@ -1,9 +1,11 @@
 package com.open115.pad.ui.offline
 
+import android.provider.OpenableColumns
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -26,11 +28,14 @@ import androidx.compose.material.icons.outlined.CloudDownload
 import androidx.compose.material.icons.outlined.Close
 import androidx.compose.material.icons.outlined.Delete
 import androidx.compose.material.icons.outlined.Folder
+import androidx.compose.material.icons.outlined.MoreVert
 import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material.icons.outlined.Search
 import androidx.compose.material3.Button
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExtendedFloatingActionButton
 import androidx.compose.material3.FilledTonalButton
@@ -41,6 +46,7 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
@@ -65,18 +71,22 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.open115.pad.data.BtTask
 import com.open115.pad.data.DownloadSubmitter
 import com.open115.pad.data.DownloadPrefs
 import com.open115.pad.data.DirCache
 import com.open115.pad.data.OpenApi
 import com.open115.pad.data.OfflineTask
 import com.open115.pad.data.PlayerPrefs
+import com.open115.pad.data.Uploader
 import com.open115.pad.data.envMsg
 import com.open115.pad.data.envOk
 import com.open115.pad.data.parseOfflineQuota
 import com.open115.pad.data.parseOfflineTasks
 import com.open115.pad.ui.components.FolderPickerDialog
 import com.open115.pad.ui.components.MagnetShotPreview
+import com.open115.pad.ui.theme.StatusDot
+import com.open115.pad.ui.theme.StatusTone
 import com.open115.pad.util.Format
 import com.open115.pad.util.Torrent
 import kotlinx.coroutines.Dispatchers
@@ -258,7 +268,7 @@ class OfflineViewModel(
             playerPrefs?.labMagnetEnabled ?: flowOf(false),
             playerPrefs?.labMagnetToken ?: flowOf(""),
         ) { on, token ->
-            android.util.Log.d("MAGDBG", "combine: enabled=$on tokenLen=${token.length} prefs=$playerPrefs")
+            com.open115.pad.util.AppLog.d("MAGDBG", "combine: enabled=$on tokenLen=${token.length} prefs=$playerPrefs")
             on && token.isNotBlank()
         }
             .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), false)
@@ -352,6 +362,25 @@ class OfflineViewModel(
     }
 
     /**
+     * 清空任务。flag 见 [OpenApi.offlineClear]：0 已完成 / 1 全部 / 2 失败 / 3 进行中，
+     * 4/5 = 对应的"并删除已下载文件"。
+     *
+     * 成功后走**全量刷新**（replace）而不是合并：清空会一次拿掉跨页的条目，
+     * mergeRefresh 只换第一页，列表里会留下已经不存在的任务。
+     */
+    suspend fun clearTasks(flag: Int): String? = try {
+        val resp = api.offlineClear(flag)
+        if (resp.envOk()) {
+            refresh()
+            null
+        } else {
+            resp.envMsg() ?: "清空任务失败"
+        }
+    } catch (e: Exception) {
+        "网络错误：${e.message}"
+    }
+
+    /**
      * 跳转目标探测（只有已完成任务有产物可跳）：
      * 先把 file_id 当目录试列一次 —— BT/多文件任务的产物本身就是个目录，直接进去；
      * 列不出（单文件任务，file_id 是文件 id，open 接口没有按 id 查文件详情的能力）
@@ -397,7 +426,7 @@ fun OfflineScreen(
     var showAdd by remember { mutableStateOf(false) }
     var showMagnetSearch by remember { mutableStateOf(false) }
     val magnetReady by vm.magnetReady.collectAsState()
-    android.util.Log.d("MAGDBG", "OfflineScreen: magnetReady=$magnetReady")
+    com.open115.pad.util.AppLog.d("MAGDBG", "OfflineScreen: magnetReady=$magnetReady")
     Scaffold(
         topBar = {
             TopAppBar(
@@ -479,6 +508,7 @@ private fun OfflineBody(
     val magnetPreviewEndpoint by vm.magnetPreviewEndpoint.collectAsState()
     val scope = rememberCoroutineScope()
     var deleteTarget by remember { mutableStateOf<OfflineTask?>(null) }
+    var showClear by remember { mutableStateOf(false) }
 
     // ---- 多选批量删除：长按卡片进入选择态，全选只作用于当前筛选出的列表 ----
     val selected = remember { mutableStateListOf<String>() } // infoHash
@@ -601,6 +631,11 @@ private fun OfflineBody(
                         modifier = Modifier.padding(end = 8.dp),
                     ) { Text("磁力搜索") }
                 }
+                if (ui.tasks.isNotEmpty()) {
+                    // 清空也放内容区：顶栏在这页是触摸死区（见上面的说明）
+                    TextButton(onClick = { showClear = true }) { Text("清空") }
+                    Spacer(Modifier.width(8.dp))
+                }
             }
 
             // 状态筛选：轻量分段胶囊
@@ -721,6 +756,10 @@ private fun OfflineBody(
             previewEnabled = magnetPreviewEnabled,
             previewEndpoint = magnetPreviewEndpoint,
             http = vm.okHttpClient,
+            onBtSubmitted = { summary ->
+                onAddDismiss()
+                notify(summary)
+            },
         )
     }
     // ★ 浮层必须在 `if (showAdd)` **之外**：入口点击是「关掉添加任务、开磁力搜索」
@@ -785,6 +824,89 @@ private fun OfflineBody(
             dismissButton = { TextButton(onClick = { batchDelete = false }) { Text("取消") } },
         )
     }
+    if (showClear) {
+        ClearTasksDialog(
+            onDismiss = { showClear = false },
+            onConfirm = { flag, label ->
+                showClear = false
+                selected.clear()
+                scope.launch { notify(vm.clearTasks(flag) ?: "已$label") }
+            },
+        )
+    }
+}
+
+/**
+ * 清空任务的范围选择。
+ *
+ * 接口只有 6 种 flag，其中"并删除已下载文件"只提供 4（已完成）/5（全部）两种组合，
+ * 所以勾上删除文件时把"失败/进行中"两个选项禁用 —— 与其提交一个语义对不上的 flag，
+ * 不如在界面上说清楚。
+ */
+@Composable
+private fun ClearTasksDialog(
+    onDismiss: () -> Unit,
+    onConfirm: (flag: Int, label: String) -> Unit,
+) {
+    var flag by remember { mutableStateOf(0) }
+    var deleteSource by remember { mutableStateOf(false) }
+    val options = listOf(
+        0 to "已完成任务",
+        2 to "失败任务",
+        3 to "进行中任务",
+        1 to "全部任务",
+    )
+    // 勾上"删除文件"后只剩 0/1 合法；停在 2/3 时自动落到"已完成"
+    LaunchedEffect(deleteSource) {
+        if (deleteSource && flag != 0 && flag != 1) flag = 0
+    }
+    val label = options.first { it.first == flag }.second
+
+    FadeAlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("清空云下载任务") },
+        text = {
+            Column {
+                options.forEach { (value, text) ->
+                    val enabled = !deleteSource || value == 0 || value == 1
+                    Row(
+                        Modifier
+                            .fillMaxWidth()
+                            .clickable(enabled = enabled) { flag = value }
+                            .padding(vertical = 2.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        RadioButton(
+                            selected = flag == value,
+                            onClick = { if (enabled) flag = value },
+                            enabled = enabled,
+                        )
+                        Text(
+                            text,
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = if (enabled) MaterialTheme.colorScheme.onSurface
+                            else MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+                HorizontalDivider(Modifier.padding(vertical = 6.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Checkbox(checked = deleteSource, onCheckedChange = { deleteSource = it })
+                    Text("同时删除已下载的文件", style = MaterialTheme.typography.bodyMedium)
+                }
+                Text(
+                    "清空不可撤销；勾选删除文件后，任务产物也会一起删掉。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        },
+        confirmButton = {
+            val realFlag = if (deleteSource) (if (flag == 0) 4 else 5) else flag
+            Button(onClick = { onConfirm(realFlag, "清空$label") }) { Text("清空") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } },
+    )
 }
 
 @Composable
@@ -843,94 +965,112 @@ private fun TaskCard(
                     )
                 }
                 Spacer(Modifier.width(10.dp))
-                Text(
-                    title,
-                    style = MaterialTheme.typography.bodyMedium,
-                    fontWeight = FontWeight.SemiBold,
-                    color = C.TextPrimary,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.weight(1f),
-                )
-                // 已完成任务才有产物可跳：目录按钮明示"打开所在目录"（点卡片同效）
-                if (!selectMode && task.status == 2) {
-                    IconButton(onClick = onJump, modifier = Modifier.size(36.dp)) {
-                        Icon(
-                            Icons.Outlined.Folder,
-                            contentDescription = "打开所在目录",
-                            tint = C.TextTertiary,
-                            modifier = Modifier.size(18.dp),
-                        )
-                    }
-                }
-                if (!selectMode) {
-                    IconButton(onClick = onDelete, modifier = Modifier.size(36.dp)) {
-                        Icon(
-                            Icons.Outlined.Delete,
-                            contentDescription = "删除任务",
-                            tint = C.TextTertiary,
-                            modifier = Modifier.size(18.dp),
-                        )
-                    }
-                }
-            }
-
-        // 状态徽章行
-        Row(
-            horizontalArrangement = Arrangement.spacedBy(6.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            when (task.status) {
-                1 -> {
-                    com.open115.pad.ui.theme.StatusBadge("下载中", C.BlueBg, C.BlueFg)
-                    if (task.size > 0) {
-                        com.open115.pad.ui.theme.StatusBadge(
-                            Format.size(task.size),
-                            C.SlateBg, C.SlateFg,
-                        )
-                    }
-                }
-                2 -> com.open115.pad.ui.theme.StatusBadge("已完成", C.GreenBg, C.GreenFg)
-                -1 -> com.open115.pad.ui.theme.StatusBadge("下载失败", C.RedBg, C.RedFg)
-                0 -> com.open115.pad.ui.theme.StatusBadge("分配中", C.AmberBg, C.AmberFg)
-                else -> com.open115.pad.ui.theme.StatusBadge(statusLabel(task.status), C.SlateBg, C.SlateFg)
-            }
-            if (task.addTime > 0) {
-                com.open115.pad.ui.theme.StatusBadge(
-                    Format.dateTime(task.addTime),
-                    C.SlateBg, C.TextTertiary,
-                )
-            }
-        }
-
-        // 下载中/分配中：行内微型进度条 + 百分比
-        if (task.status == 1 || task.status == 0) {
-            val p = Format.percent(task.percentDone) / 100f
-            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Box(
-                    Modifier
-                        .weight(1f)
-                        .height(4.dp)
-                        .clip(RoundedCornerShape(2.dp))
-                        .background(C.GraySoft),
-                ) {
-                    Box(
-                        Modifier
-                            .fillMaxWidth(p.coerceIn(0f, 1f))
-                            .height(4.dp)
-                            .clip(RoundedCornerShape(2.dp))
-                            .background(if (task.status == 1) C.Accent else C.AmberFg),
+                Column(Modifier.weight(1f)) {
+                    Text(
+                        title,
+                        style = MaterialTheme.typography.bodyMedium,
+                        fontWeight = FontWeight.SemiBold,
+                        color = C.TextPrimary,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
                     )
+                    Spacer(Modifier.height(3.dp))
+                    // 状态 + 大小 + 时间压成一行：圆点表达状态、其余走灰字，
+                    // 不再让"下载中 / 2.1 GB / 2026-10-20"三枚胶囊并排成一条色带。
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        StatusDot(statusLabel(task.status), toneOf(task.status))
+                        val meta = buildList {
+                            if (task.size > 0) add(Format.size(task.size))
+                            if (task.addTime > 0) add(Format.dateTime(task.addTime))
+                        }
+                        if (meta.isNotEmpty()) {
+                            Text(
+                                "· " + meta.joinToString(" · "),
+                                style = MaterialTheme.typography.labelSmall.copy(fontFeatureSettings = "tnum"),
+                                color = C.TextTertiary,
+                                maxLines = 1,
+                            )
+                        }
+                    }
                 }
-                Text(
-                    "${Format.percent(task.percentDone)}%",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = C.TextSecondary,
-                )
+                // 单入口 ⋮：打开所在目录 / 删除。两个常驻图标并排时，卡片右缘比左边的
+                // 标题还热闹；收进菜单后一眼只剩一个控件。
+                if (!selectMode) {
+                    var actionsOpen by remember { mutableStateOf(false) }
+                    Box {
+                        IconButton(onClick = { actionsOpen = true }, modifier = Modifier.size(36.dp)) {
+                            Icon(
+                                Icons.Outlined.MoreVert,
+                                contentDescription = "任务操作",
+                                tint = C.TextTertiary,
+                                modifier = Modifier.size(18.dp),
+                            )
+                        }
+                        DropdownMenu(expanded = actionsOpen, onDismissRequest = { actionsOpen = false }) {
+                            if (task.status == 2) {
+                                DropdownMenuItem(
+                                    text = { Text("打开所在目录") },
+                                    leadingIcon = { Icon(Icons.Outlined.Folder, contentDescription = null) },
+                                    onClick = {
+                                        actionsOpen = false
+                                        onJump()
+                                    },
+                                )
+                            }
+                            DropdownMenuItem(
+                                text = { Text("删除任务") },
+                                leadingIcon = { Icon(Icons.Outlined.Delete, contentDescription = null) },
+                                onClick = {
+                                    actionsOpen = false
+                                    onDelete()
+                                },
+                            )
+                        }
+                    }
+                }
             }
-        }
+
+            // 进度区固定 20dp：只有进行中的任务有内容，但高度一直占着 ——
+            // 两列网格里"有进度条的卡比没进度的高一截"会让每一行都参差。
+            Box(Modifier.fillMaxWidth().height(20.dp), contentAlignment = Alignment.CenterStart) {
+                if (task.status == 1 || task.status == 0) {
+                    val p = Format.percent(task.percentDone) / 100f
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Box(
+                            Modifier
+                                .weight(1f)
+                                .height(4.dp)
+                                .clip(RoundedCornerShape(2.dp))
+                                .background(C.GraySoft),
+                        ) {
+                            Box(
+                                Modifier
+                                    .fillMaxWidth(p.coerceIn(0f, 1f))
+                                    .height(4.dp)
+                                    .clip(RoundedCornerShape(2.dp))
+                                    .background(if (task.status == 1) C.Accent else C.AmberFg),
+                            )
+                        }
+                        Spacer(Modifier.width(8.dp))
+                        Text(
+                            Format.percentText(task.percentDone),
+                            style = MaterialTheme.typography.labelSmall.copy(fontFeatureSettings = "tnum"),
+                            color = C.TextSecondary,
+                        )
+                    }
+                }
+            }
         }
     }
+}
+
+/** 状态 → 圆点语义：只有进行中/失败给彩色文字，已完成只留一个绿点 */
+private fun toneOf(status: Int): StatusTone = when (status) {
+    1 -> StatusTone.Info
+    2 -> StatusTone.Success
+    -1 -> StatusTone.Error
+    0 -> StatusTone.Warning
+    else -> StatusTone.Neutral
 }
 
 @Composable
@@ -946,6 +1086,8 @@ private fun AddTaskDialog(
     previewEnabled: Boolean = false,
     previewEndpoint: String = "",
     http: OkHttpClient? = null,
+    /** 按文件勾选并提交成功：上层负责关掉对话框、提示结果 */
+    onBtSubmitted: (summary: String) -> Unit = {},
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
@@ -956,23 +1098,43 @@ private fun AddTaskDialog(
     var torrent by remember { mutableStateOf<Torrent.TorrentInfo?>(null) }
     var torrentBusy by remember { mutableStateOf(false) }
     var torrentError by remember { mutableStateOf<String?>(null) }
+    // ---- BT 按文件勾选：本地种子 → 上传 → 云端解析 → 勾选 → add_task_bt ----
+    var torrentBytes by remember { mutableStateOf<ByteArray?>(null) }
+    var torrentFileName by remember { mutableStateOf("") }
+    var btBusy by remember { mutableStateOf(false) }
+    var btError by remember { mutableStateOf<String?>(null) }
+    var btParsed by remember { mutableStateOf<BtTask.Parsed?>(null) }
+    var btSha1 by remember { mutableStateOf("") }
+    var btPickCode by remember { mutableStateOf("") }
+    var btSavePath by remember { mutableStateOf("") }
 
     // 选择 .torrent 文件 → 本地解析出 info_hash → 生成磁力链填入链接框
     val torrentPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri != null) {
             torrentBusy = true
             torrentError = null
+            btError = null
+            btParsed = null
             scope.launch {
                 try {
                     val bytes = withContext(Dispatchers.IO) {
                         context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
                             ?: throw IllegalArgumentException("无法读取所选文件")
                     }
+                    val displayName = withContext(Dispatchers.IO) {
+                        context.contentResolver.query(
+                            uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null,
+                        )?.use { c -> if (c.moveToFirst()) c.getString(0) else null }
+                    }?.takeIf { it.isNotBlank() }
+                        ?: "torrent-${System.currentTimeMillis()}.torrent"
                     val info = Torrent.parse(bytes)
                     torrent = info
+                    torrentBytes = bytes
+                    torrentFileName = displayName
                     urls = Torrent.buildMagnet(info)
                 } catch (e: Exception) {
                     torrent = null
+                    torrentBytes = null
                     torrentError = e.message ?: "种子解析失败"
                 } finally {
                     torrentBusy = false
@@ -982,7 +1144,8 @@ private fun AddTaskDialog(
     }
 
     FadeAlertDialog(
-        onDismissRequest = onDismiss,
+        // 上传/解析/提交期间不许关：关了协程还在跑，成功后会对着已经消失的弹窗报结果
+        onDismissRequest = { if (!btBusy) onDismiss() },
         title = { Text("添加云下载任务") },
         text = {
             Column {
@@ -1008,7 +1171,7 @@ private fun AddTaskDialog(
                     }
                     Spacer(Modifier.width(8.dp))
                     Text(
-                        "选 .torrent 自动转磁力链",
+                        "选 .torrent 可勾选文件，或转磁力链整包下载",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
@@ -1020,6 +1183,56 @@ private fun AddTaskDialog(
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.primary,
                     )
+                    // 按文件勾选：种子先传到云盘（接口要按 pick_code + SHA1 校验归属），
+                    // 再让云端解析出文件清单。整包提交仍可用下面的「添加」（磁力链）。
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        FilledTonalButton(
+                            onClick = {
+                                val bytes = torrentBytes
+                                if (bytes != null) {
+                                    val fileName = torrentFileName.ifBlank {
+                                        "torrent-${System.currentTimeMillis()}.torrent"
+                                    }
+                                    val cid = targetCid
+                                    btBusy = true
+                                    btError = null
+                                    scope.launch {
+                                        try {
+                                            val sha1 = BtTask.sha1Hex(bytes)
+                                            val uploaded = Uploader.uploadSmall(
+                                                api, fileName, bytes, target = "U_1_$cid",
+                                            )
+                                            val parsed = BtTask.parseOnCloud(api, uploaded.pickCode, sha1)
+                                            btSha1 = sha1
+                                            btPickCode = uploaded.pickCode
+                                            btSavePath = BtTask.savePathFor(parsed.name)
+                                            btParsed = parsed
+                                        } catch (e: Exception) {
+                                            btError = e.message ?: "准备种子失败"
+                                        } finally {
+                                            btBusy = false
+                                        }
+                                    }
+                                }
+                            },
+                            enabled = !btBusy && !torrentBusy && torrentBytes != null,
+                        ) { Text(if (btBusy) "准备中…" else "按文件选择…") }
+                        Spacer(Modifier.width(8.dp))
+                        Text(
+                            "种子会先存到保存位置",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    if (btParsed == null) {
+                        btError?.let {
+                            Text(
+                                it,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.error,
+                            )
+                        }
+                    }
                     // 选完种子顺手给几张画面（第三方预览，实验室可关）——本地解析给的是"多大/几个文件"，
                     // 这里补的是"长什么样"，推之前能对一眼
                     val client = http
@@ -1061,10 +1274,10 @@ private fun AddTaskDialog(
         confirmButton = {
             Button(
                 onClick = { onConfirm(urls.trim(), targetCid, targetName) },
-                enabled = urls.isNotBlank() && !torrentBusy,
+                enabled = urls.isNotBlank() && !torrentBusy && !btBusy,
             ) { Text("添加") }
         },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } },
+        dismissButton = { TextButton(onClick = onDismiss, enabled = !btBusy) { Text("取消") } },
     )
 
     if (picking) {
@@ -1080,6 +1293,46 @@ private fun AddTaskDialog(
                 // 立即持久化：用户只"指定目录"、不立刻提交任务时也要记住
                 onPickLocation(cid, name)
                 picking = false
+            },
+        )
+    }
+
+    // 云端解析完 → 在「添加任务」上面再压一层勾选面板；取消则退回添加任务，不丢已选目录
+    btParsed?.let { parsed ->
+        BtFileSelectDialog(
+            parsed = parsed,
+            busy = btBusy,
+            error = btError,
+            onDismiss = {
+                if (!btBusy) {
+                    btParsed = null
+                    btError = null
+                }
+            },
+            onConfirm = { selection ->
+                btBusy = true
+                btError = null
+                scope.launch {
+                    val err = BtTask.add(
+                        api = api,
+                        parsed = parsed,
+                        selection = selection,
+                        savePath = btSavePath,
+                        wpPathId = targetCid,
+                        torrentSha1 = btSha1,
+                        pickCode = btPickCode,
+                    )
+                    btBusy = false
+                    if (err == null) {
+                        btParsed = null
+                        onBtSubmitted(
+                            "已提交云下载：${parsed.name} · ${selection.size} 个文件 · " +
+                                Format.size(parsed.selectedSize(selection)),
+                        )
+                    } else {
+                        btError = err
+                    }
+                }
             },
         )
     }

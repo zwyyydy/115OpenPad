@@ -2,25 +2,54 @@ package com.open115.pad.data
 
 import android.content.Context
 import android.os.ParcelFileDescriptor
-import android.util.Log
+import com.open115.pad.util.AppLog as Log
 import com.open115.pad.data.media.MediaDatabase
 import com.open115.pad.util.APP_USER_AGENT
 import com.open115.pad.util.Format
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
+import java.io.InputStream
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.zip.ZipEntry
 import java.util.zip.ZipInputStream
 import java.util.zip.ZipOutputStream
+
+/**
+ * 备份进行到哪儿了（kind = null 即空闲）。
+ *
+ * 设置页的行内进度条与前台保活的文案（App115.taskActivity）共用这一份 —— 手动备份跑在
+ * transferScope 上、页面切走也不停，设置页回来时接上这里就能看到还剩多少。
+ */
+data class BackupProgress(
+    val kind: BackupKind? = null,
+    val phase: Phase = Phase.Idle,
+    /** 当前阶段自己的 0..100（打包按字节算、上传按分片算），换阶段归零 */
+    val percent: Int = 0,
+) {
+    enum class Phase { Idle, Packing, Uploading }
+
+    val running: Boolean get() = kind != null
+
+    val phaseLabel: String
+        get() = when (phase) {
+            Phase.Packing -> "打包"
+            Phase.Uploading -> "上传"
+            Phase.Idle -> ""
+        }
+}
 
 /**
  * 云端备份管理器：三类数据各自打包成 zip 上传到云端备份目录（每类保留最近 [KEEP] 份），
@@ -68,6 +97,17 @@ class BackupManager(
         data class Failed(val message: String) : RestoreResult()
     }
 
+    private val _progress = MutableStateFlow(BackupProgress())
+
+    /** 当前备份进度（空闲时 kind = null）。设置页与前台保活共用，见 [BackupProgress] */
+    val progress: StateFlow<BackupProgress> = _progress.asStateFlow()
+
+    /**
+     * 一次只跑一个备份：自动到点撞上手动备份、或快速双击两个 kind，都会走到这里。
+     * 抢不到锁的直接返回失败（自动那条下个小时会再查；手动那条 UI 本来就不给点）。
+     */
+    private val oneAtATime = Mutex()
+
     /** 该 kind 是否到了自动备份的时间（开关 + 间隔 + 上次时间） */
     suspend fun isDue(kind: BackupKind): Boolean {
         if (!prefs.enabled(kind).first()) return false
@@ -94,16 +134,34 @@ class BackupManager(
     /**
      * 执行一次备份：打包 → 上传 → 清理旧份（保留最近 [KEEP] 个）→ 记时间。
      * 只在成功时推进 lastAt（失败下次重试）。
+     *
+     * 进度全程写在 [progress] 上（打包按字节、上传按分片），调用方跑在哪个 scope 都行 ——
+     * 设置页的行内进度条与 taskActivity 的保活文案都只认这份流。
      */
     suspend fun backup(kind: BackupKind): BackupResult {
+        if (!oneAtATime.tryLock()) return BackupResult.Failed("已有备份在进行，等它完成")
+        try {
+            return doBackup(kind)
+        } finally {
+            oneAtATime.unlock()
+            _progress.value = BackupProgress()
+        }
+    }
+
+    private suspend fun doBackup(kind: BackupKind): BackupResult {
         val dir = ensureBackupDir()
             ?: return BackupResult.Failed("无法定位云端备份目录（115 根目录下找/建 $BACKUP_DIR_NAME 失败）")
         val stamp = SimpleDateFormat(STAMP_PATTERN, Locale.US).format(Date())
         val fileName = "pad_${kind.key}_$stamp.zip"
         val tmp = File(context.cacheDir, "backup/$fileName")
         try {
+            _progress.value = BackupProgress(kind, BackupProgress.Phase.Packing, 0)
             val packed = withContext(Dispatchers.IO) {
-                runCatching { buildPayload(kind, tmp) }
+                runCatching {
+                    buildPayload(kind, tmp) { pct ->
+                        _progress.value = _progress.value.copy(percent = pct)
+                    }
+                }
                     .onFailure { Log.e(TAG, "备份打包异常（${kind.key}）", it) }
                     .getOrElse { false }
             }
@@ -112,6 +170,7 @@ class BackupManager(
                 return BackupResult.Failed("打包失败（见日志）")
             }
             val size = tmp.length()
+            _progress.value = _progress.value.copy(phase = BackupProgress.Phase.Uploading, percent = 0)
             withContext(Dispatchers.IO) {
                 if (size <= SMALL_FILE_BYTES) {
                     Uploader.uploadSmallLogged(
@@ -123,6 +182,7 @@ class BackupManager(
                         Uploader.uploadLargeLogged(
                             log = transferLog, api = api, fileName = fileName,
                             pfd = pfd, size = size, targetCid = dir, targetName = null,
+                            onProgress = { pct -> _progress.value = _progress.value.copy(percent = pct) },
                         )
                     }
                 }
@@ -202,7 +262,28 @@ class BackupManager(
 
     // ---------------- 打包 ----------------
 
-    private fun buildPayload(kind: BackupKind, out: File): Boolean {
+    /**
+     * 打包并按字节报进度（[onProgress] 0..99，到达 100 的那一格由上传阶段接管）。
+     *
+     * 进度怎么算：先把这次要读的**数据源文件**列出来求和当分母，之后所有进 zip 的拷贝都走
+     * [copyToCounting] 逐段累加 —— 打包的耗时几乎全在字节拷贝上，按字节报最诚实。
+     * 例外是 MEDIA 的库表导出（SQLite CTAS，先建库后拷文件）：那段没法逐字节看，
+     * 分母里用 media.db 本体的大小占位（导出产物 ≈ 原库减去索引，量级一致），
+     * 真正的字节从"导出文件进 zip"那一步开始计。
+     */
+    private fun buildPayload(kind: BackupKind, out: File, onProgress: (Int) -> Unit): Boolean {
+        val total = payloadSources(kind).sumOf { it.length() }.coerceAtLeast(1L)
+        var copied = 0L
+        var lastPct = -1
+        fun tick(bytes: Long) {
+            if (bytes <= 0L) return
+            copied += bytes
+            val pct = (copied * 100 / total).toInt().coerceIn(0, 99)
+            if (pct != lastPct) {
+                lastPct = pct
+                onProgress(pct)
+            }
+        }
         out.parentFile?.mkdirs()
         if (out.exists()) out.delete()
         ZipOutputStream(FileOutputStream(out).buffered()).use { zip ->
@@ -211,8 +292,9 @@ class BackupManager(
                     zip,
                     // 会话/队列/传输记录不算"配置"：登录态换设备无意义，队列与传输是过程数据
                     listOf("app", "filter", "files", "download", "pinned", "player", "media", "quick_dirs"),
+                    ::tick,
                 )
-                BackupKind.OPLOG -> packDatastores(zip, listOf("op_log"))
+                BackupKind.OPLOG -> packDatastores(zip, listOf("op_log"), ::tick)
                 BackupKind.MEDIA -> {
                     // 换机一次恢复全量到位：结构数据 + 记录 + 图片缓存合在一个 zip。
                     // 图片为空不算失败（新装机/刚清缓存也可能没图，结构数据仍然有价值）
@@ -224,8 +306,9 @@ class BackupManager(
                             "scan_log", "watch_history",
                         ),
                         entryName = "library.db",
+                        tick = ::tick,
                     )
-                    if (!packImageCache(zip)) {
+                    if (!packImageCache(zip, ::tick)) {
                         Log.w(TAG, "图片缓存为空（media_img 不存在或没有文件），本次备份只含结构数据与记录")
                     }
                 }
@@ -234,14 +317,47 @@ class BackupManager(
         return out.exists() && out.length() > 0L
     }
 
+    /**
+     * 这次打包要读的数据源文件（[buildPayload] 的进度分母）。
+     * 只列一遍、只读长度，不在意它和实际进 zip 的内容有一点出入 —— 进度条要的是"大概还要多久"。
+     */
+    private fun payloadSources(kind: BackupKind): List<File> = when (kind) {
+        BackupKind.CONFIG, BackupKind.OPLOG -> {
+            val names = if (kind == BackupKind.CONFIG) {
+                listOf("app", "filter", "files", "download", "pinned", "player", "media", "quick_dirs")
+            } else {
+                listOf("op_log")
+            }
+            names.map { File(File(context.filesDir, "datastore"), "$it.preferences_pb") }.filter { it.exists() }
+        }
+        BackupKind.MEDIA -> {
+            val db = runCatching { mediaDb.openHelper.writableDatabase.path }
+                .getOrNull()?.let(::File)?.takeIf { it.exists() }
+            val imgDir = ImageUrlResolver.mediaCacheDir(mediaCacheRoot)
+            listOfNotNull(db) + (imgDir.takeIf { it.isDirectory }
+                ?.walkTopDown()?.filter { it.isFile }?.toList().orEmpty())
+        }
+    }
+
+    /** 流式拷贝 + 逐段回调字节数（打包进度的全部来源，见 [buildPayload]） */
+    private fun InputStream.copyToCounting(out: java.io.OutputStream, tick: (Long) -> Unit) {
+        val buf = ByteArray(DEFAULT_BUFFER_SIZE * 4)
+        while (true) {
+            val r = read(buf)
+            if (r < 0) break
+            out.write(buf, 0, r)
+            tick(r.toLong())
+        }
+    }
+
     /** 把指定 DataStore 的 preferences_pb 打进 zip（DataStore 名白名单，防路径穿越） */
-    private fun packDatastores(zip: ZipOutputStream, names: List<String>) {
+    private fun packDatastores(zip: ZipOutputStream, names: List<String>, tick: (Long) -> Unit) {
         val dir = File(context.filesDir, "datastore")
         for (n in names) {
             val f = File(dir, "$n.preferences_pb")
             if (!f.exists()) continue
             zip.putNextEntry(ZipEntry("datastore/$n.preferences_pb"))
-            FileInputStream(f).use { it.copyTo(zip) }
+            FileInputStream(f).use { it.copyToCounting(zip, tick) }
             zip.closeEntry()
         }
     }
@@ -252,14 +368,14 @@ class BackupManager(
      * 目录体积由 LRU 上限管着（设置里可调，默认几百 MB 级），这里流式写 zip，不整包进内存。
      * 目录不存在或没有文件返回 false（调用方按"打包失败"报给用户，日志里有原因）。
      */
-    private fun packImageCache(zip: ZipOutputStream): Boolean {
+    private fun packImageCache(zip: ZipOutputStream, tick: (Long) -> Unit): Boolean {
         val dir = ImageUrlResolver.mediaCacheDir(mediaCacheRoot)
         if (!dir.isDirectory) return false
         var count = 0
         dir.walkTopDown().filter { it.isFile }.forEach { f ->
             val rel = f.relativeTo(dir).invariantSeparatorsPath
             zip.putNextEntry(ZipEntry("media_img/$rel"))
-            FileInputStream(f).use { it.copyTo(zip) }
+            FileInputStream(f).use { it.copyToCounting(zip, tick) }
             zip.closeEntry()
             count++
         }
@@ -270,7 +386,12 @@ class BackupManager(
     // 把 media.db 的表子集导出成独立 db 文件：ATTACH 一个临时库，对每张表
     // CREATE TABLE bak.t AS SELECT * FROM main.t（CTAS，只做数据载体，不复制主键/索引；
     // 恢复时目标表由 Room 建好，按列名交集回插即可）。
-    private fun exportTables(zip: ZipOutputStream, tables: List<String>, entryName: String) {
+    private fun exportTables(
+        zip: ZipOutputStream,
+        tables: List<String>,
+        entryName: String,
+        tick: (Long) -> Unit,
+    ) {
         val db = mediaDb.openHelper.writableDatabase
         val tmp = File(context.cacheDir, "backup/$entryName")
         tmp.parentFile?.mkdirs()
@@ -285,7 +406,7 @@ class BackupManager(
             db.execSQL("DETACH DATABASE bak")
             detached = true
             zip.putNextEntry(ZipEntry(entryName))
-            FileInputStream(tmp).use { it.copyTo(zip) }
+            FileInputStream(tmp).use { it.copyToCounting(zip, tick) }
             zip.closeEntry()
         } finally {
             // 正常路径上面已经 DETACH 过，再来一次会刷一条 "no such database: bak" 的

@@ -276,7 +276,8 @@ fun MediaRecordsScreen(
                     items(logs, key = { it.id }) { log ->
                         ScanLogCard(
                             log = log,
-                            cards = log.newKeyList.mapNotNull { cardsByKey[it] },
+                            // ★ distinct 兜底：存量记录里可能有重复 key（同名目录旧 bug 产物）
+                            cards = log.newKeyList.distinct().mapNotNull { cardsByKey[it] },
                             onOpenMovie = onOpenMovie,
                         )
                     }

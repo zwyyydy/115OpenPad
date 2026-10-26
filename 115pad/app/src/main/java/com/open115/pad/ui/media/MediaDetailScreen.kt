@@ -29,7 +29,10 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.ArrowBack
 import androidx.compose.material.icons.outlined.AutoFixHigh
+import androidx.compose.material.icons.outlined.Cast
 import androidx.compose.material.icons.outlined.Delete
+import androidx.compose.material.icons.outlined.Edit
+import androidx.compose.material.icons.outlined.Translate
 import androidx.compose.material.icons.automirrored.outlined.DriveFileMove
 import androidx.compose.material.icons.outlined.Movie
 import androidx.compose.material.icons.outlined.PlayArrow
@@ -41,16 +44,19 @@ import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -60,8 +66,11 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.boundsInRoot
+import androidx.compose.ui.layout.onGloballyPositioned
 import coil.compose.AsyncImage
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextAlign
@@ -73,6 +82,7 @@ import com.open115.pad.data.media.backgroundSourceOf
 import com.open115.pad.data.media.ActorCard
 import com.open115.pad.data.media.EpisodeEntity
 import com.open115.pad.data.media.MediaDao
+import com.open115.pad.data.media.TranslationSupport
 import com.open115.pad.data.media.ActorAvatarSource
 import com.open115.pad.data.media.EpisodeRow
 import com.open115.pad.data.media.MovieCard
@@ -84,6 +94,8 @@ import com.open115.pad.data.media.NfoMeta
 import com.open115.pad.data.media.MovieDeleteResult
 import com.open115.pad.data.media.deleteMovie
 import com.open115.pad.data.media.episodeSortKey
+import com.open115.pad.cast.CastPickerOverlay
+import com.open115.pad.cast.startCastFrom
 import com.open115.pad.player.PlayerActivity
 import com.open115.pad.ui.components.FadeIn
 import com.open115.pad.ui.components.PreviewZoomHost
@@ -150,10 +162,51 @@ fun MediaDetailScreen(
      */
     onScraped: (newKey: String?) -> Unit = {},
     onBack: () -> Unit,
+    /**
+     * 点海报右下角的「调整封面」（只有"没有海报、用背景图裁一张"的片才出现）。
+     *
+     * 交给外层打开：裁剪浮层必须画在 `SharedTransitionLayout` 的共享元素覆盖层**之上**，
+     * 否则详情页这张海报（匹配着墙上的卡）会被画在浮层上、把编辑界面挡住一块。
+     */
+    onEditPoster: (backgroundPickCode: String) -> Unit = {},
+    /** 海报区域的额外修饰（共享元素转场落到这里） */
+    posterModifier: Modifier = Modifier,
+    /** 推荐卡的共享元素修饰：入参是推荐片的 mediaKey */
+    recommendationShared: (@Composable (String) -> Modifier)? = null,
+    /**
+     * 从这一页的推荐卡点进下一层详情时记下的那张卡（由外层保存，页面销毁重建后还在）。
+     * 退回时这一页是全新组合、pendingRecKey 已丢，靠它把同一张卡重新挂上共享元素，
+     * 海报才能缩回推荐卡；否则只有淡出。
+     */
+    savedRecKey: String? = null,
+    /**
+     * 退回重建时的滚动位置（外层按浮层 id 保存）。不恢复的话页面跳回顶部，
+     * 推荐那一排跑到屏幕外 —— 共享元素目标即使注册上也没地方飞回去。
+     */
+    initialScroll: Int = 0,
+    /** 离开时把当前滚动位置交给外层保存 */
+    onScrollSave: (Int) -> Unit = {},
+    /** 退回重建时的推荐批次号（外层保存，与 [initialRecommendations] 配套） */
+    initialShuffleTick: Int = 0,
+    /**
+     * 退回重建时的推荐列表（外层保存）。推荐是 `produceState(emptyList())` 起步的：
+     * 空着重建时推荐行要等 Room 查完才出现，目标卡晚于转场才注册 → 海报只剩淡出。
+     */
+    initialRecommendations: List<MovieRecommender.Recommendation> = emptyList(),
+    /** 推荐查完交给外层缓存（按浮层 id 存，重建时当首帧初值） */
+    onRecommendationsLoaded: (tick: Int, list: List<MovieRecommender.Recommendation>) -> Unit = { _, _ -> },
+    /** 详情页开始滚动：外层据此摘掉海报的共享元素，避免转场覆盖层里留一张不跟着滚的图 */
+    onUserScroll: () -> Unit = {},
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val snackbarHostState = remember { SnackbarHostState() }
+
+    // 详情页直达投屏：点「投屏」先选设备（通用浮层），选中即取原盘直链交给电视 ——
+    // 不必先进播放页。要投的那部片在打开浮层时记下来，免得浮层里再依赖 current。
+    var castPickerOpen by remember { mutableStateOf(false) }
+    var castPickCode by remember { mutableStateOf("") }
+    var castTitle by remember { mutableStateOf("") }
     val container = (context.applicationContext as com.open115.pad.App115).container
     var showDelete by remember { mutableStateOf(false) }
     var showScrape by remember { mutableStateOf(false) }
@@ -186,6 +239,52 @@ fun MediaDetailScreen(
         }
     }
 
+    // ---- AI 翻译（只做显示层：译文存 titleZh/plotZh，绝不覆盖 title/plot）----
+    var titleZh by remember(card.mediaKey) { mutableStateOf<String?>(null) }
+    var plotZh by remember(card.mediaKey) { mutableStateOf<String?>(null) }
+    /** 详情页内「原文/译文」切换：默认显示译文，点一下看原文 */
+    var showOriginal by remember(card.mediaKey) { mutableStateOf(false) }
+    var translating by remember(card.mediaKey) { mutableStateOf(false) }
+    // 缓存的译文只有在原文哈希仍然对得上时才用（重新刮削后自动失效）
+    LaunchedEffect(data?.movie?.mediaKey, data?.movie?.title, data?.movie?.plot, data?.movie?.zhSourceHash) {
+        val m = data?.movie ?: return@LaunchedEffect
+        if (m.zhSourceHash == TranslationSupport.sourceHash(m.title, m.plot)) {
+            titleZh = m.titleZh
+            plotZh = m.plotZh
+        } else {
+            titleZh = null
+            plotZh = null
+        }
+    }
+    val aiEndpoint by container.mediaPrefs.aiEndpoint.collectAsState(initial = container.aiEndpoint)
+    val aiKey by container.mediaPrefs.aiApiKey.collectAsState(initial = container.aiApiKey)
+    val aiModel by container.mediaPrefs.aiModel.collectAsState(initial = container.aiModel)
+    val aiReady = aiEndpoint.isNotBlank() && aiKey.isNotBlank() && aiModel.isNotBlank()
+
+    fun translateNow() {
+        val m = data?.movie ?: return
+        if (translating) return
+        translating = true
+        scope.launch {
+            val tr = runCatching { container.aiQueryClient.translate(m.title, m.plot) }.getOrNull()
+            translating = false
+            if (tr == null) {
+                snackbarHostState.showSnackbar("翻译失败：检查 AI 设置，或稍后再试")
+                return@launch
+            }
+            dao.updateTranslation(
+                key = m.mediaKey,
+                titleZh = tr.title,
+                plotZh = tr.plot,
+                hash = TranslationSupport.sourceHash(m.title, m.plot),
+                at = System.currentTimeMillis(),
+            )
+            titleZh = tr.title ?: titleZh
+            plotZh = tr.plot ?: plotZh
+            showOriginal = false
+        }
+    }
+
     /**
      * 库里**没有剧照**的片：拿它播放时抓的本机预览帧顶替剧照（用户要求：媒体库没有预览图
      * （剧照）那么还是继续生成，以后充当剧照）。抓帧那侧在 PlayerActivity.ensurePreviewThumb：
@@ -212,9 +311,11 @@ fun MediaDetailScreen(
      * 种子必须稳定，所以推荐**不能**每次重组都重算 —— `produceState` 的 key 只吃
      * "哪部片 + 第几批"，滚动/改窗口大小都不会让它重算。
      */
-    var shuffleTick by remember { mutableStateOf(0) }
+    var shuffleTick by remember { mutableStateOf(initialShuffleTick) }
     val recommendations by produceState<List<MovieRecommender.Recommendation>>(
-        initialValue = emptyList(),
+        // 重建时用外层缓存的那一批当首帧：推荐行必须在转场开始前就在，
+        // 否则退回时目标卡晚一步出现，共享元素不会飞回去（只剩淡出）
+        initialValue = if (shuffleTick == initialShuffleTick) initialRecommendations else emptyList(),
         card.mediaKey,
         shuffleTick,
     ) {
@@ -227,6 +328,7 @@ fun MediaDetailScreen(
                 seed = RecommendationSeed.of(card.mediaKey, shuffleTick),
             )
         }.getOrDefault(emptyList())
+        onRecommendationsLoaded(shuffleTick, value)
     }
 
     /**
@@ -252,8 +354,35 @@ fun MediaDetailScreen(
         }
     }
 
+    /**
+     * 推荐卡共享元素：**只给被点的那一张**挂。
+     *
+     * 早先给整排每张卡都挂了 sharedElement，Detail→Detail 时除了被点的那张，
+     * 其余卡没有对应的目标节点，转场结束后会有一张图残留在浮层里（用户截图里的"图片重合"）。
+     *
+     * ★ 不再用"进场 350ms 后才允许挂"的时间闸：那样退回时这一页是重建的、闸还没开，
+     *   海报就只能淡出（用户报的"停留久一点退回没有回缩动画"）。现在只挂一张（残留的那条前提
+     *   已经不成立），退回目标由外层的 [savedRecKey] 立刻给出，进/退动画一致。
+     */
+    var pendingRecKey by remember(card.mediaKey) { mutableStateOf<String?>(null) }
+    /** 当前该挂共享元素的那张推荐卡：本次点的优先，其次外层存下的"上次点开的那张" */
+    val sharedRecKey = pendingRecKey ?: savedRecKey
+
+    val detailScroll = rememberScrollState(initialScroll)
+    // 页面被下一层详情盖住时会销毁：离开时把滚动位置交回外层，退回重建才接得上原来的位置
+    DisposableEffect(Unit) {
+        onDispose { onScrollSave(detailScroll.value) }
+    }
+    // 一滚动就通知外层摘掉海报的共享元素：共享元素覆盖层里的图不跟内容滚动，
+    // 转场没结束时滚页面就会"海报定在上面、简介/演员滚上来"（用户截图的重合）。
+    LaunchedEffect(detailScroll.value) {
+        if (detailScroll.value > 0) onUserScroll()
+    }
+
     /** 剧照全屏查看的当前页；null = 没在看 */
     var viewingFanart by remember { mutableStateOf<Int?>(null) }
+    /** 每张剧照缩略图的位置：点开时让全屏浮层从它那儿放大出来 */
+    val fanartBounds = remember { mutableStateMapOf<Int, Rect>() }
 
     // 分集列表（显示与播放共用一份，**索引必须对齐**）：
     //  - 系列卡 → 它名下的分集行。按集号**数值**排：按标题字符串排会让 S01E2 排到 S01E10 后面
@@ -402,7 +531,7 @@ fun MediaDetailScreen(
             FadeIn(Modifier.fillMaxSize(), durationMillis = 300) {
             AdaptiveBody(modifier = Modifier.fillMaxSize().padding(padding)) {
                 Column(
-                    Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp),
+                    Modifier.fillMaxSize().verticalScroll(detailScroll).padding(16.dp),
                 ) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         IconButton(onClick = onBack) {
@@ -447,25 +576,95 @@ fun MediaDetailScreen(
                         // 没有 poster 的片用背景图裁一张（cropIfMissing = true：进这个页面才裁，
                         // 复用背景图那份字节，零额外请求；裁好后海报墙下次也用它）
                         BoxWithConstraints(Modifier.fillMaxWidth(0.32f).widthIn(min = 110.dp, max = 180.dp)) {
-                            Surface(
-                                color = MaterialTheme.colorScheme.surfaceVariant,
-                                shape = RoundedCornerShape(10.dp),
-                                modifier = Modifier.fillMaxWidth().aspectRatio(2f / 3f),
-                            ) {
-                                PosterImage(
-                                    posterPickCode = current.movie.posterPickCode,
-                                    backgroundPickCode = backgroundPick,
-                                    modifier = Modifier.fillMaxSize(),
-                                    cropIfMissing = true,
-                                )
+                            Box {
+                                Surface(
+                                    color = MaterialTheme.colorScheme.surfaceVariant,
+                                    shape = RoundedCornerShape(10.dp),
+                                    modifier = Modifier.fillMaxWidth().aspectRatio(2f / 3f).then(posterModifier),
+                                ) {
+                                    PosterImage(
+                                        posterPickCode = current.movie.posterPickCode,
+                                        backgroundPickCode = backgroundPick,
+                                        modifier = Modifier.fillMaxSize(),
+                                        cropIfMissing = true,
+                                    )
+                                }
+                                // 没有海报 → 这张是背景图裁的：给一个改构图的入口（拖/缩后保存）。
+                                // 有真海报的片不显示 —— 它不经过兜底链路，改了也不生效。
+                                if (current.movie.posterPickCode.isNullOrBlank() && backgroundPick != null &&
+                                    container.mediaCacheEnabled
+                                ) {
+                                    Box(
+                                        Modifier
+                                            .align(Alignment.BottomEnd)
+                                            .padding(6.dp)
+                                            .size(30.dp)
+                                            .clip(CircleShape)
+                                            .background(Color.Black.copy(alpha = 0.50f))
+                                            .clickable { onEditPoster(backgroundPick) },
+                                        contentAlignment = Alignment.Center,
+                                    ) {
+                                        Icon(
+                                            Icons.Outlined.Edit,
+                                            contentDescription = "调整封面裁剪",
+                                            tint = Color.White,
+                                            modifier = Modifier.size(16.dp),
+                                        )
+                                    }
+                                }
                             }
                         }
                         Column(Modifier.padding(start = 16.dp).weight(1f)) {
-                            Text(
-                                current.movie.title,
-                                style = MaterialTheme.typography.headlineSmall,
-                                color = Color.White,
-                            )
+                            val zhTitle = titleZh?.takeIf { it.isNotBlank() }
+                            val showZh = zhTitle != null && !showOriginal
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Text(
+                                    if (showZh) zhTitle!! else current.movie.title,
+                                    style = MaterialTheme.typography.headlineSmall,
+                                    color = Color.White,
+                                    // fill = false：标题短的时候翻译键紧挨着标题，不被推到行的最右端
+                                    modifier = Modifier.weight(1f, fill = false),
+                                )
+                                // 内容确实不是中文、且 AI 配好时才出现；翻译中转小圈
+                                // 已经有有效译文就不再显示翻译键（避免误触重复请求）
+                                if (aiReady && titleZh == null && plotZh == null &&
+                                    TranslationSupport.needsTranslation(current.movie.title, current.movie.plot)
+                                ) {
+                                    if (translating) {
+                                        CircularProgressIndicator(
+                                            modifier = Modifier.size(18.dp),
+                                            color = Color.White,
+                                            strokeWidth = 2.dp,
+                                        )
+                                    } else {
+                                        // 压一层淡黑圆底：浅色 fanart 上白图标几乎看不见
+                                        IconButton(
+                                            onClick = { translateNow() },
+                                            modifier = Modifier
+                                                .padding(start = 6.dp)
+                                                .size(30.dp)
+                                                .clip(CircleShape)
+                                                .background(Color.Black.copy(alpha = 0.30f)),
+                                        ) {
+                                            Icon(
+                                                Icons.Outlined.Translate,
+                                                contentDescription = "AI 翻译标题与简介",
+                                                tint = Color.White,
+                                                modifier = Modifier.size(17.dp),
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                            if (showZh && zhTitle != current.movie.title) {
+                                Text(
+                                    current.movie.title,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = Color.White.copy(alpha = 0.6f),
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                            }
                             Spacer(Modifier.height(6.dp))
                             Row(verticalAlignment = Alignment.CenterVertically) {
                                 current.movie.year?.let {
@@ -522,28 +721,78 @@ fun MediaDetailScreen(
                             val mainPc = current.movie.videoPickCode
                             // 系列卡自己没有视频文件，播放按钮落到第一集
                             val playFirstEpisode = mainPc.isNullOrBlank() && epList.isNotEmpty()
-                            Button(
-                                onClick = {
-                                    when {
-                                        playFirstEpisode -> playEpisode(0)
-                                        mainPc.isNullOrBlank() ->
-                                            scope.launch { snackbarHostState.showSnackbar("没有找到可播放的视频文件") }
-                                        else -> play(mainPc, current.movie.videoName ?: current.movie.title, movieEntries, index)
-                                    }
-                                },
-                            ) {
-                                Icon(Icons.Outlined.PlayArrow, contentDescription = null)
-                                Spacer(Modifier.width(6.dp))
-                                Text(if (playFirstEpisode) "播放第 1 集" else "播放")
+                            // 播放与投屏并排一行：两个按钮必须同处一个容器 ——
+                            // 之前投屏键单独一行时正好压在海报图上，那片区域的点击被海报层吃掉、
+                            // 按钮点了没反应（实测）。
+                            val castPc: String? = mainPc?.takeIf { it.isNotBlank() }
+                                ?: epList.firstOrNull()?.videoPickCode?.takeIf { it.isNotBlank() }
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Button(
+                                    onClick = {
+                                        when {
+                                            playFirstEpisode -> playEpisode(0)
+                                            mainPc.isNullOrBlank() ->
+                                                scope.launch { snackbarHostState.showSnackbar("没有找到可播放的视频文件") }
+                                            else -> play(mainPc, current.movie.videoName ?: current.movie.title, movieEntries, index)
+                                        }
+                                    },
+                                ) {
+                                    Icon(Icons.Outlined.PlayArrow, contentDescription = null)
+                                    Spacer(Modifier.width(6.dp))
+                                    Text(if (playFirstEpisode) "播放第 1 集" else "播放")
+                                }
+                                Spacer(Modifier.width(10.dp))
+                                // 投屏：不进播放页，直接把这部片交给电视（原始文件直链，与播放页同一条链路）。
+                                // 剧集卡落到第一集 —— 与「播放」同一规则。
+                                OutlinedButton(
+                                    onClick = {
+                                        if (castPc == null) {
+                                            scope.launch {
+                                                snackbarHostState.showSnackbar("没有找到可投屏的视频文件")
+                                            }
+                                        } else {
+                                            castPickCode = castPc
+                                            castTitle = current.movie.videoName?.takeIf { it.isNotBlank() }
+                                                ?: current.movie.title
+                                            castPickerOpen = true
+                                        }
+                                    },
+                                ) {
+                                    Icon(Icons.Outlined.Cast, contentDescription = null)
+                                    Spacer(Modifier.width(6.dp))
+                                    Text("投屏")
+                                }
                             }
                         }
                     }
 
-                    current.movie.plot?.takeIf { it.isNotBlank() }?.let {
+                    current.movie.plot?.takeIf { it.isNotBlank() }?.let { originalPlot ->
                         Spacer(Modifier.height(16.dp))
-                        Text("简介", style = MaterialTheme.typography.titleSmall, color = Color.White)
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(
+                                "简介",
+                                style = MaterialTheme.typography.titleSmall,
+                                color = Color.White,
+                                modifier = Modifier.weight(1f),
+                            )
+                            // 有译文才给切换：标题和简介共用一个开关
+                            plotZh?.takeIf { it.isNotBlank() }?.let {
+                                // 做成小胶囊：原来只是一行带 6dp padding 的小字，手指很难点中
+                                Text(
+                                    if (showOriginal) "译文" else "原文",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = Color.White.copy(alpha = 0.85f),
+                                    modifier = Modifier
+                                        .clip(RoundedCornerShape(50))
+                                        .background(Color.White.copy(alpha = 0.10f))
+                                        .clickable { showOriginal = !showOriginal }
+                                        .padding(horizontal = 10.dp, vertical = 5.dp),
+                                )
+                            }
+                        }
                         Spacer(Modifier.height(4.dp))
-                        Text(it, style = MaterialTheme.typography.bodyMedium, color = Color.White.copy(alpha = 0.9f))
+                        val shownPlot = plotZh?.takeIf { it.isNotBlank() && !showOriginal } ?: originalPlot
+                        Text(shownPlot, style = MaterialTheme.typography.bodyMedium, color = Color.White.copy(alpha = 0.9f))
                     }
 
                     // nfo 里的长尾字段（时长/首播/国家/导演/编剧/合集/技术参数…）：有值的才列
@@ -592,6 +841,7 @@ fun MediaDetailScreen(
                                             .aspectRatio(16f / 9f)
                                             .clip(RoundedCornerShape(8.dp))
                                             .background(Color.White.copy(alpha = 0.08f))
+                                            .onGloballyPositioned { fanartBounds[i] = it.boundsInRoot() }
                                             .clickable { viewingFanart = i },
                                     ) {
                                         PickCodeImage(pc, Modifier.fillMaxSize())
@@ -605,6 +855,7 @@ fun MediaDetailScreen(
                                             .aspectRatio(16f / 9f)
                                             .clip(RoundedCornerShape(8.dp))
                                             .background(Color.White.copy(alpha = 0.08f))
+                                            .onGloballyPositioned { fanartBounds[i] = it.boundsInRoot() }
                                             .clickable { viewingFanart = i },
                                     ) {
                                         AsyncImage(
@@ -707,7 +958,18 @@ fun MediaDetailScreen(
                         Spacer(Modifier.height(8.dp))
                         LazyRow(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                             itemsIndexed(recommendations) { i, rec ->
-                                RecommendTile(rec) { onOpenMovie(rec.card, recCards, i) }
+                                RecommendTile(
+                                    rec,
+                                    posterModifier = if (sharedRecKey == rec.card.mediaKey) {
+                                        recommendationShared?.invoke(rec.card.mediaKey) ?: Modifier
+                                    } else {
+                                        Modifier
+                                    },
+                                ) {
+                                    // 点下去才把共享元素挂到这一张上；其余卡保持普通卡
+                                    pendingRecKey = rec.card.mediaKey
+                                    onOpenMovie(rec.card, recCards, i)
+                                }
                             }
                         }
                     }
@@ -764,7 +1026,7 @@ fun MediaDetailScreen(
             // 只有系列卡才点明"连同名下的 N 集"（seriesEpisodes 只对系列有值）
             episodeCount = data?.seriesEpisodes?.size ?: 0,
             onDismiss = { showDelete = false },
-            onDelete = { alsoCloud ->
+            onDelete = { mode ->
                 showDelete = false
                 scope.launch {
                     val r = deleteMovie(
@@ -774,7 +1036,8 @@ fun MediaDetailScreen(
                         imageUrlResolver = container.imageUrlResolver,
                         cacheDir = container.cacheDir,
                         mediaKey = card.mediaKey,
-                        alsoCloud = alsoCloud,
+                        alsoCloud = mode != MovieDeleteMode.LibraryOnly,
+                        alsoPurgeRecycle = mode == MovieDeleteMode.Purge,
                         videoPreviews = container.videoPreviews,
                     )
                     when (r) {
@@ -796,7 +1059,10 @@ fun MediaDetailScreen(
     val fanarts = data?.fanarts.orEmpty()
     val viewing = viewingFanart
     if (viewing != null && (fanarts.isNotEmpty() || localFanarts.isNotEmpty())) {
-        PreviewZoomHost(onDismissed = { viewingFanart = null }) { requestClose ->
+        PreviewZoomHost(
+            onDismissed = { viewingFanart = null },
+            originBounds = fanartBounds[viewing],
+        ) { requestClose ->
             FanartViewer(
                 pickCodes = fanarts,
                 localFiles = localFanarts,
@@ -807,6 +1073,34 @@ fun MediaDetailScreen(
                 onDismiss = requestClose,
             )
         }
+    }
+
+    // 详情页直达投屏的设备选择浮层：复用播放页那套发现（电视端 + DLNA 并行）与投递链路
+    if (castPickerOpen) {
+        CastPickerOverlay(
+            http = container.castHttpClient,
+            onDismiss = { castPickerOpen = false },
+            onPicked = { device ->
+                castPickerOpen = false
+                val pc = castPickCode
+                val title = castTitle
+                if (pc.isNotBlank()) {
+                    scope.launch {
+                        val err = startCastFrom(
+                            context = context,
+                            http = container.castHttpClient,
+                            api = container.openApi,
+                            device = device,
+                            pickCode = pc,
+                            title = title,
+                        )
+                        snackbarHostState.showSnackbar(
+                            err ?: "已投屏到 ${device.name} · 平板可退出（控制面板在播放页与通知里）",
+                        )
+                    }
+                }
+            },
+        )
     }
 }
 
@@ -1005,14 +1299,19 @@ private fun NfoFactsSection(nfo: NfoMeta) {
  * 理由取不到时（既没共同点也没高分）那一行不占位，卡片也不会高矮不齐（标题本来就恒两行）。
  */
 @Composable
-private fun RecommendTile(rec: MovieRecommender.Recommendation, onClick: () -> Unit) {
+private fun RecommendTile(
+    rec: MovieRecommender.Recommendation,
+    posterModifier: Modifier = Modifier,
+    onClick: () -> Unit,
+) {
     Column(Modifier.width(108.dp).clickable(onClick = onClick)) {
         Box(
             Modifier
                 .fillMaxWidth()
                 .height(158.dp)
                 .clip(RoundedCornerShape(12.dp))
-                .background(Color.White.copy(alpha = 0.08f)),
+                .background(Color.White.copy(alpha = 0.08f))
+                .then(posterModifier),
         ) {
             // 兜底图标在下层：海报没加载出来/本来就没有时不剩一块空白
             Icon(

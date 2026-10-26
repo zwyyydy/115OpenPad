@@ -9,7 +9,7 @@ import android.content.Context
 import android.content.Intent
 import android.os.Build
 import android.os.IBinder
-import android.util.Log
+import com.open115.pad.util.AppLog as Log
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import com.open115.pad.MainActivity

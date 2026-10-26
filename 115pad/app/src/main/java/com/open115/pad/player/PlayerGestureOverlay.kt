@@ -11,6 +11,9 @@ import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.calculateCentroid
+import androidx.compose.foundation.gestures.calculatePan
+import androidx.compose.foundation.gestures.calculateZoom
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -34,8 +37,11 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.isSpecified
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.input.pointer.AwaitPointerEventScope
 import androidx.compose.ui.input.pointer.changedToUpIgnoreConsumed
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.positionChange
@@ -137,6 +143,9 @@ private enum class TapPhase {
     /** 按住到长按时间：倍速 */
     LONG_PRESS,
 
+    /** 落下第二根手指：双指缩放 / 拖动画面（非 VR） */
+    TRANSFORM,
+
     /** 指针被系统抢走（返回手势 / 窗口失焦）：这一下作废 */
     CANCEL,
 }
@@ -196,6 +205,44 @@ private fun speedHudText(speed: Float) =
     String.format(java.util.Locale.US, "x%.1f 快速播放中", speed)
 
 /**
+ * 双指手势循环：缩放 + 平移。
+ *
+ * 只在"当前至少两根手指按着"时应用变换；其中一根抬起后继续把事件吃掉直到全部抬起 ——
+ * 否则最后那根手指的抬手会被外层状态机当成轻点（弹出控制排）。
+ * [zoomEnabled] 为 false（滤镜的 GLSurfaceView 路径）时仍然消费事件：双指不能被单指逻辑
+ * 误判成横滑快进。
+ */
+private suspend fun AwaitPointerEventScope.handleTransformGesture(
+    zoom: VideoZoomState,
+    zoomEnabled: Boolean,
+) {
+    while (true) {
+        val ev = awaitPointerEvent()
+        val pressed = ev.changes.filter { it.pressed }
+        if (pressed.size >= 2) {
+            if (zoomEnabled) {
+                val zoomChange = ev.calculateZoom()
+                val pan = ev.calculatePan()
+                val centroid = ev.calculateCentroid(useCurrent = false)
+                if (centroid.isSpecified) {
+                    // 捏合中心换算成"相对屏幕中心"：画面框居中，两者中心重合
+                    zoom.apply(
+                        zoomChange,
+                        pan.x,
+                        pan.y,
+                        Offset(centroid.x - size.width / 2f, centroid.y - size.height / 2f),
+                    )
+                }
+            }
+            ev.changes.forEach { it.consume() }
+        } else {
+            ev.changes.forEach { it.consume() }
+            if (pressed.isEmpty()) return
+        }
+    }
+}
+
+/**
  * 播放手势覆盖层（覆盖在 PlayerView 之上的独立响应层）：
  * - 左侧竖直滑动：亮度 0.01~1.0（改 Window.screenBrightness）
  * - 右侧竖直滑动：媒体音量（STREAM_MUSIC，flag=0 不弹系统音量框）
@@ -203,6 +250,7 @@ private fun speedHudText(speed: Float) =
  * - 单击：切换控制器（3 秒无操作自动淡出，由调用方实现）
  * - 双击：左/右按 DoubleTapConfig 执行快退/快进（带水波纹反馈），中间播放/暂停
  * - 长按：倍速播放，长按后左右滑动微调倍速，松手恢复
+ * - 双指：缩放画面（1~4 倍），放大后可双指拖动位置（非 VR；见 [zoom]）
  * 所有步长按屏幕宽/高百分比计算，防抖用系统 scaledTouchSlop。
  *
  * 单击 / 双击 / 长按 / 拖动**由同一个 pointerInput 自己判定**，不再用
@@ -217,6 +265,13 @@ internal fun PlayerGestureOverlay(
     modifier: Modifier,
     enabled: Boolean,
     player: Player,
+    /** 双指缩放/拖动画面的状态（非 VR、TextureView 路径） */
+    zoom: VideoZoomState = remember { VideoZoomState() },
+    /**
+     * 是否真的应用双指变换：滤镜模式走 GLSurfaceView（SurfaceView 子类），
+     * View 变换对它不生效 —— 这种时候只把双指手势吃掉，不改缩放状态。
+     */
+    zoomEnabled: Boolean = true,
     config: DoubleTapConfig,
     longPressSpeed: Float,
     /** 长按倍速链路每次实际改变播放速度时回调（按住/微调/松手）——弹幕时间轴靠它跟手 */
@@ -250,7 +305,8 @@ internal fun PlayerGestureOverlay(
         // 闭包会把"重建播放器（切软/硬解）之前的旧实例"一直带下去 —— 那时双击水波纹照旧出现、
         // seekTo 却落在一个已经释放的播放器上，用户看到的就是"手势偶有失效"。
         // 进键后重建播放器会连手势层一起重启，闭包与播放器始终同步。
-        layer = layer.pointerInput(player, config, longPressSpeed, curve) {
+        // zoomEnabled 同理：切滤镜会改渲染路径，闭包里的旧值必须跟着换。
+        layer = layer.pointerInput(player, config, longPressSpeed, curve, zoomEnabled) {
             awaitEachGesture {
                 // 只认第一根手指：多指（双拇指连点、手掌误触）不影响判定
                 val down = awaitFirstDown(requireUnconsumed = false)
@@ -302,6 +358,11 @@ internal fun PlayerGestureOverlay(
                         var result: TapPhase? = null
                         while (result == null) {
                             val ev = awaitPointerEvent()
+                            // 第二根手指落下 = 双指缩放/拖动：单指判定作废
+                            if (ev.changes.count { it.pressed } >= 2) {
+                                result = TapPhase.TRANSFORM
+                                break
+                            }
                             val ch = ev.changes.firstOrNull { it.id == down.id }
                             if (ch == null) {
                                 result = TapPhase.CANCEL
@@ -319,6 +380,10 @@ internal fun PlayerGestureOverlay(
                 }
 
                 when (phase) {
+                    TapPhase.TRANSFORM -> {
+                        handleTransformGesture(zoom, zoomEnabled)
+                    }
+
                     TapPhase.TAP -> {
                         // 轻点：先记下抬手时刻，等一个双击窗口再定性（这一等就是单击唤出控制排的延迟）
                         lastTapUpAt[0] = upAt
@@ -336,8 +401,14 @@ internal fun PlayerGestureOverlay(
                         onSpeedChange(longPressSpeed)
                         onSpeedHud(speedHudText(longPressSpeed))
                         var acc = 0f
+                        var toTransform = false
                         while (true) {
                             val ev = awaitPointerEvent()
+                            // 长按中落下第二根手指：结束倍速，转双指缩放/拖动
+                            if (ev.changes.count { it.pressed } >= 2) {
+                                toTransform = true
+                                break
+                            }
                             val ch = ev.changes.firstOrNull { it.id == down.id } ?: break
                             if (ch.changedToUpIgnoreConsumed()) break
                             ch.consume()
@@ -350,13 +421,23 @@ internal fun PlayerGestureOverlay(
                         player.setPlaybackSpeed(1f)
                         onSpeedChange(1f)
                         onSpeedHud(null)
+                        if (toTransform) {
+                            handleTransformGesture(zoom, zoomEnabled)
+                            return@awaitEachGesture
+                        }
                     }
 
                     TapPhase.DRAG -> {
                         // 方向锁定后逐事件映射（拖动中只更新预览，抬手才真正 seek）
                         var endedWithUp = false
+                        var toTransform = false
                         while (true) {
                             val ev = awaitPointerEvent()
+                            // 单指拖动中又落下第二根手指：单指动作作废，转双指缩放/拖动
+                            if (ev.changes.count { it.pressed } >= 2) {
+                                toTransform = true
+                                break
+                            }
                             val ch = ev.changes.firstOrNull { it.id == down.id } ?: break
                             if (ch.changedToUpIgnoreConsumed()) {
                                 endedWithUp = true
@@ -404,6 +485,14 @@ internal fun PlayerGestureOverlay(
                                 }
                                 DragMode.NONE -> {}
                             }
+                        }
+                        if (toTransform) {
+                            // 撤掉单指反馈，转双指缩放/拖动；这一轮不再走 seek 提交
+                            if (state.locked == DragMode.SEEK) onSeekPreviewCancel()
+                            state.seekDeltaSec = 0f
+                            state.locked = DragMode.NONE
+                            handleTransformGesture(zoom, zoomEnabled)
+                            return@awaitEachGesture
                         }
                         if (endedWithUp && state.locked == DragMode.SEEK && state.seekDeltaSec != 0f) {
                             val dur = player.duration

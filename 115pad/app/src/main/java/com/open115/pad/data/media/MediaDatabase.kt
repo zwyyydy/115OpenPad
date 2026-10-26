@@ -21,7 +21,7 @@ import androidx.sqlite.db.SupportSQLiteDatabase
         ScanLogEntity::class,
         DanmuCacheEntity::class,
     ],
-    version = 19,
+    version = 21,
     exportSchema = false,
 )
 abstract class MediaDatabase : RoomDatabase() {
@@ -285,6 +285,29 @@ abstract class MediaDatabase : RoomDatabase() {
         }
     }
 
+    /**
+     * AI 翻译缓存：movies 加四列。老库全是 NULL/0 = 没有翻译，行为不变。
+     * 只存译文，原 `title`/`plot` 不动；`zhSourceHash` 让重新刮削后的旧译文自动失效。
+     */
+    private val MIGRATION_19_20 = object : Migration(19, 20) {
+        override fun migrate(db: SupportSQLiteDatabase) {
+            db.execSQL("ALTER TABLE movies ADD COLUMN titleZh TEXT")
+            db.execSQL("ALTER TABLE movies ADD COLUMN plotZh TEXT")
+            db.execSQL("ALTER TABLE movies ADD COLUMN zhSourceHash TEXT")
+            db.execSQL("ALTER TABLE movies ADD COLUMN zhAt INTEGER NOT NULL DEFAULT 0")
+        }
+    }
+
+    private val MIGRATION_20_21 = object : Migration(20, 21) {
+        override fun migrate(db: SupportSQLiteDatabase) {
+            // 拼音/首字母只在客户端算，DB 加两列 + 索引；老数据由启动回填（MediaDao.moviesWithoutPinyin）
+            db.execSQL("ALTER TABLE movies ADD COLUMN titlePinyin TEXT NOT NULL DEFAULT ''")
+            db.execSQL("ALTER TABLE movies ADD COLUMN titleInitials TEXT NOT NULL DEFAULT ''")
+            db.execSQL("CREATE INDEX IF NOT EXISTS index_movies_titlePinyin ON movies(titlePinyin)")
+            db.execSQL("CREATE INDEX IF NOT EXISTS index_movies_titleInitials ON movies(titleInitials)")
+        }
+    }
+
     fun build(context: Context): MediaDatabase =
         Room.databaseBuilder(context, MediaDatabase::class.java, "media.db")
             .addMigrations(
@@ -292,7 +315,7 @@ abstract class MediaDatabase : RoomDatabase() {
                 MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9,
                 MIGRATION_9_10, MIGRATION_10_11, MIGRATION_11_12, MIGRATION_12_13,
                 MIGRATION_13_14, MIGRATION_14_15, MIGRATION_15_16, MIGRATION_16_17,
-                MIGRATION_17_18, MIGRATION_18_19,
+                MIGRATION_17_18, MIGRATION_18_19, MIGRATION_19_20, MIGRATION_20_21,
             )
             .fallbackToDestructiveMigration()
             .build()

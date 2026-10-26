@@ -19,6 +19,7 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
@@ -84,7 +85,10 @@ import androidx.navigation.compose.rememberNavController
 import androidx.navigation.NavGraph.Companion.findStartDestination
 import androidx.navigation.NavType
 import androidx.navigation.navArgument
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.createSavedStateHandle
+import androidx.lifecycle.repeatOnLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.open115.pad.AppContainer
 import com.open115.pad.mainUiVisible
@@ -782,7 +786,6 @@ private fun MainScaffold(container: AppContainer, widthClass: WindowWidthSizeCla
 
     val autoSubmitClipboard by container.downloadPrefs.autoSubmitClipboardDownload
         .collectAsState(initial = false)
-    val pendingDownload by container.downloadLinks.pending.collectAsState()
     // 需要二次确认的请求（仅剪贴板来源 + 未开静默模式），留在本地状态里等用户点按
     var sheetRequest by remember { mutableStateOf<DownloadRequest?>(null) }
     var submittingDownload by remember { mutableStateOf(false) }
@@ -792,9 +795,9 @@ private fun MainScaffold(container: AppContainer, widthClass: WindowWidthSizeCla
     /**
      * 提交下载并给出反馈。
      *
-     * 注意这里的协程必须挂在 scope（随组合存活）而不是 LaunchedEffect(pendingDownload) 里：
-     * 第一行 consume() 会把 pending 置空，进而改变那个 LaunchedEffect 的 key 并**取消它自己的协程**，
-     * 后面的提示与跳转就全丢了。早期实现正是踩了这个坑——提交成功但界面毫无反馈。
+     * 注意这里的协程必须挂在 scope（随组合存活），不能直接写在下面的生命周期收集块里：
+     * 第一行 consume() 之后界面若退到后台，收集块会被 repeatOnLifecycle 取消，
+     * 后面的提交、提示与跳转就全丢了。
      */
     suspend fun submitDownload(req: DownloadRequest, auto: Boolean, gotoOffline: Boolean) {
         container.downloadLinks.consume() // 立刻消费，保证同一请求不会被处理两次
@@ -831,22 +834,33 @@ private fun MainScaffold(container: AppContainer, widthClass: WindowWidthSizeCla
         if (req.source == LinkSource.EXTERNAL) returnAsk = ReturnAsk(err)
     }
 
-    LaunchedEffect(pendingDownload) {
-        val req = pendingDownload ?: return@LaunchedEffect
-        when {
-            // 外部 App 唤起（Deep Link / 磁力 / 系统分享）：默认直接提交，不再二次确认
-            req.source == LinkSource.EXTERNAL ->
-                scope.launch { submitDownload(req, auto = true, gotoOffline = true) }
+    // 待处理的下载请求只在 RESUMED 时接。
+    //
+    // 本 App 可能同时存在多个 MainActivity 实例：别的 App 直接 startActivity（不加 NEW_TASK）
+    // 时，我们的界面会落进对方的任务栈；用户再回自己的任务栈，两个实例就同时活着。
+    // 请求存在进程级的 DownloadLinkBus 里，谁先响应谁弹窗——后台那个实例抢走后，提交、
+    // 跳转和"返回原程序"弹窗全发生在看不见的任务里，前台看着就是"切过来了但什么都没弹"。
+    val lifecycle = LocalLifecycleOwner.current.lifecycle
+    LaunchedEffect(Unit) {
+        lifecycle.repeatOnLifecycle(Lifecycle.State.RESUMED) {
+            container.downloadLinks.pending.collect { req ->
+                if (req == null) return@collect
+                when {
+                    // 外部 App 唤起（Deep Link / 磁力 / 系统分享）：默认直接提交，不再二次确认
+                    req.source == LinkSource.EXTERNAL ->
+                        scope.launch { submitDownload(req, auto = true, gotoOffline = true) }
 
-            // 剪贴板 + 静默模式：直接提交，只给一条轻提示
-            autoSubmitClipboard ->
-                scope.launch { submitDownload(req, auto = true, gotoOffline = false) }
+                    // 剪贴板 + 静默模式：直接提交，只给一条轻提示
+                    autoSubmitClipboard ->
+                        scope.launch { submitDownload(req, auto = true, gotoOffline = false) }
 
-            // 剪贴板 + 默认模式：转交底部抽屉二次确认。
-            // 请求已存进 sheetRequest，这里可以放心消费掉待处理槽位。
-            else -> {
-                sheetRequest = req
-                container.downloadLinks.consume()
+                    // 剪贴板 + 默认模式：转交底部抽屉二次确认。
+                    // 请求已存进 sheetRequest，这里可以放心消费掉待处理槽位。
+                    else -> {
+                        sheetRequest = req
+                        container.downloadLinks.consume()
+                    }
+                }
             }
         }
     }
@@ -915,7 +929,18 @@ private fun MainScaffold(container: AppContainer, widthClass: WindowWidthSizeCla
                 else fadeIn(tween(250)) + slideInHorizontally(tween(300)) { -it / 2 } + expandHorizontally(tween(300)),
                 exit = ExitTransition.None,
             ) {
-                NavigationRail {
+                // macOS 侧栏：比页面底色低一档的面 + 右侧发丝线。
+                // 壁纸开启时保持透明，让壁纸透上来（主题里其他栏也是这么处理的）
+                val railLine = com.open115.pad.ui.theme.AppColors.Divider
+                val railBg = if (com.open115.pad.ui.theme.LocalWallpaperGlass.current.active) {
+                    Color.Transparent
+                } else {
+                    com.open115.pad.ui.theme.AppColors.GraySoft
+                }
+                Row {
+                NavigationRail(containerColor = railBg) {
+                    // 整排入口往下挪一点：贴着状态栏冲顶很难看（用户定的），垫一小段空当
+                    Spacer(Modifier.height(12.dp))
                     // 常规入口（媒体库不在这里，见下面）
                     destinations.filter { it.route != MEDIA_ROUTE }.forEach { dest ->
                         NavigationRailItem(
@@ -958,6 +983,8 @@ private fun MainScaffold(container: AppContainer, widthClass: WindowWidthSizeCla
                             label = { Text(media.label) },
                         )
                     }
+                }
+                Box(Modifier.fillMaxHeight().width(1.dp).background(railLine))
                 }
             }
             // NavHost 与批量重命名面板同层，面板只盖内容区、不盖导航栏
@@ -1007,6 +1034,8 @@ private fun MainScaffold(container: AppContainer, widthClass: WindowWidthSizeCla
                                 dirRemovals = container.dirRemovals,
                                 // 删除的文件：预览图缓存跟着清（见 FilesViewModel 的构造参数）
                                 videoPreviews = container.videoPreviews,
+                                // 搜索历史（搜索框下方 chips）
+                                searchHistory = container.searchHistory,
                             )
                         })
                         FilesScreen(

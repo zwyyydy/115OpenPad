@@ -1,6 +1,8 @@
 package com.open115.pad.ui.settings
 
 import android.content.Context
+import android.content.Intent
+import android.widget.Toast
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -50,7 +52,6 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.VerticalDivider
@@ -82,6 +83,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.content.FileProvider
 import coil.compose.SubcomposeAsyncImage
 import com.open115.pad.AppContainer
 import com.open115.pad.data.ImageUrlResolver
@@ -102,6 +104,8 @@ import com.open115.pad.ui.theme.AppChip
 import com.open115.pad.ui.theme.AppColors
 import com.open115.pad.ui.theme.AppSlider
 import com.open115.pad.ui.theme.SectionHeader
+import com.open115.pad.ui.theme.AppSwitch
+import com.open115.pad.util.AppLog
 import com.open115.pad.util.Format
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -328,6 +332,9 @@ fun SettingsScreen(container: AppContainer) {
     val metatubeUrl by container.mediaPrefs.metatubeUrl.collectAsState(initial = "")
     val metatubeToken by container.mediaPrefs.metatubeToken.collectAsState(initial = "")
     var showSourceManager by remember { mutableStateOf(false) }
+    // ---- 诊断日志：开关来自 DataStore；占用在进页时算一次，清空后重算 ----
+    val logToFile by container.appPrefs.logToFile.collectAsState(initial = true)
+    var logStats by remember { mutableStateOf(AppLog.stats()) }
     val jsDirPicker = androidx.activity.compose.rememberLauncherForActivityResult(
         androidx.activity.result.contract.ActivityResultContracts.OpenDocumentTree(),
     ) { uri ->
@@ -638,6 +645,10 @@ fun SettingsScreen(container: AppContainer) {
             backup = container.backupManager,
             backupPrefs = container.backupPrefs,
             scope = scope,
+            // 备份/恢复跑在这个 scope 而不是页面的 rememberCoroutineScope：打包媒体库是
+            // 分钟级的活，切页/返回把设置页销毁时协程会被连坐砍掉（临时 zip 一起报废）。
+            // transferScope 与上传同源，页面没了照样跑完
+            backgroundScope = container.transferScope,
         ),
         labSection(
             labFilterEnabled = labFilterEnabled,
@@ -722,6 +733,46 @@ fun SettingsScreen(container: AppContainer) {
             onLabMagnetPreviewEnabled = { v -> scope.launch { container.playerPrefs.setLabMagnetPreviewEnabled(v) } },
             onLabMagnetPreviewEndpoint = { v -> scope.launch { container.playerPrefs.setLabMagnetPreviewEndpoint(v) } },
             onTestMagnet = { testMagnet() },
+        ),
+        diagSection(
+            logEnabled = logToFile,
+            logStats = logStats,
+            onLogEnabled = { v ->
+                // 立即生效（写文件的闸门），再落库供下次启动
+                AppLog.setEnabled(v)
+                scope.launch { container.appPrefs.setLogToFile(v) }
+            },
+            onExport = {
+                scope.launch {
+                    val zip = AppLog.exportZip(context)
+                    if (zip == null) {
+                        Toast.makeText(context, "还没有可导出的日志", Toast.LENGTH_SHORT).show()
+                    } else {
+                        runCatching {
+                            val uri = FileProvider.getUriForFile(
+                                context, "${context.packageName}.fileprovider", zip,
+                            )
+                            val send = Intent(Intent.ACTION_SEND).apply {
+                                type = "application/zip"
+                                putExtra(Intent.EXTRA_STREAM, uri)
+                                putExtra(Intent.EXTRA_SUBJECT, "115 OpenPad 日志")
+                                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                            }
+                            context.startActivity(
+                                Intent.createChooser(send, "导出日志")
+                                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+                            )
+                        }.onFailure {
+                            Toast.makeText(context, "导出失败：${it.message}", Toast.LENGTH_SHORT).show()
+                        }
+                    }
+                }
+            },
+            onClear = {
+                AppLog.clear(context)
+                logStats = AppLog.stats()
+                Toast.makeText(context, "日志已清空", Toast.LENGTH_SHORT).show()
+            },
         ),
         accountSection(
             clientId = clientId,
@@ -1189,7 +1240,7 @@ private fun SwitchRow(item: SwitchItem) {
         item,
         // 整行可点也能切：不必瞄准右边那个开关（原来只有开关本身响应）
         onClick = { item.onChange(!item.checked) },
-        trailing = { Switch(checked = item.checked, onCheckedChange = item.onChange) },
+        trailing = { AppSwitch(checked = item.checked, onCheckedChange = item.onChange) },
     )
 }
 
@@ -1257,20 +1308,31 @@ private fun ChoiceItem<*>.onSelectAny(value: Any?) {
 @Composable
 private fun ActionRow(item: ActionItem) {
     var asking by remember(item.id) { mutableStateOf(false) }
-    ItemShell(
-        item,
-        titleColor = if (item.danger) AppColors.RedFg else AppColors.TextPrimary,
-        onClick = { if (item.confirm != null) asking = true else item.onClick() },
-        // 动作行给个右箭头：否则它和只读信息行长得一模一样，看不出哪个能点
-        trailing = {
-            Icon(
-                Icons.Outlined.ChevronRight,
-                contentDescription = null,
-                modifier = Modifier.size(18.dp),
-                tint = AppColors.TextTertiary,
+    Column {
+        ItemShell(
+            item,
+            titleColor = if (item.danger) AppColors.RedFg else AppColors.TextPrimary,
+            onClick = { if (item.confirm != null) asking = true else item.onClick() },
+            // 动作行给个右箭头：否则它和只读信息行长得一模一样，看不出哪个能点
+            trailing = {
+                Icon(
+                    Icons.Outlined.ChevronRight,
+                    contentDescription = null,
+                    modifier = Modifier.size(18.dp),
+                    tint = AppColors.TextTertiary,
+                )
+            },
+        )
+        item.progress?.let { p ->
+            LinearProgressIndicator(
+                progress = { p.coerceIn(0f, 1f) },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(start = 16.dp, end = 16.dp, bottom = 10.dp)
+                    .height(3.dp),
             )
-        },
-    )
+        }
+    }
     val confirm = item.confirm
     if (asking && confirm != null) {
         ConfirmDialog(
@@ -1617,9 +1679,13 @@ private fun backupSection(
     backup: BackupManager,
     backupPrefs: BackupPrefs,
     scope: CoroutineScope,
+    /** 比页面活得久的 scope（transferScope）：备份/恢复不随本页销毁被砍 */
+    backgroundScope: CoroutineScope,
 ): SettingsSection {
     val context = LocalContext.current
-    var backingUp by remember { mutableStateOf<BackupKind?>(null) }
+    // 备份进度是 BackupManager 里的 StateFlow：谁启动的、跑了多久都记在那边，
+    // 手动备份切页再回来时这里照样能接上（协程本身在 backgroundScope 里跑）
+    val bp by backup.progress.collectAsState()
     var restoring by remember { mutableStateOf<BackupKind?>(null) }
 
     val configState by backupPrefs.state(BackupKind.CONFIG).collectAsState(BackupPrefs.KindState(false, 24, 0))
@@ -1663,6 +1729,7 @@ private fun backupSection(
         )
         for (kind in BackupKind.entries) {
             val st = states.getValue(kind)
+            val mine = bp.kind == kind && bp.running
             group(kind.label)
             switch(
                 id = "backup_auto_${kind.key}",
@@ -1688,16 +1755,18 @@ private fun backupSection(
                 id = "backup_now_${kind.key}",
                 title = "立即备份${kind.label}",
                 subtitle = when {
-                    backingUp == kind -> "正在备份…"
+                    mine -> "正在备份… ${bp.phaseLabel}" + if (bp.percent > 0) " ${bp.percent}%" else ""
                     st.lastAt > 0 -> "上次：" + Format.ago(st.lastAt)
                     else -> "从未备份"
                 },
+                // 打包按字节、上传按分片，都折成了 0..1 的行内进度条（备份正在别的页面跑也能看到）
+                progress = if (mine) bp.percent / 100f else null,
                 onClick = {
-                    if (backingUp == null) {
-                        backingUp = kind
-                        scope.launch {
+                    // ★ 发到 backgroundScope：本页销毁（切页/返回）不会连坐协程；
+                    //   真正的一次一个由 BackupManager 里的锁兜着（自动备份同时到点也不会撞上）
+                    if (!bp.running) {
+                        backgroundScope.launch {
                             val r = backup.backup(kind)
-                            backingUp = null
                             toast("「${kind.label}」$r")
                         }
                     }
@@ -1718,7 +1787,8 @@ private fun backupSection(
                 },
                 onClick = {
                     if (restoring == null) {
-                        scope.launch { doRestore(kind) }
+                        // 恢复同样是长活（下载整包 + 解压 + 回插），一并交给 backgroundScope
+                        backgroundScope.launch { doRestore(kind) }
                     }
                 },
             )
@@ -2242,7 +2312,7 @@ private fun labSection(
     text(
         id = "metatube_url",
         title = "HTTP 服务源地址",
-        subtitle = "自建服务的基址，如 http://192.168.31.x:8090；留空不启用",
+        subtitle = "自建服务的基址，如 http://192.168.x.x:8090；留空不启用",
         detail = "刮削逻辑与出口代理都在服务器侧，平板不用翻墙；配完在「当前源」里选它。",
         value = metatubeUrl,
         placeholder = "http://host:8090（留空 = 不启用）",
@@ -2451,6 +2521,58 @@ private fun accountSection(
     )
 }
 
+/**
+ * 诊断：运行日志与崩溃记录。
+ *
+ * 日志只落本机文件（`files/logs`），写入前脱敏令牌；开关关掉后连崩溃文件也不写。
+ * 导出走系统分享面板，用户自己决定发给谁 —— App 不上传任何日志。
+ */
+private fun diagSection(
+    logEnabled: Boolean,
+    logStats: AppLog.Stats,
+    onLogEnabled: (Boolean) -> Unit,
+    onExport: () -> Unit,
+    onClear: () -> Unit,
+): SettingsSection = section(SettingsCategory.DIAG) {
+    group("运行日志")
+    switch(
+        id = "log_to_file",
+        title = "写入日志文件",
+        subtitle = "崩溃堆栈与运行日志；只在本机，最多 8MB / 7 天",
+        detail = "关闭后不再写任何日志（包括崩溃记录），adb logcat 调试不受影响。" +
+            "写入前会把 access_token / refresh_token / Authorization / Cookie 等字段打码；" +
+            "日志不会自动上传，只有你点「导出日志」并通过系统分享发送时才会离开本机。",
+        checked = logEnabled,
+        onChange = onLogEnabled,
+    )
+    info(
+        id = "log_usage",
+        title = "当前占用",
+        subtitle = if (logStats.files == 0) {
+            "暂无日志"
+        } else {
+            "${logStats.files} 个文件 · ${Format.size(logStats.bytes)}"
+        },
+    )
+    action(
+        id = "log_export",
+        title = "导出日志",
+        subtitle = "打包成 zip，通过系统分享发送",
+        detail = "包含运行日志与崩溃记录（如果有）。适合反馈“闪退 / 卡住 / 某功能不对”时附上。",
+        onClick = onExport,
+    )
+    action(
+        id = "log_clear",
+        title = "清空日志",
+        subtitle = "删除本机全部运行日志与崩溃记录",
+        detail = "只删 files/logs 下的诊断日志，不影响缓存、媒体库和账号信息。",
+        danger = true,
+        confirm = "将删除本机所有运行日志与崩溃记录，不影响其他数据。",
+        confirmText = "清空",
+        onClick = onClear,
+    )
+}
+
 private fun aboutSection(version: String, onOpenDocs: () -> Unit): SettingsSection =
     section(SettingsCategory.ABOUT) {
         info(
@@ -2548,7 +2670,8 @@ private fun AiTemplatesDialog(
 ) {
     var editing by remember { mutableStateOf<TplEdit?>(null) }
     Dialog(onDismissRequest = { if (editing == null) onDismiss() else editing = null }) {
-        Surface(shape = RoundedCornerShape(16.dp), color = MaterialTheme.colorScheme.surface) {
+        // 弹窗实底：壁纸模式下 surface 半透明会把下面的设置项透进来
+        Surface(shape = RoundedCornerShape(16.dp), color = MaterialTheme.colorScheme.surfaceContainerHigh) {
             Column(
                 Modifier.fillMaxWidth().heightIn(max = 560.dp).verticalScroll(rememberScrollState()).padding(16.dp),
             ) {
@@ -2657,7 +2780,8 @@ private fun ScrapeSourceManagerDialog(
 ) {
     var editing by remember { mutableStateOf<Triple<String?, String, String>?>(null) }
     Dialog(onDismissRequest = { if (editing == null) onDismiss() else editing = null }) {
-        Surface(shape = RoundedCornerShape(16.dp), color = MaterialTheme.colorScheme.surface) {
+        // 弹窗实底：同上（壁纸模式）
+        Surface(shape = RoundedCornerShape(16.dp), color = MaterialTheme.colorScheme.surfaceContainerHigh) {
             Column(Modifier.fillMaxWidth().heightIn(max = 600.dp).verticalScroll(rememberScrollState()).padding(16.dp)) {
                 val ed = editing
                 if (ed == null) {
@@ -2672,7 +2796,7 @@ private fun ScrapeSourceManagerDialog(
                                 Text(s.name, fontSize = 14.sp, fontWeight = FontWeight.Medium)
                                 Text(if (s.enabled) "已启用" else "已停用", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
                             }
-                            androidx.compose.material3.Switch(checked = s.enabled, onCheckedChange = { onToggle(s.id, it) })
+                            AppSwitch(checked = s.enabled, onCheckedChange = { onToggle(s.id, it) })
                             TextButton(onClick = { editing = Triple(s.id, s.name, s.code) }) { Text("编辑") }
                             TextButton(onClick = { onDelete(s.id) }) { Text("删除", color = MaterialTheme.colorScheme.error) }
                         }

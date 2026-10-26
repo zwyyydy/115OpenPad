@@ -2,6 +2,7 @@ package com.open115.pad.data.media.scrape
 
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
@@ -39,16 +40,64 @@ class AiQueryClient(
     suspend fun suggest(rawName: String, prompt: String): String? {
         val name = rawName.trim()
         if (name.isEmpty() || !configured()) return null
+        return normalize(complete(prompt, name, temperature = 0.0, maxTokens = null))
+    }
+
+    /**
+     * 译文：一次请求同时翻标题与简介，返回结构化结果。
+     *
+     * 失败/没配/模型没按 JSON 回 → null，调用方保留原文并提示，绝不写半截。
+     * 只用于**显示**：调用方把结果存进 titleZh/plotZh，原 title/plot 不动。
+     */
+    suspend fun translate(
+        title: String,
+        plot: String?,
+        targetLanguage: String = "简体中文",
+    ): Translation? {
+        if (!configured()) return null
+        val payload = json.encodeToString(
+            TranslationPayload.serializer(),
+            TranslationPayload(title = title.trim(), plot = plot.orEmpty().trim()),
+        )
+        val system = """
+            你是影视资料翻译。把用户 JSON 里的 title（片名）和 plot（剧情简介）翻译成$targetLanguage。
+            只输出一个 JSON 对象：{"title":"…","plot":"…"}，不要 markdown 代码块、不要任何解释。
+            已经是$targetLanguage 的字段原样返回；空字段返回空字符串。
+            片名用常见译名，不要过度意译；简介保持原意、语气平实，不要增删情节。
+        """.trimIndent()
+        val content = complete(system, payload, temperature = 0.2, maxTokens = 1400) ?: return null
+        // 模型偶尔会包 ```json / 在前面加一句"好的"，取第一个 { 到最后一个 }
+        val raw = content.trim().removePrefix("```json").removePrefix("```").removeSuffix("```").trim()
+        val from = raw.indexOf('{')
+        val to = raw.lastIndexOf('}')
+        if (from < 0 || to <= from) return null
+        val out = runCatching {
+            json.decodeFromString(TranslationOut.serializer(), raw.substring(from, to + 1))
+        }.getOrNull() ?: return null
+        val t = out.title?.trim()?.takeIf { it.isNotBlank() && it != title.trim() }
+        val p = out.plot?.trim()?.takeIf { it.isNotBlank() && it != plot?.trim() }
+        if (t == null && p == null) return null
+        return Translation(title = t, plot = p)
+    }
+
+    /** 发一轮 chat/completions，返回 message.content；网络/非 2xx/解析失败都是 null */
+    private suspend fun complete(
+        system: String,
+        user: String,
+        temperature: Double,
+        maxTokens: Int?,
+    ): String? {
         val url = completionsUrl(endpoint()) ?: return null
         val body = json.encodeToString(
             ChatRequest.serializer(),
             ChatRequest(
                 model = model().trim(),
-                temperature = 0.0,
+                temperature = temperature,
                 messages = listOf(
-                    ChatMessage("system", prompt),
-                    ChatMessage("user", name),
+                    ChatMessage("system", system),
+                    ChatMessage("user", user),
                 ),
+                maxTokens = maxTokens,
             ),
         )
         return runCatching {
@@ -61,8 +110,7 @@ class AiQueryClient(
                 client.newCall(req).execute().use { resp ->
                     if (!resp.isSuccessful) return@use null
                     val text = resp.body?.string().orEmpty()
-                    val content = json.decodeFromString<ChatResponse>(text).choices.firstOrNull()?.message?.content
-                    normalize(content)
+                    json.decodeFromString<ChatResponse>(text).choices.firstOrNull()?.message?.content
                 }
             }
         }.getOrNull()
@@ -89,6 +137,9 @@ class AiQueryClient(
         return s.takeIf { it.isNotBlank() && it.length <= 120 }
     }
 
+    /** 一次翻译的结果（任意一侧可以为空：只要原文不是中文的那部分） */
+    data class Translation(val title: String?, val plot: String?)
+
     @Serializable
     private data class ChatMessage(val role: String, val content: String)
 
@@ -97,7 +148,14 @@ class AiQueryClient(
         val model: String,
         val temperature: Double,
         val messages: List<ChatMessage>,
+        @SerialName("max_tokens") val maxTokens: Int? = null,
     )
+
+    @Serializable
+    private data class TranslationPayload(val title: String, val plot: String = "")
+
+    @Serializable
+    private data class TranslationOut(val title: String? = null, val plot: String? = null)
 
     @Serializable
     private data class ChatResponse(val choices: List<Choice> = emptyList())

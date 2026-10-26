@@ -172,6 +172,18 @@ class ScrapeMatchTest {
     }
 
     @Test
+    fun `番号形状的连字符保留`() {
+        // 番号的连字符是身份的一部分：拆成 `ABC 123` 在元数据源里搜不到（2026-10-25 用户反馈）
+        assertEquals("ABC-123", ScrapeMatch.cleanQueryTitle("ABC-123 4K"))
+        assertEquals("ABC-123", ScrapeMatch.cleanQueryTitle("ABC-123 1080p"))
+        assertEquals("ABC-123", ScrapeMatch.cleanQueryTitle("ABC-123"))
+        // 带画质/字幕后缀的命名：番号主体护住，尾巴照常当分隔符拆（4K 是噪音被丢）
+        assertEquals("ABC-123 C", ScrapeMatch.cleanQueryTitle("ABC-123-4K-C"))
+        // 分隔用途的连字符不受影响：发布组尾巴照旧丢
+        assertEquals("Sample Movie 2011", ScrapeMatch.cleanQueryTitle("Sample.Movie.2011-GROUP"))
+    }
+
+    @Test
     fun `连写的编解码与音轨标记整段去掉`() {
         // `H.264` 若不先整段去掉会被点号拆成 `H`+`264`；`AC3 2.0` 拆开会剩 `2`+`0`
         assertEquals(
@@ -289,7 +301,7 @@ class ScrapeProxyParseTest {
 
     @Test
     fun `socks5 前缀走 SOCKS`() {
-        val p = proxy("socks5://10.0.0.9:1080")
+        val p = proxy("socks5://192.0.2.9:1080")
         assertEquals(java.net.Proxy.Type.SOCKS, p?.type())
         assertEquals(1080, (p?.address() as java.net.InetSocketAddress).port)
     }

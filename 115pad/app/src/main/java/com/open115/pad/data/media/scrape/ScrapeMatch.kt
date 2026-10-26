@@ -26,7 +26,13 @@ object ScrapeMatch {
         s = s.replace('_', ' ').replace('.', ' ')
         s = Regex("""\[[^\]]*]""").replace(s, " ")
         s = Regex("""【[^】]*】""").replace(s, " ")
-        val tokens = s.split(' ', '-', '(', ')', '（', '）').map { it.trim() }.filter { it.isNotEmpty() }
+        // 番号形状（如 `ABC-123`）的连字符是身份的一部分：
+        // 拆掉后检索词变 `ABC 123`，元数据源按完整番号建索引，拆开就搜不到或搜成别的片。
+        // 先护住这类连字符再分词；分隔用途的连字符（`1999-GROUP`、`WEB-DL`）不受影响照拆。
+        val shielded = ID_WITH_HYPHEN.replace(s) { it.value.replace('-', ID_HYPHEN_SHIELD) }
+        val tokens = shielded.split(' ', '-', '(', ')', '（', '）')
+            .map { it.trim().replace(ID_HYPHEN_SHIELD, '-') }
+            .filter { it.isNotEmpty() }
         var kept = tokens.filterNot { it.lowercase() in NOISE_TOKENS }
         // 发布组尾巴（`...-GROUP` 形状）才丢：必须带连字符、全大写 ASCII、且不只有数字。
         // 不做"任何全大写尾巴都丢"—— "THE MATRIX" 这类片名会被误伤。
@@ -108,6 +114,12 @@ object ScrapeMatch {
         "chs", "cht", "gb", "big5", "chinese", "中字", "中英", "国语", "粤语", "双语",
         "简中", "繁中", "简繁", "内封", "内嵌", "外挂", "字幕", "首发",
     )
+
+    /** 番号：字母段（可带少量数字，兼容 FC2/T28）+ 可选字母子段 + 2~8 位数字段 */
+    private val ID_WITH_HYPHEN = Regex("""\b[A-Za-z]{1,6}\d{0,3}(?:-[A-Za-z]{1,4})?-\d{2,8}\b""")
+
+    /** 分词前临时顶替番号连字符的占位符（不能是文件名里可能出现的字符） */
+    private const val ID_HYPHEN_SHIELD = '\u0001'
 }
 
 /**

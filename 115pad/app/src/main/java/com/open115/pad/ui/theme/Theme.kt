@@ -12,10 +12,12 @@ import androidx.compose.ui.graphics.Color
  * 柔和微冷浅灰底（#F8FAFC）+ 纯白卡片 + 高饱和现代蓝（#2563EB）。
  *
  * [wallpaper] 激活时的玻璃范围（[glassAlpha] 跟随"卡片不透明度"设置）：
- * - surface（TopAppBar）与 surfaceContainer（NavigationBar/Rail）→ 半透明白，栏体融进壁纸；
- * - surfaceContainerHigh/Highest（AlertDialog、DropdownMenu）与 Low（ModalBottomSheet）
- *   → **保持实底**：这些是浮在页面之上的覆盖层，半透明会把两个叠着的对话框/底层内容
- *   互相透视（实测：云下载"添加任务"里再开"选择保存位置"，两个对话框文字叠印）。
+ * - surface（TopAppBar）→ 半透明白，栏体融进壁纸；
+ * - surfaceContainer（M3 的 DropdownMenu 容器色）与 High/Highest（AlertDialog）、
+ *   Low（ModalBottomSheet）→ **保持实底**：这些是浮在页面之上的覆盖层，半透明会把
+ *   两个叠着的对话框/底层内容互相透视（实测：云下载"添加任务"里再开"选择保存位置"，
+ *   两个对话框文字叠印；壁纸模式下文件页的菜单/刮削弹窗同样会透出下面的文件行）。
+ *   NavigationRail 自己传 containerColor，不经过这一档。
  * AppColors.Card 系（自定义卡片）不经过这里，仍由各自控制。
  */
 @Composable
@@ -26,7 +28,7 @@ private fun lightColors(wallpaper: Boolean, glassAlpha: Float): androidx.compose
         onPrimary = Color.White,
         primaryContainer = AppColors.AccentSoft,
         onPrimaryContainer = AppColors.AccentDeep,
-        secondary = Color(0xFF0284C7),
+        secondary = Color(0xFF0066CC),
         onSecondary = Color.White,
         tertiary = AppColors.AccentDeep,
         background = AppColors.Bg,
@@ -35,14 +37,16 @@ private fun lightColors(wallpaper: Boolean, glassAlpha: Float): androidx.compose
         onSurface = AppColors.TextPrimary,
         surfaceVariant = AppColors.GraySoft,
         onSurfaceVariant = AppColors.TextSecondary,
-        surfaceContainer = glassSurface,
+        // 浮层容器实底：Menu 的容器色是 surfaceContainer（不是 High），所以这一档也必须实底，
+        // 否则壁纸模式下下拉菜单会透出下面的文件行；菜单只出现在页面之上，不承担"玻璃栏"角色
+        surfaceContainer = AppColors.Card,
         // 浮层容器实底：Low 用实底浅灰（不是半透明的 Bg token），High/Highest 用实底白
         surfaceContainerLow = LightAppPalette.bg,
         surfaceContainerHigh = AppColors.Card,
         surfaceContainerHighest = AppColors.Card,
-        outline = Color(0xFFE2E8F0),
+        outline = Color(0xFFE5E5EA),
         outlineVariant = AppColors.CardBorder,
-        error = Color(0xFFDC2626),
+        error = Color(0xFFD70015),
         onError = Color.White,
         errorContainer = AppColors.RedBg,
         onErrorContainer = AppColors.RedFg,
@@ -89,7 +93,11 @@ fun Open115Theme(
             radiusDp = glassRadiusDp,
         ),
     ) {
-        MaterialTheme(colorScheme = if (dark) DarkColors else lightColors(wallpaper, glassCardAlpha), content = content)
+        MaterialTheme(
+            colorScheme = if (dark) DarkColors else lightColors(wallpaper, glassCardAlpha),
+            shapes = AppShapes,
+            content = content,
+        )
     }
 }
 
@@ -144,6 +152,6 @@ fun Open115DarkTheme(content: @Composable () -> Unit) {
         LocalAppPalette provides DarkAppPalette,
         LocalWallpaperGlass provides WallpaperGlassStyle(active = false, cardAlpha = 1f, gapDp = 8, radiusDp = 14),
     ) {
-        MaterialTheme(colorScheme = DarkColors, content = content)
+        MaterialTheme(colorScheme = DarkColors, shapes = AppShapes, content = content)
     }
 }

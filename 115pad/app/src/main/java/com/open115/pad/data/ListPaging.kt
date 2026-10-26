@@ -1,6 +1,6 @@
 package com.open115.pad.data
 
-import android.util.Log
+import com.open115.pad.util.AppLog as Log
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 

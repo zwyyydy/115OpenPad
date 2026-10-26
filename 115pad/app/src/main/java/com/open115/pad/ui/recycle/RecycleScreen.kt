@@ -169,10 +169,10 @@ class RecycleViewModel(
         if (pcs.isEmpty()) return
         videoPreviews?.let { store ->
             val n = withContext(Dispatchers.IO) { store.deleteFor(pcs) }
-            if (n > 0) android.util.Log.i("VPreview", "回收站彻底删除：清掉 ${pcs.size} 个 pick_code 的预览图 $n 个文件")
+            if (n > 0) com.open115.pad.util.AppLog.i("VPreview", "回收站彻底删除：清掉 ${pcs.size} 个 pick_code 的预览图 $n 个文件")
         }
         val freed = withContext(Dispatchers.IO) { PlayerCache.purge(pcs) }
-        if (freed > 0) android.util.Log.i("PlayerCacheIO", "回收站彻底删除：清掉播放缓存 ${freed / 1024 / 1024}MB")
+        if (freed > 0) com.open115.pad.util.AppLog.i("PlayerCacheIO", "回收站彻底删除：清掉播放缓存 ${freed / 1024 / 1024}MB")
     }
 
     /**

@@ -78,10 +78,10 @@ suspend fun cardFacetsOf(dao: MediaDao, keys: List<String>): Map<String, CardFac
     }
     for (chunk in keys.chunked(KEY_CHUNK)) {
         runCatching { dao.tagNamesOf(chunk) }
-            .onFailure { android.util.Log.w("WorksFilter", "批量查标签失败（${chunk.size} 条）", it) }
+            .onFailure { com.open115.pad.util.AppLog.w("WorksFilter", "批量查标签失败（${chunk.size} 条）", it) }
             .getOrDefault(emptyList()).let { merge(it, tag = true) }
         runCatching { dao.actorNamesOf(chunk) }
-            .onFailure { android.util.Log.w("WorksFilter", "批量查演员失败（${chunk.size} 条）", it) }
+            .onFailure { com.open115.pad.util.AppLog.w("WorksFilter", "批量查演员失败（${chunk.size} 条）", it) }
             .getOrDefault(emptyList()).let { merge(it, tag = false) }
     }
     return out

@@ -26,6 +26,7 @@ import androidx.compose.material.icons.outlined.Close
 import androidx.compose.material.icons.outlined.CloudUpload
 import androidx.compose.material.icons.outlined.DeleteOutline
 import androidx.compose.material.icons.outlined.Download
+import androidx.compose.material.icons.outlined.MoreVert
 import androidx.compose.material.icons.outlined.OpenInNew
 import androidx.compose.material.icons.outlined.Pause
 import androidx.compose.material.icons.outlined.PlayArrow
@@ -73,11 +74,14 @@ import com.open115.pad.ui.theme.AppChip
 import com.open115.pad.ui.theme.AppColors
 import com.open115.pad.ui.theme.AdaptiveBody
 import com.open115.pad.ui.theme.KindBadge
-import com.open115.pad.ui.theme.StatusBadge
+import com.open115.pad.ui.theme.StatusDot
+import com.open115.pad.ui.theme.StatusTone
 import com.open115.pad.util.Format
 import androidx.lifecycle.viewmodel.compose.viewModel
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import com.open115.pad.ui.components.FadeAlertDialog
 
 /**
@@ -95,27 +99,28 @@ private data class DlTask(
     val reason: Int,
     val mime: String?,
     val localUri: String?,
+    /**
+     * 已完成但文件已不在：用户在系统「文件」里把它删了/移走了，或同名文件被后来的下载覆盖。
+     * 只对 file:// 落地路径做判断——content:// 交给系统的场景不猜，宁可当它还在
+     * （真点「打开」时会给出明确提示），避免误报。
+     *
+     * 在 [queryDownloads] 的 IO 线程里一次算好：以前是 val get() = File.exists()，
+     * 每次重组、每行都要在主线程 stat 一次文件。
+     */
+    val fileGone: Boolean = false,
+    /** 落地文件的修改时间（完成时间）；非完成/文件没了为 null。同样在 IO 线程算好 */
+    val completedAt: Long? = null,
 ) {
     val active: Boolean
         get() = status == DownloadManager.STATUS_PENDING ||
             status == DownloadManager.STATUS_RUNNING ||
             status == DownloadManager.STATUS_PAUSED
-
-    /**
-     * 已完成但文件已不在：用户在系统「文件」里把它删了/移走了，或同名文件被后来的下载覆盖。
-     * 只对 file:// 落地路径做判断——content:// 交给系统的场景不猜，宁可当它还在
-     * （真点「打开」时会给出明确提示），避免误报。
-     */
-    val fileGone: Boolean
-        get() = status == DownloadManager.STATUS_SUCCESSFUL &&
-            localUri?.startsWith("file://") == true &&
-            !java.io.File(android.net.Uri.parse(localUri).path ?: "").exists()
 }
 
 /** 取当前 App 名下的下载任务（DownloadManager.query 只会返回本应用入队的任务），新的在前 */
-private fun queryDownloads(context: Context): List<DlTask> {
+private suspend fun queryDownloads(context: Context): List<DlTask> = withContext(Dispatchers.IO) {
     val dm = context.getSystemService(Context.DOWNLOAD_SERVICE) as? DownloadManager
-        ?: return emptyList()
+        ?: return@withContext emptyList()
     val out = ArrayList<DlTask>()
     runCatching {
         dm.query(DownloadManager.Query())?.use { c ->
@@ -134,19 +139,30 @@ private fun queryDownloads(context: Context): List<DlTask> {
             }
         }
     }
-    return out.sortedByDescending { it.id }
+    out.sortedByDescending { it.id }.map { t ->
+        if (t.status != DownloadManager.STATUS_SUCCESSFUL || t.localUri?.startsWith("file://") != true) {
+            t
+        } else {
+            val path = android.net.Uri.parse(t.localUri).path
+            val file = path?.let { runCatching { java.io.File(it) }.getOrNull() }
+            val exists = file?.exists() == true
+            t.copy(
+                fileGone = !exists,
+                completedAt = if (exists) file!!.lastModified().takeIf { ms -> ms > 0 } else null,
+            )
+        }
+    }
 }
 
-/** 状态徽章文案 + 颜色，失败时尽量把原因翻成人话 */
-@Composable
-private fun statusVisual(t: DlTask): Pair<String, Pair<Color, Color>> =
+/** 状态文案 + 语义色，失败时尽量把原因翻成人话 */
+private fun statusVisual(t: DlTask): Pair<String, StatusTone> =
     when {
-        t.fileGone -> "文件已删除" to (AppColors.GraySoft to AppColors.TextSecondary)
-        t.status == DownloadManager.STATUS_SUCCESSFUL -> "已完成" to (AppColors.GreenBg to AppColors.GreenFg)
-        t.status == DownloadManager.STATUS_RUNNING -> "下载中" to (AppColors.BlueBg to AppColors.BlueFg)
-        t.status == DownloadManager.STATUS_PENDING -> "等待中" to (AppColors.AmberBg to AppColors.AmberFg)
-        t.status == DownloadManager.STATUS_PAUSED -> "已暂停" to (AppColors.AmberBg to AppColors.AmberFg)
-        else -> "失败" to (AppColors.RedBg to AppColors.RedFg)
+        t.fileGone -> "文件已删除" to StatusTone.Neutral
+        t.status == DownloadManager.STATUS_SUCCESSFUL -> "已完成" to StatusTone.Success
+        t.status == DownloadManager.STATUS_RUNNING -> "下载中" to StatusTone.Info
+        t.status == DownloadManager.STATUS_PENDING -> "等待中" to StatusTone.Warning
+        t.status == DownloadManager.STATUS_PAUSED -> "已暂停" to StatusTone.Warning
+        else -> "失败" to StatusTone.Error
     }
 
 private fun failureText(reason: Int): String = when (reason) {
@@ -208,9 +224,9 @@ private fun openDownloaded(context: Context, id: Long, mime: String?): String? {
  * ② `dm.remove()` 的返回值不可靠（实测出现过返回 0 但记录已消失的情况），所以判定
  *    一律以文件/记录的实际状态为准，不看返回值。
  */
-private fun removeDownload(context: Context, task: DlTask): String? {
+private suspend fun removeDownload(context: Context, task: DlTask): String? = withContext(Dispatchers.IO) {
     val dm = context.getSystemService(Context.DOWNLOAD_SERVICE) as? DownloadManager
-        ?: return "系统下载器不可用"
+        ?: return@withContext "系统下载器不可用"
     runCatching {
         dm.getUriForDownloadedFile(task.id)?.let { context.contentResolver.delete(it, null, null) }
     }
@@ -218,19 +234,12 @@ private fun removeDownload(context: Context, task: DlTask): String? {
     val filePath = task.localUri?.takeIf { it.startsWith("file://") }
         ?.let { android.net.Uri.parse(it).path }
     val stillThere = filePath != null && java.io.File(filePath).exists()
-    return if (stillThere) {
+    if (stillThere) {
         "任务已移除；文件是媒体库文件，需在系统「文件」里删除（${task.name}）"
     } else {
         null
     }
 }
-
-/** 完成时间取落地文件的修改时间；文件已删则拿不到 */
-private fun completedAt(t: DlTask): Long? =
-    t.localUri?.startsWith("file://")?.let {
-        val f = java.io.File(android.net.Uri.parse(t.localUri).path ?: "")
-        f.lastModified().takeIf { ms -> f.exists() && ms > 0 }
-    }
 
 private fun speedText(bytesPerSec: Double): String = Format.size(bytesPerSec.toLong()) + "/s"
 
@@ -331,8 +340,11 @@ fun TransferScreen(
         }
     }
 
-    // 有进行中的任务时 1 秒一刷（速度/剩余时间要秒级刷新），全部停下后放慢到 2.5 秒
-    LaunchedEffect(Unit) {
+    // 有进行中的任务时 1 秒一刷（速度/剩余时间要秒级刷新），全部停下后放慢到 2.5 秒。
+    // 只在「下载」标签页跑：以前是 LaunchedEffect(Unit)，切到上传/云下载/回收站还在
+    // 每秒查一次 DownloadManager；tab 变了就取消，切回来再自动重启。
+    LaunchedEffect(tab) {
+        if (tab != 0) return@LaunchedEffect
         while (true) {
             val now = System.currentTimeMillis()
             val list = queryDownloads(context)
@@ -344,9 +356,15 @@ fun TransferScreen(
                 }
                 val prev = samples[t.id]
                 if (prev != null && now > prev.second) {
-                    val instant = (t.downloaded - prev.first).coerceAtLeast(0) * 1000.0 / (now - prev.second)
-                    val old = speeds[t.id]
-                    speeds[t.id] = if (old == null || old <= 0) instant else old * 0.65 + instant * 0.35
+                    val elapsed = now - prev.second
+                    if (elapsed > 10_000L) {
+                        // 切去别的标签页再回来：中间这段没有采样，跨一大段算出来的速度是假的
+                        speeds.remove(t.id)
+                    } else {
+                        val instant = (t.downloaded - prev.first).coerceAtLeast(0) * 1000.0 / elapsed
+                        val old = speeds[t.id]
+                        speeds[t.id] = if (old == null || old <= 0) instant else old * 0.65 + instant * 0.35
+                    }
                 }
                 samples[t.id] = t.downloaded to now
             }
@@ -363,8 +381,10 @@ fun TransferScreen(
                 // 云下载/回收站分页有自己的刷新入口，顶栏刷新只管本机下载列表
                 if (tab <= 1) {
                     IconButton(onClick = {
-                        tasks = queryDownloads(context)
-                        notify("已刷新")
+                        scope.launch {
+                            tasks = queryDownloads(context)
+                            notify("已刷新")
+                        }
                     }) {
                         Icon(Icons.Outlined.Refresh, contentDescription = "刷新")
                     }
@@ -471,9 +491,12 @@ fun TransferScreen(
             confirmButton = {
                 TextButton(onClick = {
                     pendingDelete = null
-                    notify(removeDownload(context, t) ?: "已删除「${t.name}」")
-                    scope.launch { log.removeDownload(t.id) }
-                    tasks = queryDownloads(context)
+                    scope.launch {
+                        val msg = removeDownload(context, t)
+                        log.removeDownload(t.id)
+                        tasks = queryDownloads(context)
+                        notify(msg ?: "已删除「${t.name}」")
+                    }
                 }) { Text("删除") }
             },
             dismissButton = { TextButton(onClick = { pendingDelete = null }) { Text("取消") } },
@@ -638,7 +661,7 @@ private fun UploadRow(
     onDelete: () -> Unit,
 ) {
     AppCard(Modifier.fillMaxWidth()) {
-        Column(Modifier.padding(horizontal = 14.dp, vertical = 12.dp)) {
+        Column(Modifier.fillMaxWidth()) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 KindBadge(record.name, isDir = false)
                 Spacer(Modifier.width(12.dp))
@@ -685,60 +708,60 @@ private fun UploadRow(
                     )
                 }
                 Spacer(Modifier.width(8.dp))
-                val (label, bg, fg) = when {
-                    record.ok == null && record.paused -> Triple("已暂停", AppColors.AmberBg, AppColors.AmberFg)
-                    record.ok == null && queuedPos != null -> Triple("排队中", AppColors.AmberBg, AppColors.AmberFg)
+                val (label, tone) = when {
+                    record.ok == null && record.paused -> "已暂停" to StatusTone.Warning
+                    record.ok == null && queuedPos != null -> "排队中" to StatusTone.Warning
                     record.ok == null ->
                         if (record.size > 0 && record.uploaded > 0) {
-                            Triple("上传中 ${record.uploaded * 100 / record.size}%", AppColors.BlueBg, AppColors.BlueFg)
+                            "上传中 ${Format.percentText(record.uploaded * 100.0 / record.size)}" to StatusTone.Info
                         } else {
-                            Triple("上传中", AppColors.BlueBg, AppColors.BlueFg)
+                            "上传中" to StatusTone.Info
                         }
-                    record.ok == false -> Triple("失败", AppColors.RedBg, AppColors.RedFg)
-                    record.reused -> Triple("秒传", AppColors.AmberBg, AppColors.AmberFg)
-                    else -> Triple("已上传", AppColors.GreenBg, AppColors.GreenFg)
+                    record.ok == false -> "失败" to StatusTone.Error
+                    record.reused -> "秒传" to StatusTone.Success
+                    else -> "已上传" to StatusTone.Success
                 }
-                StatusBadge(label, bg = bg, fg = fg)
+                StatusDot(label, tone)
                 // 操作按钮：有文件来源才能暂停/继续（无 uri 的内存上传没有续传落点，只给取消/移除）
                 when {
                     // 排队中：可在真正开传前暂停（保留记录，轮到时不再抢许可），也能直接取消
                     record.ok == null && queuedPos != null -> {
                         if (record.uri != null) {
                             IconButton(onClick = onPause) {
-                                Icon(Icons.Outlined.Pause, contentDescription = "暂停", tint = AppColors.AmberFg)
+                                Icon(Icons.Outlined.Pause, contentDescription = "暂停", tint = AppColors.TextSecondary)
                             }
                         }
                         IconButton(onClick = onCancel) {
-                            Icon(Icons.Outlined.Close, contentDescription = "取消", tint = AppColors.RedFg)
+                            Icon(Icons.Outlined.Close, contentDescription = "取消", tint = AppColors.TextSecondary)
                         }
                     }
                     record.ok == null && record.paused && record.uri != null -> {
                         IconButton(onClick = onResume) {
-                            Icon(Icons.Outlined.PlayArrow, contentDescription = "继续", tint = AppColors.BlueFg)
+                            Icon(Icons.Outlined.PlayArrow, contentDescription = "继续", tint = AppColors.Accent)
                         }
                         IconButton(onClick = onCancel) {
-                            Icon(Icons.Outlined.Close, contentDescription = "取消", tint = AppColors.RedFg)
+                            Icon(Icons.Outlined.Close, contentDescription = "取消", tint = AppColors.TextSecondary)
                         }
                     }
                     // 旧记录可能没有 uri（那时小文件不落 uri），只留取消
                     record.ok == null && record.paused -> {
                         IconButton(onClick = onCancel) {
-                            Icon(Icons.Outlined.Close, contentDescription = "取消", tint = AppColors.RedFg)
+                            Icon(Icons.Outlined.Close, contentDescription = "取消", tint = AppColors.TextSecondary)
                         }
                     }
                     record.ok == null && record.uri != null -> {
                         IconButton(onClick = onPause) {
-                            Icon(Icons.Outlined.Pause, contentDescription = "暂停", tint = AppColors.AmberFg)
+                            Icon(Icons.Outlined.Pause, contentDescription = "暂停", tint = AppColors.TextSecondary)
                         }
                     }
                     record.ok == false && record.uri != null -> {
                         IconButton(onClick = onRetry) {
-                            Icon(Icons.Outlined.Refresh, contentDescription = "重试", tint = AppColors.BlueFg)
+                            Icon(Icons.Outlined.Refresh, contentDescription = "重试", tint = AppColors.Accent)
                         }
                     }
                 }
                 IconButton(onClick = onDelete) {
-                    Icon(Icons.Outlined.DeleteOutline, contentDescription = "移除记录", tint = AppColors.RedFg)
+                    Icon(Icons.Outlined.DeleteOutline, contentDescription = "移除记录", tint = AppColors.TextTertiary)
                 }
             }
             // 分片上传进行中显示进度条（小文件直传/秒传没有过程，不显示）
@@ -777,9 +800,9 @@ private fun DownloadRow(
         Modifier.fillMaxWidth(),
         // 没下完 / 文件已被移走的行不给点：点了没反应比不给点更像卡住
         onClick = primary,
-        onLongClick = if (ready) openMenu else null,
+        onLongClick = openMenu,
     ) {
-        Column(Modifier.padding(horizontal = 14.dp, vertical = 12.dp)) {
+        Column(Modifier.fillMaxWidth()) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 KindBadge(task.name, isDir = false)
                 Spacer(Modifier.width(12.dp))
@@ -829,7 +852,7 @@ private fun DownloadRow(
                         }
                         task.fileGone -> startedAt?.let { "下载于 ${timeText(it)}" }
                         task.status == DownloadManager.STATUS_SUCCESSFUL ->
-                            (completedAt(task) ?: startedAt)?.let { "完成于 ${timeText(it)}" }
+                            (task.completedAt ?: startedAt)?.let { "完成于 ${timeText(it)}" }
                         else -> startedAt?.let { "开始于 ${timeText(it)}" }
                     }
                     if (!timing.isNullOrBlank()) {
@@ -842,22 +865,15 @@ private fun DownloadRow(
                     }
                 }
                 Spacer(Modifier.width(8.dp))
-                val (label, colors) = statusVisual(task)
-                StatusBadge(label, bg = colors.first, fg = colors.second)
-                if (ready) {
-                    IconButton(onClick = { primary?.invoke() }) {
-                        Icon(
-                            if (playable) Icons.Outlined.PlayArrow else Icons.Outlined.OpenInNew,
-                            contentDescription = if (playable) "播放" else "打开",
-                            tint = AppColors.AccentDeep,
-                        )
-                    }
-                }
-                IconButton(onClick = onDelete) {
+                val (label, tone) = statusVisual(task)
+                StatusDot(label, tone)
+                // 打开/删除收进 ⋮：行本身点一下就打开，两个图标常驻只是在右缘堆颜色。
+                IconButton(onClick = openMenu, modifier = Modifier.size(36.dp)) {
                     Icon(
-                        Icons.Outlined.DeleteOutline,
-                        contentDescription = "删除",
-                        tint = AppColors.RedFg,
+                        Icons.Outlined.MoreVert,
+                        contentDescription = "更多",
+                        tint = AppColors.TextTertiary,
+                        modifier = Modifier.size(18.dp),
                     )
                 }
             }
@@ -876,13 +892,15 @@ private fun DownloadRow(
             // 长按菜单。长按不是可发现的交互，所以行内那个图标按钮做的是同一件事，
             // 这里只是把「外部打开」和「删除」也挂到长按上。
             DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
-                DropdownMenuItem(
-                    text = { Text("用其他应用打开") },
-                    onClick = {
-                        menuOpen = false
-                        onOpenExternal()
-                    },
-                )
+                if (ready) {
+                    DropdownMenuItem(
+                        text = { Text("用其他应用打开") },
+                        onClick = {
+                            menuOpen = false
+                            onOpenExternal()
+                        },
+                    )
+                }
                 DropdownMenuItem(
                     text = { Text("删除") },
                     onClick = {

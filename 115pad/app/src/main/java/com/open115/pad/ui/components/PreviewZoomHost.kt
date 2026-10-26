@@ -13,6 +13,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.PointerEventPass
@@ -67,11 +68,18 @@ private val ExitSpec = tween<Float>(200, easing = CubicBezierEasing(0.3f, 0f, 0.
 fun PreviewZoomHost(
     onDismissed: () -> Unit,
     modifier: Modifier = Modifier,
+    /** 触发这次预览的缩略图在窗口里的位置：给了就从它的中心、按它的尺寸放大进来 */
+    originBounds: Rect? = null,
     content: @Composable (requestClose: () -> Unit) -> Unit,
 ) {
     var size by remember { mutableStateOf(IntSize.Zero) }
     // 组合发生在点击 UP 之后，LastTapPoint 里存的就是这次点击；拿不到（键盘/外设唤起）退化为中心
     val origin = remember { LastTapPoint.position }
+    val scaleFrom = if (originBounds != null && size.width > 0 && size.height > 0) {
+        maxOf(originBounds.width / size.width, originBounds.height / size.height).coerceIn(0.45f, 0.84f)
+    } else {
+        0.84f
+    }
     val progress = remember { Animatable(0f) }
     var closing by remember { mutableStateOf(false) }
 
@@ -93,11 +101,11 @@ fun PreviewZoomHost(
             .graphicsLayer {
                 val t = progress.value
                 alpha = (t * 2f).coerceAtMost(1f)
-                val scale = 0.84f + 0.16f * t
+                val scale = scaleFrom + (1f - scaleFrom) * t
                 scaleX = scale
                 scaleY = scale
                 transformOrigin = if (size.width > 0 && size.height > 0) {
-                    val o = origin
+                    val o = originBounds?.center ?: origin
                     if (o != null) {
                         TransformOrigin(
                             (o.x / size.width).coerceIn(0f, 1f),

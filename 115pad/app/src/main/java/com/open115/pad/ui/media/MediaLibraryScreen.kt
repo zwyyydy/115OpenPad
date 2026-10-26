@@ -1,7 +1,13 @@
 package com.open115.pad.ui.media
 
 import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.BoundsTransform
+import androidx.compose.animation.ExperimentalSharedTransitionApi
+import androidx.compose.animation.SharedTransitionLayout
 import androidx.compose.animation.SizeTransform
+import androidx.compose.animation.core.CubicBezierEasing
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.LinearOutSlowInEasing
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
@@ -30,6 +36,7 @@ import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
+import androidx.compose.foundation.lazy.grid.rememberLazyGridState
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -55,14 +62,16 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Surface
-import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.mutableStateMapOf
@@ -71,6 +80,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.drawBehind
@@ -94,6 +104,7 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
@@ -103,11 +114,14 @@ import androidx.compose.ui.window.PopupProperties
 import coil.compose.AsyncImage
 import com.open115.pad.appContainer
 import com.open115.pad.data.FileItem
+import com.open115.pad.data.SearchHistory
 import com.open115.pad.data.media.ActorAvatarRef
-import com.open115.pad.data.media.MEDIA_NO_LIMIT
 import com.open115.pad.data.media.MediaLibraryEntity
+import com.open115.pad.data.media.PinyinText
+import com.open115.pad.data.media.SEARCH_PAGE_SIZE
 import com.open115.pad.data.media.MediaScanner
 import com.open115.pad.data.media.MovieCard
+import com.open115.pad.data.media.MovieRecommender
 import com.open115.pad.data.media.QueuedScan
 import com.open115.pad.data.media.ScanMode
 import com.open115.pad.data.media.MediaPrefs
@@ -120,8 +134,10 @@ import com.open115.pad.player.PlayerActivity
 import com.open115.pad.player.PlayerCache
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import com.open115.pad.ui.components.EmptyState
 import com.open115.pad.ui.components.GlassCard
 import com.open115.pad.ui.components.MetaChip
+import com.open115.pad.ui.components.SearchHistoryRow
 import com.open115.pad.ui.components.auroraBackdrop
 import com.open115.pad.ui.components.dissolve
 import com.open115.pad.ui.history.displaySubtitle
@@ -129,6 +145,7 @@ import com.open115.pad.ui.history.displayTitle
 import com.open115.pad.ui.history.isFinished
 import com.open115.pad.ui.theme.AdaptiveBody
 import com.open115.pad.ui.theme.AppColors
+import com.open115.pad.ui.theme.AppSwitch
 import com.open115.pad.util.Format
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -143,10 +160,60 @@ private const val DISSOLVE_IN_MS = 500
 private const val DISSOLVE_OUT_MS = 450
 
 /**
+ * 海报共享元素的位移/缩放曲线：显式三次贝塞尔"快出慢收"，不用默认弹簧 ——
+ * 弹簧在长距离上末段会回弹一下，和页面淡变叠在一起像"冲过头再顿住"。
+ * 420ms 比默认稍长，给眼睛留出跟上"这张海报从墙上飞过来"的时间；
+ * 进出共用这条曲线，退回时才能原路缩回去。
+ */
+@OptIn(ExperimentalSharedTransitionApi::class)
+private val PosterBounds = BoundsTransform { _, _ ->
+    tween(420, easing = CubicBezierEasing(0.2f, 0f, 0f, 1f))
+}
+
+/**
+ * "这一层浮层是从哪一张海报点开的"：mediaKey 用来在重建后的列表里认出那张卡，
+ * sharedKey 是两侧共享元素的对上号。
+ *
+ * 浮层栈只渲染栈顶，下层页面在转场结束后会被销毁；停留久一点再退回时它是全新组合，
+ * 页面内的 pending 状态早就没了 —— 所以这份记录必须放在页面之外，否则只有"秒退"才有
+ * 海报缩回动画，稍久一点就只剩淡出（用户报的效果不统一）。
+ */
+private data class OpenedPoster(val mediaKey: String, val sharedKey: String)
+
+/**
+ * 一层详情页的"页面外状态"：滚动位置 + 推荐批次。页面被下一层详情盖住时会销毁，
+ * 退回重建必须接回这里 —— 滚动位置不接回，推荐行在屏幕外，共享元素没有可落的位置；
+ * 推荐列表不接回，推荐行要等 Room 查完才出现，目标卡会晚于转场才注册（只剩淡出）。
+ */
+private data class DetailPageState(
+    val scroll: Int = 0,
+    val shuffleTick: Int = 0,
+    val recs: List<MovieRecommender.Recommendation> = emptyList(),
+)
+
+/**
+ * 库卡片"脸面"的缓存键：封面图列表与部数。
+ *
+ * 为什么需要缓存：库列表是 LazyColumn，快速上下滑时卡片会被**销毁再重建**。
+ * 没有缓存时每次重建都从空值起步、重新查一遍 Room + 列一遍海报缓存目录 ——
+ * 用户看到的就是"滑过去再滑回来，明明看过的封面又要重新加载一遍"（部数徽标也会消失再出现）。
+ * 键里带上 refreshTick / scanFinishedAt，扫描或删片后自动换一代，不会拿旧数据。
+ *
+ * [covers] 是封面要几张（1×1 卡 1 张、1×2 卡 2 张、1×3 卡 6 张）；部数用 0（与封面区分开）。
+ */
+private data class LibraryFaceKey(
+    val id: Long,
+    val refreshTick: Int,
+    val scanFinishedAt: Long,
+    val covers: Int,
+)
+
+/**
  * 媒体库页（类 Yamby）：左侧独立入口。
  * 「新建媒体库」→ 输名字 + 从云盘目录树选路径 → 保存为库；
  * 每个库可手动扫描（带进度、可续跑）或删除。
  */
+@OptIn(androidx.compose.animation.ExperimentalSharedTransitionApi::class)
 @Composable
 fun MediaLibraryScreen(api: com.open115.pad.data.OpenApi) {
     val context = LocalContext.current
@@ -155,11 +222,12 @@ fun MediaLibraryScreen(api: com.open115.pad.data.OpenApi) {
     val dao = container.mediaDatabase.mediaDao()
     // 手机（窄屏）排版开关：搜索框 + 3 个图标在 411dp 宽下会互相挤压，按这个标志切紧凑形态
     // （搜索结果网格的列宽也跟着它）；平板（>=600dp）保持原样
-    val compact = LocalConfiguration.current.screenWidthDp < 600
-    // 库卡片是否铺两列：通栏单列在内容宽度（AdaptiveBody 收到 960dp）下，文字靠左、封面靠右，
-    // 中间空出约 400dp —— 这就是"卡片又宽又空"的来源。两列之后卡片变窄、同屏还多看得见几个库。
-    // 阈值 860dp：再窄下去每张卡不到 410dp，文字列装不下一行摘要
-    val libColumns = if (LocalConfiguration.current.screenWidthDp >= 860) 2 else 1
+    val screenW = LocalConfiguration.current.screenWidthDp
+    val compact = screenW < 600
+    // 宽屏首页：「最近新增 / 继续观看」的横排海报用大一号的卡
+    val wideHome = screenW >= 1000
+    // 横排海报的宽度：「最近新增 / 继续观看」在宽屏上用大一号的卡
+    val tileWidth = if (wideHome) 168.dp else 108.dp
 
         val libraries by dao.libraries().collectAsState(initial = emptyList())
 /**
@@ -176,20 +244,62 @@ fun MediaLibraryScreen(api: com.open115.pad.data.OpenApi) {
         // 拖动期间列表可能被改（新建/删库/扫描收尾）：对不上就退回库里自己的顺序，别少画几张卡
         if (mapped.size == libraries.size) mapped else libraries
     }
+
+    /**
+     * 每张库卡的**大小与封面数**：用户在「⋯ → 卡片大小」里定义的（持久化在 [MediaPrefs]）。
+     *
+     * 没有条目的库 = 自动（老规则：奇数个库时第一张当通栏主推位）。手机是单列，
+     * 一律 1×1、一张封面 —— "pad 模式才可定义"（见 [libraryTiles]）。
+     */
+    val cardSizes by container.mediaPrefs.libraryCardSpans.collectAsState(initial = emptyMap())
+    /** 有没有库定义过固定大小：有的话 pad 网格改成**一行三等分**（见下面的 [libColumns]） */
+    val anyManualSize = orderedLibs.any { cardSizes[it.id] in 1..3 }
+
+    /**
+     * 网格列数。
+     *
+     * ★ **横屏 + 定义过卡片大小时一行三等分**：1×1 = 1/3、1×2 = 2/3、1×3 = 整行 ——
+     *   不然 2 列屏上 1×2 / 1×3 都只能占满整行，两者看着一模一样（用户报的问题）。
+     * ★ **竖屏 pad（600~859dp）也两列**：原来落到 1 列，一张卡横贯整屏、右边全是空的
+     *   （竖屏实测很难看）；竖屏只有 2 格宽，1×2/1×3 都占满整行，靠封面数和卡片高度区分。
+     *   没定义过时保持老密度（平板 2 列 / 宽屏 3 列，不超过库的总数）。
+     */
+    val libColumns = when {
+        orderedLibs.isEmpty() -> 1
+        compact -> 1
+        anyManualSize && screenW >= 860 -> 3
+        else -> minOf(
+            when {
+                screenW >= 1240 -> 3
+                screenW >= 600 -> 2
+                else -> 1
+            },
+            orderedLibs.size,
+        )
+    }
+
+    /**
+     * 网格是不是"窄卡"布局（1 格 < 430dp）：竖屏两列 ≈333、横屏三等分 ≈360 都算窄，
+     * 横屏两列 ≈553 不算。窄卡才需要统一高度 + 标签单行（见 LibraryCard 的 uniformHeight）。
+     */
+    val narrowLayout = isNarrowLibraryGrid(screenW, libColumns, compact)
+
+    /** 1 格宽度 / 一张卡宽度（dp）：封面张数要不要折行由后者决定（见 libraryCoverColumns） */
+    val unitWidth = libraryUnitWidth(screenW, libColumns)
     LaunchedEffect(libraries, pendingOrder) {
         val pending = pendingOrder ?: return@LaunchedEffect
         if (libraries.map { it.id } == pending) pendingOrder = null
     }
     val dragHost = remember { LibraryDragHost() }
 
-    /**
-     * 奇数个库时把**第一张**提出来做通栏（[heroLib]），剩下的（偶数个）两两成对。
-     *
-     * 为什么不是"落单那张通栏"：第一张当主推位、下面都是规整的两列，读起来是"一个主卡 + 一个网格"；
-     * 而落单那张通栏会让最后一行孤零零横在下面。宽度不够两列（手机）时不做，保持单列。
-     */
-    val heroLib = if (libColumns > 1 && orderedLibs.size % 2 == 1) orderedLibs.first() else null
-    val gridLibs = if (heroLib == null) orderedLibs else orderedLibs.drop(1)
+    val libTiles = remember(orderedLibs, libColumns, compact, cardSizes) {
+        libraryTiles(orderedLibs.map { it.id }, libColumns, compact, cardSizes)
+    }
+    /** 按 span 装行：1×2 + 1×1 能拼成一整行（见 [packLibraryTiles]） */
+    val libRows = remember(libTiles, libColumns) { packLibraryTiles(libTiles, libColumns) }
+    val libsById = remember(orderedLibs) { orderedLibs.associateBy { it.id } }
+    /** 每张卡要几张封面：封面的预取与渲染必须同一份口径 */
+    val coversById = remember(libTiles) { libTiles.associate { it.id to it.covers } }
 
     /** 松手落定：算新顺序 → 乐观生效 → 落盘（空拖动/原地放回都直接返回，不白写库） */
     fun dropLibrary(fromId: Long, hoverId: Long) {
@@ -223,14 +333,66 @@ fun MediaLibraryScreen(api: com.open115.pad.data.OpenApi) {
      * 都是本地 Room 查询（毫秒级），换来的是内存不随层数增长。
      */
     val overlays = remember { mutableStateListOf<MediaOverlay>() }
+    /** 浮层 id → 从它这里点开的那张海报：转场销毁重建后靠它把同一张重新挂上共享元素（见 [OpenedPoster]） */
+    val openedPoster = remember { mutableStateMapOf<Long, OpenedPoster>() }
+    /** 详情页的滚动位置与推荐批次（浮层 id → 状态）：重建后接回，退回才有飞回去的落点 */
+    val detailPageCache = remember { mutableMapOf<Long, DetailPageState>() }
+    /** 作品页网格位置（浮层 id → 首项/偏移）：详情盖上来时页面销毁，退回要停在原处 */
+    val worksGridCache = remember { mutableMapOf<Long, Pair<Int, Int>>() }
+    /** 哪些详情浮层已经滚动过：滚动后它的海报不再挂共享元素（覆盖层里的图不跟滚动） */
+    var posterShareOff by remember { mutableStateOf<Long?>(null) }
+    /**
+     * 正在编辑兜底海报裁剪的背景图 pickCode（null = 没开）。
+     *
+     * 状态放在媒体库页这一层、浮层也画在 SharedTransitionLayout **之后**：详情页那张海报
+     * 匹配着墙上的卡，会被画进共享元素的顶层覆盖层里 —— 浮层画在详情页内部的话，
+     * 海报会压在编辑界面上（实测左边露出一截旧海报）。
+     */
+    var cropEditPick by remember { mutableStateOf<String?>(null) }
+    /**
+     * 从墙上点开的那张海报（mediaKey）：浮层栈非空期间，墙上这张交给共享元素接管、原地隐藏。
+     *
+     * 为什么不能直接用普通 [androidx.compose.animation.SharedTransitionScope.sharedElement]：
+     * 墙在**另一个** AnimatedContent 里，点开详情时它自己的转场是静止的。Compose 只给正在
+     * 转场的一侧驱动边界动画 —— 实测静止那一侧会被直接拉到终点：卡原地消失、图直接出现在
+     * 详情页海报的位置，中间没有飞行（用户报的"海报墙进详情没有动效"）。
+     * 换成 caller-managed 可见性后，visible 翻转会让这张卡自己跑一个过渡，飞行动画才有源。
+     */
+    var wallPosterInFlight by remember { mutableStateOf<String?>(null) }
+    /**
+     * 墙上共享元素的"代次"：退回墙时 +1。
+     *
+     * 墙是一直活着的（浮层盖在它上面，页面没销毁），它的共享元素节点也是老的 ——
+     * 返回时只把 visible 翻回 true 还不够：老节点不会被重新放置，边界动画没有启动的机会，
+     * 结果就是详情页的大海报原地淡出、墙上的卡直接出现（作品页返回能用是因为那页整个重建了）。
+     * 换一个 key 让节点销毁重建，效果等同于"页面重建"，返回的收缩动画才会跑。
+     */
+    var wallPosterEpoch by remember { mutableStateOf(0) }
     // 作品页最近一次的数据（kind+name → cards）：栈只渲染栈顶，详情盖上来时作品页实例被销毁，
     // 退回是全新组合。它纯黑底起步、背景图也取自 cards，不喂初值的话头几帧是"黑底空网格"，
     // 叠上详情页的淡出就是肉眼可见的闪黑。查完写回（onCardsLoaded），重建时当首帧初值。
     val worksCache = remember { mutableMapOf<Pair<WorksKind, String>, List<MovieCard>>() }
+    /**
+     * 库卡片的封面 / 部数缓存（键见 [LibraryFaceKey]）。
+     *
+     * 用普通 HashMap 而不是 SnapshotStateMap：它只在组合时被读一次当**首帧初值**，
+     * 结果回来由各自的 produceState 推给 UI —— 不需要让一次写入把整屏卡片全部重组。
+     */
+    val libraryCoverCache = remember { HashMap<LibraryFaceKey, List<String>>() }
+    val libraryCountCache = remember { HashMap<LibraryFaceKey, Int>() }
     // 入栈/出栈各包一层：转场目前是方向无关的淡入淡出，这两个只是把"改栈"收口到一处，
     // 将来若要换回带方向的滑动，方向标志在这里加回即可。
     fun pushOverlay(o: MediaOverlay) { overlays.add(o) }
-    fun popOverlay() { overlays.removeLastOrNull() }
+    fun popOverlay() {
+        overlays.removeLastOrNull()
+        // 退回墙：清掉"在飞的那张"并把墙上的共享元素节点换一代。
+        // 只翻 visible 不够：墙一直活着，老节点不会被重新放置，边界动画没有启动的机会
+        // （实测详情页的大海报原地淡出、墙上的卡直接出现）；换 key 让节点重建才有返回动画。
+        if (overlays.isEmpty()) {
+            wallPosterInFlight = null
+            wallPosterEpoch++
+        }
+    }
     /**
      * 海报墙的刷新信号，**墙和详情页共用**。
      *
@@ -241,19 +403,84 @@ fun MediaLibraryScreen(api: com.open115.pad.data.OpenApi) {
     var wallTick by remember { mutableStateOf(0) }
 
     /**
+     * 后台把每个库的**部数 + 封面**先算出来塞进缓存。
+     *
+     * 快速滑动时卡片是"滑到才组合"的：每张都现查 Room（部数/候选海报）+ 现列一遍海报缓存目录
+     * （`cachedAmong` 里 dir.list + 逐个 stat），卡片多了就来不及。这里按顺序先备好，
+     * 滑到哪张基本都能直接命中缓存，首帧就有图（Coil 再从内存缓存取位图）。
+     *
+     * 每 4 个库让出一帧：几百个库时也不能把滑动/启动卡住。查询本身都是 suspend，
+     * 文件遍历在 IO 线程（见 cachedAmong），主线程只做调度。
+     */
+    LaunchedEffect(orderedLibs, libTiles, wallTick, scanProgress.finishedAt) {
+        if (orderedLibs.isEmpty()) return@LaunchedEffect
+        val tick = wallTick
+        val at = scanProgress.finishedAt
+        // 换一代就清掉上一代的条目：键里带着 tick/时间，旧条目不会再被读到，留着只是白占内存
+        libraryCoverCache.keys.removeAll { it.refreshTick != tick || it.scanFinishedAt != at }
+        libraryCountCache.keys.removeAll { it.refreshTick != tick || it.scanFinishedAt != at }
+        orderedLibs.forEachIndexed { i, lib ->
+            // 封面张数跟着这张卡的定义走（1×3 要 6 张）：缓存键里带 covers，换了大小会重新取
+            val covers = coversById[lib.id] ?: 1
+            val countKey = LibraryFaceKey(lib.id, tick, at, 0)
+            if (libraryCountCache[countKey] == null) {
+                libraryCountCache[countKey] = lib.rootPaths.sumOf { dao.movieCountIn(it) }
+            }
+            val coverKey = LibraryFaceKey(lib.id, tick, at, covers)
+            if (libraryCoverCache[coverKey] == null) {
+                val candidates = lib.rootPaths.flatMap { dao.posterSamplesInPath(it) }.distinct()
+                val models = container.imageUrlResolver.cachedAmong(candidates, container.cacheDir, covers)
+                // 空结果不缓存：库可能是"还没有缓存海报"，等用户浏览过海报墙就该补上新封面
+                if (models.isNotEmpty()) libraryCoverCache[coverKey] = models
+            }
+            if (i % 4 == 3) delay(16)
+        }
+    }
+
+    /**
      * 这一页的搜索：与海报墙**同一个查询**（片名/演员/标签，跨所有媒体库）。
      * 有搜索词时列表换成结果网格，点结果直接开详情浮层（走上面那个浮层栈）。
      */
     var query by remember { mutableStateOf("") }
     // 搜索结果跟着"作品排序"设置走（与海报墙/作品页同一个设置，不在这里再放一个菜单）
     val sort by container.mediaPrefs.worksSort.collectAsState(initial = WorksSort.DEFAULT)
-    val hits by produceState<List<MovieCard>?>(initialValue = null, query, sort) {
+    // 分页：先要 60 条，滚到底再加一页（不再一次拉全库）
+    var searchLimit by remember(query) { mutableIntStateOf(SEARCH_PAGE_SIZE) }
+    val hits by produceState<List<MovieCard>?>(initialValue = null, query, sort, searchLimit) {
         if (query.isBlank()) {
             value = null
             return@produceState
         }
-        delay(250) // 防抖：连续输入只跑最后一次（produceState 换 key 会取消上一轮，不必手动去抖）
-        value = dao.searchAll(query, MEDIA_NO_LIMIT, sort.sql)
+        // 只有第一页防抖；翻页是用户已经滚到底的明确动作，不该再等
+        if (searchLimit == SEARCH_PAGE_SIZE) delay(250)
+        value = dao.searchAll(
+            keyword = query.trim(),
+            pinyin = PinyinText.normalizeQuery(query),
+            limit = searchLimit,
+            offset = 0,
+            sort = sort.sql,
+        )
+    }
+    // 历史：输入停 900ms 落一条（merge 会顶掉"庆"→"庆余"这种中间态）
+    val searchHistory by container.searchHistory.media.collectAsState(initial = emptyList())
+    LaunchedEffect(query) {
+        val q = query.trim()
+        if (q.isNotBlank()) {
+            delay(900)
+            container.searchHistory.add(SearchHistory.Scope.MEDIA, q)
+        }
+    }
+    // 结果网格滚到底 → 再要一页（total >= limit 才说明可能还有）
+    val searchGridState = rememberLazyGridState()
+    LaunchedEffect(searchGridState, query, sort) {
+        snapshotFlow {
+            val last = searchGridState.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: -1
+            Triple(last, hits?.size ?: 0, searchLimit)
+        }.collect { (last, total, limit) ->
+            if (query.isNotBlank() && total > 0 && total >= limit && last >= total - 8) {
+                searchLimit += SEARCH_PAGE_SIZE
+            }
+        }
     }
     // 返回键：正在搜索就先清搜索（与海报墙一致）
     androidx.activity.compose.BackHandler(enabled = query.isNotBlank()) { query = "" }
@@ -375,6 +602,12 @@ fun MediaLibraryScreen(api: com.open115.pad.data.OpenApi) {
 
     // 极光底：几团很淡的径向渐变，给毛玻璃卡片一点"透出来的东西"（纯绘制、零请求）。
     // 它同时是背景图那层的**兜底**：一张 fanart 都没缓存时就只剩它，所以浓度不能太低
+    // 海报 ↔ 详情共用一个 SharedTransitionLayout：进详情那张海报从墙上/搜索结果卡"飞"到详情页，
+    // 退回来再飞回去。两个 AnimatedContent 各自提供 scope，key 用 mediaKey 对上。
+    // ★ 它必须包住**本页内容**（搜索结果网格在这里）：搜索结果卡的共享元素修饰要在 scope 里
+    //   才构得出来 —— 早先它只包两个 AnimatedContent，列表页的搜索结果卡够不着，
+    //   点结果进详情就只剩淡入淡出（用户报的效果不统一）。
+    SharedTransitionLayout {
     Box(Modifier.fillMaxSize().auroraBackdrop()) {
     backdrop?.let { model ->
         // 只压暗、**不模糊**。★ 试过 `Modifier.blur`：全屏图加 RenderEffect 直接把 MEmu 的
@@ -403,7 +636,7 @@ fun MediaLibraryScreen(api: com.open115.pad.data.OpenApi) {
             ),
         )
     }
-    AdaptiveBody(modifier = Modifier.fillMaxSize()) {
+    AdaptiveBody(modifier = Modifier.fillMaxSize(), maxWidth = if (wideHome) 1240.dp else 960.dp) {
         Column(Modifier.fillMaxSize()) {
             // 顶栏：标题 + 新建
             Row(
@@ -464,6 +697,15 @@ fun MediaLibraryScreen(api: com.open115.pad.data.OpenApi) {
                 }
             }
 
+            // 搜索框为空时铺最近搜索（输入中让位给结果）
+            if (query.isBlank()) {
+                SearchHistoryRow(
+                    history = searchHistory,
+                    onPick = { query = it },
+                    onClear = { scope.launch { container.searchHistory.clear(SearchHistory.Scope.MEDIA) } },
+                )
+            }
+
             // 全局扫描进度 + 跳过。跳过**在目录/簇边界生效**（不会打断正在进行的那个请求），
             // 所以按钮点下去会先变成"跳过中…"，等当前这一小步跑完才真的跳。
             if (scanProgress.running) {
@@ -509,7 +751,7 @@ fun MediaLibraryScreen(api: com.open115.pad.data.OpenApi) {
             val results = hits
             if (results != null) {
                 Text(
-                    "片名 / 演员 / 标签 · ${results.size} 部 · 全部媒体库",
+                    "片名 / 拼音 / 演员 / 标签 · 已加载 ${results.size} 部 · 全部媒体库",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(horizontal = 16.dp, vertical = 2.dp),
@@ -521,7 +763,7 @@ fun MediaLibraryScreen(api: com.open115.pad.data.OpenApi) {
                         verticalArrangement = Arrangement.Center,
                     ) {
                         Text(
-                            "全部媒体库里都没有匹配「$query」的片名 / 演员 / 标签",
+                            "全部媒体库里都没有匹配「$query」的片名 / 拼音 / 演员 / 标签",
                             style = MaterialTheme.typography.bodyLarge,
                         )
                     }
@@ -529,6 +771,7 @@ fun MediaLibraryScreen(api: com.open115.pad.data.OpenApi) {
                     LazyVerticalGrid(
                         // 窄屏用更小的列宽 → 手机上排 3 列（130dp 在 411dp 宽下只排得下 2 列，卡片偏大）
                         columns = GridCells.Adaptive(minSize = if (compact) 110.dp else 130.dp),
+                        state = searchGridState,
                         contentPadding = PaddingValues(16.dp),
                         horizontalArrangement = Arrangement.spacedBy(16.dp),
                         verticalArrangement = Arrangement.spacedBy(16.dp),
@@ -538,8 +781,26 @@ fun MediaLibraryScreen(api: com.open115.pad.data.OpenApi) {
                             PosterCard(
                                 card = card,
                                 onClick = {
+                                    // 与海报墙同一条路：记下这张，浮层栈非空期间它让位给共享元素。
+                                    // sharedKey 用独立命名空间（墙上是 "poster-…"）：列表↔墙转场的
+                                    // 那几帧两侧可能在同时组合，同 movie 撞 key 会留残影
+                                    wallPosterInFlight = card.mediaKey
                                     pushOverlay(
-                                        MediaOverlay.Detail(card, results, results.indexOf(card)),
+                                        MediaOverlay.Detail(
+                                            card, results, results.indexOf(card),
+                                            sharedKey = "search-${card.mediaKey}",
+                                        ),
+                                    )
+                                },
+                                // 海报从搜索结果卡"飞"进详情页（早先这条路只有淡入淡出，用户报过）。
+                                // 机制与海报墙那侧一字不差：本页在浮层栈打开期间一直活着（只是被盖住），
+                                // 普通 sharedElement 拿不到边界动画驱动，得用 caller-managed 可见性；
+                                // epoch 是返回时换一代让节点重建，返回的收缩动画才有首次放置
+                                posterModifier = key(wallPosterEpoch) {
+                                    Modifier.sharedElementWithCallerManagedVisibility(
+                                        rememberSharedContentState("search-${card.mediaKey}"),
+                                        visible = wallPosterInFlight != card.mediaKey || overlays.isEmpty(),
+                                        boundsTransform = PosterBounds,
                                     )
                                 },
                             )
@@ -547,73 +808,64 @@ fun MediaLibraryScreen(api: com.open115.pad.data.OpenApi) {
                     }
                 }
             } else if (libraries.isEmpty()) {
-                Column(
-                    Modifier
-                        .fillMaxSize()
-                        .padding(32.dp),
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                    verticalArrangement = Arrangement.Center,
-                ) {
-                    Text("还没有媒体库", style = MaterialTheme.typography.titleMedium)
-                    Spacer(Modifier.height(8.dp))
-                    Text("点右上角「新建」，选择云盘里的 Emby 资源目录", style = MaterialTheme.typography.bodyMedium)
-                }
+                EmptyState(
+                    icon = Icons.Outlined.Movie,
+                    title = "还没有媒体库",
+                    hint = "选择云盘里的 Emby 资源目录，扫描后影片就会出现在这里",
+                    action = {
+                        androidx.compose.material3.Button(onClick = { showCreate = true }) {
+                            Text("新建媒体库")
+                        }
+                    },
+                )
             } else {
                 LazyColumn(
                     Modifier.weight(1f),
                     contentPadding = PaddingValues(bottom = 16.dp),
                 ) {
-                    // 奇数个库时**最上面那张通栏**（用户要的"1×2"）：它铺 [HERO_COVERS] 张封面，
-                    // 把多出来的宽度压住；其余的照旧两两成对。这样每一行都是满的，页面上不留洞。
-                    // 通栏放在最上面而不是最后一张：视觉上"第一张是主推位"，往下都是规整的两列
-                    if (heroLib != null) {
-                        item(key = "hero-${heroLib.id}") {
-                            LibraryCell(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .padding(horizontal = 16.dp, vertical = 8.dp),
-                                lib = heroLib,
-                                covers = HERO_COVERS,
-                                dao = dao,
-                                container = container,
-                                refreshTick = wallTick,
-                                scanFinishedAt = scanProgress.finishedAt,
-                                // 「扫描中 / 排队中」都是**按库**判的（早先只有一个全局 running，
-                                // 一个库在扫就把所有库的扫描按钮一起置灰 —— 队列化之后没这个问题了）
-                                scanning = scanProgress.running && scanProgress.libraryId == heroLib.id,
-                                queued = pendingScans.any { it.libraryId == heroLib.id },
-                                recentAdded = recentAdded[heroLib.id] ?: 0,
-                                canDrag = orderedLibs.size > 1,
-                                host = dragHost,
-                                onOpen = { openedLib = heroLib },
-                                onScan = { mode -> startScan(heroLib, mode) },
-                                onScrape = { askScrape(heroLib) },
-                                onEdit = { editTarget = heroLib },
-                                onDelete = { deleteTarget = heroLib },
-                                onDrop = { fromId, hoverId -> dropLibrary(fromId, hoverId) },
-                            )
-                        }
-                    }
-
-                    // 其余库：宽屏两列（窄屏单列，[libColumns] 定的）。
+                    // 库卡片按**每库定义的大小**装行（1×1 / 1×2 / 1×3，见 libraryTiles）：
+                    // 定义过大小后 pad 网格一行**三等分** —— 1×1 占 1/3、1×2 占 2/3、1×3 占满，
+                    // 所以 1×2 和 1×3 有实实在在的宽度差别；没定义过则保持老密度。
                     // 按行铺而不是用 LazyVerticalGrid：网格和下面两条横排（最近新增 / 继续观看）
-                    // 没法在同一个滚动容器里混排，这里只要"每行 [libColumns] 张、等宽"就够了
-                    items(gridLibs.chunked(libColumns), key = { row -> row.first().id }) { row ->
+                    // 没法在同一个滚动容器里混排，按行 + span 权重就够。
+                    items(libRows, key = { row -> row.first().id }) { row ->
                         Row(
                             Modifier
                                 .fillMaxWidth()
                                 .padding(horizontal = 16.dp, vertical = 8.dp),
                             horizontalArrangement = Arrangement.spacedBy(12.dp),
                         ) {
-                            row.forEach { lib ->
+                            row.forEach { tile ->
+                                val lib = libsById[tile.id] ?: return@forEach
+                                // 6 张封面在窄卡上折成 3+3（两行），否则文字被挤没；折行后卡片要更高，
+                                // 因此**不能**再套统一高度（那一行只有它自己，不影响 1×1 的整齐）
+                                val coverCols = libraryCoverColumns(
+                                    tile.covers,
+                                    libraryCardWidth(screenW, libColumns, tile.span),
+                                )
                                 LibraryCell(
-                                    modifier = Modifier.weight(1f),
+                                    // 宽度按 span 分：同一张 1×2 在每行里都一样宽
+                                    modifier = Modifier.weight(tile.span.toFloat()),
                                     lib = lib,
-                                    covers = 1,
+                                    covers = tile.covers,
+                                    coverColumns = coverCols,
+                                    cardSize = cardSizes[lib.id] ?: 0,
+                                    showCardSize = !compact,
+                                    // 窄卡（竖屏两列 / 横屏三等分）才收窄路径、统一高度；
+                                    // 封面折成两行的卡本来就更高，不套统一高度
+                                    narrow = narrowLayout && tile.span == 1,
+                                    uniformHeight = narrowLayout && tile.covers <= coverCols,
+                                    onSetCardSize = { size ->
+                                        scope.launch { container.mediaPrefs.setLibraryCardSpan(lib.id, size) }
+                                    },
                                     dao = dao,
                                     container = container,
+                                    coverCache = libraryCoverCache,
+                                    countCache = libraryCountCache,
                                     refreshTick = wallTick,
                                     scanFinishedAt = scanProgress.finishedAt,
+                                    // 「扫描中 / 排队中」都是**按库**判的（早先只有一个全局 running，
+                                    // 一个库在扫就把所有库的扫描按钮一起置灰 —— 队列化之后没这个问题了）
                                     scanning = scanProgress.running && scanProgress.libraryId == lib.id,
                                     queued = pendingScans.any { it.libraryId == lib.id },
                                     recentAdded = recentAdded[lib.id] ?: 0,
@@ -627,8 +879,8 @@ fun MediaLibraryScreen(api: com.open115.pad.data.OpenApi) {
                                     onDrop = { fromId, hoverId -> dropLibrary(fromId, hoverId) },
                                 )
                             }
-                            // 单列时 [libColumns] = 1，这里天然是 0 次
-                            repeat(libColumns - row.size) {
+                            // 行尾不满时**留空位**而不是把卡片拉宽：用户定义的 1×2 在每行都该是 2/列数 宽
+                            repeat((libColumns - row.sumOf { it.span }).coerceAtLeast(0)) {
                                 Spacer(Modifier.weight(1f))
                             }
                         }
@@ -652,6 +904,7 @@ fun MediaLibraryScreen(api: com.open115.pad.data.OpenApi) {
                                     PosterTile(
                                         card = card,
                                         libraryName = recentLibOf[card.mediaKey],
+                                        width = tileWidth,
                                         onClick = {
                                             pushOverlay(
                                                 MediaOverlay.Detail(card, recentCards, recentCards.indexOf(card)),
@@ -672,7 +925,7 @@ fun MediaLibraryScreen(api: com.open115.pad.data.OpenApi) {
                                 horizontalArrangement = Arrangement.spacedBy(12.dp),
                             ) {
                                 items(continueRows, key = { it.itemKey }) { row ->
-                                    ContinueTile(row = row, onClick = { playRow(row) })
+                                    ContinueTile(row = row, width = tileWidth, onClick = { playRow(row) })
                                 }
                             }
                         }
@@ -729,12 +982,14 @@ fun MediaLibraryScreen(api: com.open115.pad.data.OpenApi) {
         )
     }
 
+    // （SharedTransitionLayout 在上面：它现在包着本页内容 + 下面两个 AnimatedContent，
+    //   搜索结果网格的共享元素也要在它的 scope 里，见页面开头那段说明。）
     // 库列表 ↔ 海报墙：同款淡入淡出溶解（点库卡片进、返回退都淡变，不再硬切）。
     // 墙盖在列表之上、浮层栈之下；进详情时 openedLib 不变、墙不动，只有下面浮层那个 AnimatedContent 在淡。
     AnimatedContent(
         targetState = openedLib,
         transitionSpec = {
-            fadeIn(tween(DISSOLVE_IN_MS)) togetherWith fadeOut(tween(DISSOLVE_OUT_MS)) using SizeTransform(clip = false)
+            fadeIn(tween(DISSOLVE_IN_MS, easing = FastOutSlowInEasing)) togetherWith fadeOut(tween(DISSOLVE_OUT_MS, easing = LinearOutSlowInEasing)) using SizeTransform(clip = false)
         },
         contentKey = { it?.id ?: -1L },
     ) { lib ->
@@ -756,7 +1011,22 @@ fun MediaLibraryScreen(api: com.open115.pad.data.OpenApi) {
                     onChanged = { wallTick++ },
                     onBack = { openedLib = null },
                     onOpenMovie = { card, list, index ->
+                        // 记下这一张：浮层栈非空期间墙上它让位给共享元素（见 wallPosterInFlight）
+                        wallPosterInFlight = card.mediaKey
                         pushOverlay(MediaOverlay.Detail(card, list, index))
+                    },
+                    posterShared = { card ->
+                        // ★ 这里不能用普通 sharedElement：墙所在的 AnimatedContent 此时是静止的，
+                        //   共享元素的边界动画拿不到驱动（会被直接摆到终点）。caller-managed 可见性
+                        //   让这张卡在 visible 翻转时自己跑一个过渡；退回（栈空）立刻翻回可见。
+                        //   外面再套一层 key：退回时换一代、节点重建，返回动画才有首次放置。
+                        key(wallPosterEpoch) {
+                            Modifier.sharedElementWithCallerManagedVisibility(
+                                rememberSharedContentState("poster-${card.mediaKey}"),
+                                visible = wallPosterInFlight != card.mediaKey || overlays.isEmpty(),
+                                boundsTransform = PosterBounds,
+                            )
+                        }
                     },
                 )
             }
@@ -777,10 +1047,12 @@ fun MediaLibraryScreen(api: com.open115.pad.data.OpenApi) {
             //   （不能用 ExitTransition.None 垫底——那在 AnimatedContent 里是"零时长退场"，
             //   旧页第一帧就被拆掉，实测露出的是更下面的海报墙。）
             //   例外：退到栈空（target=null，下面是海报墙）没有新页盖，保持对称淡出。
+            //   曲线：新页「快起缓收」、旧页「线性起步」（前半段保持不透明、后段才收），
+            //   比对称线性更顺，也不会让旧页过早透出下面的黑底。
             if (targetState == null) {
-                fadeIn(tween(DISSOLVE_IN_MS)) togetherWith fadeOut(tween(DISSOLVE_OUT_MS)) using SizeTransform(clip = false)
+                fadeIn(tween(DISSOLVE_IN_MS, easing = FastOutSlowInEasing)) togetherWith fadeOut(tween(DISSOLVE_OUT_MS, easing = LinearOutSlowInEasing)) using SizeTransform(clip = false)
             } else {
-                fadeIn(tween(DISSOLVE_IN_MS)) togetherWith fadeOut(tween(DISSOLVE_OUT_MS * 2)) using SizeTransform(clip = false)
+                fadeIn(tween(DISSOLVE_IN_MS, easing = FastOutSlowInEasing)) togetherWith fadeOut(tween(DISSOLVE_OUT_MS * 2, easing = LinearOutSlowInEasing)) using SizeTransform(clip = false)
             }
         },
         // key 只认浮层实例自己的 id（创建后不变）：入栈/出栈换了实例 → id 变 → 走转场；
@@ -788,15 +1060,44 @@ fun MediaLibraryScreen(api: com.open115.pad.data.OpenApi) {
         // ★ 千万别把栈深掺进来——出栈那一帧栈深就变了，转场里的旧页会被当成新内容重建（见 MediaOverlay.id 注释）
         contentKey = { top -> top?.id ?: -1L },
     ) { top -> Box(Modifier.fillMaxSize()) { when (top) {
-        is MediaOverlay.Detail -> MediaDetailScreen(
+        is MediaOverlay.Detail -> {
+            // 三种状态要分开看：
+            // ① 当前栈顶：正常挂（进详情时它是目标，退回下一层时它是目标）；
+            // ② **已经出栈**（退场中的那一页）：也要挂 —— 它是退回动画的**源**，不挂就只有淡出。
+            //    原来只放行"栈空"这一种，于是详情→详情退回时海报从不抬起来（只有秒退偶尔撞上）；
+            // ③ 还在栈里但不是栈顶（详情→详情刚压上去时的旧页）：**不挂** —— 它的 key 会跟
+            //    底下海报墙上的同一张撞上，转场结束后留一张残影（用户截图里的"图片重合"）。
+            val inStack = overlays.any { it === top }
+            val tagPoster = (!inStack || top === overlays.lastOrNull()) &&
+                posterShareOff != top.id
+            val pageState = detailPageCache[top.id]
+            MediaDetailScreen(
             card = top.card,
             playlist = top.list,
             index = top.index,
             dao = dao,
+            // 退回时要把共享元素重新挂到那张推荐卡上（页面重建后 pending 状态已经没了）
+            savedRecKey = openedPoster[top.id]?.takeIf { it.sharedKey.startsWith("rec-") }?.mediaKey,
+            // 重建时接回滚动位置与推荐列表：推荐行要在首帧就存在、且落在视野里，海报才有地方飞回去
+            initialScroll = pageState?.scroll ?: 0,
+            onScrollSave = { y ->
+                detailPageCache[top.id] = (detailPageCache[top.id] ?: DetailPageState()).copy(scroll = y)
+            },
+            initialShuffleTick = pageState?.shuffleTick ?: 0,
+            initialRecommendations = pageState?.recs.orEmpty(),
+            onRecommendationsLoaded = { tick, list ->
+                detailPageCache[top.id] = (detailPageCache[top.id] ?: DetailPageState()).copy(shuffleTick = tick, recs = list)
+            },
             onDeleted = { wallTick++ },
             onOpenWorks = { kind, name -> pushOverlay(MediaOverlay.Works(kind, name)) },
             // 点详情底部的推荐 → 再压一层详情；传的是那一批推荐，播完自动接下一部就在推荐里走
-            onOpenMovie = { c, l, i -> pushOverlay(MediaOverlay.Detail(c, l, i)) },
+            // 从推荐进下一部：带上"父片-子片"的共享元素 key，海报从推荐卡飞过去
+            onOpenMovie = { c, l, i ->
+                val key = "rec-${top.card.mediaKey}-${c.mediaKey}"
+                // 记在本页之外：新详情盖上来后这层会被销毁，退回时靠它把这张推荐卡重新挂上
+                openedPoster[top.id] = OpenedPoster(c.mediaKey, key)
+                pushOverlay(MediaOverlay.Detail(c, l, i, sharedKey = key))
+            },
             // 刮削写完：mediaKey 可能已经变了（文件前缀 → tmdb-<id>，扫描器删旧行建新行），
             // 详情页捧的还是旧卡 —— 按**不随 nfo 变的视频 pick_code** 把这条片重新认回来，
             // 换掉栈顶这张卡（produceState 以 mediaKey 为 key，换了卡才会拿新数据重查）
@@ -812,7 +1113,26 @@ fun MediaLibraryScreen(api: com.open115.pad.data.OpenApi) {
                 }
             },
             onBack = { popOverlay() },
-        )
+            onEditPoster = { pick -> cropEditPick = pick },
+            onUserScroll = { posterShareOff = top.id },
+            posterModifier = if (tagPoster) {
+                Modifier.sharedElement(
+                    rememberSharedContentState(top.sharedKey ?: "poster-${top.card.mediaKey}"),
+                    this@AnimatedContent,
+                    boundsTransform = PosterBounds,
+                )
+            } else {
+                Modifier
+            },
+            recommendationShared = { childKey ->
+                Modifier.sharedElement(
+                    rememberSharedContentState("rec-${top.card.mediaKey}-$childKey"),
+                    this@AnimatedContent,
+                    boundsTransform = PosterBounds,
+                )
+            },
+            )
+        }
 
         is MediaOverlay.Works -> {
             val worksKey = top.kind to top.name
@@ -824,10 +1144,30 @@ fun MediaLibraryScreen(api: com.open115.pad.data.OpenApi) {
                 onChanged = { wallTick++ },
                 onBack = { popOverlay() },
                 onOpenMovie = { card, list, index ->
-                    pushOverlay(MediaOverlay.Detail(card, list, index))
+                    val key = "works-${top.id}-${card.mediaKey}"
+                    openedPoster[top.id] = OpenedPoster(card.mediaKey, key)
+                    pushOverlay(MediaOverlay.Detail(card, list, index, sharedKey = key))
+                },
+                // 只给"从这一页点开的那一张"挂共享元素：整页都挂的话，没有对应目标的那些
+                // 会在转场结束后留下残留图层（推荐卡踩过同一个坑）。
+                posterShared = { card ->
+                    val opened = openedPoster[top.id]
+                    if (opened != null && opened.mediaKey == card.mediaKey) {
+                        Modifier.sharedElement(
+                            rememberSharedContentState(opened.sharedKey),
+                            this@AnimatedContent,
+                            boundsTransform = PosterBounds,
+                        )
+                    } else {
+                        Modifier
+                    }
                 },
                 initialCards = worksCache[worksKey].orEmpty(),
                 onCardsLoaded = { worksCache[worksKey] = it },
+                // 退回重建时停在原来的网格位置：点开的那张要在视野里，海报才飞得回去
+                initialGridIndex = worksGridCache[top.id]?.first ?: 0,
+                initialGridScrollOffset = worksGridCache[top.id]?.second ?: 0,
+                onGridSave = { i, o -> worksGridCache[top.id] = i to o },
             )
         }
 
@@ -856,7 +1196,9 @@ fun MediaLibraryScreen(api: com.open115.pad.data.OpenApi) {
                 host = dragHost,
                 lib = lib,
                 dao = dao,
+                refreshTick = wallTick,
                 scanFinishedAt = scanProgress.finishedAt,
+                countCache = libraryCountCache,
             )
         }
     }
@@ -965,6 +1307,19 @@ fun MediaLibraryScreen(api: com.open115.pad.data.OpenApi) {
         )
     }
     }   // 极光底 Box 收尾
+    }   // SharedTransitionLayout 收尾（从极光 Box 之前包到这：页面内容 + 两个 AnimatedContent 都在它的 scope 里）
+
+    // 兜底海报裁剪浮层：画在整个媒体库页的最外层（在 SharedTransitionLayout 之后），
+    // 才能盖住共享元素覆盖层里的那张海报。
+    cropEditPick?.let { pick ->
+        PosterCropOverlay(
+            backgroundPickCode = pick,
+            resolver = container.imageUrlResolver,
+            cacheDir = container.cacheDir,
+            onDismiss = { cropEditPick = null },
+            onSaved = { cropEditPick = null },
+        )
+    }
 }
 
 /**
@@ -1024,7 +1379,7 @@ private suspend fun deleteLibraryFully(
         container.videoPreviews.deleteFor(videoCodes)
         // 播放缓存：直链档按 pick_code 清；转码分片 key 是文件 sha1，库里没存，留给上限淘汰
         val freed = withContext(Dispatchers.IO) { PlayerCache.purge(videoCodes) }
-        if (freed > 0) android.util.Log.i("PlayerCacheIO", "删库：清掉播放缓存 ${freed / 1024 / 1024}MB")
+        if (freed > 0) com.open115.pad.util.AppLog.i("PlayerCacheIO", "删库：清掉播放缓存 ${freed / 1024 / 1024}MB")
     }
 
     // 演员头像：**只被这个库引用**的演员，头像引用与落盘字节一起清（别的库还在用的留着复用）。
@@ -1060,7 +1415,7 @@ private fun ratePlanText(lib: MediaLibraryEntity): String? = listOfNotNull(
         lib.rateLimitMs > 0 -> "限速 ${lib.rateLimitMs}ms"
         else -> null
     },
-    if (lib.tierRestMinutes > 0) "每100个休 ${lib.tierRestMinutes} 分" else null,
+    if (lib.tierRestMinutes > 0) "每100次列目录休 ${lib.tierRestMinutes} 分" else null,
 ).joinToString(" · ").ifEmpty { null }
 
 private fun autoScanText(lib: MediaLibraryEntity): String {
@@ -1077,21 +1432,151 @@ private fun autoScanText(lib: MediaLibraryEntity): String {
  * [refreshKey] 必须传一个"扫描结束后会变"的值（这里传 scanProgress.finishedAt）：
  * produceState 只在 key 变化时重算，而 rootPaths 在扫描前后是不变的 ——
  * 只以它为 key 的话，刚扫完的库会一直显示扫描前的数字（"还没有影片"）。
+ *
+ * [cache] 是页面级缓存：LazyColumn 回收重建卡片时先用上次的结果，部数徽标不会消失再出现；
+ * 键里同时带上 [refreshTick]（删片/刮削也会变），保证不会拿旧数字。
  */
 @Composable
 private fun LibraryCountState(
     dao: com.open115.pad.data.media.MediaDao,
-    rootPaths: List<String>,
+    lib: MediaLibraryEntity,
+    refreshTick: Int,
     refreshKey: Long,
+    cache: MutableMap<LibraryFaceKey, Int>,
 ): Int? {
-    val count by produceState(initialValue = -1, rootPaths, refreshKey) {
-        value = rootPaths.sumOf { dao.movieCountIn(it) }
+    val key = remember(lib.id, refreshTick, refreshKey) {
+        LibraryFaceKey(lib.id, refreshTick, refreshKey, 0)
+    }
+    val count by produceState(initialValue = cache[key] ?: -1, key) {
+        cache[key]?.let {
+            value = it
+            return@produceState
+        }
+        val n = lib.rootPaths.sumOf { dao.movieCountIn(it) }
+        cache[key] = n
+        value = n
     }
     return if (count < 0) null else count
 }
 
-/** 通栏那张铺几张封面：一张太单薄（卡片宽一倍，右边会空一大片），三张正好压住宽度 */
-private const val HERO_COVERS = 3
+/**
+ * 一张库卡在 pad 网格里的排布单元。
+ *
+ * [size] = 用户定义的大小（1/2/3 列；自动主推位时等于当前列数）；[span] = **实际占的列数**
+ * （不会超过当前行有几列 —— 列数不足时会夹到列数）；[covers] = 铺几张封面。
+ */
+internal data class LibraryTile(val id: Long, val size: Int, val span: Int, val covers: Int)
+
+/** 占 [size] 列时铺几张封面（用户定的映射）：1→1、2→2、3→**6**（1×3 一行六张） */
+internal fun coversForLibrarySize(size: Int): Int = if (size >= 3) 6 else size.coerceIn(1, 2)
+
+/**
+ * 3 列及以上网格里卡片的**统一高度**（封面 112dp + 上下 padding 14×2）。
+ *
+ * 1×1 卡在 1/3 宽时，路径/标签换行会把卡撑得高矮不齐 —— 统一钉死这个高度，
+ * 内容按 [LibraryCard] 的窄卡规则收进 112dp 里（见 narrow / uniformHeight）。
+ */
+private val LIBRARY_CARD_FIXED_HEIGHT = 140.dp
+
+/**
+ * pad 网格里 1 格占多宽（dp）：行宽（屏宽减两侧 16）减列间距后均分。
+ *
+ * 纯逻辑，单测钉在 `LibraryCardLayoutTest` —— 竖屏两列 / 横屏三等分的卡宽都从这里算。
+ */
+internal fun libraryUnitWidth(screenWidthDp: Int, columns: Int): Int {
+    val cols = columns.coerceAtLeast(1)
+    return ((screenWidthDp - 32 - 12 * (cols - 1)) / cols).coerceAtLeast(120)
+}
+
+/** 一张卡的实际宽度（dp）：span 格宽 + 中间的列间距 */
+internal fun libraryCardWidth(screenWidthDp: Int, columns: Int, span: Int): Int {
+    val s = span.coerceAtLeast(1)
+    return libraryUnitWidth(screenWidthDp, columns) * s + 12 * (s - 1)
+}
+
+/** 网格是不是窄卡布局（1 格 < 430dp）：决定统一高度 / 标签单行 / 窄卡只留一条路径 */
+internal fun isNarrowLibraryGrid(screenWidthDp: Int, columns: Int, compact: Boolean): Boolean =
+    !compact && columns >= 2 && libraryUnitWidth(screenWidthDp, columns) < 430
+
+/**
+ * 6 张封面能不能**一行**放下（用户要的 1×3 = 一行六张）。
+ *
+ * 一行封面 = 6×84 + 5×6 = 534dp，右边还要给文字列和「⋯」留约 270dp ——
+ * 卡片至少 ~800dp 才放得下；不够就折成 **3 张一行 × 2 行**，否则竖屏下
+ * 1×3 卡的文字会被挤成一条缝（真机竖屏实测）。
+ */
+internal fun libraryCoverColumns(covers: Int, cardWidthDp: Int): Int =
+    if (covers >= 6 && cardWidthDp < 800) 3 else covers.coerceAtLeast(1)
+
+/**
+ * 算出 pad 网格里每张库卡的占列数与封面数（纯逻辑，单测见 `LibraryCardLayoutTest`）。
+ *
+ * - 手机（[compact]）：一律 1×1、一张封面 —— "pad 模式才可定义"
+ * - **没有任何库设过大小**：保持老规则（只有一个库、或"提走一张刚好排满整行"时，
+ *   第一张当通栏主推位），其余 1×1。主推位的封面数也按同一套映射：2 列→2 张、3 列→6 张
+ * - **只要有一个库设过**：全部按手动来（没设过的算 1×1）—— 规则简单可预期，
+ *   不会出现"自动主推位"和用户定义的大小互相打架
+ */
+internal fun libraryTiles(
+    libIds: List<Long>,
+    columns: Int,
+    compact: Boolean,
+    explicitSizes: Map<Long, Int>,
+): List<LibraryTile> {
+    if (libIds.isEmpty()) return emptyList()
+    // 手机是单列：不管存过什么，一律 1×1、一张封面（"pad 模式才可定义"）
+    if (compact) return libIds.map { LibraryTile(it, 1, 1, 1) }
+    val cols = columns.coerceAtLeast(1)
+    val manual = libIds.any { explicitSizes[it] in 1..3 }
+    if (!manual) {
+        // 自动：只有一个库时它本来就占满整行（[libColumns] 会退到 1），按 1×2 的封面数铺；
+        // 否则"提走一张刚好排满整行"时第一张当通栏主推位
+        val hero = libIds.size == 1 || (cols > 1 && libIds.size % cols == 1)
+        if (!hero) return libIds.map { LibraryTile(it, 1, 1, 1) }
+        val heroSize = if (cols == 1) 2 else cols
+        return libIds.mapIndexed { i, id ->
+            if (i == 0) LibraryTile(id, heroSize, cols, coversForLibrarySize(heroSize))
+            else LibraryTile(id, 1, 1, 1)
+        }
+    }
+    return libIds.map { id ->
+        val size = explicitSizes[id]?.takeIf { it in 1..3 } ?: 1
+        LibraryTile(id, size, minOf(size, cols), coversForLibrarySize(size))
+    }
+}
+
+/**
+ * 按顺序把卡片装进一行行（贪心：放不下就换行）。
+ *
+ * 卡片宽度按 [LibraryTile.span] 的权重分配，所以 1×2 + 1×1 能拼成一整行；
+ * 行尾不满由 UI 补 spacer（不拉伸卡片 —— 同一张 1×2 在不同行里宽度不该变）。
+ */
+internal fun packLibraryTiles(tiles: List<LibraryTile>, columns: Int): List<List<LibraryTile>> {
+    val cols = columns.coerceAtLeast(1)
+    val rows = mutableListOf<List<LibraryTile>>()
+    var row = mutableListOf<LibraryTile>()
+    var used = 0
+    for (tile in tiles) {
+        val span = tile.span.coerceIn(1, cols)
+        if (row.isNotEmpty() && used + span > cols) {
+            rows += row
+            row = mutableListOf()
+            used = 0
+        }
+        row += tile
+        used += span
+    }
+    if (row.isNotEmpty()) rows += row
+    return rows
+}
+
+/** 「卡片大小」菜单/弹窗里的显示名（0 = 自动） */
+private fun libraryCardSizeLabel(size: Int): String = when (size) {
+    1 -> "1×1"
+    2 -> "1×2"
+    3 -> "1×3"
+    else -> "自动"
+}
 
 /**
  * 库列表里的**一个格子**：包一层拖动手势，里面就是 [LibraryCard]。
@@ -1106,6 +1591,9 @@ private fun LibraryCell(
     covers: Int,
     dao: com.open115.pad.data.media.MediaDao,
     container: com.open115.pad.AppContainer,
+    /** 页面级封面/部数缓存（LazyColumn 回收重建时首帧直接命中） */
+    coverCache: MutableMap<LibraryFaceKey, List<String>>,
+    countCache: MutableMap<LibraryFaceKey, Int>,
     /** 内容变了要重查的信号（删片、扫描落了新海报都算）：由页面传，组件自己拿不到 */
     refreshTick: Int,
     scanFinishedAt: Long,
@@ -1115,6 +1603,17 @@ private fun LibraryCell(
     /** 库少于两个时没得排序，直接不挂拖动手势 */
     canDrag: Boolean,
     host: LibraryDragHost,
+    /** pad 网格里用户定义的大小（0 = 自动）；手机恒 0 */
+    cardSize: Int,
+    /** 是否给「⋯」菜单挂上「卡片大小」（仅 pad 网格：手机只有单列，没得选） */
+    showCardSize: Boolean,
+    /** 3 列网格里占 1 格的窄卡（路径只留一条） */
+    narrow: Boolean,
+    /** 3 列网格：统一卡片高度、标签只排一行 */
+    uniformHeight: Boolean,
+    /** 封面一行铺几张（6 张在窄卡上折成 3+3 两行） */
+    coverColumns: Int,
+    onSetCardSize: (Int) -> Unit,
     onOpen: () -> Unit,
     onScan: (ScanMode) -> Unit,
     /** 批量「补全缺失元数据」（TMDB 刮削），见 LibraryCard 的同名参数 */
@@ -1134,12 +1633,20 @@ private fun LibraryCell(
             lib = lib,
             dao = dao,
             container = container,
+            coverCache = coverCache,
+            countCache = countCache,
             refreshTick = refreshTick,
             scanFinishedAt = scanFinishedAt,
             scanning = scanning,
             queued = queued,
             recentAdded = recentAdded,
             covers = covers,
+            coverColumns = coverColumns,
+            cardSize = cardSize,
+            showCardSize = showCardSize,
+            narrow = narrow,
+            uniformHeight = uniformHeight,
+            onSetCardSize = onSetCardSize,
             // 拎在手上的那张淡下去、被压住的那张亮一圈：拖动时"我从哪儿拿、要放哪儿"看得见
             dimmed = host.draggingId == lib.id,
             highlighted = host.hoverId == lib.id && host.draggingId != lib.id,
@@ -1171,6 +1678,8 @@ private fun LibraryCard(
     lib: MediaLibraryEntity,
     dao: com.open115.pad.data.media.MediaDao,
     container: com.open115.pad.AppContainer,
+    coverCache: MutableMap<LibraryFaceKey, List<String>>,
+    countCache: MutableMap<LibraryFaceKey, Int>,
     /** 内容变了要重查的信号（删片、扫描落了新海报都算），见 LibraryCover / LibraryCountState */
     refreshTick: Int,
     scanFinishedAt: Long,
@@ -1180,8 +1689,19 @@ private fun LibraryCard(
     queued: Boolean,
     /** 最近一轮扫描新增了几部（0 = 这轮没捞到新片，卡上就不显示这枚胶囊） */
     recentAdded: Int,
-    /** 封面位铺几张：普通卡 1 张；**通栏卡 3 张**（卡片变宽，只放一张右边会空一大片） */
+    /** 封面位铺几张：1×1 卡 1 张、1×2 卡 2 张、1×3 卡 **6 张**（见 coversForLibrarySize） */
     covers: Int = 1,
+    /** 3 列及以上网格里的窄卡（占 1 格）：路径只留一条，免得把卡撑高 */
+    narrow: Boolean = false,
+    /** 3 列及以上网格：卡片统一高度（[LIBRARY_CARD_FIXED_HEIGHT]），标签行只排一行 */
+    uniformHeight: Boolean = false,
+    /** pad 网格里用户定义的大小（0 = 自动）；手机恒 0 */
+    cardSize: Int = 0,
+    /** 是否显示「卡片大小」菜单项（仅 pad 网格） */
+    showCardSize: Boolean = false,
+    /** 封面一行铺几张（6 张在窄卡上折成 3+3 两行，见 libraryCoverColumns） */
+    coverColumns: Int = 1,
+    onSetCardSize: (Int) -> Unit = {},
     /** 正被拖在手上（整块淡下去，主体交给跟着手指的幻影） */
     dimmed: Boolean = false,
     /** 拖动落点（亮一圈主色描边） */
@@ -1195,9 +1715,13 @@ private fun LibraryCard(
     modifier: Modifier = Modifier,
 ) {
     var menuOpen by remember { mutableStateOf(false) }
-    val count = LibraryCountState(dao, lib.rootPaths, scanFinishedAt)
+    var sizePickerOpen by remember { mutableStateOf(false) }
+    val count = LibraryCountState(dao, lib, refreshTick, scanFinishedAt, countCache)
     GlassCard(
-        modifier = modifier.fillMaxWidth(),
+        modifier = modifier.fillMaxWidth().then(
+            // 3 列以上统一高度：1×1 卡在 1/3 宽时标签会换行，不钉死就高矮不齐
+            if (uniformHeight) Modifier.height(LIBRARY_CARD_FIXED_HEIGHT) else Modifier,
+        ),
         onClick = onOpen,
         dimmed = dimmed,
         highlighted = highlighted,
@@ -1206,7 +1730,10 @@ private fun LibraryCard(
             Modifier.fillMaxWidth().padding(14.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            LibraryCover(lib, dao, container, refreshTick, scanFinishedAt, count, want = covers)
+            LibraryCover(
+                lib, dao, container, refreshTick, scanFinishedAt, count,
+                want = covers, tilesPerRow = coverColumns, cache = coverCache,
+            )
             Spacer(Modifier.width(12.dp))
             Column(Modifier.weight(1f)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
@@ -1231,9 +1758,10 @@ private fun LibraryCard(
                 }
                 Spacer(Modifier.height(4.dp))
                 // 路径降权（弱一档字色 + folder 图标）：卡上该先看到库名和部数，路径只是
-                // "这个库指向哪儿"的注脚。最多铺 2 行，其余折成一句提示 —— 路径行数会顶高卡片，
-                // 而卡片高度该由封面定（两列并排时不等高会很乱）。完整路径在「编辑」里
-                val shownPaths = lib.rootPaths.take(2)
+                // "这个库指向哪儿"的注脚。完整路径在「编辑」里。
+                // 3 列网格的 1/3 宽卡只留一条（多一条就把卡撑出统一高度）；宽度够时最多铺 2 行，
+                // 其余折成一句提示。
+                val shownPaths = lib.rootPaths.take(if (narrow) 1 else 2)
                 shownPaths.forEach { path ->
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Icon(
@@ -1252,7 +1780,7 @@ private fun LibraryCard(
                         )
                     }
                 }
-                if (lib.rootPaths.size > shownPaths.size) {
+                if (!narrow && lib.rootPaths.size > shownPaths.size) {
                     Text(
                         "还有 ${lib.rootPaths.size - shownPaths.size} 个目录",
                         style = MaterialTheme.typography.bodySmall,
@@ -1264,7 +1792,8 @@ private fun LibraryCard(
                     )
                 }
                 Spacer(Modifier.height(6.dp))
-                LibraryMetaChips(lib, recentAdded)
+                // 3 列网格里标签**只排一行**：1/3 宽的卡上它们会换成 3~4 行，卡片高度就被撑歪了
+                LibraryMetaChips(lib, recentAdded, maxLines = if (uniformHeight) 1 else Int.MAX_VALUE)
             }
             Spacer(Modifier.width(4.dp))
             // 「⋯」贴顶：它是这张卡的操作，跟标题同一行更顺眼（封面和文字列是垂直居中的）
@@ -1307,6 +1836,16 @@ private fun LibraryCard(
                             onScan(ScanMode.Full)
                         },
                     )
+                    // pad 才有"卡片大小"：手机是单列，没有可定义的宽度
+                    if (showCardSize) {
+                        DropdownMenuItem(
+                            text = { Text("卡片大小（${libraryCardSizeLabel(cardSize)}）") },
+                            onClick = {
+                                menuOpen = false
+                                sizePickerOpen = true
+                            },
+                        )
+                    }
                     DropdownMenuItem(
                         text = { Text("补全缺失元数据（刮削）") },
                         onClick = {
@@ -1332,6 +1871,69 @@ private fun LibraryCard(
             }
         }
     }
+
+    if (sizePickerOpen) {
+        LibraryCardSizeDialog(
+            libName = lib.name,
+            selected = cardSize,
+            onDismiss = { sizePickerOpen = false },
+            onPick = { size ->
+                sizePickerOpen = false
+                onSetCardSize(size)
+            },
+        )
+    }
+}
+
+/**
+ * 「卡片大小」选择器（仅 pad）：自动 / 1×1 / 1×2 / 1×3。
+ *
+ * 选任意一个固定大小都会关掉"奇数个库时提第一张当主推位"的自动规则
+ * （见 [libraryTiles]）—— 两条规则同时生效只会让排布变得猜不透。
+ */
+@Composable
+private fun LibraryCardSizeDialog(
+    libName: String,
+    selected: Int,
+    onDismiss: () -> Unit,
+    onPick: (Int) -> Unit,
+) {
+    // 大小 → 名字 + 一句说明（说明里带上"占多宽 + 几张封面"，用户选之前就知道会变成什么样）。
+    // "1 格 / 2 格"是网格单位：横屏三等分时 1 格 = 1/3；竖屏是两列，2 格和 3 格都占满整行。
+    val choices = listOf(
+        Triple(0, "自动", "奇数个库时把第一张提成通栏主推位（原来的规则）"),
+        Triple(1, "1×1", "最小：占 1 格，铺 1 张封面"),
+        Triple(2, "1×2", "中：占 2 格，铺 2 张封面"),
+        Triple(3, "1×3", "最大：占满整行，铺 6 张封面"),
+    )
+    FadeAlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("「$libName」卡片大小") },
+        text = {
+            Column {
+                choices.forEach { (size, label, hint) ->
+                    Row(
+                        Modifier
+                            .fillMaxWidth()
+                            .clickable { onPick(size) }
+                            .padding(vertical = 2.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        RadioButton(selected = selected == size, onClick = { onPick(size) })
+                        Column {
+                            Text(label, style = MaterialTheme.typography.bodyLarge)
+                            Text(
+                                hint,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = { TextButton(onClick = onDismiss) { Text("关闭") } },
+    )
 }
 
 /**
@@ -1354,14 +1956,26 @@ private fun LibraryCover(
     refreshTick: Int,
     scanFinishedAt: Long,
     count: Int?,
-    /** 铺几张：普通卡 1 张；**通栏那张 3 张**（见列表里"通栏卡"那段） */
+    /** 铺几张：1×1 卡 1 张、1×2 卡 2 张、1×3 卡 **6 张**（见 coversForLibrarySize） */
     want: Int = 1,
+    /** 一行铺几张：6 张在窄卡上由 [libraryCoverColumns] 折成 3+3（两行），否则会把文字挤没 */
+    tilesPerRow: Int = want,
+    /** 页面级缓存：卡片被 LazyColumn 回收重建时首帧直接拿到上次的结果 */
+    cache: MutableMap<LibraryFaceKey, List<String>>,
 ) {
-    val models by produceState<List<String>>(
-        initialValue = emptyList(), lib.rootPaths, refreshTick, scanFinishedAt, want,
-    ) {
+    val key = remember(lib.id, refreshTick, scanFinishedAt, want) {
+        LibraryFaceKey(lib.id, refreshTick, scanFinishedAt, want)
+    }
+    val models by produceState<List<String>>(initialValue = cache[key].orEmpty(), key) {
+        cache[key]?.let {
+            value = it
+            return@produceState
+        }
         val candidates = lib.rootPaths.flatMap { dao.posterSamplesInPath(it) }.distinct()
-        value = container.imageUrlResolver.cachedAmong(candidates, container.cacheDir, want)
+        val loaded = container.imageUrlResolver.cachedAmong(candidates, container.cacheDir, want)
+        // 空结果不缓存：可能只是"还没缓存过海报"，用户看过海报墙后应该能补上
+        if (loaded.isNotEmpty()) cache[key] = loaded
+        value = loaded
     }
     val shape = RoundedCornerShape(12.dp)
     val tile = Modifier.size(width = 84.dp, height = 112.dp)
@@ -1372,15 +1986,22 @@ private fun LibraryCover(
         }
         return
     }
-    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-        models.forEach { model ->
-            Box(tile.clip(shape).background(MaterialTheme.colorScheme.surfaceVariant)) {
-                AsyncImage(
-                    model = model,
-                    contentDescription = null,
-                    contentScale = ContentScale.Crop,
-                    modifier = Modifier.fillMaxSize(),
-                )
+    // 按 [tilesPerRow] 摆成若干行：1×3 在宽卡上是一行 6 张；竖屏/窄卡上折成 3+3，
+    // 封面块宽度被限制在 3 格（264dp）以内，右边的文字列才留得下。
+    val perRow = tilesPerRow.coerceIn(1, want.coerceAtLeast(1))
+    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        models.chunked(perRow).forEach { row ->
+            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                row.forEach { model ->
+                    Box(tile.clip(shape).background(MaterialTheme.colorScheme.surfaceVariant)) {
+                        AsyncImage(
+                            model = model,
+                            contentDescription = null,
+                            contentScale = ContentScale.Crop,
+                            modifier = Modifier.fillMaxSize(),
+                        )
+                    }
+                }
             }
         }
     }
@@ -1466,15 +2087,16 @@ private fun StatusPill(text: String) {
  * 哪个是状态、哪个是配置。拆成胶囊之后每条都能一眼定位；写成 `if (x) MetaChip(y)`
  * 的语句式，顺带绕开了"字符串拼接里的 if 会把后面几段全吞掉"那个老坑。
  *
- * 换行带来的高度由封面的固定高兜底（见 [LibraryCover]），所以换到两行也不会
- * 把两列卡片撑得高低不一。
+ * [maxLines] 给 3 列网格用：1/3 宽的卡上这些胶囊会换成好几行、把卡片撑得高矮不齐，
+ * 只排一行（放不下的按顺序丢掉，最重要的「新增/上次扫描」在最前面）。
  */
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
-private fun LibraryMetaChips(lib: MediaLibraryEntity, recentAdded: Int) {
+private fun LibraryMetaChips(lib: MediaLibraryEntity, recentAdded: Int, maxLines: Int = Int.MAX_VALUE) {
     FlowRow(
         horizontalArrangement = Arrangement.spacedBy(6.dp),
         verticalArrangement = Arrangement.spacedBy(4.dp),
+        maxLines = maxLines,
     ) {
         // 「新增」排最前并上色：这轮扫描到底捞到新片没有，是这几条里最该先看到的
         if (recentAdded > 0) MetaChip("新增 $recentAdded 部", tint = AppColors.GreenFg)
@@ -1520,12 +2142,17 @@ private fun SectionHeaderRow(title: String, actionText: String? = null, onAction
  * 这一排是**跨库摊平**的，"这是哪个库新加的"必须看得见。
  */
 @Composable
-private fun PosterTile(card: MovieCard, libraryName: String?, onClick: () -> Unit) {
-    Column(Modifier.width(108.dp).clickable(onClick = onClick)) {
+private fun PosterTile(
+    card: MovieCard,
+    libraryName: String?,
+    width: Dp = 108.dp,
+    onClick: () -> Unit,
+) {
+    Column(Modifier.width(width).clickable(onClick = onClick)) {
         Box(
             Modifier
                 .fillMaxWidth()
-                .height(158.dp)
+                .height(width * 1.46f)
                 .clip(RoundedCornerShape(12.dp))
                 .background(MaterialTheme.colorScheme.surfaceVariant),
         ) {
@@ -1574,17 +2201,17 @@ private fun PosterTile(card: MovieCard, libraryName: String?, onClick: () -> Uni
  * （判据与意图都和观影历史页一致，见 [com.open115.pad.ui.history.isFinished]）。
  */
 @Composable
-private fun ContinueTile(row: WatchHistoryRow, onClick: () -> Unit) {
+private fun ContinueTile(row: WatchHistoryRow, width: Dp = 108.dp, onClick: () -> Unit) {
     val fraction = if (row.durationMs > 0L) {
         (row.positionMs.toFloat() / row.durationMs).coerceIn(0f, 1f)
     } else {
         0f
     }
-    Column(Modifier.width(108.dp).clickable(onClick = onClick)) {
+    Column(Modifier.width(width).clickable(onClick = onClick)) {
         Box(
             Modifier
                 .fillMaxWidth()
-                .height(158.dp)
+                .height(width * 1.46f)
                 .clip(RoundedCornerShape(12.dp))
                 .background(MaterialTheme.colorScheme.surfaceVariant),
         ) {
@@ -1647,7 +2274,7 @@ private fun LibraryEditDialog(
         autoScanIntervalHours: Int,
         /** 阶梯限速（防 ban），见 [MediaLibraryEntity.rateTiered] */
         rateTiered: Boolean,
-        /** 每 100 个目录休息几分钟（0 = 不休息） */
+        /** 每 100 次列目录休息几分钟（0 = 不休息） */
         tierRestMinutes: Int,
     ) -> Unit,
 ) {
@@ -1744,7 +2371,7 @@ private fun LibraryEditDialog(
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                     }
-                    Switch(checked = tiered, onCheckedChange = { tiered = it })
+                    AppSwitch(checked = tiered, onCheckedChange = { tiered = it })
                 }
                 // 定死值与阶梯是两套规则，同时生效只会互相打架 —— 开了阶梯就把这个输入框收起来
                 if (!tiered) {
@@ -1770,7 +2397,7 @@ private fun LibraryEditDialog(
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     Column(Modifier.weight(1f)) {
-                        Text("每 100 个目录休息一次", style = MaterialTheme.typography.bodyMedium)
+                        Text("每 100 次列目录休息一次", style = MaterialTheme.typography.bodyMedium)
                         Text(
                             "连着扫几百个目录后停几分钟，最能让 115 那边看不出这是脚本；" +
                                 "休息时进度卡上会写「休息中」，点停止最多多等 1 秒",
@@ -1778,7 +2405,7 @@ private fun LibraryEditDialog(
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                     }
-                    Switch(checked = restOn, onCheckedChange = { restOn = it })
+                    AppSwitch(checked = restOn, onCheckedChange = { restOn = it })
                 }
                 if (restOn) {
                     Spacer(Modifier.height(8.dp))
@@ -1823,7 +2450,7 @@ private fun LibraryEditDialog(
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                     }
-                    Switch(checked = autoScan, onCheckedChange = { autoScan = it })
+                    AppSwitch(checked = autoScan, onCheckedChange = { autoScan = it })
                 }
                 // 方式与间隔只在开关打开时才有意义（关掉了给它设这些是自相矛盾的输入）
                 if (autoScan) {
@@ -2126,6 +2753,8 @@ private sealed interface MediaOverlay {
         val list: List<MovieCard>,
         val index: Int,
         override val id: Long = newOverlayId(),
+        /** 共享元素 key：从推荐卡进来时是 "rec-<父片>-<子片>"，默认按墙上的海报 key */
+        val sharedKey: String? = null,
     ) : MediaOverlay
 
     /** 同一个演员 / 同一个标签的全部作品（**跨所有媒体库**，见 dao.byActor/byTag） */
@@ -2231,8 +2860,8 @@ private class LibraryDragHost {
      * 落点判定：**指尖落在谁的矩形里就是谁**（绝大多数时候这一句就定了）；落在卡片之间的缝里、
      * 或者落在列表外，再按"到矩形边的距离"取最近的那张。
      *
-     * ★ 别用"离中心最近"：通栏那张（奇数个时的第一张）横跨两整列，它的中心在屏幕正中间，
-     *   于是指尖在它**左上角**时算出来反而离下面那张更近 —— 想把它前面的格子当落点会全落偏
+     * ★ 别用"离中心最近"：通栏主推位、以及用户设成 1×2 / 1×3 的宽卡横跨整行，它的中心在屏幕
+     *   正中间，于是指尖在它**左上角**时算出来反而离下面那张更近 —— 想把它前面的格子当落点会全落偏
      *   （实测：把最后一张拖到左上角，结果插到了第二张的位置）。按边距离算就不受卡片宽窄影响。
      */
     private fun nearest(p: Offset): Long? {
@@ -2343,11 +2972,13 @@ private fun LibraryDragGhost(
     host: LibraryDragHost,
     lib: MediaLibraryEntity,
     dao: com.open115.pad.data.media.MediaDao,
+    refreshTick: Int,
     scanFinishedAt: Long,
+    countCache: MutableMap<LibraryFaceKey, Int>,
 ) {
     val size = host.cardSize
     if (size.width <= 0 || size.height <= 0) return
-    val count = LibraryCountState(dao, lib.rootPaths, scanFinishedAt)
+    val count = LibraryCountState(dao, lib, refreshTick, scanFinishedAt, countCache)
     val density = LocalDensity.current
     val topLeft = host.finger - host.grab
     val w = with(density) { size.width.toDp() }

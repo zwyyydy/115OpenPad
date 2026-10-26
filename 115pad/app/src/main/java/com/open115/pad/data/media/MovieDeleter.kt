@@ -1,10 +1,11 @@
 package com.open115.pad.data.media
 
-import android.util.Log
+import com.open115.pad.util.AppLog as Log
 import com.open115.pad.data.ImageUrlResolver
 import com.open115.pad.data.OpenApi
 import com.open115.pad.data.envMsg
 import com.open115.pad.data.envOk
+import com.open115.pad.data.purgeRecycleEntries
 import com.open115.pad.data.VideoPreviewStore
 import com.open115.pad.data.listDirPaged
 import com.open115.pad.player.PlayerCache
@@ -50,6 +51,10 @@ sealed interface MovieDeleteResult {
  *   所以全删完可能剩几个空目录，那个留给用户自己在网盘里处置。
  *   这两个子目录是**整个目录共用**的（一季的剧照挂在每一条上），所以只在目录被删空时才清
  *   —— 删一集就顺手删掉整季剧照，会让别的集全是死链。
+ *   ★ 例外是**附加内容目录**（`behind the scenes/` 花絮预告这类，见 [isExtraDirName]）：
+ *     扫描期整棵忽略、索引里一个字没记，上面的按 fid 删除永远够不着它 —— 不专门处理的话
+ *     "彻底删除"之后整个目录连同里面的视频原样留在云端。它们同样按"删空才动"的口径，
+ *     在 [deleteExtraDirs] 里整个删掉（目录 fid 连带内容）。
  *   ★ 头像还要多看一眼：**这个演员在库里还有别的作品就不删**（见 [avatarsToDelete]）——
  *     头像按名字全局唯一、跨影片复用，删了别的片就再也配不上；
  *     只有一部作品都不剩时，才把文件删掉、引用清掉。
@@ -72,6 +77,12 @@ suspend fun deleteMovie(
     cacheDir: File,
     mediaKey: String,
     alsoCloud: Boolean,
+    /**
+     * 彻底删除时**连回收站里对应的条目一起清**（与文件页同一套语义：
+     * 删除 = 云端删进回收站、可还原；彻底删除 = 删除 + 清掉对应回收站项）。
+     * 只在 [alsoCloud] = true 时有意义；回收站异步生效，清不掉的留在站里（见 [purgeRecycleEntries]）。
+     */
+    alsoPurgeRecycle: Boolean = false,
     /**
      * 视频预览图缓存（文件页缩略图 + 预览条那套）。
      *
@@ -114,6 +125,14 @@ suspend fun deleteMovie(
 
     var deletedIds = emptySet<String>()
 
+    // 「彻底删除」回收站清理的时间窗下界（删完之后按"进站时间晚于它"认领本次的回收条目）
+    val purgeSinceSec = System.currentTimeMillis() / 1000 - 120
+    // 头像文件可能**不在**本次要清理的目录里（它来自之前已经删掉的那部片）——
+    // 那时要单独去它所在的目录把这一张删掉，只删这一个 pick_code 对应的文件。
+    // alsoCloud = false 时空集，不影响；purge 时它也是"这次动过的目录"之一。
+    val strayAvatarDirs = doomedAvatars.mapNotNull { it.avatarDirCid }
+        .filter { it.isNotEmpty() && it !in sideDirs }.distinct()
+
     if (alsoCloud) {
         // v7 之前的索引只有 pick_code（`ufile/delete` 不认），图片的 id 更是本次才存。
         // 缺谁就按它自己的目录列一次文件表把 id 换回来，否则"彻底删除"会留下图片，
@@ -123,10 +142,6 @@ suspend fun deleteMovie(
         // 剧照 + 没人再用的头像（在要删空的那些子目录里）
         sideDirs.flatMap { imageIdsInDir(api, it, exceptPickCodes = keptAvatarPickCodes) }
             .forEach { if (it !in ids) ids += it }
-        // 头像文件可能**不在**本次要清理的目录里（它来自之前已经删掉的那部片）——
-        // 那时要单独去它所在的目录把这一张删掉，只删这一个 pick_code 对应的文件
-        val strayAvatarDirs = doomedAvatars.mapNotNull { it.avatarDirCid }
-            .filter { it.isNotEmpty() && it !in sideDirs }.distinct()
         if (strayAvatarDirs.isNotEmpty()) {
             val doomedPcs = doomedAvatars.map { it.avatarPickCode }.toSet()
             strayAvatarDirs.flatMap { imageIdsInDir(api, it, onlyPickCodes = doomedPcs) }
@@ -175,7 +190,21 @@ suspend fun deleteMovie(
         imageUrlResolver.evictPosterCache(doomedAvatars.map { it.avatarPickCode }, cacheDir)
     }
     // 云端已删干净的那些目录，顺手把没有归属的素材图也清了（云端删除失败时压根走不到这里）
-    if (alsoCloud) sweepOrphanArt(api, dao, dirKeys, deletedIds)
+    if (alsoCloud) {
+        sweepOrphanArt(api, dao, dirKeys, deletedIds)
+        val extraDirCids = deleteExtraDirs(api, dao, emptiedDirs.toList())
+        if (alsoPurgeRecycle) {
+            // 彻底删除 = 删除 + 清掉**对应的回收站项**（与文件页同一套语义）。这次删除动过的
+            // 目录全在这：影片目录（正片/nfo/图）、剧照/头像目录、散落头像目录、花絮预告目录
+            // ——窗口内这些目录的回收条目都来自本次删除，按 cid + 时间就够准（不必按名）。
+            purgeRecycleEntries(
+                api,
+                dirKeys + sideDirs + strayAvatarDirs + extraDirCids,
+                purgeSinceSec,
+                tag = "MoviePurge",
+            )
+        }
+    }
     return MovieDeleteResult.Ok
 }
 
@@ -254,6 +283,49 @@ private suspend fun sweepOrphanArt(
             Log.i(TAG, "清理 $cid 下 ${ids.size} 个无归属素材图")
         }
     }
+}
+
+/**
+ * 删掉已删空目录里的**附加内容目录**（`behind the scenes/` 花絮预告这类，见 [isExtraDirName]）。
+ *
+ * 为什么要在删除器里单独处理：扫描期这些目录整棵被忽略（[MediaScanner.pushChildren] 不进、
+ * [DirectorySniffer.sideArtOf] 不认），目录 cid 与里面文件的 fid **没有存在任何一列里** ——
+ * 上面的按 fid 删除只能删"索引里有归属"的文件，够不着它们；不专门列一遍的话，
+ * "彻底删除"之后整个目录连同里面的预告/花絮视频原样留在云端（真机实测踩到）。
+ *
+ * 口径与剧照/头像一致：只在目录被删空时才动（调用方传的就是 [emptiedDirs]），
+ * 删一集不碰 —— 谁知道别的集还要不要那份花絮。
+ *
+ * 怎么删：115 的 `ufile/delete` 认目录 fid、目录会连带内容一起走（文件页清理空文件夹就是
+ * 这条路）；仍先把目录里**这一层**的条目 fid 一并塞进批次 —— 万一接口对非空目录的处置有出入
+ * （历史行为只验证过"删空目录"），文件已经先删掉了，目录壳跟上就是删干净。
+ * 失败只记日志：主删除已经成功，不能因为收尾这步拦住"删除成功"的结论。
+ *
+ * 返回动过的那些目录的 cid（「彻底删除」清回收站时要连它们名下的回收条目一起认领 ——
+ * 目录删了，里面的文件在回收站里挂的 cid 是这个目录）。
+ */
+private suspend fun deleteExtraDirs(api: OpenApi, dao: MediaDao, dirCids: List<String>): List<String> {
+    val touched = mutableListOf<String>()
+    for (cid in dirCids) {
+        if (dao.rowsInDir(cid) > 0) continue
+        val page = runCatching { listDirPaged(api, cid) }.getOrNull() ?: continue
+        val extras = page.items.filter { it.isDir && isExtraDirName(it.fn) }
+        for (extra in extras) {
+            val dirFid = extra.fid?.takeIf { it.isNotEmpty() } ?: continue
+            touched += dirFid
+            val inner = runCatching { listDirPaged(api, dirFid) }.getOrNull()
+            val innerIds = inner?.items.orEmpty()
+                .mapNotNull { it.fid?.takeIf { f -> f.isNotEmpty() } }
+            val batch = (innerIds + dirFid).distinct()
+            val resp = runCatching { api.deleteFiles(batch.joinToString(","), parentId = null) }.getOrNull()
+            if (resp != null && resp.envOk()) {
+                Log.i(TAG, "删掉附加内容目录「${extra.fn}」（$dirFid，连带 ${batch.size - 1} 个条目）")
+            } else {
+                Log.w(TAG, "附加内容目录「${extra.fn}」删除失败：${resp?.envMsg() ?: "网络异常"}")
+            }
+        }
+    }
+    return touched
 }
 
 /**

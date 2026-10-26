@@ -7,7 +7,7 @@ import android.opengl.GLES20
 import android.opengl.GLSurfaceView
 import android.os.Handler
 import android.os.Looper
-import android.util.Log
+import com.open115.pad.util.AppLog as Log
 import android.view.Surface
 import java.nio.ByteBuffer
 import java.nio.ByteOrder

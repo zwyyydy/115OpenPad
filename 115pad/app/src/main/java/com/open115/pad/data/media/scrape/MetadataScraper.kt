@@ -37,7 +37,7 @@ import kotlinx.serialization.json.JsonPrimitive
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.OkHttpClient
 import okhttp3.Request
-import android.util.Log
+import com.open115.pad.util.AppLog as Log
 import java.util.concurrent.TimeUnit
 
 /**
@@ -270,7 +270,7 @@ class MetadataScraper(
     private suspend fun targetsOf(library: MediaLibraryEntity) = library.rootPaths
         .flatMap { p ->
             runCatching { dao.scrapeTargetsInPath(p.trim().trimEnd('/')) }
-                .onFailure { android.util.Log.w(TAG, "统计待刮削条目失败（根路径 $p）：界面会误报成「没有需要刮削的片」", it) }
+                .onFailure { com.open115.pad.util.AppLog.w(TAG, "统计待刮削条目失败（根路径 $p）：界面会误报成「没有需要刮削的片」", it) }
                 .getOrDefault(emptyList())
         }
         .distinctBy { it.mediaKey }
@@ -522,7 +522,7 @@ class MetadataScraper(
             ScrapeFailure.RequestError("还没配置刮削源：设置 → 实验室 → 元数据刮削（TMDB）"),
         )
         return runCatching { src.search(query) }
-            .onFailure { android.util.Log.w(TAG, "搜索失败 query=$query", it) }
+            .onFailure { com.open115.pad.util.AppLog.w(TAG, "搜索失败 query=$query", it) }
             .getOrThrow()
     }
 
@@ -670,7 +670,7 @@ class MetadataScraper(
             // 同名上传会生成「（1）」：替换前先回收旧文件（进回收站，可还原）
             existingNfo.fid?.takeIf { it.isNotBlank() }?.let { fid ->
                 runCatching { api.deleteFiles(fid, dirCid) }
-                    .onFailure { android.util.Log.w(TAG, "手动编辑前回收旧 nfo 失败（可能生成副本）", it) }
+                    .onFailure { com.open115.pad.util.AppLog.w(TAG, "手动编辑前回收旧 nfo 失败（可能生成副本）", it) }
             }
             Uploader.uploadSmallLogged(
                 transferLog, api, nfoName, merged.toByteArray(Charsets.UTF_8), dirCid, null,
@@ -844,7 +844,7 @@ class MetadataScraper(
             else -> null
         }
     } catch (e: Exception) {
-        android.util.Log.w(TAG, "nfo 直链解析失败 pc=$pickCode：${e.message}", e)
+        com.open115.pad.util.AppLog.w(TAG, "nfo 直链解析失败 pc=$pickCode：${e.message}", e)
         null
     }
 
@@ -949,7 +949,7 @@ class MetadataScraper(
                         }
                         .onFailure {
                             // 改名没成，nfo/海报仍按原名写：不喊一声的话，视频旧名 + 装饰新名会被扫成两条
-                            android.util.Log.w(TAG, "按规范名改名失败（$videoName → $proposed），nfo/海报仍按原名写", it)
+                            com.open115.pad.util.AppLog.w(TAG, "按规范名改名失败（$videoName → $proposed），nfo/海报仍按原名写", it)
                         }
                 }
             }
@@ -1006,7 +1006,7 @@ class MetadataScraper(
                     fetchBytes(url)?.takeIf { isDecodableImage(it) }
                 }
             }.getOrElse { e ->
-                android.util.Log.w(TAG, "获取剧照失败（不影响 nfo/海报写入）", e)
+                com.open115.pad.util.AppLog.w(TAG, "获取剧照失败（不影响 nfo/海报写入）", e)
                 emptyList()
             }
         } else {
@@ -1032,10 +1032,10 @@ class MetadataScraper(
                 val oldFids = runCatching { listItems(cid) }.getOrDefault(emptyList())
                     .filter { !it.isDir }.mapNotNull { it.fid }
                 if (oldFids.isNotEmpty()) runCatching { api.deleteFiles(oldFids.joinToString(","), cid) }
-                    .onFailure { android.util.Log.w(TAG, "清理旧剧照失败（旧图会与新上传的并存成「（1）」副本）", it) }
+                    .onFailure { com.open115.pad.util.AppLog.w(TAG, "清理旧剧照失败（旧图会与新上传的并存成「（1）」副本）", it) }
             }
             if (deleteFids.isNotEmpty()) runCatching { api.deleteFiles(deleteFids.joinToString(","), dirCid) }
-                .onFailure { android.util.Log.w(TAG, "清理同名旧 nfo/海报/背景失败（可能生成「（1）」副本）", it) }
+                .onFailure { com.open115.pad.util.AppLog.w(TAG, "清理同名旧 nfo/海报/背景失败（可能生成「（1）」副本）", it) }
         }
 
         onStep("正在上传海报…")
@@ -1060,7 +1060,7 @@ class MetadataScraper(
                     }.onSuccess { wroteStills++ }
                 }
             } else {
-                android.util.Log.w(TAG, "extrafanart 目录建不出来，剧照跳过")
+                com.open115.pad.util.AppLog.w(TAG, "extrafanart 目录建不出来，剧照跳过")
             }
         }
         if (wroteStills > 0) changed = true
@@ -1074,15 +1074,15 @@ class MetadataScraper(
             val merged = existingText?.let { NfoMerger.merge(it, NfoWriter.build(meta)) }
             when {
                 merged == null ->
-                    android.util.Log.w(TAG, "现有 nfo 读不到或无法解析，补充模式跳过 nfo（原文件保持不动）")
+                    com.open115.pad.util.AppLog.w(TAG, "现有 nfo 读不到或无法解析，补充模式跳过 nfo（原文件保持不动）")
                 merged.added <= 0 ->
-                    android.util.Log.i(TAG, "现有 nfo 内容已齐全，无需补充")
+                    com.open115.pad.util.AppLog.i(TAG, "现有 nfo 内容已齐全，无需补充")
                 else -> {
                     addedFields = merged.added
                     // 同名上传会生成「（1）」：替换前先回收旧文件（进回收站，可还原）
                     existingNfo.fid?.takeIf { it.isNotBlank() }?.let { fid ->
                         runCatching { api.deleteFiles(fid, dirCid) }
-                            .onFailure { android.util.Log.w(TAG, "补充 nfo 前回收旧文件失败（可能生成副本）", it) }
+                            .onFailure { com.open115.pad.util.AppLog.w(TAG, "补充 nfo 前回收旧文件失败（可能生成副本）", it) }
                     }
                     Uploader.uploadSmallLogged(
                         transferLog, api, nfoName, merged.xml.toByteArray(Charsets.UTF_8), dirCid, null,
@@ -1123,7 +1123,7 @@ class MetadataScraper(
         // 上传完成到"列目录可见"之间可能有几秒延迟：轻确认一下再重扫，免得白扫一轮
         onStep("正在确认云端文件…")
         if (!waitListingHas(dirCid, nfoName)) {
-            android.util.Log.w(TAG, "上传后 $LISTING_CONFIRM_MS 内没在列表里看到 $nfoName，仍照常排重扫")
+            com.open115.pad.util.AppLog.w(TAG, "上传后 $LISTING_CONFIRM_MS 内没在列表里看到 $nfoName，仍照常排重扫")
         }
 
         onStep("正在重扫该目录…")
@@ -1211,7 +1211,7 @@ class MetadataScraper(
                     if (old.isNotEmpty()) continue
                 } else if (old.isNotEmpty()) {
                     runCatching { api.deleteFiles(old.joinToString(","), cid) }
-                        .onFailure { android.util.Log.w(TAG, "清理旧分集 nfo 失败（$epBase）", it) }
+                        .onFailure { com.open115.pad.util.AppLog.w(TAG, "清理旧分集 nfo 失败（$epBase）", it) }
                 }
                 val xml = NfoWriter.buildEpisode(meta.title, ep)
                 runCatching {
@@ -1220,7 +1220,7 @@ class MetadataScraper(
                     written++
                     onStep("正在写分集（$written/$total）…")
                 }.onFailure {
-                    android.util.Log.w(TAG, "写分集 nfo 失败（$epBase）", it)
+                    com.open115.pad.util.AppLog.w(TAG, "写分集 nfo 失败（$epBase）", it)
                 }
             }
         }
@@ -1273,7 +1273,7 @@ class MetadataScraper(
         val memberIds = listing.filter { movieGroupOf(it) == group }.mapNotNull { it.fid }.distinct()
         if (memberIds.isEmpty()) return null
         val ok = runCatching { api.moveFiles(memberIds.joinToString(","), folderCid) }
-            .onFailure { android.util.Log.w(TAG, "归位失败（这部片仍原地写，不搬进独立目录）", it) }
+            .onFailure { com.open115.pad.util.AppLog.w(TAG, "归位失败（这部片仍原地写，不搬进独立目录）", it) }
             .isSuccess
         if (!ok) return null
         return folderCid to listOf(dirPath, base).filter { it.isNotBlank() }.joinToString("/")

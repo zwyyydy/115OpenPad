@@ -9,10 +9,10 @@ import okhttp3.Request
 /**
  * 云盘上的 `.torrent` → 115 云下载（离线）。
  *
- * 开放平台**没有**"上传种子文件建 BT 任务"的接口（只有 `add_task_urls`，文档 §40），
- * 所以流程只能是：取种子文件的 115 直链 → 把那几十 KB 读回本地 → 算出 info_hash →
- * 拼磁力链 → 交给云下载。种子里的 tracker 由 [Torrent.buildMagnet] 一并带进磁力链，
- * 私有种子只能靠它找到 peer。
+ * 两条路：
+ * - 整包：取直链读回本地 → 算 info_hash → 拼磁力链 → `add_task_urls`；
+ * - 按文件勾选：走 [BtTask] 的 `offline/torrent` + `offline/add_task_bt`（种子已在云盘，
+ *   不需要再上传），这里只负责把字节读回来（本地解析预览 + 种子文件 SHA1）。
  *
  * 失败一律抛 [IllegalArgumentException]，消息是能直接给用户看的人话（调用方展示即可）。
  */
@@ -26,7 +26,14 @@ object CloudTorrent {
      *
      * @param url 115 直链，由 ImageUrlResolver.downloadUrl(pickCode) 解析得到
      */
-    suspend fun read(client: OkHttpClient, url: String): Torrent.TorrentInfo = withContext(Dispatchers.IO) {
+    suspend fun read(client: OkHttpClient, url: String): Torrent.TorrentInfo =
+        Torrent.parse(readBytes(client, url))
+
+    /**
+     * 只把原始字节读回来：本地解析与"算种子文件 SHA1"共用同一次下载。
+     * 云端 BT 任务（`offline/torrent`）要的是种子文件本身的 SHA1，不是 info_hash。
+     */
+    suspend fun readBytes(client: OkHttpClient, url: String): ByteArray = withContext(Dispatchers.IO) {
         val resp = try {
             client.newCall(Request.Builder().url(url).build()).execute()
         } catch (e: Exception) {
@@ -48,7 +55,7 @@ object CloudTorrent {
             if (read > MAX_BYTES) {
                 throw IllegalArgumentException("文件超过 ${MAX_BYTES / 1024 / 1024}MB，不像是种子文件")
             }
-            Torrent.parse(buf.copyOf(read))
+            buf.copyOf(read)
         }
     }
 }
